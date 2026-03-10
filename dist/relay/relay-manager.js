@@ -42,6 +42,11 @@ export async function runRelayManager(opts) {
         relayWs.on("open", () => {
             console.log(`Connected to relay server (gatewayId=${opts.gatewayId})`);
             opts.onConnected?.();
+            send({
+                type: "hello",
+                platform: process.platform,
+                agentVersion: "1.0.0",
+            });
             // Start the persistent gateway connection as soon as we're connected
             // to the relay server. Its lifetime is tied to this relay session.
             gatewayClient = new OpenClawGatewayClient({
@@ -104,6 +109,13 @@ export async function runRelayManager(opts) {
                 msg = JSON.parse(raw.toString());
             }
             catch {
+                return;
+            }
+            if (msg.type === "heartbeat") {
+                send({ type: "heartbeat" });
+                return;
+            }
+            if (msg.type === "hello") {
                 return;
             }
             if (msg.type !== "cmd" || !msg.method)

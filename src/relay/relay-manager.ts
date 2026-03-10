@@ -19,6 +19,8 @@ const OUTBOUND_DIR = join(homedir(), ".openclaw", "media", "outbound");
 
 /** Messages the relay client sends to the relay server. */
 type ToServer =
+  | { type: "hello"; platform: string; agentVersion: string }
+  | { type: "heartbeat" }
   | { type: "gateway_connected" }
   | { type: "gateway_disconnected"; reason: string }
   | { type: "event"; event: string; payload: unknown }
@@ -26,7 +28,7 @@ type ToServer =
 
 /** Messages the relay server sends to the relay client. */
 interface FromServer {
-  type: "cmd";
+  type: "cmd" | "hello" | "heartbeat";
   id?: string;
   method: string;
   params: unknown;
@@ -83,6 +85,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     relayWs.on("open", () => {
       console.log(`Connected to relay server (gatewayId=${opts.gatewayId})`);
       opts.onConnected?.();
+      send({
+        type: "hello",
+        platform: process.platform,
+        agentVersion: "1.0.0",
+      });
 
       // Start the persistent gateway connection as soon as we're connected
       // to the relay server. Its lifetime is tied to this relay session.
@@ -152,6 +159,15 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       try {
         msg = JSON.parse(raw.toString()) as FromServer;
       } catch {
+        return;
+      }
+
+      if (msg.type === "heartbeat") {
+        send({ type: "heartbeat" });
+        return;
+      }
+
+      if (msg.type === "hello") {
         return;
       }
 

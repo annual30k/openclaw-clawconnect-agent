@@ -22,6 +22,18 @@ export interface ProviderEntry {
   isDefault: boolean;
 }
 
+export interface ConfiguredModelEntry {
+  providerId: string;
+  provider: string;
+  modelId: string;
+  alias: string;
+  name: string;
+  contextWindow: string;
+  tags: string[];
+  isSelected: boolean;
+  isDefault: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -88,6 +100,21 @@ function inferType(id: string): string {
   // custom providers have ids like "custom-<uuid>"
   if (id.startsWith("custom-")) return "custom";
   return id;
+}
+
+function readStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string" && item.length > 0);
+}
+
+function modelContextWindow(modelRaw: Record<string, unknown>): string {
+  const candidates = ["contextWindow", "context_window", "contextLength", "context_length", "maxInputTokens"];
+  for (const key of candidates) {
+    const value = modelRaw[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return "--";
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +195,63 @@ export async function listProviderEntries(): Promise<ProviderEntry[]> {
       keyMasked,
       hasKey,
       isDefault,
+    });
+  }
+
+  return entries;
+}
+
+export async function listConfiguredModels(): Promise<ConfiguredModelEntry[]> {
+  const config = await readJson(OPENCLAW_CONFIG);
+
+  const agents = (config["agents"] as Record<string, unknown> | undefined) ?? {};
+  const defaults = (agents["defaults"] as Record<string, unknown> | undefined) ?? {};
+  const modelDefaults = (defaults["model"] as Record<string, unknown> | undefined) ?? {};
+  const primaryModel = typeof modelDefaults["primary"] === "string" ? modelDefaults["primary"] : "";
+
+  const entries: ConfiguredModelEntry[] = [];
+  const seen = new Set<string>();
+
+  const models = (config["models"] as Record<string, unknown> | undefined) ?? {};
+  const providers = (models["providers"] as Record<string, unknown> | undefined) ?? {};
+
+  const modelAliases = (defaults["models"] as Record<string, unknown> | undefined) ?? {};
+
+  for (const [fullKey, aliasRaw] of Object.entries(modelAliases)) {
+    const slashIndex = fullKey.indexOf("/");
+    if (slashIndex <= 0 || slashIndex >= fullKey.length - 1) continue;
+
+    const providerId = fullKey.slice(0, slashIndex);
+    const modelId = fullKey.slice(slashIndex + 1);
+    const aliasObj = aliasRaw != null && typeof aliasRaw === "object" && !Array.isArray(aliasRaw)
+      ? (aliasRaw as Record<string, unknown>)
+      : {};
+    const alias = typeof aliasObj["alias"] === "string" && aliasObj["alias"].trim().length > 0
+      ? aliasObj["alias"].trim()
+      : modelId;
+
+    if (seen.has(fullKey)) continue;
+    seen.add(fullKey);
+
+    const providerConfig = (providers[providerId] as Record<string, unknown> | undefined) ?? {};
+    const configuredModels = Array.isArray(providerConfig["models"]) ? providerConfig["models"] : [];
+    const modelRecord = configuredModels.find((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+      const record = entry as Record<string, unknown>;
+      return record["id"] === modelId;
+    }) as Record<string, unknown> | undefined;
+
+    const info = PROVIDER_REGISTRY[inferType(providerId)];
+    entries.push({
+      providerId,
+      provider: info?.displayName ?? providerId,
+      modelId,
+      alias,
+      name: alias,
+      contextWindow: modelRecord ? modelContextWindow(modelRecord) : "--",
+      tags: modelRecord ? [modelId, ...readStringArray(modelRecord["tags"])] : [modelId],
+      isSelected: false,
+      isDefault: fullKey === primaryModel,
     });
   }
 
@@ -274,5 +358,14 @@ export async function setDefaultProvider(id: string): Promise<void> {
   const model = getNestedObj(defaults, ["model"]);
   model["primary"] = primary;
 
+  await writeJson(OPENCLAW_CONFIG, config);
+}
+
+export async function setDefaultModel(providerId: string, modelId: string): Promise<void> {
+  const config = await readJson(OPENCLAW_CONFIG);
+  const agents = getNestedObj(config, ["agents"]);
+  const defaults = getNestedObj(agents, ["defaults"]);
+  const model = getNestedObj(defaults, ["model"]);
+  model["primary"] = `${providerId}/${modelId}`;
   await writeJson(OPENCLAW_CONFIG, config);
 }

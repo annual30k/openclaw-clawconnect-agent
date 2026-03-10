@@ -7,9 +7,11 @@ import type { LocalResult } from "./local-handlers.js";
 import { PROVIDER_REGISTRY } from "./provider-registry.js";
 import {
   listProviderEntries,
+  listConfiguredModels,
   addProvider,
   deleteProvider,
   setDefaultProvider,
+  setDefaultModel,
 } from "./provider-config.js";
 
 // ---------------------------------------------------------------------------
@@ -200,6 +202,40 @@ async function cmdSetDefault(params: Record<string, unknown>): Promise<LocalResu
   }
 }
 
+async function cmdListModels(): Promise<LocalResult> {
+  try {
+    const items = await listConfiguredModels();
+    return { ok: true, payload: { items } };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+async function cmdSelectModel(params: Record<string, unknown>): Promise<LocalResult> {
+  try {
+    return { ok: false, error: "Use chat.send with /model <alias> for session model switching" };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+async function cmdSetDefaultModel(params: Record<string, unknown>): Promise<LocalResult> {
+  try {
+    const providerId = typeof params.providerId === "string" ? params.providerId.trim() : "";
+    const modelId = typeof params.modelId === "string" ? params.modelId.trim() : "";
+    const modelAlias = typeof params.modelAlias === "string" ? params.modelAlias.trim() : "";
+    if (!providerId || !modelId) {
+      return { ok: false, error: "providerId and modelId are required" };
+    }
+
+    await setDefaultModel(providerId, modelId);
+    restartGateway();
+    return { ok: true, payload: { providerId, modelId, modelAlias, defaultModel: `${providerId}/${modelId}` } };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main dispatch
 // ---------------------------------------------------------------------------
@@ -208,7 +244,14 @@ export function handleProviderCommand(
   method: string,
   params: unknown
 ): Promise<LocalResult> | null {
-  if (!method.startsWith("clawpilot.provider.") && !method.startsWith("pocketclaw.provider.") && !method.startsWith("clawconnect.provider.")) return null;
+  if (
+    !method.startsWith("clawpilot.provider.")
+    && !method.startsWith("pocketclaw.provider.")
+    && !method.startsWith("clawconnect.provider.")
+    && !method.startsWith("clawpilot.model.")
+    && !method.startsWith("pocketclaw.model.")
+    && !method.startsWith("clawconnect.model.")
+  ) return null;
   const p = (params ?? {}) as Record<string, unknown>;
 
   switch (method) {
@@ -227,6 +270,15 @@ export function handleProviderCommand(
     case "clawconnect.provider.setDefault":
     case "pocketclaw.provider.setDefault":
     case "clawpilot.provider.setDefault": return cmdSetDefault(p);
+    case "clawconnect.model.list":
+    case "pocketclaw.model.list":
+    case "clawpilot.model.list":         return cmdListModels();
+    case "clawconnect.model.select":
+    case "pocketclaw.model.select":
+    case "clawpilot.model.select":       return cmdSelectModel(p);
+    case "clawconnect.model.setDefault":
+    case "pocketclaw.model.setDefault":
+    case "clawpilot.model.setDefault":   return cmdSetDefaultModel(p);
     default:
       return Promise.resolve({ ok: false, error: `Unknown provider command: ${method}` });
   }

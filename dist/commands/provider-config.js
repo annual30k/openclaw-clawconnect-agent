@@ -66,6 +66,22 @@ function inferType(id) {
         return "custom";
     return id;
 }
+function readStringArray(value) {
+    if (!Array.isArray(value))
+        return [];
+    return value.filter((item) => typeof item === "string" && item.length > 0);
+}
+function modelContextWindow(modelRaw) {
+    const candidates = ["contextWindow", "context_window", "contextLength", "context_length", "maxInputTokens"];
+    for (const key of candidates) {
+        const value = modelRaw[key];
+        if (typeof value === "string" && value.trim().length > 0)
+            return value.trim();
+        if (typeof value === "number" && Number.isFinite(value))
+            return String(value);
+    }
+    return "--";
+}
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -134,6 +150,55 @@ export async function listProviderEntries() {
             keyMasked,
             hasKey,
             isDefault,
+        });
+    }
+    return entries;
+}
+export async function listConfiguredModels() {
+    const config = await readJson(OPENCLAW_CONFIG);
+    const agents = config["agents"] ?? {};
+    const defaults = agents["defaults"] ?? {};
+    const modelDefaults = defaults["model"] ?? {};
+    const primaryModel = typeof modelDefaults["primary"] === "string" ? modelDefaults["primary"] : "";
+    const entries = [];
+    const seen = new Set();
+    const models = config["models"] ?? {};
+    const providers = models["providers"] ?? {};
+    const modelAliases = defaults["models"] ?? {};
+    for (const [fullKey, aliasRaw] of Object.entries(modelAliases)) {
+        const slashIndex = fullKey.indexOf("/");
+        if (slashIndex <= 0 || slashIndex >= fullKey.length - 1)
+            continue;
+        const providerId = fullKey.slice(0, slashIndex);
+        const modelId = fullKey.slice(slashIndex + 1);
+        const aliasObj = aliasRaw != null && typeof aliasRaw === "object" && !Array.isArray(aliasRaw)
+            ? aliasRaw
+            : {};
+        const alias = typeof aliasObj["alias"] === "string" && aliasObj["alias"].trim().length > 0
+            ? aliasObj["alias"].trim()
+            : modelId;
+        if (seen.has(fullKey))
+            continue;
+        seen.add(fullKey);
+        const providerConfig = providers[providerId] ?? {};
+        const configuredModels = Array.isArray(providerConfig["models"]) ? providerConfig["models"] : [];
+        const modelRecord = configuredModels.find((entry) => {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry))
+                return false;
+            const record = entry;
+            return record["id"] === modelId;
+        });
+        const info = PROVIDER_REGISTRY[inferType(providerId)];
+        entries.push({
+            providerId,
+            provider: info?.displayName ?? providerId,
+            modelId,
+            alias,
+            name: alias,
+            contextWindow: modelRecord ? modelContextWindow(modelRecord) : "--",
+            tags: modelRecord ? [modelId, ...readStringArray(modelRecord["tags"])] : [modelId],
+            isSelected: false,
+            isDefault: fullKey === primaryModel,
         });
     }
     return entries;
@@ -213,6 +278,14 @@ export async function setDefaultProvider(id) {
     const defaults = getNestedObj(agents, ["defaults"]);
     const model = getNestedObj(defaults, ["model"]);
     model["primary"] = primary;
+    await writeJson(OPENCLAW_CONFIG, config);
+}
+export async function setDefaultModel(providerId, modelId) {
+    const config = await readJson(OPENCLAW_CONFIG);
+    const agents = getNestedObj(config, ["agents"]);
+    const defaults = getNestedObj(agents, ["defaults"]);
+    const model = getNestedObj(defaults, ["model"]);
+    model["primary"] = `${providerId}/${modelId}`;
     await writeJson(OPENCLAW_CONFIG, config);
 }
 //# sourceMappingURL=provider-config.js.map
