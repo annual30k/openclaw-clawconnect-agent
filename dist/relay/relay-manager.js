@@ -10,6 +10,48 @@ import { randomUUID } from "crypto";
 // Constants
 // ---------------------------------------------------------------------------
 const OUTBOUND_DIR = join(homedir(), ".openclaw", "media", "outbound");
+function normalizeChatEventPayload(rawPayload) {
+    if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
+        return rawPayload;
+    }
+    const payload = { ...rawPayload };
+    const stateRaw = typeof payload.state === "string" ? payload.state.trim().toLowerCase() : "";
+    const phaseRaw = typeof payload.phase === "string" ? payload.phase.trim().toLowerCase() : "";
+    const hasState = stateRaw.length > 0;
+    if (!hasState && phaseRaw) {
+        if (phaseRaw.includes("delta") || phaseRaw.includes("stream")) {
+            payload.state = "delta";
+        }
+        else if (phaseRaw.includes("final") || phaseRaw.includes("complete") || phaseRaw.includes("done")) {
+            payload.state = "final";
+        }
+        else if (phaseRaw.includes("error") || phaseRaw.includes("fail")) {
+            payload.state = "error";
+        }
+    }
+    const hasMessage = payload.message && typeof payload.message === "object" && !Array.isArray(payload.message);
+    const text = typeof payload.text === "string" ? payload.text : undefined;
+    const delta = typeof payload.delta === "string" ? payload.delta : undefined;
+    const streamText = text ?? delta;
+    if (!hasMessage && streamText && streamText.length > 0) {
+        payload.message = { content: [{ type: "text", text: streamText }] };
+    }
+    return payload;
+}
+async function withTimeout(promise, timeoutMs, label) {
+    return await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs}ms`)), timeoutMs);
+        promise
+            .then((value) => {
+            clearTimeout(timer);
+            resolve(value);
+        })
+            .catch((error) => {
+            clearTimeout(timer);
+            reject(error);
+        });
+    });
+}
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -62,11 +104,12 @@ export async function runRelayManager(opts) {
                     send({ type: "gateway_disconnected", reason });
                 },
                 onEvent: (event, payload) => {
+                    const normalizedPayload = event === "chat" ? normalizeChatEventPayload(payload) : payload;
                     // On chat final, fetch history to get actual content (OpenClaw 2026.3.2+
                     // no longer includes message content in the chat final event payload).
                     // This mirrors what the macOS 2026.3.2 client does.
                     if (event === "chat") {
-                        const p = payload;
+                        const p = normalizedPayload;
                         if (p?.state === "final" && p?.sessionKey) {
                             const sessionKey = p.sessionKey;
                             const runId = p.runId;
@@ -76,29 +119,29 @@ export async function runRelayManager(opts) {
                                 const last = [...msgs].reverse().find((m) => m.role === "assistant");
                                 return last?.content?.find((b) => b.type === "text")?.text;
                             };
-                            fetchHistory()
+                            withTimeout(fetchHistory(), 2500, "chat.history")
                                 .then(async (history) => {
                                 let text = extractText(history);
                                 // Retry once after 600ms if OpenClaw hasn't committed the message yet
                                 if (!text) {
                                     await new Promise((resolve) => setTimeout(resolve, 600));
-                                    const retryHistory = await fetchHistory();
+                                    const retryHistory = await withTimeout(fetchHistory(), 2500, "chat.history retry");
                                     text = extractText(retryHistory);
                                 }
                                 if (text) {
                                     p.message = { content: [{ type: "text", text }] };
                                 }
                                 console.log(`[relay] chat final (history fetched): runId=${runId} textLength=${text?.length ?? 0}`);
-                                send({ type: "event", event, payload });
+                                send({ type: "event", event, payload: normalizedPayload });
                             })
                                 .catch((err) => {
                                 console.error(`[relay] chat.history fetch failed: ${err}`);
-                                send({ type: "event", event, payload });
+                                send({ type: "event", event, payload: normalizedPayload });
                             });
                             return; // will send after history fetch
                         }
                     }
-                    send({ type: "event", event, payload });
+                    send({ type: "event", event, payload: normalizedPayload });
                 },
             });
             gatewayClient.start();
