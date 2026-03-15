@@ -3,13 +3,229 @@ import { OpenClawGatewayClient } from "./gateway-client.js";
 import { handleLocalCommand } from "../commands/local-handlers.js";
 import { handleProviderCommand } from "../commands/provider-handlers.js";
 import { homedir } from "os";
-import { join } from "path";
-import { mkdir, writeFile } from "fs/promises";
+import { isAbsolute, join, resolve } from "path";
+import { mkdir, open as openFile, readFile, writeFile } from "fs/promises";
 import { randomUUID } from "crypto";
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 const OUTBOUND_DIR = join(homedir(), ".openclaw", "media", "outbound");
+const OPENCLAW_HOME = join(homedir(), ".openclaw");
+const TRANSCRIPT_TAIL_CHUNK_BYTES = 64 * 1024;
+function toFiniteInteger(value) {
+    return typeof value === "number" && Number.isFinite(value) ? Math.round(value) : undefined;
+}
+function toPositiveInteger(value) {
+    const normalized = toFiniteInteger(value);
+    return typeof normalized === "number" && normalized > 0 ? normalized : undefined;
+}
+function resolveAgentIdFromSessionKey(sessionKey, defaults) {
+    const match = sessionKey.match(/^agent:([^:]+):/);
+    if (match?.[1]) {
+        return match[1];
+    }
+    return defaults.defaultAgentId || "main";
+}
+function resolveSessionsDir(sessionKey, defaults) {
+    return join(OPENCLAW_HOME, "agents", resolveAgentIdFromSessionKey(sessionKey, defaults), "sessions");
+}
+async function readSessionStoreEntry(sessionKey, defaults) {
+    const storePath = join(resolveSessionsDir(sessionKey, defaults), "sessions.json");
+    try {
+        const raw = await readFile(storePath, "utf8");
+        const parsed = JSON.parse(raw);
+        const directEntry = parsed?.[sessionKey];
+        if (directEntry && typeof directEntry === "object") {
+            return directEntry;
+        }
+        const mainAliases = new Set([sessionKey, defaults.mainSessionKey, defaults.mainKey, "main"]);
+        const defaultAgentMainKey = defaults.defaultAgentId ? `agent:${defaults.defaultAgentId}:main` : undefined;
+        if (defaultAgentMainKey) {
+            const defaultEntry = parsed?.[defaultAgentMainKey];
+            if (defaultEntry && typeof defaultEntry === "object" && mainAliases.has(sessionKey)) {
+                return defaultEntry;
+            }
+        }
+        if (mainAliases.has(sessionKey)) {
+            const mainEntry = Object.entries(parsed).find(([key]) => key.endsWith(":main"))?.[1];
+            if (mainEntry && typeof mainEntry === "object") {
+                return mainEntry;
+            }
+            const firstEntry = Object.values(parsed).find((value) => value && typeof value === "object");
+            return firstEntry ?? null;
+        }
+        return null;
+    }
+    catch {
+        return null;
+    }
+}
+function normalizeUsageRecord(rawUsage) {
+    if (!rawUsage || typeof rawUsage !== "object" || Array.isArray(rawUsage)) {
+        return undefined;
+    }
+    const usage = rawUsage;
+    const input = toFiniteInteger(usage.input) ?? 0;
+    const output = toFiniteInteger(usage.output) ?? 0;
+    const cacheRead = toFiniteInteger(usage.cacheRead) ?? 0;
+    const cacheWrite = toFiniteInteger(usage.cacheWrite) ?? 0;
+    const total = toPositiveInteger(usage.total) ??
+        toPositiveInteger(usage.totalTokens) ??
+        toPositiveInteger(usage.total_tokens);
+    const promptTokens = toPositiveInteger(usage.promptTokens) ??
+        toPositiveInteger(usage.prompt_tokens);
+    if (input <= 0 && output <= 0 && cacheRead <= 0 && cacheWrite <= 0 && !total && !promptTokens) {
+        return undefined;
+    }
+    return {
+        input: Math.max(0, input),
+        output: Math.max(0, output),
+        cacheRead: Math.max(0, cacheRead),
+        cacheWrite: Math.max(0, cacheWrite),
+        total,
+        promptTokens,
+    };
+}
+function derivePromptTokens(usage) {
+    if (usage.promptTokens) {
+        return usage.promptTokens;
+    }
+    const derived = usage.input + usage.cacheRead + usage.cacheWrite;
+    return derived > 0 ? derived : undefined;
+}
+function resolveSessionLogPath(sessionKey, sessionId, entry, defaults) {
+    const sessionsDir = resolveSessionsDir(sessionKey, defaults);
+    const candidate = typeof entry?.sessionFile === "string" && entry.sessionFile.trim().length > 0
+        ? entry.sessionFile.trim()
+        : typeof entry?.transcriptPath === "string" && entry.transcriptPath.trim().length > 0
+            ? entry.transcriptPath.trim()
+            : "";
+    if (!candidate) {
+        return join(sessionsDir, `${sessionId}.jsonl`);
+    }
+    return isAbsolute(candidate) ? candidate : resolve(sessionsDir, candidate);
+}
+async function readFileTail(filePath, maxBytes = TRANSCRIPT_TAIL_CHUNK_BYTES) {
+    const handle = await openFile(filePath, "r");
+    try {
+        const stats = await handle.stat();
+        const size = Math.max(0, Math.floor(stats.size));
+        if (size === 0) {
+            return null;
+        }
+        const length = Math.min(size, maxBytes);
+        const buffer = Buffer.alloc(length);
+        const offset = Math.max(0, size - length);
+        await handle.read(buffer, 0, length, offset);
+        return buffer.toString("utf8");
+    }
+    finally {
+        await handle.close();
+    }
+}
+async function readUsageFromSessionLog(sessionKey, sessionId, entry, defaults) {
+    const logPath = resolveSessionLogPath(sessionKey, sessionId, entry, defaults);
+    try {
+        const tail = await readFileTail(logPath);
+        if (!tail) {
+            return null;
+        }
+        const offset = tail.indexOf("\n");
+        const lines = (offset > 0 ? tail.slice(offset + 1) : tail).split(/\n+/);
+        let lastUsage;
+        let model;
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) {
+                continue;
+            }
+            try {
+                const parsed = JSON.parse(trimmed);
+                const message = parsed.message && typeof parsed.message === "object" && !Array.isArray(parsed.message)
+                    ? parsed.message
+                    : undefined;
+                const usage = normalizeUsageRecord(message?.usage ?? parsed.usage);
+                if (usage) {
+                    lastUsage = usage;
+                }
+                if (typeof message?.model === "string" && message.model.trim().length > 0) {
+                    model = message.model.trim();
+                }
+                else if (typeof parsed.model === "string" && parsed.model.trim().length > 0) {
+                    model = parsed.model.trim();
+                }
+            }
+            catch {
+                // Ignore malformed transcript lines.
+            }
+        }
+        if (!lastUsage) {
+            return null;
+        }
+        const promptTokens = derivePromptTokens(lastUsage) ?? lastUsage.total ?? lastUsage.input + lastUsage.output;
+        const total = lastUsage.total ?? promptTokens + lastUsage.output;
+        if (promptTokens === 0 && total === 0) {
+            return null;
+        }
+        return {
+            promptTokens,
+            total,
+            model,
+        };
+    }
+    catch {
+        return null;
+    }
+}
+function deriveStoredContextUsage(entry) {
+    if (!entry) {
+        return undefined;
+    }
+    const total = toPositiveInteger(entry.totalTokens);
+    if (total) {
+        return total;
+    }
+    const input = toFiniteInteger(entry.inputTokens) ?? 0;
+    const output = toFiniteInteger(entry.outputTokens) ?? 0;
+    const fallback = input + output;
+    return fallback > 0 ? fallback : undefined;
+}
+async function readContextUsageSnapshot(sessionKey, defaults) {
+    const entry = await readSessionStoreEntry(sessionKey, defaults);
+    if (!entry) {
+        return null;
+    }
+    const contextLimit = toPositiveInteger(entry.contextTokens);
+    let currentModel = typeof entry.model === "string" && entry.model.trim().length > 0 ? entry.model.trim() : undefined;
+    let contextUsage = deriveStoredContextUsage(entry);
+    let promptTokens;
+    let totalTokens;
+    if (typeof entry.sessionId === "string" && entry.sessionId.trim().length > 0) {
+        const transcriptUsage = await readUsageFromSessionLog(sessionKey, entry.sessionId.trim(), entry, defaults);
+        if (transcriptUsage) {
+            promptTokens = transcriptUsage.promptTokens;
+            totalTokens = transcriptUsage.total;
+            const candidate = transcriptUsage.promptTokens || transcriptUsage.total;
+            if (!contextUsage || candidate > contextUsage) {
+                contextUsage = candidate;
+            }
+            if (!currentModel && transcriptUsage.model) {
+                currentModel = transcriptUsage.model;
+            }
+        }
+    }
+    if (!currentModel && !contextLimit && !contextUsage) {
+        return null;
+    }
+    return {
+        sessionKey,
+        currentModel,
+        contextUsage,
+        contextLimit,
+        promptTokens,
+        totalTokens,
+    };
+}
 function normalizeChatEventPayload(rawPayload) {
     if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
         return rawPayload;
@@ -134,6 +350,60 @@ function appendUniqueSuffix(base, suffix) {
     }
     return base + suffix;
 }
+function extractHistoryMessageText(message) {
+    const content = Array.isArray(message?.content) ? message.content : [];
+    const parts = content
+        .filter((block) => block?.type === "text" && typeof block.text === "string")
+        .map((block) => block.text?.trim() ?? "")
+        .filter((text) => text.length > 0);
+    return parts.join("\n\n");
+}
+function findHistoryUserIndex(messages, context) {
+    const normalizedPrompt = context.promptText?.trim();
+    const notBeforeMs = context.requestedAtMs - 1_000;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message.role !== "user") {
+            continue;
+        }
+        const timestamp = typeof message.timestamp === "number" ? message.timestamp : Number.NaN;
+        if (Number.isFinite(timestamp) && timestamp < notBeforeMs) {
+            continue;
+        }
+        const text = extractHistoryMessageText(message);
+        if (!normalizedPrompt || text === normalizedPrompt) {
+            return index;
+        }
+    }
+    return -1;
+}
+function extractHistoryOutcome(history, context) {
+    const messages = history?.messages ?? [];
+    if (messages.length === 0) {
+        return null;
+    }
+    const userIndex = findHistoryUserIndex(messages, context);
+    if (userIndex === -1) {
+        return null;
+    }
+    let latestError = null;
+    for (let index = userIndex + 1; index < messages.length; index += 1) {
+        const message = messages[index];
+        if (message.role !== "assistant") {
+            continue;
+        }
+        const text = extractHistoryMessageText(message);
+        if (text.length > 0) {
+            return { kind: "final", text };
+        }
+        if (typeof message.errorMessage === "string" &&
+            message.errorMessage.trim().length > 0 &&
+            (message.stopReason === "error" || !message.stopReason)) {
+            latestError = message.errorMessage.trim();
+        }
+    }
+    return latestError ? { kind: "error", errorMessage: latestError } : null;
+}
 function extractChatText(rawPayload) {
     if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
         return "";
@@ -194,6 +464,20 @@ function extractChatRole(rawPayload) {
     if (typeof message?.role === "string" && message.role.trim()) {
         return message.role.trim().toLowerCase();
     }
+    const state = normalizeChatState(rawPayload);
+    if (state === "delta" ||
+        state === "streaming" ||
+        state === "in_progress" ||
+        state === "final" ||
+        state === "done" ||
+        state === "completed" ||
+        state === "complete" ||
+        state === "error" ||
+        state === "failed" ||
+        state === "fail" ||
+        state === "aborted") {
+        return "assistant";
+    }
     return "";
 }
 function withMessageText(rawPayload, text) {
@@ -247,6 +531,9 @@ export async function runRelayManager(opts) {
         let sessionDefaults = { mainSessionKey: "main", mainKey: "main" };
         const chatBuffers = new Map();
         const chatFallbacks = new Map();
+        const chatRunContexts = new Map();
+        const contextUsageRefreshes = new Map();
+        const contextUsageFingerprints = new Map();
         const clearChatFallback = (runId) => {
             const timer = chatFallbacks.get(runId);
             if (timer) {
@@ -254,57 +541,124 @@ export async function runRelayManager(opts) {
                 chatFallbacks.delete(runId);
             }
         };
-        const extractHistoryAssistantText = (history) => {
-            const msgs = history?.messages ?? [];
-            const last = [...msgs].reverse().find((m) => m.role === "assistant");
-            return last?.content?.find((b) => b.type === "text")?.text ?? "";
+        const publishContextUsageSnapshot = async (sessionKey, force = false) => {
+            const normalizedSessionKey = canonicalizeSessionKey(sessionKey, sessionDefaults);
+            if (typeof normalizedSessionKey !== "string" || normalizedSessionKey.trim().length === 0) {
+                return;
+            }
+            const snapshot = await readContextUsageSnapshot(normalizedSessionKey.trim(), sessionDefaults);
+            if (!snapshot) {
+                return;
+            }
+            const fingerprint = JSON.stringify({
+                currentModel: snapshot.currentModel ?? null,
+                contextUsage: snapshot.contextUsage ?? null,
+                contextLimit: snapshot.contextLimit ?? null,
+            });
+            if (!force && contextUsageFingerprints.get(snapshot.sessionKey) === fingerprint) {
+                return;
+            }
+            contextUsageFingerprints.set(snapshot.sessionKey, fingerprint);
+            send({
+                type: "event",
+                event: "context_usage",
+                payload: {
+                    sessionKey: snapshot.sessionKey,
+                    currentModel: snapshot.currentModel,
+                    contextUsage: snapshot.contextUsage,
+                    contextLimit: snapshot.contextLimit,
+                    promptTokens: snapshot.promptTokens,
+                    maxInputTokens: snapshot.contextLimit,
+                },
+            });
         };
-        const scheduleChatHistoryFallback = (runId, sessionKey, attempt = 0) => {
-            if (!runId || !sessionKey) {
+        const scheduleContextUsageRefresh = (sessionKey, delayMs = 250, force = false) => {
+            if (!sessionKey) {
+                return;
+            }
+            const normalizedSessionKey = canonicalizeSessionKey(sessionKey, sessionDefaults);
+            if (typeof normalizedSessionKey !== "string" || normalizedSessionKey.trim().length === 0) {
+                return;
+            }
+            const key = normalizedSessionKey.trim();
+            const existing = contextUsageRefreshes.get(key);
+            if (existing) {
+                clearTimeout(existing);
+            }
+            const timer = setTimeout(() => {
+                contextUsageRefreshes.delete(key);
+                void publishContextUsageSnapshot(key, force).catch((error) => {
+                    console.warn(`[relay] failed to publish context usage for session ${key}: ${String(error)}`);
+                });
+            }, delayMs);
+            timer.unref?.();
+            contextUsageRefreshes.set(key, timer);
+        };
+        const scheduleChatHistoryFallback = (runId, context, attempt = 0) => {
+            if (!runId || !context.sessionKey) {
                 return;
             }
             clearChatFallback(runId);
+            chatRunContexts.set(runId, context);
             const timer = setTimeout(() => {
                 if (!gatewayClient) {
                     chatFallbacks.delete(runId);
                     return;
                 }
-                const fetchHistory = () => gatewayClient.request("chat.history", { sessionKey, limit: 10 });
+                const fetchHistory = () => gatewayClient.request("chat.history", { sessionKey: context.sessionKey, limit: 10 });
                 withTimeout(fetchHistory(), 800, "chat.history fallback")
                     .then(async (history) => {
-                    let text = extractHistoryAssistantText(history);
-                    if (!text && attempt < 4) {
-                        scheduleChatHistoryFallback(runId, sessionKey, attempt + 1);
+                    const outcome = extractHistoryOutcome(history, context);
+                    if (!outcome && attempt < 4) {
+                        scheduleChatHistoryFallback(runId, context, attempt + 1);
                         return;
                     }
-                    if (!text) {
+                    if (!outcome) {
                         chatFallbacks.delete(runId);
+                        chatRunContexts.delete(runId);
                         return;
                     }
-                    console.log(`[relay] synthesized chat final from history: runId=${runId} sessionKey=${sessionKey} textLength=${text.length} attempt=${attempt}`);
                     clearChatFallback(runId);
+                    chatRunContexts.delete(runId);
+                    if (outcome.kind === "final") {
+                        console.log(`[relay] synthesized chat final from history: runId=${runId} sessionKey=${context.sessionKey} textLength=${outcome.text.length} attempt=${attempt}`);
+                        send({
+                            type: "event",
+                            event: "chat",
+                            payload: {
+                                runId,
+                                sessionKey: context.sessionKey,
+                                state: "final",
+                                role: "assistant",
+                                message: {
+                                    role: "assistant",
+                                    content: [{ type: "text", text: outcome.text }],
+                                },
+                            },
+                        });
+                        return;
+                    }
+                    console.log(`[relay] synthesized chat error from history: runId=${runId} sessionKey=${context.sessionKey} attempt=${attempt}`);
                     send({
                         type: "event",
                         event: "chat",
                         payload: {
                             runId,
-                            sessionKey,
-                            state: "final",
+                            sessionKey: context.sessionKey,
+                            state: "error",
                             role: "assistant",
-                            message: {
-                                role: "assistant",
-                                content: [{ type: "text", text }],
-                            },
+                            errorMessage: outcome.errorMessage,
                         },
                     });
                 })
                     .catch((err) => {
                     if (attempt < 4) {
-                        scheduleChatHistoryFallback(runId, sessionKey, attempt + 1);
+                        scheduleChatHistoryFallback(runId, context, attempt + 1);
                         return;
                     }
                     console.warn(`[relay] chat history fallback failed runId=${runId}: ${String(err)}`);
                     chatFallbacks.delete(runId);
+                    chatRunContexts.delete(runId);
                 });
             }, attempt === 0 ? 1500 : 2000);
             timer.unref?.();
@@ -321,6 +675,7 @@ export async function runRelayManager(opts) {
                     sessionDefaults = nextDefaults;
                     console.log(`[relay] session defaults updated mainSessionKey=${sessionDefaults.mainSessionKey} mainKey=${sessionDefaults.mainKey}`);
                 }
+                scheduleContextUsageRefresh(sessionDefaults.mainSessionKey, 50, true);
             }
             catch (err) {
                 console.warn(`[relay] failed to load session defaults: ${String(err)}`);
@@ -375,12 +730,17 @@ export async function runRelayManager(opts) {
                             }
                         }
                         if (state === "final" && p?.sessionKey) {
+                            scheduleContextUsageRefresh(p.sessionKey, 450);
                             const bufferedText = runId ? chatBuffers.get(runId) ?? "" : "";
                             const resolvedText = currentText || bufferedText;
+                            const runContext = runId ? chatRunContexts.get(runId) : undefined;
                             if (runId) {
                                 chatBuffers.delete(runId);
                             }
                             if (resolvedText.trim()) {
+                                if (runId) {
+                                    chatRunContexts.delete(runId);
+                                }
                                 send({ type: "event", event, payload: withMessageText(normalizedPayload, resolvedText) });
                                 return;
                             }
@@ -388,21 +748,47 @@ export async function runRelayManager(opts) {
                             const fetchHistory = () => gatewayClient.request("chat.history", { sessionKey, limit: 10 });
                             withTimeout(fetchHistory(), 500, "chat.history")
                                 .then(async (history) => {
-                                let text = extractHistoryAssistantText(history);
+                                let outcome = runContext ? extractHistoryOutcome(history, runContext) : null;
                                 // Retry once after a short delay if OpenClaw hasn't committed the message yet.
-                                if (!text) {
+                                if (!outcome) {
                                     await new Promise((resolve) => setTimeout(resolve, 150));
                                     const retryHistory = await withTimeout(fetchHistory(), 500, "chat.history retry");
-                                    text = extractHistoryAssistantText(retryHistory);
+                                    outcome = runContext ? extractHistoryOutcome(retryHistory, runContext) : null;
                                 }
-                                console.log(`[relay] chat final enriched from history: runId=${runId || "(unknown)"} textLength=${text?.length ?? 0}`);
-                                send({ type: "event", event, payload: text ? withMessageText(normalizedPayload, text) : normalizedPayload });
+                                console.log(`[relay] chat final enriched from history: runId=${runId || "(unknown)"} outcome=${outcome?.kind ?? "none"} textLength=${outcome?.kind === "final" ? outcome.text.length : 0}`);
+                                if (runId) {
+                                    chatRunContexts.delete(runId);
+                                }
+                                if (outcome?.kind === "final") {
+                                    send({ type: "event", event, payload: withMessageText(normalizedPayload, outcome.text) });
+                                    return;
+                                }
+                                if (outcome?.kind === "error") {
+                                    send({
+                                        type: "event",
+                                        event,
+                                        payload: {
+                                            ...normalizedPayload,
+                                            state: "error",
+                                            errorMessage: outcome.errorMessage,
+                                        },
+                                    });
+                                    return;
+                                }
+                                send({ type: "event", event, payload: normalizedPayload });
                             })
                                 .catch((err) => {
                                 console.error(`[relay] chat.history fetch failed: ${err}`);
+                                if (runId) {
+                                    chatRunContexts.delete(runId);
+                                }
                                 send({ type: "event", event, payload: normalizedPayload });
                             });
                             return;
+                        }
+                        if (runId && (state === "error" || state === "failed" || state === "fail" || state === "aborted")) {
+                            chatRunContexts.delete(runId);
+                            scheduleContextUsageRefresh(p?.sessionKey, 450);
                         }
                     }
                     send({ type: "event", event, payload: normalizedPayload });
@@ -510,8 +896,16 @@ export async function runRelayManager(opts) {
                         ? resultRecord.runId.trim()
                         : requestId;
                     if (runId) {
-                        scheduleChatHistoryFallback(runId, sessionKey);
+                        const promptText = typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
+                            ? paramsRecord.message.trim()
+                            : undefined;
+                        scheduleChatHistoryFallback(runId, {
+                            sessionKey,
+                            requestedAtMs: Date.now(),
+                            promptText,
+                        });
                     }
+                    scheduleContextUsageRefresh(sessionKey, 1200, msg.method === "chat.send" && /^\/model\s+/i.test(String(paramsRecord.message ?? "")));
                 }
                 if (requestId) {
                     send({ type: "res", id: requestId, ok: true, payload: result });
