@@ -2,6 +2,13 @@ export interface GatewayClientOptions {
     url: string;
     token?: string;
     password?: string;
+    role?: string;
+    scopes?: string[];
+    caps?: string[];
+    clientMode?: string;
+    clientId?: string;
+    clientDisplayName?: string;
+    clientVersion?: string;
     onConnected: () => void;
     onEvent: (eventName: string, payload: unknown) => void;
     onDisconnected: (reason: string) => void;

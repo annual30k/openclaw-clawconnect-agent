@@ -124,6 +124,13 @@ export interface GatewayClientOptions {
   url: string;
   token?: string;
   password?: string;
+  role?: string;
+  scopes?: string[];
+  caps?: string[];
+  clientMode?: string;
+  clientId?: string;
+  clientDisplayName?: string;
+  clientVersion?: string;
   onConnected: () => void;
   onEvent: (eventName: string, payload: unknown) => void;
   onDisconnected: (reason: string) => void;
@@ -218,10 +225,17 @@ export class OpenClawGatewayClient {
     this.connectSent = true;
     if (this.connectTimer) { clearTimeout(this.connectTimer); this.connectTimer = null; }
 
-    const role = "operator";
-    const scopes = ["operator.admin", "operator.read", "operator.write", "operator.approvals", "operator.pairing"];
-    const clientId = "openclaw-macos";
-    const clientMode = "ui";
+    const role = this.opts.role ?? "operator";
+    const scopes = this.opts.scopes ?? [
+      "operator.admin",
+      "operator.read",
+      "operator.write",
+      "operator.approvals",
+      "operator.pairing",
+    ];
+    const clientId = this.opts.clientId ?? "openclaw-macos";
+    const clientMode = this.opts.clientMode ?? "ui";
+    const caps = this.opts.caps ?? ["tool-events"];
     const signedAtMs = Date.now();
     const nonce = this.connectNonce ?? undefined;
     const authToken = this.storedDeviceToken ?? this.opts.token;
@@ -237,11 +251,11 @@ export class OpenClawGatewayClient {
       maxProtocol: PROTOCOL_VERSION,
       role,
       scopes,
-      caps: ["tool-events"],
+      caps,
       client: {
         id: clientId,
-        displayName: "ClawConnect Agent",
-        version: "1.0.0",
+        displayName: this.opts.clientDisplayName ?? "ClawConnect Agent",
+        version: this.opts.clientVersion ?? "1.0.0",
         platform: process.platform,
         mode: clientMode,
       },
@@ -311,19 +325,13 @@ export class OpenClawGatewayClient {
       return;
     }
 
-    // Handle incoming req frames from OpenClaw (e.g. chat.push in OpenClaw 2026.3.2+)
+    // Handle incoming req frames from OpenClaw. Ack immediately so the
+    // gateway doesn't retry control-plane requests at this relay client.
     if (parsed.type === "req") {
       const id: string | undefined = parsed.id;
-      const method: string | undefined = parsed.method;
-      const params: unknown = parsed.params;
-      console.log(`[gateway-client] incoming req: method=${method} params=${JSON.stringify(params).slice(0, 300)}`);
       // Ack immediately so OpenClaw doesn't retry
       if (id && this.ws?.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: "res", id, ok: true }));
-      }
-      // Forward chat.push as a "chat" event so the relay server can broadcast it to iOS
-      if (method === "chat.push" && params != null) {
-        this.opts.onEvent("chat", params);
       }
       return;
     }

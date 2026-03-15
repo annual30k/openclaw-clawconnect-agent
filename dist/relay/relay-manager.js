@@ -12,6 +12,7 @@ import { randomUUID } from "crypto";
 const OUTBOUND_DIR = join(homedir(), ".openclaw", "media", "outbound");
 const OPENCLAW_HOME = join(homedir(), ".openclaw");
 const TRANSCRIPT_TAIL_CHUNK_BYTES = 64 * 1024;
+const UI_SYNC_RUN_ID_PREFIX = "relay-ui-sync-";
 function toFiniteInteger(value) {
     return typeof value === "number" && Number.isFinite(value) ? Math.round(value) : undefined;
 }
@@ -429,6 +430,13 @@ function extractHistoryOutcome(history, context) {
     }
     return latestError ? { kind: "error", errorMessage: latestError } : null;
 }
+function hasPersistedHistoryUserMessage(history, context) {
+    const messages = history?.messages ?? [];
+    if (messages.length === 0) {
+        return false;
+    }
+    return findHistoryUserIndex(messages, context) !== -1;
+}
 function extractChatText(rawPayload) {
     if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
         return "";
@@ -460,6 +468,9 @@ function extractChatText(rawPayload) {
         return data.delta;
     }
     return "";
+}
+function isUiSyncRunId(runId) {
+    return typeof runId === "string" && runId.startsWith(UI_SYNC_RUN_ID_PREFIX);
 }
 function normalizeChatState(rawPayload) {
     if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
@@ -566,9 +577,11 @@ export async function runRelayManager(opts) {
             return;
         }
         let gatewayClient = null;
+        let gatewayRefreshClient = null;
         let sessionDefaults = { mainSessionKey: "main", mainKey: "main" };
         const chatBuffers = new Map();
         const chatFallbacks = new Map();
+        const chatWebSyncs = new Map();
         const chatRunContexts = new Map();
         const contextUsageRefreshes = new Map();
         const contextUsageFingerprints = new Map();
@@ -577,6 +590,13 @@ export async function runRelayManager(opts) {
             if (timer) {
                 clearTimeout(timer);
                 chatFallbacks.delete(runId);
+            }
+        };
+        const clearChatWebSync = (runId) => {
+            const timer = chatWebSyncs.get(runId);
+            if (timer) {
+                clearTimeout(timer);
+                chatWebSyncs.delete(runId);
             }
         };
         const publishContextUsageSnapshot = async (sessionKey, force = false) => {
@@ -702,6 +722,65 @@ export async function runRelayManager(opts) {
             timer.unref?.();
             chatFallbacks.set(runId, timer);
         };
+        const scheduleWebChatHistorySync = (runId, context, attempt = 0) => {
+            if (!runId || !context.sessionKey) {
+                return;
+            }
+            clearChatWebSync(runId);
+            const timer = setTimeout(() => {
+                const historyClient = gatewayClient;
+                const refreshClient = gatewayRefreshClient;
+                if (!historyClient || !refreshClient) {
+                    chatWebSyncs.delete(runId);
+                    return;
+                }
+                const fetchHistory = () => historyClient.request("chat.history", {
+                    sessionKey: context.sessionKey,
+                    limit: 10,
+                });
+                withTimeout(fetchHistory(), 600, "chat.history web sync")
+                    .then((history) => {
+                    if (!hasPersistedHistoryUserMessage(history, context)) {
+                        if (attempt < 4) {
+                            scheduleWebChatHistorySync(runId, context, attempt + 1);
+                        }
+                        else {
+                            chatWebSyncs.delete(runId);
+                        }
+                        return;
+                    }
+                    clearChatWebSync(runId);
+                    refreshClient
+                        .request("chat.send", {
+                        sessionKey: context.sessionKey,
+                        message: "/debug",
+                        deliver: false,
+                        idempotencyKey: `${UI_SYNC_RUN_ID_PREFIX}${runId}`,
+                    })
+                        .then(() => {
+                        console.log(`[relay] triggered local UI history refresh: runId=${runId} sessionKey=${context.sessionKey} attempt=${attempt}`);
+                    })
+                        .catch((err) => {
+                        if (attempt < 4) {
+                            scheduleWebChatHistorySync(runId, context, attempt + 1);
+                            return;
+                        }
+                        console.warn(`[relay] ui history refresh failed runId=${runId}: ${String(err)}`);
+                        chatWebSyncs.delete(runId);
+                    });
+                })
+                    .catch((err) => {
+                    if (attempt < 4) {
+                        scheduleWebChatHistorySync(runId, context, attempt + 1);
+                        return;
+                    }
+                    console.warn(`[relay] web chat sync fallback failed runId=${runId}: ${String(err)}`);
+                    chatWebSyncs.delete(runId);
+                });
+            }, attempt === 0 ? 150 : 250);
+            timer.unref?.();
+            chatWebSyncs.set(runId, timer);
+        };
         const refreshSessionDefaults = async () => {
             if (!gatewayClient) {
                 return;
@@ -753,6 +832,9 @@ export async function runRelayManager(opts) {
                         const p = normalizedPayload;
                         const state = normalizeChatState(normalizedPayload);
                         const runId = typeof p?.runId === "string" ? p.runId : "";
+                        if (isUiSyncRunId(runId)) {
+                            return;
+                        }
                         const currentText = extractChatText(normalizedPayload);
                         const role = extractChatRole(normalizedPayload);
                         if (runId) {
@@ -832,7 +914,26 @@ export async function runRelayManager(opts) {
                     send({ type: "event", event, payload: normalizedPayload });
                 },
             });
+            gatewayRefreshClient = new OpenClawGatewayClient({
+                url: opts.gatewayUrl,
+                token: opts.gatewayToken,
+                password: opts.gatewayPassword,
+                scopes: ["operator.read", "operator.write"],
+                caps: [],
+                clientDisplayName: "ClawConnect UI Sync",
+                onConnected: () => {
+                    console.log("Gateway UI sync client connected.");
+                },
+                onDisconnected: (reason) => {
+                    console.log(`Gateway UI sync client disconnected: ${reason}`);
+                },
+                onEvent: () => {
+                    // The refresh client only issues dummy chat.send requests to trigger
+                    // local history reloads. It never forwards gateway events.
+                },
+            });
             gatewayClient.start();
+            gatewayRefreshClient.start();
         });
         relayWs.on("message", async (raw) => {
             let msg;
@@ -937,11 +1038,15 @@ export async function runRelayManager(opts) {
                         const promptText = typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
                             ? paramsRecord.message.trim()
                             : undefined;
-                        scheduleChatHistoryFallback(runId, {
+                        const runContext = {
                             sessionKey,
                             requestedAtMs: Date.now(),
                             promptText,
-                        });
+                        };
+                        scheduleChatHistoryFallback(runId, runContext);
+                        if (msg.method === "chat.send") {
+                            scheduleWebChatHistorySync(runId, runContext);
+                        }
                     }
                     scheduleContextUsageRefresh(sessionKey, 1200, msg.method === "chat.send" && /^\/model\s+/i.test(String(paramsRecord.message ?? "")));
                 }
@@ -960,7 +1065,21 @@ export async function runRelayManager(opts) {
             console.log(`Relay connection closed: ${code} ${reason.toString()}`);
             opts.onDisconnected?.();
             gatewayClient?.stop();
+            gatewayRefreshClient?.stop();
             gatewayClient = null;
+            gatewayRefreshClient = null;
+            for (const timer of chatFallbacks.values()) {
+                clearTimeout(timer);
+            }
+            chatFallbacks.clear();
+            for (const timer of chatWebSyncs.values()) {
+                clearTimeout(timer);
+            }
+            chatWebSyncs.clear();
+            for (const timer of contextUsageRefreshes.values()) {
+                clearTimeout(timer);
+            }
+            contextUsageRefreshes.clear();
             // Code 4000 = server kicked us because another relay client took over.
             // Stop retrying so the two instances don't bounce each other forever.
             resolve(code !== 4000);
