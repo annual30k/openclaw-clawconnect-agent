@@ -396,12 +396,42 @@ function normalizeChatEventPayload(rawPayload: unknown): unknown {
     }
   }
 
+  const normalizeTimestamp = (value: unknown): number | undefined => {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return Math.round(value > 10_000_000_000 ? value : value * 1000);
+    }
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value.trim());
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return Math.round(parsed > 10_000_000_000 ? parsed : parsed * 1000);
+      }
+    }
+    return undefined;
+  };
+
+  const resolvedTimestamp =
+    normalizeTimestamp(payload.ts)
+    ?? normalizeTimestamp(payload.timestamp)
+    ?? normalizeTimestamp(
+      payload.message && typeof payload.message === "object" && !Array.isArray(payload.message)
+        ? (payload.message as Record<string, unknown>).timestamp
+        : undefined,
+    );
+  if (resolvedTimestamp !== undefined) {
+    payload.ts = resolvedTimestamp;
+  }
+
   const hasMessage = payload.message && typeof payload.message === "object" && !Array.isArray(payload.message);
   const text = typeof payload.text === "string" ? payload.text : undefined;
   const delta = typeof payload.delta === "string" ? payload.delta : undefined;
   const streamText = text ?? delta;
   if (!hasMessage && streamText && streamText.length > 0) {
-    payload.message = { content: [{ type: "text", text: streamText }] };
+    const role = typeof payload.role === "string" && payload.role.trim() ? payload.role.trim() : undefined;
+    payload.message = {
+      ...(role ? { role } : {}),
+      ...(resolvedTimestamp !== undefined ? { timestamp: resolvedTimestamp } : {}),
+      content: [{ type: "text", text: streamText }],
+    };
   }
 
   return payload;
@@ -679,9 +709,24 @@ function withMessageText(rawPayload: unknown, text: string): unknown {
     return rawPayload;
   }
   const payload = { ...(rawPayload as Record<string, unknown>) };
+  const existingMessage =
+    payload.message && typeof payload.message === "object" && !Array.isArray(payload.message)
+      ? (payload.message as Record<string, unknown>)
+      : undefined;
+  const timestamp =
+    typeof payload.ts === "number" && Number.isFinite(payload.ts) && payload.ts > 0
+      ? payload.ts
+      : typeof existingMessage?.timestamp === "number" && Number.isFinite(existingMessage.timestamp) && existingMessage.timestamp > 0
+        ? existingMessage.timestamp
+        : undefined;
   payload.message = {
+    ...(typeof existingMessage?.role === "string" && existingMessage.role.trim() ? { role: existingMessage.role.trim() } : {}),
+    ...(timestamp !== undefined ? { timestamp } : {}),
     content: [{ type: "text", text }],
   };
+  if (timestamp !== undefined && payload.ts === undefined) {
+    payload.ts = timestamp;
+  }
   return payload;
 }
 
