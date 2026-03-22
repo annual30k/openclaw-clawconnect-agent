@@ -810,6 +810,7 @@ export async function runRelayManager(opts) {
                 type: "hello",
                 platform: process.platform,
                 agentVersion: "1.0.0",
+                capabilities: ["chat", "skills", "schedules", "logs"],
             });
             // Start the persistent gateway connection as soon as we're connected
             // to the relay server. Its lifetime is tied to this relay session.

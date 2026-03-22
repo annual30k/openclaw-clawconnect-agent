@@ -22,7 +22,7 @@ const UI_SYNC_RUN_ID_PREFIX = "relay-ui-sync-";
 
 /** Messages the relay client sends to the relay server. */
 type ToServer =
-  | { type: "hello"; platform: string; agentVersion: string }
+  | { type: "hello"; platform: string; agentVersion: string; capabilities?: string[] }
   | { type: "heartbeat" }
   | { type: "gateway_connected" }
   | { type: "gateway_disconnected"; reason: string }
@@ -1046,6 +1046,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         type: "hello",
         platform: process.platform,
         agentVersion: "1.0.0",
+        capabilities: ["chat", "skills", "schedules", "logs"],
       });
 
       // Start the persistent gateway connection as soon as we're connected
