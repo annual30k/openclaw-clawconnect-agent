@@ -1228,7 +1228,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       }
 
       // Handle clawpilot.* commands locally without forwarding to the gateway
-      const localResult = handleLocalCommand(msg.method);
+      const localResult = handleLocalCommand(msg.method, msg.params);
       if (localResult !== null) {
         if (requestId) {
           if (localResult.ok) {

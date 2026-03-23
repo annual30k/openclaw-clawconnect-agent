@@ -5,4 +5,4 @@ export type LocalResult = {
     ok: false;
     error: string;
 };
-export declare function handleLocalCommand(method: string): LocalResult | null;
+export declare function handleLocalCommand(method: string, params?: unknown): LocalResult | null;

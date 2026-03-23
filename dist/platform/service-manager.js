@@ -37,9 +37,17 @@ function commandExists(command) {
         return false;
     }
 }
+function resolveServiceEntryPath(scriptPath) {
+    const normalizedScriptPath = scriptPath.replace(/\\/g, "/");
+    const distIndexPath = normalizedScriptPath.replace(/\/src\/index\.(ts|js)$/, "/dist/index.js");
+    if (distIndexPath !== normalizedScriptPath && existsSync(distIndexPath)) {
+        return distIndexPath;
+    }
+    return scriptPath;
+}
 function getProgramArgs() {
     const nodeBin = process.execPath;
-    const scriptPath = process.argv[1];
+    const scriptPath = resolveServiceEntryPath(process.argv[1]);
     return nodeBin === scriptPath ? [scriptPath, "run"] : [nodeBin, scriptPath, "run"];
 }
 function ensureLogDir() {

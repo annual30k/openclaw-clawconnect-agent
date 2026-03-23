@@ -2,6 +2,7 @@ import { readdirSync, statSync, copyFileSync, existsSync, readFileSync } from "f
 import { join, dirname } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
+import { createBackup, deleteBackup, listBackups, restoreBackup, updateBackup } from "./backup-manager.js";
 
 const OPENCLAW_DIR    = join(homedir(), ".openclaw");
 const OPENCLAW_CONFIG = join(OPENCLAW_DIR, "openclaw.json");
@@ -62,7 +63,7 @@ function getOpenclawBin(): string {
 
 // ---------------------------------------------------------------------------
 
-export function handleLocalCommand(method: string): LocalResult | null {
+export function handleLocalCommand(method: string, params: unknown = undefined): LocalResult | null {
   switch (method) {
     case "clawconnect.config":
     case "pocketclaw.config":
@@ -73,6 +74,21 @@ export function handleLocalCommand(method: string): LocalResult | null {
     case "clawconnect.restore.config":
     case "pocketclaw.restore.config":
     case "clawpilot.restore.config":      return restoreConfig();
+    case "clawconnect.backup.list":
+    case "pocketclaw.backup.list":
+    case "clawpilot.backup.list":         return readBackups();
+    case "clawconnect.backup.create":
+    case "pocketclaw.backup.create":
+    case "clawpilot.backup.create":       return createBackupRecord(params);
+    case "clawconnect.backup.update":
+    case "pocketclaw.backup.update":
+    case "clawpilot.backup.update":       return updateBackupRecord(params);
+    case "clawconnect.backup.delete":
+    case "pocketclaw.backup.delete":
+    case "clawpilot.backup.delete":       return deleteBackupRecord(params);
+    case "clawconnect.backup.restore":
+    case "pocketclaw.backup.restore":
+    case "clawpilot.backup.restore":      return restoreBackupRecord(params);
     case "clawconnect.watchskill":
     case "pocketclaw.watchskill":
     case "clawpilot.watchskill":          return watchSkill();
@@ -105,6 +121,13 @@ function execErrorOutput(err: unknown): string {
   const errStr = e.stderr?.toString() ?? "";
   if (out && errStr) return `${out}\n${errStr}`;
   return out || errStr;
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message;
+  }
+  return String(err);
 }
 
 /** Run openclaw with the resolved path and the enriched subprocess environment. */
@@ -175,7 +198,7 @@ function readOpenclawConfig(): LocalResult {
 
     return { ok: true, payload: { output: `[${OPENCLAW_CONFIG}]\n${output}` } };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    return { ok: false, error: errorMessage(err) };
   }
 }
 
@@ -213,15 +236,22 @@ function fixToolsPermissions202632(): LocalResult {
     return { ok: true, payload: { output } };
   } catch (err) {
     const output = execErrorOutput(err);
-    return output ? { ok: true, payload: { output } } : { ok: false, error: String(err) };
+    return output ? { ok: true, payload: { output } } : { ok: false, error: errorMessage(err) };
   }
 }
 
 function restoreConfig(): LocalResult {
   try {
+    const backups = listBackups().backups;
+    if (backups.length > 0) {
+      restoreBackup({ backupId: backups[0].id });
+      return { ok: true, payload: { restoredFrom: backups[0].filename } };
+    }
+
     if (!existsSync(OPENCLAW_DIR)) {
       return { ok: false, error: `openclaw config dir not found: ${OPENCLAW_DIR}` };
     }
+
     const bakFiles = readdirSync(OPENCLAW_DIR)
       .filter(name => name.startsWith("openclaw.json.bak"))
       .map(name => {
@@ -238,7 +268,47 @@ function restoreConfig(): LocalResult {
     console.log(`[clawconnect] Config restored from ${latest.name}`);
     return { ok: true, payload: { restoredFrom: latest.name } };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function readBackups(): LocalResult {
+  try {
+    return { ok: true, payload: listBackups() };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function createBackupRecord(params: unknown): LocalResult {
+  try {
+    return { ok: true, payload: createBackup(params) };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function updateBackupRecord(params: unknown): LocalResult {
+  try {
+    return { ok: true, payload: updateBackup(params) };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function deleteBackupRecord(params: unknown): LocalResult {
+  try {
+    return { ok: true, payload: deleteBackup(params) };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function restoreBackupRecord(params: unknown): LocalResult {
+  try {
+    return { ok: true, payload: restoreBackup(params) };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
   }
 }
 
@@ -248,7 +318,7 @@ function watchSkill(): LocalResult {
     console.log("[clawconnect] skills.load.watch set to true");
     return { ok: true, payload: { message: "skills.load.watch enabled" } };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    return { ok: false, error: errorMessage(err) };
   }
 }
 
@@ -259,7 +329,7 @@ function runDoctor(): LocalResult {
     return { ok: true, payload: { output } };
   } catch (err) {
     const output = execErrorOutput(err);
-    return output ? { ok: true, payload: { output } } : { ok: false, error: String(err) };
+    return output ? { ok: true, payload: { output } } : { ok: false, error: errorMessage(err) };
   }
 }
 
@@ -291,7 +361,7 @@ function readLogs(): LocalResult {
     console.log(`[clawconnect] logs read from ${latest}`);
     return { ok: true, payload: { output: `[${latest}]\n${last100}` } };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    return { ok: false, error: errorMessage(err) };
   }
 }
 
@@ -302,7 +372,7 @@ function restartGateway(): LocalResult {
     return { ok: true, payload: { output: output || "Gateway restarted successfully." } };
   } catch (err) {
     const output = execErrorOutput(err);
-    return output ? { ok: true, payload: { output } } : { ok: false, error: String(err) };
+    return output ? { ok: true, payload: { output } } : { ok: false, error: errorMessage(err) };
   }
 }
 
@@ -345,6 +415,6 @@ function updateOpenclaw(): LocalResult {
     return { ok: true, payload: { output: output || "openclaw updated successfully." } };
   } catch (err) {
     const output = execErrorOutput(err);
-    return output ? { ok: true, payload: { output } } : { ok: false, error: String(err) };
+    return output ? { ok: true, payload: { output } } : { ok: false, error: errorMessage(err) };
   }
 }

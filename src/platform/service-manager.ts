@@ -55,9 +55,18 @@ function commandExists(command: string): boolean {
   }
 }
 
+function resolveServiceEntryPath(scriptPath: string): string {
+  const normalizedScriptPath = scriptPath.replace(/\\/g, "/");
+  const distIndexPath = normalizedScriptPath.replace(/\/src\/index\.(ts|js)$/, "/dist/index.js");
+  if (distIndexPath !== normalizedScriptPath && existsSync(distIndexPath)) {
+    return distIndexPath;
+  }
+  return scriptPath;
+}
+
 function getProgramArgs(): string[] {
   const nodeBin = process.execPath;
-  const scriptPath = process.argv[1];
+  const scriptPath = resolveServiceEntryPath(process.argv[1]);
   return nodeBin === scriptPath ? [scriptPath, "run"] : [nodeBin, scriptPath, "run"];
 }
 
