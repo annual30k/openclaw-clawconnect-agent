@@ -499,17 +499,6 @@ function canonicalizeSessionKey(rawValue: unknown, defaults: GatewaySessionDefau
   }
 
   const mainKey = defaults.mainKey || "main";
-  const legacyIosSessionMatch = trimmed.match(/^agent:([^:]+):ios-[0-9a-f-]+$/i);
-  if (legacyIosSessionMatch) {
-    const [, legacyAgentId] = legacyIosSessionMatch;
-    if (!defaults.defaultAgentId || defaults.defaultAgentId === legacyAgentId) {
-      const scopedMainSessionKey =
-        defaults.mainSessionKey.startsWith(`agent:${legacyAgentId}:`)
-          ? defaults.mainSessionKey
-          : `agent:${legacyAgentId}:${mainKey}`;
-      return scopedMainSessionKey;
-    }
-  }
   const isMainAlias =
     trimmed === "main" ||
     trimmed === mainKey ||
@@ -789,46 +778,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     const contextUsageRefreshes = new Map<string, ReturnType<typeof setTimeout>>();
     const contextUsageFingerprints = new Map<string, string>();
 
-    const resolveEventSessionKey = (rawPayload: unknown): string | undefined => {
-      if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
-        return undefined;
-      }
-
-      const payload = rawPayload as Record<string, unknown>;
-      const explicitSessionKey =
-        typeof payload.sessionKey === "string"
-          ? canonicalizeSessionKey(payload.sessionKey, sessionDefaults)
-          : undefined;
-      if (typeof explicitSessionKey === "string" && explicitSessionKey.trim().length > 0) {
-        return explicitSessionKey.trim();
-      }
-
-      const runId = typeof payload.runId === "string" ? payload.runId.trim() : "";
-      if (!runId) {
-        return undefined;
-      }
-
-      const runContext = chatRunContexts.get(runId);
-      if (!runContext?.sessionKey) {
-        return undefined;
-      }
-
-      const contextualSessionKey = canonicalizeSessionKey(runContext.sessionKey, sessionDefaults);
-      return typeof contextualSessionKey === "string" && contextualSessionKey.trim().length > 0
-        ? contextualSessionKey.trim()
-        : undefined;
-    };
-
-    const withSessionKey = (rawPayload: unknown, sessionKey: string | undefined): unknown => {
-      if (!sessionKey || !rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
-        return rawPayload;
-      }
-      return {
-        ...(rawPayload as Record<string, unknown>),
-        sessionKey,
-      };
-    };
-
     const clearChatFallback = (runId: string): void => {
       const timer = chatFallbacks.get(runId);
       if (timer) {
@@ -1028,13 +977,12 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
         onEvent: (event, payload) => {
           const normalizedPayload = event === "chat" ? normalizeChatEventPayload(payload) : payload;
-          const relayPayload = withSessionKey(normalizedPayload, resolveEventSessionKey(normalizedPayload));
           if (event === "chat") {
-            const p = relayPayload as { sessionKey?: string; runId?: string };
-            const state = normalizeChatState(relayPayload);
+            const p = normalizedPayload as { sessionKey?: string; runId?: string };
+            const state = normalizeChatState(normalizedPayload);
             const runId = typeof p?.runId === "string" ? p.runId : "";
-            const currentText = extractChatText(relayPayload);
-            const role = extractChatRole(relayPayload);
+            const currentText = extractChatText(normalizedPayload);
+            const role = extractChatRole(normalizedPayload);
 
             if (runId) {
               if (role === "assistant" && (state === "delta" || state === "final" || state === "error" || state === "failed" || state === "fail")) {
@@ -1060,7 +1008,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 if (runId) {
                   chatRunContexts.delete(runId);
                 }
-                send({ type: "event", event, payload: withMessageText(relayPayload, resolvedText) });
+                send({ type: "event", event, payload: withMessageText(normalizedPayload, resolvedText) });
                 return;
               }
 
@@ -1083,7 +1031,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     chatRunContexts.delete(runId);
                   }
                   if (outcome?.kind === "final") {
-                    send({ type: "event", event, payload: withMessageText(relayPayload, outcome.text) });
+                    send({ type: "event", event, payload: withMessageText(normalizedPayload, outcome.text) });
                     return;
                   }
                   if (outcome?.kind === "error") {
@@ -1091,21 +1039,21 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                       type: "event",
                       event,
                       payload: {
-                        ...(relayPayload as Record<string, unknown>),
+                        ...(normalizedPayload as Record<string, unknown>),
                         state: "error",
                         errorMessage: outcome.errorMessage,
                       },
                     });
                     return;
                   }
-                  send({ type: "event", event, payload: relayPayload });
+                  send({ type: "event", event, payload: normalizedPayload });
                 })
                 .catch((err) => {
                   console.error(`[relay] chat.history fetch failed: ${err}`);
                   if (runId) {
                     chatRunContexts.delete(runId);
                   }
-                  send({ type: "event", event, payload: relayPayload });
+                  send({ type: "event", event, payload: normalizedPayload });
                 });
               return;
             }
@@ -1115,7 +1063,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               scheduleContextUsageRefresh(p?.sessionKey, 450);
             }
           }
-          send({ type: "event", event, payload: relayPayload });
+          send({ type: "event", event, payload: normalizedPayload });
         },
       });
 
@@ -1172,40 +1120,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           }
         }
         return;
-      }
-
-      if ((msg.method === "chat.send" || msg.method === "agent") && msg.params && typeof msg.params === "object" && !Array.isArray(msg.params)) {
-        const paramsRecord = msg.params as Record<string, unknown>;
-        const rawSessionKey =
-          typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
-            ? paramsRecord.sessionKey.trim()
-            : "";
-        const runContextKey =
-          typeof paramsRecord.idempotencyKey === "string" && paramsRecord.idempotencyKey.trim().length > 0
-            ? paramsRecord.idempotencyKey.trim()
-            : requestId;
-        if (rawSessionKey && runContextKey) {
-          const sessionKey = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
-          if (typeof sessionKey === "string" && sessionKey !== rawSessionKey) {
-            console.log(
-              `[relay] session remap method=${msg.method} raw=${rawSessionKey} normalized=${sessionKey} id=${requestId ?? "(no-id)"}`
-            );
-          } else if (rawSessionKey) {
-            console.log(
-              `[relay] session pass-through method=${msg.method} session=${rawSessionKey} id=${requestId ?? "(no-id)"}`
-            );
-          }
-          if (typeof sessionKey === "string" && sessionKey.trim().length > 0) {
-            chatRunContexts.set(runContextKey, {
-              sessionKey: sessionKey.trim(),
-              requestedAtMs: Date.now(),
-              promptText:
-                typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
-                  ? paramsRecord.message.trim()
-                  : undefined,
-            });
-          }
-        }
       }
 
       // Handle chat.send with attachments - save to disk and add path reference
