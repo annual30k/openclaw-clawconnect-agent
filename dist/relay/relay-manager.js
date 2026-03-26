@@ -330,6 +330,16 @@ function canonicalizeSessionKey(rawValue, defaults) {
         return trimmed;
     }
     const mainKey = defaults.mainKey || "main";
+    const legacyIosSessionMatch = trimmed.match(/^agent:([^:]+):ios-[0-9a-f-]+$/i);
+    if (legacyIosSessionMatch) {
+        const [, legacyAgentId] = legacyIosSessionMatch;
+        if (!defaults.defaultAgentId || defaults.defaultAgentId === legacyAgentId) {
+            const scopedMainSessionKey = defaults.mainSessionKey.startsWith(`agent:${legacyAgentId}:`)
+                ? defaults.mainSessionKey
+                : `agent:${legacyAgentId}:${mainKey}`;
+            return scopedMainSessionKey;
+        }
+    }
     const isMainAlias = trimmed === "main" ||
         trimmed === mainKey ||
         trimmed === defaults.mainSessionKey ||
@@ -572,6 +582,39 @@ export async function runRelayManager(opts) {
         const chatRunContexts = new Map();
         const contextUsageRefreshes = new Map();
         const contextUsageFingerprints = new Map();
+        const resolveEventSessionKey = (rawPayload) => {
+            if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
+                return undefined;
+            }
+            const payload = rawPayload;
+            const explicitSessionKey = typeof payload.sessionKey === "string"
+                ? canonicalizeSessionKey(payload.sessionKey, sessionDefaults)
+                : undefined;
+            if (typeof explicitSessionKey === "string" && explicitSessionKey.trim().length > 0) {
+                return explicitSessionKey.trim();
+            }
+            const runId = typeof payload.runId === "string" ? payload.runId.trim() : "";
+            if (!runId) {
+                return undefined;
+            }
+            const runContext = chatRunContexts.get(runId);
+            if (!runContext?.sessionKey) {
+                return undefined;
+            }
+            const contextualSessionKey = canonicalizeSessionKey(runContext.sessionKey, sessionDefaults);
+            return typeof contextualSessionKey === "string" && contextualSessionKey.trim().length > 0
+                ? contextualSessionKey.trim()
+                : undefined;
+        };
+        const withSessionKey = (rawPayload, sessionKey) => {
+            if (!sessionKey || !rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
+                return rawPayload;
+            }
+            return {
+                ...rawPayload,
+                sessionKey,
+            };
+        };
         const clearChatFallback = (runId) => {
             const timer = chatFallbacks.get(runId);
             if (timer) {
@@ -750,12 +793,13 @@ export async function runRelayManager(opts) {
                 },
                 onEvent: (event, payload) => {
                     const normalizedPayload = event === "chat" ? normalizeChatEventPayload(payload) : payload;
+                    const relayPayload = withSessionKey(normalizedPayload, resolveEventSessionKey(normalizedPayload));
                     if (event === "chat") {
-                        const p = normalizedPayload;
-                        const state = normalizeChatState(normalizedPayload);
+                        const p = relayPayload;
+                        const state = normalizeChatState(relayPayload);
                         const runId = typeof p?.runId === "string" ? p.runId : "";
-                        const currentText = extractChatText(normalizedPayload);
-                        const role = extractChatRole(normalizedPayload);
+                        const currentText = extractChatText(relayPayload);
+                        const role = extractChatRole(relayPayload);
                         if (runId) {
                             if (role === "assistant" && (state === "delta" || state === "final" || state === "error" || state === "failed" || state === "fail")) {
                                 clearChatFallback(runId);
@@ -780,7 +824,7 @@ export async function runRelayManager(opts) {
                                 if (runId) {
                                     chatRunContexts.delete(runId);
                                 }
-                                send({ type: "event", event, payload: withMessageText(normalizedPayload, resolvedText) });
+                                send({ type: "event", event, payload: withMessageText(relayPayload, resolvedText) });
                                 return;
                             }
                             const sessionKey = p.sessionKey;
@@ -799,7 +843,7 @@ export async function runRelayManager(opts) {
                                     chatRunContexts.delete(runId);
                                 }
                                 if (outcome?.kind === "final") {
-                                    send({ type: "event", event, payload: withMessageText(normalizedPayload, outcome.text) });
+                                    send({ type: "event", event, payload: withMessageText(relayPayload, outcome.text) });
                                     return;
                                 }
                                 if (outcome?.kind === "error") {
@@ -807,21 +851,21 @@ export async function runRelayManager(opts) {
                                         type: "event",
                                         event,
                                         payload: {
-                                            ...normalizedPayload,
+                                            ...relayPayload,
                                             state: "error",
                                             errorMessage: outcome.errorMessage,
                                         },
                                     });
                                     return;
                                 }
-                                send({ type: "event", event, payload: normalizedPayload });
+                                send({ type: "event", event, payload: relayPayload });
                             })
                                 .catch((err) => {
                                 console.error(`[relay] chat.history fetch failed: ${err}`);
                                 if (runId) {
                                     chatRunContexts.delete(runId);
                                 }
-                                send({ type: "event", event, payload: normalizedPayload });
+                                send({ type: "event", event, payload: relayPayload });
                             });
                             return;
                         }
@@ -830,7 +874,7 @@ export async function runRelayManager(opts) {
                             scheduleContextUsageRefresh(p?.sessionKey, 450);
                         }
                     }
-                    send({ type: "event", event, payload: normalizedPayload });
+                    send({ type: "event", event, payload: relayPayload });
                 },
             });
             gatewayClient.start();
@@ -882,6 +926,33 @@ export async function runRelayManager(opts) {
                     }
                 }
                 return;
+            }
+            if ((msg.method === "chat.send" || msg.method === "agent") && msg.params && typeof msg.params === "object" && !Array.isArray(msg.params)) {
+                const paramsRecord = msg.params;
+                const rawSessionKey = typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
+                    ? paramsRecord.sessionKey.trim()
+                    : "";
+                const runContextKey = typeof paramsRecord.idempotencyKey === "string" && paramsRecord.idempotencyKey.trim().length > 0
+                    ? paramsRecord.idempotencyKey.trim()
+                    : requestId;
+                if (rawSessionKey && runContextKey) {
+                    const sessionKey = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
+                    if (typeof sessionKey === "string" && sessionKey !== rawSessionKey) {
+                        console.log(`[relay] session remap method=${msg.method} raw=${rawSessionKey} normalized=${sessionKey} id=${requestId ?? "(no-id)"}`);
+                    }
+                    else if (rawSessionKey) {
+                        console.log(`[relay] session pass-through method=${msg.method} session=${rawSessionKey} id=${requestId ?? "(no-id)"}`);
+                    }
+                    if (typeof sessionKey === "string" && sessionKey.trim().length > 0) {
+                        chatRunContexts.set(runContextKey, {
+                            sessionKey: sessionKey.trim(),
+                            requestedAtMs: Date.now(),
+                            promptText: typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
+                                ? paramsRecord.message.trim()
+                                : undefined,
+                        });
+                    }
+                }
             }
             // Handle chat.send with attachments - save to disk and add path reference
             if (msg.method === "chat.send") {
