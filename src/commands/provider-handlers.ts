@@ -1,9 +1,8 @@
-import { execSync } from "child_process";
-import { existsSync } from "fs";
 import { dirname } from "path";
 import { homedir } from "os";
 import { randomUUID } from "crypto";
 import type { LocalResult } from "./local-handlers.js";
+import { requestGatewayRestart } from "./local-handlers.js";
 import { PROVIDER_REGISTRY } from "./provider-registry.js";
 import {
   listProviderEntries,
@@ -33,30 +32,10 @@ const SUBPROCESS_ENV: NodeJS.ProcessEnv = {
   ].join(":"),
 };
 
-function resolveOpenclawBin(): string {
-  try {
-    const p = execSync("which openclaw", { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 })
-      .toString().trim();
-    if (p && existsSync(p)) return p;
-  } catch { /* fall through */ }
-  return "openclaw";
-}
-
-let cachedOpenclawBin: string | null = null;
-
-function getOpenclawBin(): string {
-  if (cachedOpenclawBin == null) {
-    cachedOpenclawBin = resolveOpenclawBin();
-  }
-  return cachedOpenclawBin;
-}
-
 function restartGateway(): void {
-  try {
-    execSync(`"${getOpenclawBin()}" gateway restart`, { stdio: "pipe", env: SUBPROCESS_ENV });
-    console.log("[provider] gateway restarted");
-  } catch (err) {
-    console.warn("[provider] gateway restart failed:", String(err));
+  const restart = requestGatewayRestart("provider");
+  if (!restart.ok) {
+    console.warn("[provider] gateway restart request failed:", restart.error);
   }
 }
 

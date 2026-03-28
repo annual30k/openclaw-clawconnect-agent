@@ -1,7 +1,7 @@
 import { readdirSync, statSync, copyFileSync, existsSync, readFileSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 import { createBackup, deleteBackup, listBackups, restoreBackup, updateBackup } from "./backup-manager.js";
 const OPENCLAW_DIR = join(homedir(), ".openclaw");
 const OPENCLAW_CONFIG = join(OPENCLAW_DIR, "openclaw.json");
@@ -119,6 +119,26 @@ function errorMessage(err) {
 function openclaw(args) {
     return execSync(`"${getOpenclawBin()}" ${args}`, { stdio: "pipe", env: SUBPROCESS_ENV });
 }
+export function requestGatewayRestart(source = "clawconnect") {
+    try {
+        const child = spawn(getOpenclawBin(), ["gateway", "restart"], {
+            env: SUBPROCESS_ENV,
+            stdio: "ignore",
+            detached: true,
+            windowsHide: true,
+        });
+        child.once("error", (err) => {
+            console.warn(`[${source}] gateway restart failed to start:`, String(err));
+        });
+        child.unref();
+        console.log(`[${source}] gateway restart requested`);
+        return { ok: true, payload: { output: "Gateway restart requested." } };
+    }
+    catch (err) {
+        const output = execErrorOutput(err);
+        return output ? { ok: true, payload: { output } } : { ok: false, error: errorMessage(err) };
+    }
+}
 function maskSensitive(value, parentKey) {
     if (Array.isArray(value)) {
         return value.map(item => maskSensitive(item));
@@ -188,7 +208,18 @@ function fixToolsPermissions202632() {
     try {
         const outputs = [];
         for (const step of steps) {
-            const output = openclaw(step).toString().trim();
+            let output = "";
+            if (step === "gateway restart") {
+                const restart = requestGatewayRestart("clawconnect");
+                if (!restart.ok) {
+                    throw new Error(restart.error);
+                }
+                const payload = restart.payload;
+                output = typeof payload?.output === "string" ? payload.output.trim() : "";
+            }
+            else {
+                output = openclaw(step).toString().trim();
+            }
             if (output) {
                 outputs.push(output);
             }
@@ -201,7 +232,7 @@ function fixToolsPermissions202632() {
             "- tools.exec.security = full",
             "- tools.exec.ask = off",
             "",
-            "Gateway restarted.",
+            "Gateway restart requested.",
         ].join("\n");
         const output = outputs.length > 0 ? `${summary}\n\n${outputs.join("\n\n")}` : summary;
         return { ok: true, payload: { output } };
@@ -331,15 +362,7 @@ function readLogs() {
     }
 }
 function restartGateway() {
-    try {
-        const output = openclaw("gateway restart").toString();
-        console.log("[clawconnect] gateway restarted");
-        return { ok: true, payload: { output: output || "Gateway restarted successfully." } };
-    }
-    catch (err) {
-        const output = execErrorOutput(err);
-        return output ? { ok: true, payload: { output } } : { ok: false, error: errorMessage(err) };
-    }
+    return requestGatewayRestart("clawconnect");
 }
 function getOpenclawVersion() {
     const candidates = ["--version", "version"];
