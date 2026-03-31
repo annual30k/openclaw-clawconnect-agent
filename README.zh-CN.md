@@ -112,6 +112,26 @@ clawconnect uninstall
 clawconnect reset
 ```
 
+### 9. 发送文件/图片
+
+把本地图片或其他文件发到已配对的聊天会话：
+
+```bash
+clawconnect send-file ~/Pictures/demo.jpg
+```
+
+可选参数：
+
+- `-g, --gateway <id>`：覆盖本地配置里的网关 ID
+- `-s, --session <key>`：指定聊天会话，不传时默认使用最近活跃会话
+- `--json`：以 JSON 输出上传结果
+
+说明：
+
+- `send-file` 会先把文件上传到 relay，再把文件消息发到手机端。
+- 图片类型会在 iPhone 聊天里显示预览图，其他类型则显示文件卡片。
+- `chat.send` 的 `attachments` 目前只是本地落盘引用，不是跨设备文件传输入口。
+
 ## 工作原理
 
 整个链路如下：
@@ -121,6 +141,7 @@ clawconnect reset
 3. `ClawConnect Agent` 与中继站保持长连接
 4. `ClawConnect Agent` 再连接本机 OpenClaw Gateway
 5. 移动端的聊天、模型切换、技能操作等请求，通过中继转发到本机 OpenClaw
+6. 本机文件可通过 `clawconnect send-file <path>` 发送到聊天会话，并在手机端作为文件消息展示
 
 ## 本地目录
 

@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "test": "node --test --import tsx src/commands/send-file.test.ts src/relay/attachment-staging.test.ts",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js"
   },

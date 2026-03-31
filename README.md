@@ -92,12 +92,31 @@ Stop the service and clear local pairing config:
 clawconnect reset
 ```
 
+### Send Files / Images
+
+Send a local file into the paired chat session:
+
+```bash
+clawconnect send-file ~/Pictures/demo.jpg
+```
+
+Options:
+- `-g, --gateway <id>` — Override the gateway ID from local config
+- `-s, --session <key>` — Target chat session key. If omitted, the latest active session is used
+- `--json` — Print the upload result as JSON
+
+Notes:
+- `send-file` uploads through the relay and posts a file message to mobile.
+- Image MIME types render as preview cards in the iPhone chat UI.
+- `chat.send` attachments are local staging references, not the cross-device file transfer path.
+
 ## How It Works
 
 1. **Pair** — Generate a QR code
 2. **Scan QR with mobile app** — iOS or Android app pairs with your host
 3. **Run** — Host agent stays connected to your relay server
 4. **Communicate** — Mobile app sends commands through the relay to OpenClaw
+5. **Send files** — Use `clawconnect send-file <path>` to deliver a local file or image into the chat session
 
 ## Requirements
 

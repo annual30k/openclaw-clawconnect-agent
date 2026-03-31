@@ -1,4 +1,5 @@
 import { WebSocket } from "ws";
+import { buildAttachmentStagingPath, resolveAttachmentMimeType, } from "./attachment-staging.js";
 import { OpenClawGatewayClient } from "./gateway-client.js";
 import { handleLocalCommand } from "../commands/local-handlers.js";
 import { handleProviderCommand } from "../commands/provider-handlers.js";
@@ -731,7 +732,7 @@ export async function runRelayManager(opts) {
                 type: "hello",
                 platform: process.platform,
                 agentVersion: "1.0.0",
-                capabilities: ["chat", "skills", "schedules", "logs"],
+                capabilities: ["chat", "skills", "schedules", "logs", "files"],
             });
             // Start the persistent gateway connection as soon as we're connected
             // to the relay server. Its lifetime is tied to this relay session.
@@ -897,14 +898,15 @@ export async function runRelayManager(opts) {
                         try {
                             // Decode base64 to buffer
                             const buffer = Buffer.from(att.content, "base64");
-                            const ext = att.mimeType === "image/png" ? ".png" : ".jpg";
-                            const stagedFileName = `${randomUUID()}${ext}`;
-                            const stagedPath = join(OUTBOUND_DIR, stagedFileName);
+                            const stagingId = randomUUID();
+                            const stagedPath = buildAttachmentStagingPath(att, OUTBOUND_DIR, stagingId);
+                            const mimeType = resolveAttachmentMimeType(att);
                             // Write to disk
+                            await mkdir(join(OUTBOUND_DIR, stagingId), { recursive: true });
                             await writeFile(stagedPath, buffer);
                             console.log(`[relay] Saved attachment to: ${stagedPath}`);
                             // Create path reference (same format as ClawX)
-                            fileReferences.push(`[media attached: ${stagedPath} (${att.mimeType}) | ${stagedPath}]`);
+                            fileReferences.push(`[media attached: ${stagedPath} (${mimeType}) | ${stagedPath}]`);
                         }
                         catch (err) {
                             console.error(`[relay] Failed to save attachment: ${err}`);

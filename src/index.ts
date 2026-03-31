@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { createRequire } from "module";
 import { pairCommand } from "./commands/pair.js";
 import { runCommand } from "./commands/run.js";
+import { sendFileCommand } from "./commands/send-file.js";
 import { installCommand, uninstallCommand, stopCommand, restartCommand, resetCommand } from "./commands/install.js";
 import { statusCommand } from "./commands/status.js";
 import { setTokenCommand } from "./commands/set-token.js";
@@ -26,6 +27,27 @@ program
   .action(async (opts: { server: string; name: string; codeOnly?: boolean }) => {
     try {
       await pairCommand(opts);
+    } catch (err) {
+      console.error("Error:", err instanceof Error ? err.message : err);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("send-file")
+  .description("Upload a local file to the paired gateway's chat session")
+  .argument("<path>", "Path to the local file")
+  .option("-g, --gateway <id>", "Override gateway ID from local config")
+  .option("-s, --session <key>", "Target chat session key (defaults to the latest active session)")
+  .option("--json", "Print the upload result as JSON", false)
+  .action(async (filePath: string, opts: { gateway?: string; session?: string; json?: boolean }) => {
+    try {
+      await sendFileCommand({
+        filePath,
+        gateway: opts.gateway,
+        session: opts.session,
+        json: opts.json,
+      });
     } catch (err) {
       console.error("Error:", err instanceof Error ? err.message : err);
       process.exit(1);
