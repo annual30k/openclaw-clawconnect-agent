@@ -122,6 +122,8 @@ export async function sendFileCommand(
     throw new Error("gateway_id_required");
   }
 
+  const clientCreatedAt = new Date().toISOString();
+
   const sessionKey = await resolveTargetSessionKey(opts.session, deps.sessionStoreRoot);
   const absolutePath = resolve(opts.filePath);
   let fileStat: Awaited<ReturnType<typeof stat>>;
@@ -157,6 +159,7 @@ export async function sendFileCommand(
           sizeBytes,
           sha256,
           senderDisplayName: config.displayName,
+          clientCreatedAt,
         }),
       }, "init upload"),
   );

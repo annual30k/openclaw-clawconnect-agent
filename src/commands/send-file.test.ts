@@ -50,6 +50,7 @@ test("send-file uploads chunks and finalizes the transfer", async () => {
         assert.equal(initBody.sizeBytes, fileBytes.byteLength);
         assert.equal(initBody.senderDisplayName, "Host Mac");
         assert.equal(initBody.sha256, expectedSha256);
+        assert.equal(typeof initBody.clientCreatedAt, "string");
 
         sendJson(res, {
           fileId: "file_test",
@@ -200,6 +201,7 @@ test("send-file infers the latest active session when session is omitted", async
         assert.equal(initBody.fileName, "sample.mp3");
         assert.equal(initBody.mimeType, "audio/mpeg");
         assert.equal(initBody.sha256, expectedSha256);
+        assert.equal(typeof initBody.clientCreatedAt, "string");
 
         sendJson(res, {
           fileId: "file_inferred",
