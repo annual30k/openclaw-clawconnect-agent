@@ -20,6 +20,14 @@ export type ContextUsageSnapshot = {
   totalTokens?: number;
 };
 
+export function buildContextUsageFingerprint(snapshot: ContextUsageSnapshot): string {
+  return JSON.stringify({
+    currentModel: snapshot.currentModel ?? null,
+    contextUsage: snapshot.promptTokens ?? snapshot.contextUsage ?? null,
+    contextLimit: snapshot.contextLimit ?? null,
+  });
+}
+
 type SessionStoreEntry = {
   sessionId?: string;
   model?: string;
@@ -62,7 +70,7 @@ export async function readContextUsageSnapshot(
 
   const contextLimit = toPositiveInteger(entry.contextTokens);
   let currentModel = typeof entry.model === "string" && entry.model.trim().length > 0 ? entry.model.trim() : undefined;
-  let contextUsage = deriveStoredContextUsage(entry) ?? contextLimit;
+  let contextUsage = deriveStoredContextUsage(entry);
   let promptTokens: number | undefined;
   let totalTokens: number | undefined;
 
@@ -71,21 +79,14 @@ export async function readContextUsageSnapshot(
       if (transcriptUsage) {
         promptTokens = transcriptUsage.promptTokens;
         totalTokens = transcriptUsage.total;
-        const candidate = transcriptUsage.promptTokens || transcriptUsage.total;
-        if (!contextUsage || candidate > contextUsage) {
-          contextUsage = candidate;
-        }
+        contextUsage = transcriptUsage.promptTokens;
         if (!currentModel && transcriptUsage.model) {
           currentModel = transcriptUsage.model;
         }
       }
   }
 
-  if (contextLimit && (!contextUsage || contextUsage < contextLimit)) {
-    contextUsage = contextLimit;
-  }
-
-  if (!currentModel && !contextLimit && !contextUsage) {
+  if (!currentModel && !contextLimit && contextUsage === undefined) {
     return null;
   }
 
@@ -197,8 +198,13 @@ function toFiniteInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? Math.round(value) : undefined;
 }
 
-function toPositiveInteger(value: unknown): number | undefined {
+function toNonNegativeInteger(value: unknown): number | undefined {
   const normalized = toFiniteInteger(value);
+  return typeof normalized === "number" && normalized >= 0 ? normalized : undefined;
+}
+
+function toPositiveInteger(value: unknown): number | undefined {
+  const normalized = toNonNegativeInteger(value);
   return typeof normalized === "number" && normalized > 0 ? normalized : undefined;
 }
 
@@ -257,21 +263,32 @@ function normalizeUsageRecord(rawUsage: unknown): NormalizedUsageRecord | undefi
     return undefined;
   }
   const usage = rawUsage as Record<string, unknown>;
-  const input = toFiniteInteger(usage.input) ?? 0;
-  const output = toFiniteInteger(usage.output) ?? 0;
-  const cacheRead = toFiniteInteger(usage.cacheRead) ?? 0;
-  const cacheWrite = toFiniteInteger(usage.cacheWrite) ?? 0;
-  const total =
-    toPositiveInteger(usage.total) ??
-    toPositiveInteger(usage.totalTokens) ??
-    toPositiveInteger(usage.total_tokens);
-  const promptTokens =
-    toPositiveInteger(usage.promptTokens) ??
-    toPositiveInteger(usage.prompt_tokens);
+  const hasKnownField =
+    Object.prototype.hasOwnProperty.call(usage, "input") ||
+    Object.prototype.hasOwnProperty.call(usage, "output") ||
+    Object.prototype.hasOwnProperty.call(usage, "cacheRead") ||
+    Object.prototype.hasOwnProperty.call(usage, "cacheWrite") ||
+    Object.prototype.hasOwnProperty.call(usage, "total") ||
+    Object.prototype.hasOwnProperty.call(usage, "totalTokens") ||
+    Object.prototype.hasOwnProperty.call(usage, "total_tokens") ||
+    Object.prototype.hasOwnProperty.call(usage, "promptTokens") ||
+    Object.prototype.hasOwnProperty.call(usage, "prompt_tokens");
 
-  if (input <= 0 && output <= 0 && cacheRead <= 0 && cacheWrite <= 0 && !total && !promptTokens) {
+  if (!hasKnownField) {
     return undefined;
   }
+
+  const input = toNonNegativeInteger(usage.input) ?? 0;
+  const output = toNonNegativeInteger(usage.output) ?? 0;
+  const cacheRead = toNonNegativeInteger(usage.cacheRead) ?? 0;
+  const cacheWrite = toNonNegativeInteger(usage.cacheWrite) ?? 0;
+  const total =
+    toNonNegativeInteger(usage.total) ??
+    toNonNegativeInteger(usage.totalTokens) ??
+    toNonNegativeInteger(usage.total_tokens);
+  const promptTokens =
+    toNonNegativeInteger(usage.promptTokens) ??
+    toNonNegativeInteger(usage.prompt_tokens);
 
   return {
     input: Math.max(0, input),
@@ -284,11 +301,10 @@ function normalizeUsageRecord(rawUsage: unknown): NormalizedUsageRecord | undefi
 }
 
 function derivePromptTokens(usage: NormalizedUsageRecord): number | undefined {
-  if (usage.promptTokens) {
+  if (usage.promptTokens !== undefined) {
     return usage.promptTokens;
   }
-  const derived = usage.input + usage.cacheRead + usage.cacheWrite;
-  return derived > 0 ? derived : undefined;
+  return usage.input + usage.cacheRead + usage.cacheWrite;
 }
 
 function resolveSessionLogPath(
@@ -381,9 +397,6 @@ async function readUsageFromSessionLog(
 
     const promptTokens = derivePromptTokens(lastUsage) ?? lastUsage.total ?? lastUsage.input + lastUsage.output;
     const total = lastUsage.total ?? promptTokens + lastUsage.output;
-    if (promptTokens === 0 && total === 0) {
-      return null;
-    }
 
     return {
       promptTokens,
@@ -399,14 +412,24 @@ function deriveStoredContextUsage(entry: SessionStoreEntry | null): number | und
   if (!entry) {
     return undefined;
   }
-  const total = toPositiveInteger(entry.totalTokens);
-  if (total) {
+  const total = toNonNegativeInteger(entry.totalTokens);
+  if (typeof total === "number") {
     return total;
   }
   const input = toFiniteInteger(entry.inputTokens) ?? 0;
   const output = toFiniteInteger(entry.outputTokens) ?? 0;
   const fallback = input + output;
-  return fallback > 0 ? fallback : undefined;
+  if (fallback > 0) {
+    return fallback;
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(entry, "inputTokens") ||
+    Object.prototype.hasOwnProperty.call(entry, "outputTokens") ||
+    Object.prototype.hasOwnProperty.call(entry, "totalTokens")
+  ) {
+    return 0;
+  }
+  return undefined;
 }
 
 function shouldCanonicalizeSessionKey(method: string): boolean {

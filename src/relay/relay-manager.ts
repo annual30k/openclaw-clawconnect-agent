@@ -4,6 +4,7 @@ import { handleLocalCommand } from "../commands/local-handlers.js";
 import { handleProviderCommand } from "../commands/provider-handlers.js";
 import {
   DEFAULT_GATEWAY_SESSION_DEFAULTS,
+  buildContextUsageFingerprint,
   readContextUsageSnapshot,
   canonicalizeRelayParams,
   canonicalizeSessionKey,
@@ -109,11 +110,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         return;
       }
 
-      const fingerprint = JSON.stringify({
-        currentModel: snapshot.currentModel ?? null,
-        contextUsage: snapshot.contextUsage ?? null,
-        contextLimit: snapshot.contextLimit ?? null,
-      });
+      const fingerprint = buildContextUsageFingerprint(snapshot);
       if (!force && contextUsageFingerprints.get(snapshot.sessionKey) === fingerprint) {
         return;
       }
@@ -125,7 +122,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         payload: {
           sessionKey: snapshot.sessionKey,
           currentModel: snapshot.currentModel,
-          contextUsage: snapshot.contextUsage,
+          contextUsage: snapshot.promptTokens ?? snapshot.contextUsage,
           contextLimit: snapshot.contextLimit,
           promptTokens: snapshot.promptTokens,
           maxInputTokens: snapshot.contextLimit,

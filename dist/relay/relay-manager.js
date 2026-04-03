@@ -2,7 +2,7 @@ import { WebSocket } from "ws";
 import { OpenClawGatewayClient } from "./gateway-client.js";
 import { handleLocalCommand } from "../commands/local-handlers.js";
 import { handleProviderCommand } from "../commands/provider-handlers.js";
-import { DEFAULT_GATEWAY_SESSION_DEFAULTS, readContextUsageSnapshot, canonicalizeRelayParams, canonicalizeSessionKey, extractGatewaySessionDefaults, } from "./session-context.js";
+import { DEFAULT_GATEWAY_SESSION_DEFAULTS, buildContextUsageFingerprint, readContextUsageSnapshot, canonicalizeRelayParams, canonicalizeSessionKey, extractGatewaySessionDefaults, } from "./session-context.js";
 import { appendUniqueSuffix, extractChatRole, extractChatText, normalizeChatEventPayload, normalizeChatState, withMessageText, } from "./chat-payload.js";
 import { extractHistoryOutcome, withTimeout } from "./chat-history.js";
 import { prepareChatSendParams } from "./chat-send-attachments.js";
@@ -52,11 +52,7 @@ export async function runRelayManager(opts) {
             if (!snapshot) {
                 return;
             }
-            const fingerprint = JSON.stringify({
-                currentModel: snapshot.currentModel ?? null,
-                contextUsage: snapshot.contextUsage ?? null,
-                contextLimit: snapshot.contextLimit ?? null,
-            });
+            const fingerprint = buildContextUsageFingerprint(snapshot);
             if (!force && contextUsageFingerprints.get(snapshot.sessionKey) === fingerprint) {
                 return;
             }
@@ -67,7 +63,7 @@ export async function runRelayManager(opts) {
                 payload: {
                     sessionKey: snapshot.sessionKey,
                     currentModel: snapshot.currentModel,
-                    contextUsage: snapshot.contextUsage,
+                    contextUsage: snapshot.promptTokens ?? snapshot.contextUsage,
                     contextLimit: snapshot.contextLimit,
                     promptTokens: snapshot.promptTokens,
                     maxInputTokens: snapshot.contextLimit,

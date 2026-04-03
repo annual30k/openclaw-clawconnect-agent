@@ -11,6 +11,7 @@ import { extractHistoryOutcome, type HistoryResponse } from "./chat-history.js";
 import {
   canonicalizeRelayParams,
   extractGatewaySessionDefaults,
+  buildContextUsageFingerprint,
   type GatewaySessionDefaults,
 } from "./session-context.js";
 
@@ -88,4 +89,23 @@ test("session context helpers extract defaults and canonicalize main-session ali
     canonicalizeRelayParams("status.get", { sessionKey: "main" }, fallbackDefaults),
     { sessionKey: "main" },
   );
+});
+
+test("context usage fingerprint changes when prompt tokens change", () => {
+  const summaryFingerprint = buildContextUsageFingerprint({
+    sessionKey: "agent:main:main",
+    currentModel: "model-a",
+    contextUsage: 200_000,
+    contextLimit: 200_000,
+  });
+
+  const promptFingerprint = buildContextUsageFingerprint({
+    sessionKey: "agent:main:main",
+    currentModel: "model-a",
+    contextUsage: 200_000,
+    contextLimit: 200_000,
+    promptTokens: 0,
+  });
+
+  assert.notEqual(summaryFingerprint, promptFingerprint);
 });
