@@ -11,6 +11,8 @@ export type LocalResult =
   | { ok: true; payload?: unknown }
   | { ok: false; error: string };
 
+type GatewayRuntimeState = "running" | "stopped" | "unknown";
+
 // ---------------------------------------------------------------------------
 // Subprocess environment
 //
@@ -40,6 +42,15 @@ const SUBPROCESS_ENV: NodeJS.ProcessEnv = {
 };
 
 function resolveOpenclawBin(): string {
+  const explicitBin = process.env.OPENCLAW_BIN?.trim();
+  if (explicitBin) {
+    if (existsSync(explicitBin)) {
+      console.log(`[clawconnect] openclaw resolved from OPENCLAW_BIN: ${explicitBin}`);
+      return explicitBin;
+    }
+    console.warn(`[clawconnect] OPENCLAW_BIN is set but missing: ${explicitBin}`);
+  }
+
   try {
     const p = execSync("which openclaw", { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 })
       .toString().trim();
@@ -101,6 +112,9 @@ export function handleLocalCommand(method: string, params: unknown = undefined):
     case "clawconnect.gateway.restart":
     case "pocketclaw.gateway.restart":
     case "clawpilot.gateway.restart":     return restartGateway();
+    case "clawconnect.gateway.remoteRestart":
+    case "pocketclaw.gateway.remoteRestart":
+    case "clawpilot.gateway.remoteRestart": return remoteRestartGateway();
     case "clawconnect.version":
     case "pocketclaw.version":
     case "clawpilot.version":             return getOpenclawVersion();
@@ -135,9 +149,9 @@ function openclaw(args: string): Buffer {
   return execSync(`"${getOpenclawBin()}" ${args}`, { stdio: "pipe", env: SUBPROCESS_ENV });
 }
 
-export function requestGatewayRestart(source = "clawconnect"): LocalResult {
+function launchGatewayLifecycleCommand(action: "start" | "restart", source = "clawconnect"): LocalResult {
   try {
-    const child = spawn(getOpenclawBin(), ["gateway", "restart"], {
+    const child = spawn(getOpenclawBin(), ["gateway", action], {
       env: SUBPROCESS_ENV,
       stdio: "ignore",
       detached: true,
@@ -145,16 +159,70 @@ export function requestGatewayRestart(source = "clawconnect"): LocalResult {
     });
 
     child.once("error", (err) => {
-      console.warn(`[${source}] gateway restart failed to start:`, String(err));
+      console.warn(`[${source}] gateway ${action} failed to start:`, String(err));
     });
     child.unref();
 
-    console.log(`[${source}] gateway restart requested`);
-    return { ok: true, payload: { output: "Gateway restart requested." } };
+    console.log(`[${source}] gateway ${action} requested`);
+    return { ok: true, payload: { output: `Gateway ${action} requested.` } };
   } catch (err) {
     const output = execErrorOutput(err);
     return output ? { ok: true, payload: { output } } : { ok: false, error: errorMessage(err) };
   }
+}
+
+export function parseGatewayRuntimeState(output: string): GatewayRuntimeState {
+  const stripped = output.replace(/\u001B\[[0-9;]*[A-Za-z]/g, "");
+  const runtimeLine = stripped
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^Runtime:/i.test(line));
+
+  if (!runtimeLine) {
+    return "unknown";
+  }
+
+  const runtime = runtimeLine.replace(/^Runtime:\s*/i, "").trim().toLowerCase();
+  if (runtime === "running" || (runtime.includes("running") && !runtime.includes("not running"))) {
+    return "running";
+  }
+  if (runtime === "stopped" || runtime.includes("stopped") || runtime.includes("not running")) {
+    return "stopped";
+  }
+  return "unknown";
+}
+
+export function resolveGatewayRemoteRestartAction(runtime: GatewayRuntimeState): "start" | "restart" {
+  return runtime === "running" ? "restart" : "start";
+}
+
+function readGatewayRuntimeState(): GatewayRuntimeState {
+  try {
+    const output = openclaw("gateway status --no-probe").toString();
+    return parseGatewayRuntimeState(output);
+  } catch (err) {
+    return parseGatewayRuntimeState(execErrorOutput(err));
+  }
+}
+
+export function requestGatewayRestart(source = "clawconnect"): LocalResult {
+  return launchGatewayLifecycleCommand("restart", source);
+}
+
+export function requestGatewayRemoteRestart(source = "clawconnect"): LocalResult {
+  const runtime = readGatewayRuntimeState();
+  const action = resolveGatewayRemoteRestartAction(runtime);
+  if (action === "restart") {
+    console.log(`[${source}] gateway runtime is running, restarting OpenClaw gateway`);
+    return launchGatewayLifecycleCommand("restart", source);
+  }
+
+  if (runtime === "stopped") {
+    console.log(`[${source}] gateway runtime is stopped, starting OpenClaw gateway`);
+  } else {
+    console.log(`[${source}] gateway runtime is unknown, starting OpenClaw gateway`);
+  }
+  return launchGatewayLifecycleCommand("start", source);
 }
 
 function maskSensitive(value: unknown, parentKey?: string): unknown {
@@ -399,6 +467,10 @@ function readLogs(): LocalResult {
 
 function restartGateway(): LocalResult {
   return requestGatewayRestart("clawconnect");
+}
+
+function remoteRestartGateway(): LocalResult {
+  return requestGatewayRemoteRestart("clawconnect");
 }
 
 function getOpenclawVersion(): LocalResult {
