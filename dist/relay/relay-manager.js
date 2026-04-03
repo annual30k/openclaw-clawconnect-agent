@@ -373,7 +373,9 @@ export async function runRelayManager(opts) {
                         };
                         scheduleChatHistoryFallback(runId, runContext);
                     }
-                    scheduleContextUsageRefresh(sessionKey, 1200, msg.method === "chat.send" && /^\/model\s+/i.test(String(paramsRecord.message ?? "")));
+                    // Let a model switch settle before publishing context usage again.
+                    // Forced refreshes can replay a stale model snapshot and overwrite the new selection.
+                    scheduleContextUsageRefresh(sessionKey, 1200);
                 }
                 if (requestId) {
                     send({ type: "res", id: requestId, ok: true, payload: result });
