@@ -38,6 +38,8 @@ export interface SendFileResult {
   fileName: string;
   mimeType: string;
   sizeBytes: number;
+  imageWidth?: number;
+  imageHeight?: number;
   sha256: string;
   chunkSize: number;
   totalChunks: number;
@@ -67,6 +69,8 @@ type FileUploadCompleteResponse = {
     fileName: string;
     mimeType: string;
     sizeBytes: number;
+    imageWidth?: number;
+    imageHeight?: number;
     sha256: string;
     origin: string;
     senderDisplayName?: string;
@@ -139,6 +143,9 @@ export async function sendFileCommand(
   const fileName = basename(absolutePath);
   const mimeType = inferMimeType(fileName);
   const sizeBytes = Math.max(0, Math.floor(fileStat.size));
+  const imageDimensions = mimeType.startsWith("image/")
+    ? await readImageDimensions(absolutePath, sizeBytes)
+    : undefined;
   const sha256 = await computeSha256(absolutePath);
   const relayBaseUrl = toRelayHttpBase(relayServerUrl);
   const uploadInitUrl = new URL(`/api/host/gateways/${encodeURIComponent(gatewayId)}/files/init`, relayBaseUrl).toString();
@@ -151,16 +158,18 @@ export async function sendFileCommand(
       requestJson<FileUploadInitResponse>(fetchImpl, uploadInitUrl, {
         method: "POST",
         headers: JSON_HEADERS,
-        body: JSON.stringify({
-          secret: relaySecret,
-          sessionKey,
-          fileName,
-          mimeType,
-          sizeBytes,
-          sha256,
-          senderDisplayName: config.displayName,
-          clientCreatedAt,
-        }),
+          body: JSON.stringify({
+            secret: relaySecret,
+            sessionKey,
+            fileName,
+            mimeType,
+            sizeBytes,
+            imageWidth: imageDimensions?.width,
+            imageHeight: imageDimensions?.height,
+            sha256,
+            senderDisplayName: config.displayName,
+            clientCreatedAt,
+          }),
       }, "init upload"),
   );
 
@@ -232,6 +241,8 @@ export async function sendFileCommand(
     fileName: payload.fileName,
     mimeType: payload.mimeType,
     sizeBytes: payload.sizeBytes,
+    imageWidth: payload.imageWidth,
+    imageHeight: payload.imageHeight,
     sha256: payload.sha256,
     chunkSize,
     totalChunks,
@@ -272,6 +283,209 @@ async function computeSha256(filePath: string): Promise<string> {
   }
 
   return hash.digest("hex");
+}
+
+async function readImageDimensions(filePath: string, fileSize: number): Promise<{ width: number; height: number } | undefined> {
+  const maxBytes = Math.min(Math.max(0, Math.floor(fileSize)), 256 * 1024);
+  if (maxBytes === 0) {
+    return undefined;
+  }
+
+  const handle = await open(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(maxBytes);
+    let bytesRead = 0;
+
+    while (bytesRead < maxBytes) {
+      const { bytesRead: chunkRead } = await handle.read(buffer, bytesRead, maxBytes - bytesRead, bytesRead);
+      if (chunkRead <= 0) {
+        break;
+      }
+      bytesRead += chunkRead;
+
+      const dimensions = parseImageDimensions(buffer.subarray(0, bytesRead));
+      if (dimensions) {
+        return dimensions;
+      }
+    }
+
+    return parseImageDimensions(buffer.subarray(0, bytesRead));
+  } catch {
+    return undefined;
+  } finally {
+    await handle.close();
+  }
+}
+
+function parseImageDimensions(buffer: Buffer): { width: number; height: number } | undefined {
+  return (
+    parsePngDimensions(buffer) ??
+    parseGifDimensions(buffer) ??
+    parseWebpDimensions(buffer) ??
+    parseJpegDimensions(buffer) ??
+    parseBmpDimensions(buffer)
+  );
+}
+
+function parsePngDimensions(buffer: Buffer): { width: number; height: number } | undefined {
+  if (buffer.length < 24) {
+    return undefined;
+  }
+  if (buffer.readUInt32BE(0) !== 0x89504e47 || buffer.readUInt32BE(4) !== 0x0d0a1a0a) {
+    return undefined;
+  }
+  if (buffer.readUInt32BE(12) !== 0x49484452) {
+    return undefined;
+  }
+  const width = buffer.readUInt32BE(16);
+  const height = buffer.readUInt32BE(20);
+  return width > 0 && height > 0 ? { width, height } : undefined;
+}
+
+function parseGifDimensions(buffer: Buffer): { width: number; height: number } | undefined {
+  if (buffer.length < 10) {
+    return undefined;
+  }
+  const signature = buffer.toString("ascii", 0, 6);
+  if (signature !== "GIF87a" && signature !== "GIF89a") {
+    return undefined;
+  }
+  const width = buffer.readUInt16LE(6);
+  const height = buffer.readUInt16LE(8);
+  return width > 0 && height > 0 ? { width, height } : undefined;
+}
+
+function parseWebpDimensions(buffer: Buffer): { width: number; height: number } | undefined {
+  if (buffer.length < 30) {
+    return undefined;
+  }
+  if (buffer.toString("ascii", 0, 4) !== "RIFF" || buffer.toString("ascii", 8, 12) !== "WEBP") {
+    return undefined;
+  }
+
+  const chunkType = buffer.toString("ascii", 12, 16);
+  if (chunkType === "VP8X") {
+    const width = readUInt24LE(buffer, 24) + 1;
+    const height = readUInt24LE(buffer, 27) + 1;
+    return width > 0 && height > 0 ? { width, height } : undefined;
+  }
+
+  if (chunkType === "VP8L") {
+    if (buffer.length < 25 || buffer[20] !== 0x2f) {
+      return undefined;
+    }
+    const packed = buffer.readUInt32LE(21);
+    const width = (packed & 0x3fff) + 1;
+    const height = ((packed >> 14) & 0x3fff) + 1;
+    return width > 0 && height > 0 ? { width, height } : undefined;
+  }
+
+  if (chunkType === "VP8 ") {
+    if (buffer.length < 30 || buffer[23] !== 0x9d || buffer[24] !== 0x01 || buffer[25] !== 0x2a) {
+      return undefined;
+    }
+    const width = buffer.readUInt16LE(26) & 0x3fff;
+    const height = buffer.readUInt16LE(28) & 0x3fff;
+    return width > 0 && height > 0 ? { width, height } : undefined;
+  }
+
+  return undefined;
+}
+
+function parseBmpDimensions(buffer: Buffer): { width: number; height: number } | undefined {
+  if (buffer.length < 26 || buffer.toString("ascii", 0, 2) !== "BM") {
+    return undefined;
+  }
+
+  const width = buffer.readInt32LE(18);
+  const height = Math.abs(buffer.readInt32LE(22));
+  return width > 0 && height > 0 ? { width, height } : undefined;
+}
+
+function parseJpegDimensions(buffer: Buffer): { width: number; height: number } | undefined {
+  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) {
+    return undefined;
+  }
+
+  let offset = 2;
+  while (offset + 3 < buffer.length) {
+    if (buffer[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+
+    let markerOffset = offset + 1;
+    while (markerOffset < buffer.length && buffer[markerOffset] === 0xff) {
+      markerOffset += 1;
+    }
+    if (markerOffset >= buffer.length) {
+      return undefined;
+    }
+
+    const marker = buffer[markerOffset];
+    if (marker === 0xda || marker === 0xd9) {
+      return undefined;
+    }
+    if (marker === 0x00 || (marker >= 0xd0 && marker <= 0xd7) || marker === 0x01) {
+      offset = markerOffset + 1;
+      continue;
+    }
+
+    if (markerOffset + 2 >= buffer.length) {
+      return undefined;
+    }
+
+    const segmentLength = buffer.readUInt16BE(markerOffset + 1);
+    if (segmentLength < 2) {
+      return undefined;
+    }
+
+    const segmentEnd = markerOffset + 1 + segmentLength;
+    if (segmentEnd > buffer.length) {
+      return undefined;
+    }
+
+    if (isStartOfFrameMarker(marker)) {
+      if (segmentLength < 7) {
+        return undefined;
+      }
+      const height = buffer.readUInt16BE(markerOffset + 4);
+      const width = buffer.readUInt16BE(markerOffset + 6);
+      return width > 0 && height > 0 ? { width, height } : undefined;
+    }
+
+    offset = segmentEnd;
+  }
+
+  return undefined;
+}
+
+function isStartOfFrameMarker(marker: number): boolean {
+  switch (marker) {
+    case 0xc0:
+    case 0xc1:
+    case 0xc2:
+    case 0xc3:
+    case 0xc5:
+    case 0xc6:
+    case 0xc7:
+    case 0xc9:
+    case 0xca:
+    case 0xcb:
+    case 0xcd:
+    case 0xce:
+    case 0xcf:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function readUInt24LE(buffer: Buffer, offset: number): number {
+  if (offset + 2 >= buffer.length) {
+    return 0;
+  }
+  return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
 }
 
 async function readChunk(handle: FileHandle, start: number, length: number): Promise<Buffer> {

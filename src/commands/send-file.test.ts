@@ -164,6 +164,124 @@ test("send-file uploads chunks and finalizes the transfer", async () => {
   }
 });
 
+test("send-file includes image dimensions for PNG uploads", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-send-file-image-"));
+  const filePath = join(tempDir, "photo.png");
+  const fileBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO5dXhsAAAAASUVORK5CYII=",
+    "base64",
+  );
+  await writeFile(filePath, fileBytes);
+
+  const expectedSha256 = createHash("sha256").update(fileBytes).digest("hex");
+  let initBody: Record<string, unknown> | undefined;
+
+  const server = createServer(async (req, res) => {
+    try {
+      const body = await readRequestBody(req);
+
+      if (req.method === "POST" && req.url === "/api/host/gateways/gw-1/files/init") {
+        initBody = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
+        assert.equal(initBody.fileName, "photo.png");
+        assert.equal(initBody.mimeType, "image/png");
+        assert.equal(initBody.sizeBytes, fileBytes.byteLength);
+        assert.equal(initBody.imageWidth, 1);
+        assert.equal(initBody.imageHeight, 1);
+        assert.equal(initBody.sha256, expectedSha256);
+        assert.equal(typeof initBody.clientCreatedAt, "string");
+
+        sendJson(res, {
+          fileId: "file_png",
+          uploadId: "up_png",
+          chunkSize: 4096,
+          expiresAt: "2030-01-01T00:00:00.000Z",
+          uploadUrl: "/api/host/files/up_png/chunks",
+        });
+        return;
+      }
+
+      if (req.method === "PUT" && req.url === "/api/host/files/up_png/chunks/0") {
+        sendJson(res, { ok: true });
+        return;
+      }
+
+      if (req.method === "POST" && req.url === "/api/host/files/up_png/complete") {
+        sendJson(res, {
+          ok: true,
+          payload: {
+            fileId: "file_png",
+            gatewayId: "gw-1",
+            sessionKey: "main",
+            fileName: "photo.png",
+            mimeType: "image/png",
+            sizeBytes: fileBytes.byteLength,
+            imageWidth: 1,
+            imageHeight: 1,
+            sha256: expectedSha256,
+            origin: "host",
+            senderDisplayName: "Host Mac",
+            createdAt: "2030-01-01T00:00:00.000Z",
+            updatedAt: "2030-01-01T00:00:00.000Z",
+            expiresAt: "2030-01-08T00:00:00.000Z",
+            status: "completed",
+            storagePath: "/tmp/file_png.png",
+            downloadPath: "/api/mobile/files/file_png",
+            downloadUrl: "/api/mobile/files/file_png",
+            chunkSize: 4096,
+            totalChunks: 1,
+          },
+        });
+        return;
+      }
+
+      throw new Error(`unexpected route: ${req.method} ${req.url}`);
+    } catch (error) {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    }
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const stdout = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+  });
+  const stderr = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+  });
+
+  try {
+    const result = await sendFileCommand(
+      { filePath, gateway: "gw-1", session: "main", json: true },
+      {
+        loadConfig: () => ({
+          relayServerUrl: baseUrl,
+          gatewayId: "gw-1",
+          relaySecret: "secret-123",
+          displayName: "Host Mac",
+        }),
+        fetchImpl: fetch,
+        stdout,
+        stderr,
+      },
+    );
+
+    assert.equal(result.imageWidth, 1);
+    assert.equal(result.imageHeight, 1);
+    assert.ok(initBody);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("send-file infers the latest active session when session is omitted", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-send-file-session-"));
   const filePath = join(tempDir, "sample.mp3");
