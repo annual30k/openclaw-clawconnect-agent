@@ -96,7 +96,15 @@ clawconnect stop
 clawconnect restart
 ```
 
-### 7. 卸载服务
+### 7. 设置 Gateway Token
+
+当本机 Gateway 使用 token 鉴权时，可以手动保存 token：
+
+```bash
+clawconnect set-token
+```
+
+### 8. 卸载服务
 
 移除后台服务定义，但保留本地配置：
 
@@ -104,7 +112,7 @@ clawconnect restart
 clawconnect uninstall
 ```
 
-### 8. 重置配对
+### 9. 重置配对
 
 停止服务并清除本地配对配置：
 
@@ -112,7 +120,7 @@ clawconnect uninstall
 clawconnect reset
 ```
 
-### 9. 发送文件/图片
+### 10. 发送文件/图片
 
 把本地图片或其他文件发到已配对的聊天会话：
 
@@ -131,6 +139,89 @@ clawconnect send-file ~/Pictures/demo.jpg
 - `send-file` 会先把文件上传到 relay，再把文件消息发到手机端。
 - 图片类型会在 iPhone 聊天里显示预览图，其他类型则显示文件卡片。
 - `chat.send` 的 `attachments` 目前只是本地落盘引用，不是跨设备文件传输入口。
+
+## 代码结构
+
+```text
+clawconnect-agent/
+  README.md
+  README.zh-CN.md
+  package.json
+  tsconfig.json
+  tsconfig.build.json
+  src/
+    index.ts                  CLI 入口和命令注册
+    commands/
+      pair.ts                 配对、写入配置、安装后台服务
+      run.ts                  前台运行 relay 主循环
+      send-file.ts            将本地文件/图片发送到已配对会话
+      status.ts               查看配对与服务状态
+      install.ts              install / restart / stop / uninstall / reset
+      set-token.ts            手动保存 Gateway Token
+      local-handlers.ts       兼容旧命令前缀和本地维护命令
+      local-runtime.ts        解析 OpenClaw 可执行文件并触发网关生命周期
+      provider-handlers.ts    provider 命令分发和网关重启
+      provider-config.ts      provider 配置读写
+      provider-registry.ts    provider 注册信息
+      backup-manager.ts       本地配置备份管理
+      send-file-utils.ts      relay 地址和文件传输辅助
+      *.test.ts               紧邻源码的单元测试
+    config/
+      config.ts               配对配置读写
+    i18n/
+      index.ts                CLI 文案
+    platform/
+      service-manager.ts              跨平台服务入口
+      service-manager-common.ts       通用平台辅助常量
+      service-manager-linux.ts        Linux systemd/nohup 逻辑
+      *.test.ts                       平台层单元测试
+    relay/
+      gateway-client.ts       连接并认证本地 OpenClaw Gateway
+      relay-manager.ts        中继服务器桥接与命令分发
+      session-context.ts      会话默认值和上下文使用量快照
+      chat-payload.ts         聊天 payload 归一化
+      chat-history.ts         历史消息回退
+      attachment-staging.ts   附件本地落盘
+      chat-send-attachments.ts 发送带附件消息的参数准备
+      reconnect.ts            重连策略
+      *.test.ts               relay 层单元测试
+```
+
+测试文件和源码采用邻近放置的方式，统一以 `*.test.ts` 命名。它们会被 `npm test` 执行，但不会进入发布包。
+
+## 关键模块与功能
+
+- `src/index.ts` 是 CLI 入口，负责命令注册和顶层错误处理。
+- `src/commands/pair.ts` 负责主机配对、保存 relay 配置，并在配对后安装后台服务。
+- `src/commands/run.ts` 负责前台启动 relay 循环，供服务管理或调试使用。
+- `src/commands/send-file.ts` 负责把本地文件或图片上传到已配对的聊天会话。
+- `src/commands/install.ts` 负责后台服务的安装、重启、停止、卸载和重置。
+- `src/commands/set-token.ts` 负责在需要 token 鉴权时保存本地 Gateway Token。
+- `src/commands/local-handlers.ts` 负责兼容旧命令前缀，以及备份、恢复、日志、doctor、gateway 重启等本地维护命令。
+- `src/commands/local-runtime.ts` 负责解析 `openclaw` 可执行文件并触发网关生命周期动作。
+- `src/commands/provider-handlers.ts` 负责 provider 专属命令分发，并复用同一套 gateway 重启逻辑。
+- `src/platform/service-manager.ts` 负责 macOS 和 Linux 的跨平台服务管理入口。
+- `src/relay/relay-manager.ts` 负责中继服务器与本地 Gateway 的桥接、命令分发，以及 chat/history 回退处理。
+- `src/relay/gateway-client.ts` 负责连接 OpenClaw Gateway，并处理设备身份认证。
+- `src/relay/session-context.ts` 负责读取会话默认值和上下文使用量快照。
+- `src/relay/chat-payload.ts`、`src/relay/chat-history.ts`、`src/relay/attachment-staging.ts`、`src/relay/chat-send-attachments.ts` 负责聊天数据归一化、历史回退和附件暂存。
+- `src/config/config.ts` 负责读写 `~/.clawconnect` 下的本地配对配置。
+- `src/i18n/index.ts` 负责 CLI 文案。
+
+## 重要函数
+
+- `pairCommand()` 负责主机配对、生成配对 payload，并持久化 relay 配置。
+- `runCommand()` 负责启动前台 relay 客户端循环，供后台服务使用。
+- `sendFileCommand()` 负责暂存本地文件并上传到已配对的聊天会话。
+- `installCommand()`、`restartCommand()`、`stopCommand()`、`uninstallCommand()`、`resetCommand()` 负责服务生命周期管理。
+- `statusCommand()` 负责打印配对配置、Gateway 状态和服务健康信息。
+- `setTokenCommand()` 负责保存本地 OpenClaw Gateway Token。
+- `handleLocalCommand()` 和 `handleProviderCommand()` 负责在转发前处理本地控制平面命令。
+- `OpenClawGatewayClient` 负责管理 Gateway WebSocket、重连和请求/响应帧。
+- `canonicalizeRelayParams()`、`extractGatewaySessionDefaults()`、`buildContextUsageFingerprint()` 负责统一 relay 协议 payload。
+- `normalizeChatEventPayload()`、`extractChatText()`、`extractHistoryOutcome()`、`withMessageText()` 负责稳定聊天事件与历史回退结果。
+- `buildAttachmentStagingPath()` 和 `resolveAttachmentFileName()` 负责附件暂存路径和文件名处理。
+- `getServiceStatus()`、`installService()`、`restartService()`、`stopService()`、`uninstallService()` 负责跨平台服务控制。
 
 ## 工作原理
 

@@ -202,13 +202,6 @@ export class OpenClawGatewayClient {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error("gateway not connected");
     }
-    // Debug: log chat.send with attachments
-    if (method === "chat.send") {
-      const p = params as any;
-      if (p.attachments && p.attachments.length > 0) {
-        console.log(`[gateway-client] Sending chat.send to gateway, message="${p.message}", attachments count=${p.attachments.length}`);
-      }
-    }
     const id = randomUUID();
     const frame: ReqFrame = { type: "req", id, method, params };
     const p = new Promise<T>((resolve, reject) => {

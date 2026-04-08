@@ -1,4 +1,4 @@
-export interface ClawaiConfig {
+export interface ClawConnectConfig {
     relayServerUrl: string;
     gatewayId: string;
     relaySecret: string;
@@ -9,8 +9,8 @@ export interface ClawaiConfig {
     gatewayPassword?: string;
 }
 export declare function configExists(): boolean;
-export declare function readConfig(): ClawaiConfig;
-export declare function writeConfig(config: ClawaiConfig): void;
+export declare function readConfig(): ClawConnectConfig;
+export declare function writeConfig(config: ClawConnectConfig): void;
 export declare function readGatewayUrl(): string;
 /**
  * Reads the gateway token or password. Priority order:
@@ -18,7 +18,7 @@ export declare function readGatewayUrl(): string;
  * 2. ~/.openclaw/openclaw.json (gateway.token / gateway.auth.token)
  * 3. Environment variables (OPENCLAW_GATEWAY_TOKEN / OPENCLAW_GATEWAY_PASSWORD)
  */
-export declare function readGatewayAuth(cfg: ClawaiConfig): {
+export declare function readGatewayAuth(cfg: ClawConnectConfig): {
     token?: string;
     password?: string;
 };

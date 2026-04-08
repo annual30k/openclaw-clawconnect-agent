@@ -3,7 +3,7 @@ import { readdir, readFile, stat, open, type FileHandle } from "fs/promises";
 import { basename, join, resolve } from "path";
 import { createHash } from "crypto";
 import { homedir } from "os";
-import { readConfig, type ClawaiConfig } from "../config/config.js";
+import { readConfig, type ClawConnectConfig } from "../config/config.js";
 import {
   DEFAULT_FILE_CHUNK_SIZE,
   calculateChunkCount,
@@ -21,7 +21,7 @@ export interface SendFileCommandOptions {
 }
 
 export interface SendFileCommandDependencies {
-  loadConfig?: () => ClawaiConfig;
+  loadConfig?: () => ClawConnectConfig;
   fetchImpl?: typeof fetch;
   stdout?: Pick<NodeJS.WritableStream, "write">;
   stderr?: Pick<NodeJS.WritableStream, "write">;

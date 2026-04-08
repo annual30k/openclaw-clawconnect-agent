@@ -6,7 +6,7 @@ const CONFIG_DIR = join(homedir(), ".clawconnect");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const OPENCLAW_CONFIG_PATH = join(homedir(), ".openclaw", "openclaw.json");
 
-export interface ClawaiConfig {
+export interface ClawConnectConfig {
   relayServerUrl: string;
   gatewayId: string;
   relaySecret: string;
@@ -21,15 +21,15 @@ export function configExists(): boolean {
   return existsSync(CONFIG_PATH);
 }
 
-export function readConfig(): ClawaiConfig {
+export function readConfig(): ClawConnectConfig {
   if (!existsSync(CONFIG_PATH)) {
     throw new Error(`Config not found at ${CONFIG_PATH}. Run 'clawconnect pair' first.`);
   }
   const raw = readFileSync(CONFIG_PATH, "utf-8");
-  return JSON.parse(raw) as ClawaiConfig;
+  return JSON.parse(raw) as ClawConnectConfig;
 }
 
-export function writeConfig(config: ClawaiConfig): void {
+export function writeConfig(config: ClawConnectConfig): void {
   mkdirSync(CONFIG_DIR, { recursive: true });
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
 }
@@ -51,7 +51,7 @@ export function readGatewayUrl(): string {
  * 2. ~/.openclaw/openclaw.json (gateway.token / gateway.auth.token)
  * 3. Environment variables (OPENCLAW_GATEWAY_TOKEN / OPENCLAW_GATEWAY_PASSWORD)
  */
-export function readGatewayAuth(cfg: ClawaiConfig): { token?: string; password?: string } {
+export function readGatewayAuth(cfg: ClawConnectConfig): { token?: string; password?: string } {
   if (cfg.gatewayToken || cfg.gatewayPassword) {
     return { token: cfg.gatewayToken, password: cfg.gatewayPassword };
   }

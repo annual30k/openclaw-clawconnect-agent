@@ -1,8 +1,6 @@
-import { dirname } from "path";
-import { homedir } from "os";
 import { randomUUID } from "crypto";
-import type { LocalResult } from "./local-handlers.js";
-import { requestGatewayRestart } from "./local-handlers.js";
+import type { LocalResult } from "./local-runtime.js";
+import { requestGatewayRestart } from "./local-runtime.js";
 import { PROVIDER_REGISTRY } from "./provider-registry.js";
 import {
   listProviderEntries,
@@ -12,25 +10,6 @@ import {
   setDefaultProvider,
   setDefaultModel,
 } from "./provider-config.js";
-
-// ---------------------------------------------------------------------------
-// Subprocess env (mirrors local-handlers.ts)
-// ---------------------------------------------------------------------------
-
-const NODE_BIN_DIR = dirname(process.execPath);
-
-const SUBPROCESS_ENV: NodeJS.ProcessEnv = {
-  ...process.env,
-  HOME: homedir(),
-  PATH: [
-    NODE_BIN_DIR,
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/local/bin",
-    "/usr/local/sbin",
-    process.env.PATH ?? "/usr/bin:/bin",
-  ].join(":"),
-};
 
 function restartGateway(): void {
   const restart = requestGatewayRestart("provider");
@@ -190,12 +169,8 @@ async function cmdListModels(): Promise<LocalResult> {
   }
 }
 
-async function cmdSelectModel(params: Record<string, unknown>): Promise<LocalResult> {
-  try {
-    return { ok: false, error: "Use chat.send with /model <alias> for session model switching" };
-  } catch (err) {
-    return { ok: false, error: String(err) };
-  }
+async function cmdSelectModel(_params?: Record<string, unknown>): Promise<LocalResult> {
+  return { ok: false, error: "Use chat.send with /model <alias> for session model switching" };
 }
 
 async function cmdSetDefaultModel(params: Record<string, unknown>): Promise<LocalResult> {

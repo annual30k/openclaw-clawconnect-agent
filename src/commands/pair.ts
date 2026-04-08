@@ -1,31 +1,11 @@
-import { hostname } from "os";
-import { execSync } from "child_process";
-import { getServicePlatform } from "../platform/service-manager.js";
-
-function sanitizeDisplayName(name: string): string {
-  // Replace smart quotes and other problematic characters with regular ones
-  return name
-    .replace(/[\u2018\u2019\u201C\u201D]/g, "'")  // Smart quotes → regular quotes
-    .replace(/[\u2013\u2014]/g, "-")              // En/em dashes → regular dash
-    .replace(/[\u00A0]/g, " ")                    // Non-breaking space → regular space
-    .replace(/[^\x20-\x7E]/g, "");               // Remove any other non-ASCII characters
-}
-
-function getDisplayName(): string {
-  if (getServicePlatform() !== "macos") {
-    return hostname();
-  }
-  try {
-    const raw = execSync("scutil --get ComputerName", { encoding: "utf8" }).trim();
-    return sanitizeDisplayName(raw);
-  } catch {
-    return hostname();
-  }
-}
 import { configExists, readConfig, writeConfig } from "../config/config.js";
 import { installCommand } from "./install.js";
 import qrcodeTerminal from "qrcode-terminal";
 import { t } from "../i18n/index.js";
+import { execSync } from "child_process";
+import { hostname } from "os";
+import { getServicePlatform } from "../platform/service-manager.js";
+import { toRelayHttpBase } from "./send-file-utils.js";
 
 const DEFAULT_RELAY_SERVER = "http://223.109.141.71";
 
@@ -37,7 +17,7 @@ interface PairOptions {
 
 export async function pairCommand(opts: PairOptions): Promise<void> {
   const relayServerUrl = opts.server ?? DEFAULT_RELAY_SERVER;
-  const httpBase = relayServerUrl.replace(/^wss?/, "http");
+  const httpBase = toRelayHttpBase(relayServerUrl);
 
   let gatewayId: string;
   let relaySecret: string;
@@ -118,4 +98,25 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
 
   console.log(t("pair.installingService"));
   installCommand();
+}
+
+function sanitizeDisplayName(name: string): string {
+  // Replace smart quotes and other problematic characters with regular ones
+  return name
+    .replace(/[\u2018\u2019\u201C\u201D]/g, "'") // Smart quotes -> regular quotes
+    .replace(/[\u2013\u2014]/g, "-") // En/em dashes -> regular dash
+    .replace(/[\u00A0]/g, " ") // Non-breaking space -> regular space
+    .replace(/[^\x20-\x7E]/g, ""); // Remove any other non-ASCII characters
+}
+
+function getDisplayName(): string {
+  if (getServicePlatform() !== "macos") {
+    return hostname();
+  }
+  try {
+    const raw = execSync("scutil --get ComputerName", { encoding: "utf8" }).trim();
+    return sanitizeDisplayName(raw);
+  } catch {
+    return hostname();
+  }
 }

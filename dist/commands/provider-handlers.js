@@ -1,25 +1,7 @@
-import { dirname } from "path";
-import { homedir } from "os";
 import { randomUUID } from "crypto";
-import { requestGatewayRestart } from "./local-handlers.js";
+import { requestGatewayRestart } from "./local-runtime.js";
 import { PROVIDER_REGISTRY } from "./provider-registry.js";
 import { listProviderEntries, listConfiguredModels, addProvider, deleteProvider, setDefaultProvider, setDefaultModel, } from "./provider-config.js";
-// ---------------------------------------------------------------------------
-// Subprocess env (mirrors local-handlers.ts)
-// ---------------------------------------------------------------------------
-const NODE_BIN_DIR = dirname(process.execPath);
-const SUBPROCESS_ENV = {
-    ...process.env,
-    HOME: homedir(),
-    PATH: [
-        NODE_BIN_DIR,
-        "/opt/homebrew/bin",
-        "/opt/homebrew/sbin",
-        "/usr/local/bin",
-        "/usr/local/sbin",
-        process.env.PATH ?? "/usr/bin:/bin",
-    ].join(":"),
-};
 function restartGateway() {
     const restart = requestGatewayRestart("provider");
     if (!restart.ok) {
@@ -171,13 +153,8 @@ async function cmdListModels() {
         return { ok: false, error: String(err) };
     }
 }
-async function cmdSelectModel(params) {
-    try {
-        return { ok: false, error: "Use chat.send with /model <alias> for session model switching" };
-    }
-    catch (err) {
-        return { ok: false, error: String(err) };
-    }
+async function cmdSelectModel(_params) {
+    return { ok: false, error: "Use chat.send with /model <alias> for session model switching" };
 }
 async function cmdSetDefaultModel(params) {
     try {

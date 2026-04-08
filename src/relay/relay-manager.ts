@@ -183,9 +183,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             clearChatFallback(runId);
             chatRunContexts.delete(runId);
             if (outcome.kind === "final") {
-              console.log(
-                `[relay] synthesized chat final from history: runId=${runId} sessionKey=${context.sessionKey} textLength=${outcome.text.length} attempt=${attempt}`,
-              );
               send({
                 type: "event",
                 event: "chat",
@@ -202,9 +199,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               });
               return;
             }
-            console.log(
-              `[relay] synthesized chat error from history: runId=${runId} sessionKey=${context.sessionKey} attempt=${attempt}`,
-            );
             send({
               type: "event",
               event: "chat",
@@ -240,9 +234,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         const nextDefaults = extractGatewaySessionDefaults(payload);
         if (nextDefaults) {
           sessionDefaults = nextDefaults;
-          console.log(
-            `[relay] session defaults updated mainSessionKey=${sessionDefaults.mainSessionKey} mainKey=${sessionDefaults.mainKey}`,
-          );
         }
         scheduleContextUsageRefresh(sessionDefaults.mainSessionKey, 50, true);
       } catch (err) {
@@ -333,9 +324,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     const retryHistory = await withTimeout(fetchHistory(), 500, "chat.history retry");
                     outcome = runContext ? extractHistoryOutcome(retryHistory, runContext) : null;
                   }
-                  console.log(
-                    `[relay] chat final enriched from history: runId=${runId || "(unknown)"} outcome=${outcome?.kind ?? "none"} textLength=${outcome?.kind === "final" ? outcome.text.length : 0}`,
-                  );
                   if (runId) {
                     chatRunContexts.delete(runId);
                   }
@@ -399,7 +387,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       if (msg.type !== "cmd" || !msg.method) return;
 
       const requestId = msg.id;
-      console.log(`[relay] cmd received method=${msg.method} id=${requestId ?? "(no-id)"}`);
 
       // Handle clawpilot.provider.* commands locally (async)
       const providerPromise = handleProviderCommand(msg.method, msg.params);
@@ -440,7 +427,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       gatewayClient
         ?.request(msg.method, params)
         .then((result) => {
-          console.log(`[relay] cmd ok method=${msg.method} id=${requestId ?? "(no-id)"}`);
           if ((msg.method === "chat.send" || msg.method === "agent") && params && typeof params === "object" && !Array.isArray(params)) {
             const paramsRecord = params as Record<string, unknown>;
             const sessionKey =

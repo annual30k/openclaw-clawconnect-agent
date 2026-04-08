@@ -74,7 +74,7 @@ test("readContextUsageSnapshot preserves a zero-token current session", () => {
       );
 
       assert(snapshot);
-      console.log(JSON.stringify(snapshot));
+      process.stdout.write(JSON.stringify(snapshot));
     `;
 
     const stdout = execFileSync(
