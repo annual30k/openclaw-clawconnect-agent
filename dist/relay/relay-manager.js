@@ -7,6 +7,7 @@ import { appendUniqueSuffix, extractChatRole, extractChatText, normalizeChatEven
 import { extractHistoryOutcome, withTimeout } from "./chat-history.js";
 import { buildOfficeEventPayload } from "./office-payload.js";
 import { prepareChatSendParams } from "./chat-send-attachments.js";
+import { OPENCLAW_SLASH_COMMAND_CATALOG, } from "./slash-command-catalog.js";
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -192,12 +193,11 @@ export async function runRelayManager(opts) {
         relayWs.on("open", () => {
             console.log(`Connected to relay server (gatewayId=${opts.gatewayId})`);
             opts.onConnected?.();
-            send({
-                type: "hello",
+            send(buildRelayHelloMessage({
                 platform: process.platform,
                 agentVersion: "1.0.0",
                 capabilities: ["chat", "skills", "schedules", "logs", "files"],
-            });
+            }));
             // Start the persistent gateway connection as soon as we're connected
             // to the relay server. Its lifetime is tied to this relay session.
             gatewayClient = new OpenClawGatewayClient({
@@ -440,6 +440,15 @@ export async function runRelayManager(opts) {
             // close event will follow
         });
     });
+}
+export function buildRelayHelloMessage(opts) {
+    return {
+        type: "hello",
+        platform: opts.platform,
+        agentVersion: opts.agentVersion,
+        capabilities: opts.capabilities,
+        slashCommands: OPENCLAW_SLASH_COMMAND_CATALOG,
+    };
 }
 function buildRelayUrl(serverUrl, gatewayId, relaySecret) {
     const base = serverUrl.replace(/\/+$/, "").replace(/^http/, "ws");

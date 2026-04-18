@@ -1,3 +1,12 @@
+import { type RelaySlashCommandDescriptor } from "./slash-command-catalog.js";
+/** Messages the relay client sends to the relay server. */
+export type RelayHelloMessage = {
+    type: "hello";
+    platform: string;
+    agentVersion: string;
+    capabilities?: string[];
+    slashCommands?: readonly RelaySlashCommandDescriptor[];
+};
 export interface RelayManagerOptions {
     relayServerUrl: string;
     gatewayId: string;
@@ -17,3 +26,8 @@ export interface RelayManagerOptions {
  * connection closes.
  */
 export declare function runRelayManager(opts: RelayManagerOptions): Promise<boolean>;
+export declare function buildRelayHelloMessage(opts: {
+    platform: string;
+    agentVersion: string;
+    capabilities?: string[];
+}): RelayHelloMessage;

@@ -22,14 +22,26 @@ import {
 import { extractHistoryOutcome, withTimeout, type ChatRunContext, type HistoryResponse } from "./chat-history.js";
 import { buildOfficeEventPayload } from "./office-payload.js";
 import { prepareChatSendParams } from "./chat-send-attachments.js";
+import {
+  OPENCLAW_SLASH_COMMAND_CATALOG,
+  type RelaySlashCommandDescriptor,
+} from "./slash-command-catalog.js";
 
 // ---------------------------------------------------------------------------
 // Messages: relay client ↔ relay server
 // ---------------------------------------------------------------------------
 
 /** Messages the relay client sends to the relay server. */
+export type RelayHelloMessage = {
+  type: "hello";
+  platform: string;
+  agentVersion: string;
+  capabilities?: string[];
+  slashCommands?: readonly RelaySlashCommandDescriptor[];
+};
+
 type ToServer =
-  | { type: "hello"; platform: string; agentVersion: string; capabilities?: string[] }
+  | RelayHelloMessage
   | { type: "heartbeat" }
   | { type: "gateway_connected" }
   | { type: "gateway_disconnected"; reason: string }
@@ -259,12 +271,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     relayWs.on("open", () => {
       console.log(`Connected to relay server (gatewayId=${opts.gatewayId})`);
       opts.onConnected?.();
-      send({
-        type: "hello",
-        platform: process.platform,
-        agentVersion: "1.0.0",
-        capabilities: ["chat", "skills", "schedules", "logs", "files"],
-      });
+      send(
+        buildRelayHelloMessage({
+          platform: process.platform,
+          agentVersion: "1.0.0",
+          capabilities: ["chat", "skills", "schedules", "logs", "files"],
+        }),
+      );
 
       // Start the persistent gateway connection as soon as we're connected
       // to the relay server. Its lifetime is tied to this relay session.
@@ -528,6 +541,20 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       // close event will follow
     });
   });
+}
+
+export function buildRelayHelloMessage(opts: {
+  platform: string;
+  agentVersion: string;
+  capabilities?: string[];
+}): RelayHelloMessage {
+  return {
+    type: "hello",
+    platform: opts.platform,
+    agentVersion: opts.agentVersion,
+    capabilities: opts.capabilities,
+    slashCommands: OPENCLAW_SLASH_COMMAND_CATALOG,
+  };
 }
 
 function buildRelayUrl(serverUrl: string, gatewayId: string, relaySecret: string): string {
