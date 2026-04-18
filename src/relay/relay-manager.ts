@@ -20,6 +20,7 @@ import {
   withMessageText,
 } from "./chat-payload.js";
 import { extractHistoryOutcome, withTimeout, type ChatRunContext, type HistoryResponse } from "./chat-history.js";
+import { buildOfficeEventPayload } from "./office-payload.js";
 import { prepareChatSendParams } from "./chat-send-attachments.js";
 
 // ---------------------------------------------------------------------------
@@ -247,6 +248,14 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       }
     }
 
+    function publishOfficeSnapshot(eventName: string, payload: unknown): void {
+      const officePayload = buildOfficeEventPayload(eventName, payload, () => new Date().toISOString());
+      if (!officePayload) {
+        return;
+      }
+      send({ type: "event", event: "office", payload: officePayload });
+    }
+
     relayWs.on("open", () => {
       console.log(`Connected to relay server (gatewayId=${opts.gatewayId})`);
       opts.onConnected?.();
@@ -267,16 +276,23 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         onConnected: () => {
           console.log("Gateway connected.");
           send({ type: "gateway_connected" });
+          publishOfficeSnapshot("gateway_connected", {
+            sessionKey: sessionDefaults.mainSessionKey,
+          });
           void refreshSessionDefaults();
         },
 
         onDisconnected: (reason) => {
           console.log(`Gateway disconnected: ${reason}`);
           send({ type: "gateway_disconnected", reason });
+          publishOfficeSnapshot("gateway_disconnected", {
+            reason,
+          });
         },
 
         onEvent: (event, payload) => {
           const normalizedPayload = event === "chat" ? normalizeChatEventPayload(payload) : payload;
+          const shouldPublishOffice = event === "chat" || event === "agent" || event === "context_usage";
           if (event === "chat") {
             const p = normalizedPayload as { sessionKey?: string; runId?: string };
             const state = normalizeChatState(normalizedPayload);
@@ -308,7 +324,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 if (runId) {
                   chatRunContexts.delete(runId);
                 }
-                send({ type: "event", event, payload: withMessageText(normalizedPayload, resolvedText) });
+                const outgoingPayload = withMessageText(normalizedPayload, resolvedText);
+                if (shouldPublishOffice) {
+                  publishOfficeSnapshot(event, outgoingPayload);
+                }
+                send({ type: "event", event, payload: outgoingPayload });
                 return;
               }
 
@@ -328,20 +348,31 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     chatRunContexts.delete(runId);
                   }
                   if (outcome?.kind === "final") {
-                    send({ type: "event", event, payload: withMessageText(normalizedPayload, outcome.text) });
+                    const outgoingPayload = withMessageText(normalizedPayload, outcome.text);
+                    if (shouldPublishOffice) {
+                      publishOfficeSnapshot(event, outgoingPayload);
+                    }
+                    send({ type: "event", event, payload: outgoingPayload });
                     return;
                   }
                   if (outcome?.kind === "error") {
+                    const outgoingPayload = {
+                      ...(normalizedPayload as Record<string, unknown>),
+                      state: "error",
+                      errorMessage: outcome.errorMessage,
+                    };
+                    if (shouldPublishOffice) {
+                      publishOfficeSnapshot(event, outgoingPayload);
+                    }
                     send({
                       type: "event",
                       event,
-                      payload: {
-                        ...(normalizedPayload as Record<string, unknown>),
-                        state: "error",
-                        errorMessage: outcome.errorMessage,
-                      },
+                      payload: outgoingPayload,
                     });
                     return;
+                  }
+                  if (shouldPublishOffice) {
+                    publishOfficeSnapshot(event, normalizedPayload);
                   }
                   send({ type: "event", event, payload: normalizedPayload });
                 })
@@ -349,6 +380,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                   console.error(`[relay] chat.history fetch failed: ${err}`);
                   if (runId) {
                     chatRunContexts.delete(runId);
+                  }
+                  if (shouldPublishOffice) {
+                    publishOfficeSnapshot(event, normalizedPayload);
                   }
                   send({ type: "event", event, payload: normalizedPayload });
                 });
@@ -359,6 +393,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               chatRunContexts.delete(runId);
               scheduleContextUsageRefresh(p?.sessionKey, 450);
             }
+          }
+          if (shouldPublishOffice) {
+            publishOfficeSnapshot(event, normalizedPayload);
           }
           send({ type: "event", event, payload: normalizedPayload });
         },
