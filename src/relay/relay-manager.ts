@@ -11,6 +11,7 @@ import {
   extractGatewaySessionDefaults,
   type GatewaySessionDefaults,
 } from "./session-context.js";
+import { VoiceReplyPreferenceStore } from "./voice-reply-preference.js";
 import {
   appendUniqueSuffix,
   extractChatRole,
@@ -22,6 +23,7 @@ import {
 import { extractHistoryOutcome, withTimeout, type ChatRunContext, type HistoryResponse } from "./chat-history.js";
 import { buildOfficeEventPayload } from "./office-payload.js";
 import { prepareChatSendParams } from "./chat-send-attachments.js";
+import { sendVoiceReplyCommand } from "../commands/voice-reply.js";
 import {
   OPENCLAW_SLASH_COMMAND_CATALOG,
   type RelaySlashCommandDescriptor,
@@ -53,6 +55,7 @@ interface FromServer {
   type: "cmd" | "hello" | "heartbeat";
   id?: string;
   method: string;
+  voiceReplyEnabled?: boolean;
   params: unknown;
 }
 
@@ -67,6 +70,7 @@ export interface RelayManagerOptions {
   gatewayUrl: string;
   gatewayToken?: string;
   gatewayPassword?: string;
+  defaultVoiceReplyEnabled?: boolean;
   onConnected?: () => void;
   onDisconnected?: () => void;
 }
@@ -103,6 +107,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     const chatRunContexts = new Map<string, ChatRunContext>();
     const contextUsageRefreshes = new Map<string, ReturnType<typeof setTimeout>>();
     const contextUsageFingerprints = new Map<string, string>();
+    const voiceReplyPreferences = new VoiceReplyPreferenceStore(opts.defaultVoiceReplyEnabled ?? false, sessionDefaults);
 
     const clearChatFallback = (runId: string): void => {
       const timer = chatFallbacks.get(runId);
@@ -247,6 +252,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         const nextDefaults = extractGatewaySessionDefaults(payload);
         if (nextDefaults) {
           sessionDefaults = nextDefaults;
+          voiceReplyPreferences.setSessionDefaults(sessionDefaults);
         }
         scheduleContextUsageRefresh(sessionDefaults.mainSessionKey, 50, true);
       } catch (err) {
@@ -266,6 +272,35 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         return;
       }
       send({ type: "event", event: "office", payload: officePayload });
+    }
+
+    function queueVoiceReply(sessionKey: string, text: string): void {
+      const normalizedText = text.trim();
+      if (!normalizedText) {
+        return;
+      }
+
+      console.log(`[relay] queueing voice reply sessionKey=${sessionKey} textLength=${normalizedText.length}`);
+
+      void sendVoiceReplyCommand(
+        {
+          text: normalizedText,
+          gateway: opts.gatewayId,
+          session: sessionKey,
+          voice: process.env.OPENCLAW_TTS_VOICE?.trim() || undefined,
+          speaker: (process.env.OPENCLAW_TTS_ENGINE?.trim() as "system" | "espeak" | undefined) || undefined,
+        },
+      ).catch((error) => {
+        console.warn(`[relay] voice reply generation failed sessionKey=${sessionKey}: ${String(error)}`);
+      });
+    }
+
+    function shouldUseVoiceReply(runId: string | undefined, sessionKey?: string): boolean {
+      return voiceReplyPreferences.shouldUse(runId, sessionKey);
+    }
+
+    function shouldSendTextReply(runId: string | undefined, sessionKey?: string): boolean {
+      return !shouldUseVoiceReply(runId, sessionKey);
     }
 
     relayWs.on("open", () => {
@@ -310,6 +345,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             const p = normalizedPayload as { sessionKey?: string; runId?: string };
             const state = normalizeChatState(normalizedPayload);
             const runId = typeof p?.runId === "string" ? p.runId : "";
+            const sessionKey = typeof p?.sessionKey === "string" && p.sessionKey.trim().length > 0 ? p.sessionKey.trim() : undefined;
+            const runContext = runId ? chatRunContexts.get(runId) : undefined;
+            const resolvedSessionKey = sessionKey ?? runContext?.sessionKey;
             const currentText = extractChatText(normalizedPayload);
             const role = extractChatRole(normalizedPayload);
 
@@ -325,11 +363,10 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               }
             }
 
-            if (state === "final" && p?.sessionKey) {
-              scheduleContextUsageRefresh(p.sessionKey, 450);
+            if (state === "final" && resolvedSessionKey) {
+              scheduleContextUsageRefresh(resolvedSessionKey, 450);
               const bufferedText = runId ? chatBuffers.get(runId) ?? "" : "";
               const resolvedText = currentText || bufferedText;
-              const runContext = runId ? chatRunContexts.get(runId) : undefined;
               if (runId) {
                 chatBuffers.delete(runId);
               }
@@ -341,13 +378,19 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 if (shouldPublishOffice) {
                   publishOfficeSnapshot(event, outgoingPayload);
                 }
-                send({ type: "event", event, payload: outgoingPayload });
+                if (shouldSendTextReply(runId, resolvedSessionKey)) {
+                  send({ type: "event", event, payload: outgoingPayload });
+                } else {
+                  queueVoiceReply(resolvedSessionKey, resolvedText);
+                }
+                if (runId) {
+                  voiceReplyPreferences.clearRun(runId);
+                }
                 return;
               }
 
-              const sessionKey = p.sessionKey;
               const fetchHistory = () =>
-                gatewayClient!.request<HistoryResponse>("chat.history", { sessionKey, limit: 10 });
+                gatewayClient!.request<HistoryResponse>("chat.history", { sessionKey: resolvedSessionKey, limit: 10 });
               withTimeout(fetchHistory(), 500, "chat.history")
                 .then(async (history) => {
                   let outcome = runContext ? extractHistoryOutcome(history, runContext) : null;
@@ -365,7 +408,14 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     if (shouldPublishOffice) {
                       publishOfficeSnapshot(event, outgoingPayload);
                     }
-                    send({ type: "event", event, payload: outgoingPayload });
+                    if (shouldSendTextReply(runId, resolvedSessionKey)) {
+                      send({ type: "event", event, payload: outgoingPayload });
+                    } else {
+                      queueVoiceReply(resolvedSessionKey, outcome.text);
+                    }
+                    if (runId) {
+                      voiceReplyPreferences.clearRun(runId);
+                    }
                     return;
                   }
                   if (outcome?.kind === "error") {
@@ -382,17 +432,24 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                       event,
                       payload: outgoingPayload,
                     });
+                    if (runId) {
+                      voiceReplyPreferences.clearRun(runId);
+                    }
                     return;
                   }
                   if (shouldPublishOffice) {
                     publishOfficeSnapshot(event, normalizedPayload);
                   }
                   send({ type: "event", event, payload: normalizedPayload });
+                  if (runId) {
+                    voiceReplyPreferences.clearRun(runId);
+                  }
                 })
                 .catch((err) => {
                   console.error(`[relay] chat.history fetch failed: ${err}`);
                   if (runId) {
                     chatRunContexts.delete(runId);
+                    voiceReplyPreferences.clearRun(runId);
                   }
                   if (shouldPublishOffice) {
                     publishOfficeSnapshot(event, normalizedPayload);
@@ -457,10 +514,10 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
       // Handle clawpilot.* commands locally without forwarding to the gateway
       const localResult = handleLocalCommand(msg.method, msg.params);
-      if (localResult !== null) {
-        if (requestId) {
-          if (localResult.ok) {
-            send({ type: "res", id: requestId, ok: true, payload: localResult.payload });
+        if (localResult !== null) {
+          if (requestId) {
+            if (localResult.ok) {
+              send({ type: "res", id: requestId, ok: true, payload: localResult.payload });
           } else {
             send({ type: "res", id: requestId, ok: false, error: { message: localResult.error } });
           }
@@ -473,10 +530,27 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       }
 
       const params = canonicalizeRelayParams(msg.method, msg.params, sessionDefaults);
+      const paramsRecord =
+        params && typeof params === "object" && !Array.isArray(params)
+          ? (params as Record<string, unknown>)
+          : undefined;
+      const voiceReplyEnabled = typeof msg.voiceReplyEnabled === "boolean" ? msg.voiceReplyEnabled : undefined;
+      const requestSessionKey =
+        paramsRecord && typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
+          ? paramsRecord.sessionKey.trim()
+          : undefined;
+      if (requestId && typeof voiceReplyEnabled === "boolean" && (msg.method === "chat.send" || msg.method === "agent")) {
+        voiceReplyPreferences.register({
+          runId: requestId,
+          sessionKey: requestSessionKey,
+          enabled: voiceReplyEnabled,
+        });
+      }
 
       gatewayClient
         ?.request(msg.method, params)
         .then((result) => {
+          let resolvedRunId: string | undefined;
           if ((msg.method === "chat.send" || msg.method === "agent") && params && typeof params === "object" && !Array.isArray(params)) {
             const paramsRecord = params as Record<string, unknown>;
             const sessionKey =
@@ -490,6 +564,14 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               typeof resultRecord?.runId === "string" && resultRecord.runId.trim().length > 0
                 ? resultRecord.runId.trim()
                 : requestId;
+            resolvedRunId = runId;
+            if (runId && typeof voiceReplyEnabled === "boolean") {
+              voiceReplyPreferences.register({
+                runId,
+                sessionKey,
+                enabled: voiceReplyEnabled,
+              });
+            }
             if (runId) {
               const promptText =
                 typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
@@ -507,12 +589,16 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             scheduleContextUsageRefresh(sessionKey, 1200);
           }
           if (requestId) {
+            if (resolvedRunId && resolvedRunId !== requestId) {
+              voiceReplyPreferences.clearRun(requestId);
+            }
             send({ type: "res", id: requestId, ok: true, payload: result });
           }
         })
         .catch((err: unknown) => {
           console.error(`[relay] cmd failed method=${msg.method} id=${requestId ?? "(no-id)"}: ${String(err)}`);
           if (requestId) {
+            voiceReplyPreferences.clearRun(requestId);
             send({ type: "res", id: requestId, ok: false, error: { message: String(err) } });
           }
         });

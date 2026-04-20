@@ -46,6 +46,14 @@ clawconnect run
 
 适合调试中继连接、本地 Gateway 鉴权和日志输出。
 
+如果需要语音播报助手回复，可以显式开启：
+
+```bash
+OPENCLAW_TTS_ENABLED=1 clawconnect run
+```
+
+未设置这个开关时，助手回复保持纯文字。
+
 ### 3. 查看状态
 
 查看当前配对信息、网关地址和后台服务状态：
@@ -139,6 +147,7 @@ clawconnect send-file ~/Pictures/demo.jpg
 - `send-file` 会先把文件上传到 relay，再把文件消息发到手机端。
 - 图片类型会在 iPhone 聊天里显示预览图，其他类型则显示文件卡片。
 - `chat.send` 的 `attachments` 目前只是本地落盘引用，不是跨设备文件传输入口。
+- 默认不启用语音回复；只有设置 `OPENCLAW_TTS_ENABLED=1` 时，agent 才会把助手回复合成为音频文件。
 
 ## 代码结构
 

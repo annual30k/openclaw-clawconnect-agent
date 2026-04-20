@@ -18,6 +18,8 @@ export interface SendFileCommandOptions {
   gateway?: string;
   session?: string;
   json?: boolean;
+  durationMs?: number;
+  transcript?: string;
 }
 
 export interface SendFileCommandDependencies {
@@ -38,6 +40,7 @@ export interface SendFileResult {
   fileName: string;
   mimeType: string;
   sizeBytes: number;
+  durationMs?: number;
   imageWidth?: number;
   imageHeight?: number;
   sha256: string;
@@ -69,6 +72,7 @@ type FileUploadCompleteResponse = {
     fileName: string;
     mimeType: string;
     sizeBytes: number;
+    durationMs?: number;
     imageWidth?: number;
     imageHeight?: number;
     sha256: string;
@@ -158,18 +162,20 @@ export async function sendFileCommand(
       requestJson<FileUploadInitResponse>(fetchImpl, uploadInitUrl, {
         method: "POST",
         headers: JSON_HEADERS,
-          body: JSON.stringify({
-            secret: relaySecret,
-            sessionKey,
-            fileName,
-            mimeType,
-            sizeBytes,
-            imageWidth: imageDimensions?.width,
-            imageHeight: imageDimensions?.height,
-            sha256,
-            senderDisplayName: config.displayName,
-            clientCreatedAt,
-          }),
+        body: JSON.stringify({
+          secret: relaySecret,
+          sessionKey,
+          fileName,
+          mimeType,
+          sizeBytes,
+          durationMs: opts.durationMs,
+          imageWidth: imageDimensions?.width,
+          imageHeight: imageDimensions?.height,
+          sha256,
+          senderDisplayName: config.displayName,
+          transcript: typeof opts.transcript === "string" ? opts.transcript.trim() : undefined,
+          clientCreatedAt,
+        }),
       }, "init upload"),
   );
 
@@ -241,6 +247,7 @@ export async function sendFileCommand(
     fileName: payload.fileName,
     mimeType: payload.mimeType,
     sizeBytes: payload.sizeBytes,
+    durationMs: payload.durationMs,
     imageWidth: payload.imageWidth,
     imageHeight: payload.imageHeight,
     sha256: payload.sha256,

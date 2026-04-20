@@ -14,6 +14,7 @@ export interface RelayManagerOptions {
     gatewayUrl: string;
     gatewayToken?: string;
     gatewayPassword?: string;
+    defaultVoiceReplyEnabled?: boolean;
     onConnected?: () => void;
     onDisconnected?: () => void;
 }

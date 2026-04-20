@@ -37,6 +37,14 @@ Start the host agent:
 clawconnect run
 ```
 
+Optional: enable assistant voice replies only when you want audio output by setting:
+
+```bash
+OPENCLAW_TTS_ENABLED=1 clawconnect run
+```
+
+When this flag is not set, assistant replies stay text-only.
+
 ### Check Status
 
 Show pairing config and background service status:
@@ -125,6 +133,7 @@ Notes:
 - `send-file` uploads through the relay and posts a file message to mobile.
 - Image MIME types render as preview cards in the iPhone chat UI.
 - `chat.send` attachments are local staging references, not the cross-device file transfer path.
+- Voice replies are disabled by default; set `OPENCLAW_TTS_ENABLED=1` to have the agent synthesize assistant replies as audio files.
 
 ## Project Structure
 

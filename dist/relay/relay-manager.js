@@ -3,10 +3,12 @@ import { OpenClawGatewayClient } from "./gateway-client.js";
 import { handleLocalCommand } from "../commands/local-handlers.js";
 import { handleProviderCommand } from "../commands/provider-handlers.js";
 import { DEFAULT_GATEWAY_SESSION_DEFAULTS, buildContextUsageFingerprint, readContextUsageSnapshot, canonicalizeRelayParams, canonicalizeSessionKey, extractGatewaySessionDefaults, } from "./session-context.js";
+import { VoiceReplyPreferenceStore } from "./voice-reply-preference.js";
 import { appendUniqueSuffix, extractChatRole, extractChatText, normalizeChatEventPayload, normalizeChatState, withMessageText, } from "./chat-payload.js";
 import { extractHistoryOutcome, withTimeout } from "./chat-history.js";
 import { buildOfficeEventPayload } from "./office-payload.js";
 import { prepareChatSendParams } from "./chat-send-attachments.js";
+import { sendVoiceReplyCommand } from "../commands/voice-reply.js";
 import { OPENCLAW_SLASH_COMMAND_CATALOG, } from "./slash-command-catalog.js";
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -38,6 +40,7 @@ export async function runRelayManager(opts) {
         const chatRunContexts = new Map();
         const contextUsageRefreshes = new Map();
         const contextUsageFingerprints = new Map();
+        const voiceReplyPreferences = new VoiceReplyPreferenceStore(opts.defaultVoiceReplyEnabled ?? false, sessionDefaults);
         const clearChatFallback = (runId) => {
             const timer = chatFallbacks.get(runId);
             if (timer) {
@@ -171,6 +174,7 @@ export async function runRelayManager(opts) {
                 const nextDefaults = extractGatewaySessionDefaults(payload);
                 if (nextDefaults) {
                     sessionDefaults = nextDefaults;
+                    voiceReplyPreferences.setSessionDefaults(sessionDefaults);
                 }
                 scheduleContextUsageRefresh(sessionDefaults.mainSessionKey, 50, true);
             }
@@ -189,6 +193,28 @@ export async function runRelayManager(opts) {
                 return;
             }
             send({ type: "event", event: "office", payload: officePayload });
+        }
+        function queueVoiceReply(sessionKey, text) {
+            const normalizedText = text.trim();
+            if (!normalizedText) {
+                return;
+            }
+            console.log(`[relay] queueing voice reply sessionKey=${sessionKey} textLength=${normalizedText.length}`);
+            void sendVoiceReplyCommand({
+                text: normalizedText,
+                gateway: opts.gatewayId,
+                session: sessionKey,
+                voice: process.env.OPENCLAW_TTS_VOICE?.trim() || undefined,
+                speaker: process.env.OPENCLAW_TTS_ENGINE?.trim() || undefined,
+            }).catch((error) => {
+                console.warn(`[relay] voice reply generation failed sessionKey=${sessionKey}: ${String(error)}`);
+            });
+        }
+        function shouldUseVoiceReply(runId, sessionKey) {
+            return voiceReplyPreferences.shouldUse(runId, sessionKey);
+        }
+        function shouldSendTextReply(runId, sessionKey) {
+            return !shouldUseVoiceReply(runId, sessionKey);
         }
         relayWs.on("open", () => {
             console.log(`Connected to relay server (gatewayId=${opts.gatewayId})`);
@@ -226,6 +252,9 @@ export async function runRelayManager(opts) {
                         const p = normalizedPayload;
                         const state = normalizeChatState(normalizedPayload);
                         const runId = typeof p?.runId === "string" ? p.runId : "";
+                        const sessionKey = typeof p?.sessionKey === "string" && p.sessionKey.trim().length > 0 ? p.sessionKey.trim() : undefined;
+                        const runContext = runId ? chatRunContexts.get(runId) : undefined;
+                        const resolvedSessionKey = sessionKey ?? runContext?.sessionKey;
                         const currentText = extractChatText(normalizedPayload);
                         const role = extractChatRole(normalizedPayload);
                         if (runId) {
@@ -240,11 +269,10 @@ export async function runRelayManager(opts) {
                                 chatBuffers.delete(runId);
                             }
                         }
-                        if (state === "final" && p?.sessionKey) {
-                            scheduleContextUsageRefresh(p.sessionKey, 450);
+                        if (state === "final" && resolvedSessionKey) {
+                            scheduleContextUsageRefresh(resolvedSessionKey, 450);
                             const bufferedText = runId ? chatBuffers.get(runId) ?? "" : "";
                             const resolvedText = currentText || bufferedText;
-                            const runContext = runId ? chatRunContexts.get(runId) : undefined;
                             if (runId) {
                                 chatBuffers.delete(runId);
                             }
@@ -256,11 +284,18 @@ export async function runRelayManager(opts) {
                                 if (shouldPublishOffice) {
                                     publishOfficeSnapshot(event, outgoingPayload);
                                 }
-                                send({ type: "event", event, payload: outgoingPayload });
+                                if (shouldSendTextReply(runId, resolvedSessionKey)) {
+                                    send({ type: "event", event, payload: outgoingPayload });
+                                }
+                                else {
+                                    queueVoiceReply(resolvedSessionKey, resolvedText);
+                                }
+                                if (runId) {
+                                    voiceReplyPreferences.clearRun(runId);
+                                }
                                 return;
                             }
-                            const sessionKey = p.sessionKey;
-                            const fetchHistory = () => gatewayClient.request("chat.history", { sessionKey, limit: 10 });
+                            const fetchHistory = () => gatewayClient.request("chat.history", { sessionKey: resolvedSessionKey, limit: 10 });
                             withTimeout(fetchHistory(), 500, "chat.history")
                                 .then(async (history) => {
                                 let outcome = runContext ? extractHistoryOutcome(history, runContext) : null;
@@ -278,7 +313,15 @@ export async function runRelayManager(opts) {
                                     if (shouldPublishOffice) {
                                         publishOfficeSnapshot(event, outgoingPayload);
                                     }
-                                    send({ type: "event", event, payload: outgoingPayload });
+                                    if (shouldSendTextReply(runId, resolvedSessionKey)) {
+                                        send({ type: "event", event, payload: outgoingPayload });
+                                    }
+                                    else {
+                                        queueVoiceReply(resolvedSessionKey, outcome.text);
+                                    }
+                                    if (runId) {
+                                        voiceReplyPreferences.clearRun(runId);
+                                    }
                                     return;
                                 }
                                 if (outcome?.kind === "error") {
@@ -295,17 +338,24 @@ export async function runRelayManager(opts) {
                                         event,
                                         payload: outgoingPayload,
                                     });
+                                    if (runId) {
+                                        voiceReplyPreferences.clearRun(runId);
+                                    }
                                     return;
                                 }
                                 if (shouldPublishOffice) {
                                     publishOfficeSnapshot(event, normalizedPayload);
                                 }
                                 send({ type: "event", event, payload: normalizedPayload });
+                                if (runId) {
+                                    voiceReplyPreferences.clearRun(runId);
+                                }
                             })
                                 .catch((err) => {
                                 console.error(`[relay] chat.history fetch failed: ${err}`);
                                 if (runId) {
                                     chatRunContexts.delete(runId);
+                                    voiceReplyPreferences.clearRun(runId);
                                 }
                                 if (shouldPublishOffice) {
                                     publishOfficeSnapshot(event, normalizedPayload);
@@ -378,9 +428,24 @@ export async function runRelayManager(opts) {
                 msg.params = await prepareChatSendParams(msg.params);
             }
             const params = canonicalizeRelayParams(msg.method, msg.params, sessionDefaults);
+            const paramsRecord = params && typeof params === "object" && !Array.isArray(params)
+                ? params
+                : undefined;
+            const voiceReplyEnabled = typeof msg.voiceReplyEnabled === "boolean" ? msg.voiceReplyEnabled : undefined;
+            const requestSessionKey = paramsRecord && typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
+                ? paramsRecord.sessionKey.trim()
+                : undefined;
+            if (requestId && typeof voiceReplyEnabled === "boolean" && (msg.method === "chat.send" || msg.method === "agent")) {
+                voiceReplyPreferences.register({
+                    runId: requestId,
+                    sessionKey: requestSessionKey,
+                    enabled: voiceReplyEnabled,
+                });
+            }
             gatewayClient
                 ?.request(msg.method, params)
                 .then((result) => {
+                let resolvedRunId;
                 if ((msg.method === "chat.send" || msg.method === "agent") && params && typeof params === "object" && !Array.isArray(params)) {
                     const paramsRecord = params;
                     const sessionKey = typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
@@ -392,6 +457,14 @@ export async function runRelayManager(opts) {
                     const runId = typeof resultRecord?.runId === "string" && resultRecord.runId.trim().length > 0
                         ? resultRecord.runId.trim()
                         : requestId;
+                    resolvedRunId = runId;
+                    if (runId && typeof voiceReplyEnabled === "boolean") {
+                        voiceReplyPreferences.register({
+                            runId,
+                            sessionKey,
+                            enabled: voiceReplyEnabled,
+                        });
+                    }
                     if (runId) {
                         const promptText = typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
                             ? paramsRecord.message.trim()
@@ -408,12 +481,16 @@ export async function runRelayManager(opts) {
                     scheduleContextUsageRefresh(sessionKey, 1200);
                 }
                 if (requestId) {
+                    if (resolvedRunId && resolvedRunId !== requestId) {
+                        voiceReplyPreferences.clearRun(requestId);
+                    }
                     send({ type: "res", id: requestId, ok: true, payload: result });
                 }
             })
                 .catch((err) => {
                 console.error(`[relay] cmd failed method=${msg.method} id=${requestId ?? "(no-id)"}: ${String(err)}`);
                 if (requestId) {
+                    voiceReplyPreferences.clearRun(requestId);
                     send({ type: "res", id: requestId, ok: false, error: { message: String(err) } });
                 }
             });

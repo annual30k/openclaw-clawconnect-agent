@@ -1,5 +1,6 @@
 const MIME_BY_EXTENSION: Record<string, string> = {
   ".aac": "audio/aac",
+  ".aiff": "audio/aiff",
   ".apk": "application/vnd.android.package-archive",
   ".avif": "image/avif",
   ".bmp": "image/bmp",
