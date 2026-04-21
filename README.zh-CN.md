@@ -148,6 +148,7 @@ clawconnect send-file ~/Pictures/demo.jpg
 - 图片类型会在 iPhone 聊天里显示预览图，其他类型则显示文件卡片。
 - `chat.send` 的 `attachments` 目前只是本地落盘引用，不是跨设备文件传输入口。
 - 默认不启用语音回复；只有设置 `OPENCLAW_TTS_ENABLED=1` 时，agent 才会把助手回复合成为音频文件。
+- 语音合成优先使用 `edge-tts-universal`，如果生成失败则回退到电脑自带的 TTS。
 
 ## 代码结构
 

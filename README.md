@@ -134,6 +134,7 @@ Notes:
 - Image MIME types render as preview cards in the iPhone chat UI.
 - `chat.send` attachments are local staging references, not the cross-device file transfer path.
 - Voice replies are disabled by default; set `OPENCLAW_TTS_ENABLED=1` to have the agent synthesize assistant replies as audio files.
+- The agent now prefers `edge-tts-universal` for synthesis and falls back to the computer's built-in TTS on failure.
 
 ## Project Structure
 

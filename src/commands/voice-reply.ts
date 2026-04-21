@@ -1,5 +1,5 @@
 import { execFile as execFileCb } from "child_process";
-import { mkdtemp, rm } from "fs/promises";
+import { mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { promisify } from "util";
@@ -13,7 +13,11 @@ export interface VoiceReplyCommandOptions extends Pick<SendFileCommandOptions, "
   speaker?: "system" | "espeak";
 }
 
-export interface VoiceReplyCommandDependencies extends SendFileCommandDependencies {}
+export interface VoiceReplyCommandDependencies extends SendFileCommandDependencies {
+  sendFileCommandImpl?: typeof sendFileCommand;
+  synthesizeEdgeTtsImpl?: typeof synthesizeWithEdgeTts;
+  synthesizeSystemTtsImpl?: typeof synthesizeWithSystemTts;
+}
 
 export interface VoiceReplyCommandResult {
   audioPath: string;
@@ -32,12 +36,19 @@ export async function sendVoiceReplyCommand(
 
   const durationMs = estimateSpeechDurationMs(text);
   const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-voice-reply-"));
-  const extension = process.platform === "darwin" ? "aiff" : "wav";
-  const audioPath = join(tempDir, `reply.${extension}`);
+  const audioPath = join(tempDir, "reply.mp3");
 
   try {
-    await synthesizeAudio(text, audioPath, opts.voice, opts.speaker);
-    const sendFileResult = await sendFileCommand(
+    await synthesizeVoiceReplyAudio(
+      {
+        text,
+        audioPath,
+        voice: opts.voice,
+        speaker: opts.speaker,
+      },
+      deps,
+    );
+    const sendFileResult = await (deps.sendFileCommandImpl ?? sendFileCommand)(
       {
         filePath: audioPath,
         gateway: opts.gateway,
@@ -53,36 +64,93 @@ export async function sendVoiceReplyCommand(
       sendFileResult,
     };
   } catch (error) {
-    await rm(tempDir, { recursive: true, force: true });
     throw error;
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
 }
 
-async function synthesizeAudio(
-  text: string,
-  audioPath: string,
-  voice?: string,
-  speaker?: "system" | "espeak",
+export async function synthesizeVoiceReplyAudio(
+  opts: {
+    text: string;
+    audioPath: string;
+    voice?: string;
+    speaker?: "system" | "espeak";
+  },
+  deps: Pick<VoiceReplyCommandDependencies, "synthesizeEdgeTtsImpl" | "synthesizeSystemTtsImpl"> = {},
 ): Promise<void> {
-  if (speaker === "espeak") {
-    await synthesizeWithEspeak(text, audioPath);
+  const synthesizeEdgeTts = deps.synthesizeEdgeTtsImpl ?? synthesizeWithEdgeTts;
+  const synthesizeSystemTts = deps.synthesizeSystemTtsImpl ?? synthesizeWithSystemTts;
+
+  if (opts.speaker === "espeak") {
+    await synthesizeSystemTts({
+      text: opts.text,
+      audioPath: opts.audioPath,
+      voice: opts.voice,
+      strict: true,
+    });
     return;
   }
 
+  if (opts.speaker === "system") {
+    await synthesizeSystemTts({
+      text: opts.text,
+      audioPath: opts.audioPath,
+      voice: opts.voice,
+      strict: true,
+    });
+    return;
+  }
+
+  try {
+    await synthesizeEdgeTts({
+      text: opts.text,
+      audioPath: opts.audioPath,
+      voice: opts.voice,
+    });
+    return;
+  } catch (edgeError) {
+    console.warn(`[voice-reply] edge-tts-universal failed, falling back to system TTS: ${String(edgeError)}`);
+  }
+
+  await synthesizeSystemTts({
+    text: opts.text,
+    audioPath: opts.audioPath,
+    voice: opts.voice,
+    strict: false,
+  });
+}
+
+async function synthesizeWithEdgeTts(opts: {
+  text: string;
+  audioPath: string;
+  voice?: string;
+}): Promise<void> {
+  const { EdgeTTS } = await import("edge-tts-universal");
+  const tts = new EdgeTTS(opts.text, resolveEdgeVoice(opts.text, opts.voice));
+  const result = await tts.synthesize();
+  const audioBuffer = Buffer.from(await result.audio.arrayBuffer());
+  await writeFile(opts.audioPath, audioBuffer);
+}
+
+async function synthesizeWithSystemTts(opts: {
+  text: string;
+  audioPath: string;
+  voice?: string;
+  strict?: boolean;
+}): Promise<void> {
   if (process.platform === "darwin") {
     try {
-      await synthesizeWithSay(text, audioPath, voice ?? defaultMacVoice(text));
+      await synthesizeWithSay(opts.text, opts.audioPath, resolveSystemVoice(opts.text, opts.voice));
       return;
     } catch (error) {
-      if (speaker === "system") {
+      if (opts.strict) {
         throw error;
       }
     }
   }
 
-  await synthesizeWithEspeak(text, audioPath);
+  await synthesizeWithEspeak(opts.text, opts.audioPath);
 }
 
 async function synthesizeWithSay(text: string, audioPath: string, voice?: string): Promise<void> {
@@ -101,6 +169,33 @@ async function synthesizeWithEspeak(text: string, audioPath: string): Promise<vo
   } catch {
     await execFile("espeak", ["-w", audioPath, text]);
   }
+}
+
+function resolveEdgeVoice(text: string, voice?: string): string {
+  const preferredVoice = voice?.trim();
+  if (preferredVoice && looksLikeEdgeVoice(preferredVoice)) {
+    return preferredVoice;
+  }
+  return defaultEdgeVoice(text);
+}
+
+function resolveSystemVoice(text: string, voice?: string): string | undefined {
+  const preferredVoice = voice?.trim();
+  if (preferredVoice && !looksLikeEdgeVoice(preferredVoice)) {
+    return preferredVoice;
+  }
+  return defaultMacVoice(text);
+}
+
+function looksLikeEdgeVoice(voice: string): boolean {
+  return /Neural$/i.test(voice);
+}
+
+function defaultEdgeVoice(text: string): string {
+  if (containsCjk(text)) {
+    return "zh-CN-XiaoxiaoNeural";
+  }
+  return "en-US-EmmaMultilingualNeural";
 }
 
 function defaultMacVoice(text: string): string | undefined {
