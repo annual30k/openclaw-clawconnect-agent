@@ -51,7 +51,7 @@ export function handleLocalCommand(method: string, params: unknown = undefined):
     case "clawpilot.doctor":              return runDoctor();
     case "clawconnect.logs":
     case "pocketclaw.logs":
-    case "clawpilot.logs":                return readLogs();
+    case "clawpilot.logs":                return readLogs(params);
     case "clawconnect.gateway.restart":
     case "pocketclaw.gateway.restart":
     case "clawpilot.gateway.restart":     return restartGateway();
@@ -307,7 +307,7 @@ function runDoctor(): LocalResult {
   }
 }
 
-function readLogs(): LocalResult {
+function readLogs(_params: unknown = undefined): LocalResult {
   try {
     const logsDir = join(OPENCLAW_DIR, "logs");
     let logFiles: string[] = [];
@@ -329,11 +329,26 @@ function readLogs(): LocalResult {
     const logFilesWithMtime = logFiles.map(f => ({ path: f, mtime: statSync(f).mtimeMs }));
     logFilesWithMtime.sort((a, b) => b.mtime - a.mtime);
     const latest = logFilesWithMtime[0].path;
-    const allLines = readFileSync(latest, "utf-8").split("\n");
-    const last100 = allLines.slice(-100).join("\n");
+    const allLines = readFileSync(latest, "utf-8")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .split("\n");
+    if (allLines.length > 0 && allLines[allLines.length - 1] === "") {
+      allLines.pop();
+    }
 
     console.log(`[clawconnect] logs read from ${latest}`);
-    return { ok: true, payload: { output: `[${latest}]\n${last100}` } };
+    return {
+      ok: true,
+      payload: {
+        logPath: latest,
+        lines: allLines,
+        totalLines: allLines.length,
+        returnedLines: allLines.length,
+        truncated: false,
+        output: `[${latest}]\n${allLines.join("\n")}`,
+      },
+    };
   } catch (err) {
     return { ok: false, error: errorMessage(err) };
   }
