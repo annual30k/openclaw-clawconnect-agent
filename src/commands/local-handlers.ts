@@ -4,10 +4,12 @@ import { homedir } from "os";
 import { createBackup, deleteBackup, listBackups, restoreBackup, updateBackup } from "./backup-manager.js";
 import { readConfig, updateVoiceReplyConfig } from "../config/config.js";
 import {
+  LocalCommandContext,
   LocalResult,
   errorMessage,
   execErrorOutput,
   openclaw,
+  runDoctorFix as runDoctorFixStreaming,
   requestGatewayRemoteRestart,
   requestGatewayRestart,
 } from "./local-runtime.js";
@@ -17,7 +19,11 @@ const OPENCLAW_CONFIG = join(OPENCLAW_DIR, "openclaw.json");
 
 // ---------------------------------------------------------------------------
 
-export function handleLocalCommand(method: string, params: unknown = undefined): LocalResult | null {
+export function handleLocalCommand(
+  method: string,
+  params: unknown = undefined,
+  context: LocalCommandContext = {},
+): LocalResult | Promise<LocalResult> | null {
   switch (method) {
     case "clawconnect.config":
     case "pocketclaw.config":
@@ -49,6 +55,9 @@ export function handleLocalCommand(method: string, params: unknown = undefined):
     case "clawconnect.doctor":
     case "pocketclaw.doctor":
     case "clawpilot.doctor":              return runDoctor();
+    case "clawconnect.doctor.fix":
+    case "pocketclaw.doctor.fix":
+    case "clawpilot.doctor.fix":          return runDoctorFixStreaming(context);
     case "clawconnect.logs":
     case "pocketclaw.logs":
     case "clawpilot.logs":                return readLogs(params);

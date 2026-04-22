@@ -9,6 +9,18 @@ export type LocalResult =
 
 export type GatewayRuntimeState = "running" | "stopped" | "unknown";
 
+export type LocalCommandEventPublisher = (event: {
+  type: "event";
+  event: string;
+  payload: unknown;
+}) => void;
+
+export type LocalCommandContext = {
+  requestId?: string;
+  gatewayId?: string;
+  publishEvent?: LocalCommandEventPublisher;
+};
+
 // ---------------------------------------------------------------------------
 // Subprocess environment
 //
@@ -148,4 +160,145 @@ export function requestGatewayRemoteRestart(source = "clawconnect"): LocalResult
   const runtime = readGatewayRuntimeState();
   const action = resolveGatewayRemoteRestartAction(runtime);
   return launchGatewayLifecycleCommand(action, source);
+}
+
+export async function runDoctorFix(context: LocalCommandContext = {}): Promise<LocalResult> {
+  const openclawBin = getOpenclawBin();
+  const child = spawn(openclawBin, ["doctor", "--fix"], {
+    env: SUBPROCESS_ENV,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+
+  let output = "";
+  let sequence = 0;
+  const buffers: Record<"stdout" | "stderr", string> = {
+    stdout: "",
+    stderr: "",
+  };
+  const publishEvent = context.publishEvent;
+  const requestId = context.requestId;
+  const gatewayId = context.gatewayId;
+
+  const emitLine = (stream: "stdout" | "stderr", line: string): void => {
+    const trimmed = line.replace(/\u001B\[[0-9;]*[A-Za-z]/g, "").replace(/\r$/, "");
+    if (!trimmed && stream !== "stderr") {
+      return;
+    }
+    const timestamp = new Date().toISOString();
+    if (publishEvent) {
+      publishEvent({
+        type: "event",
+        event: "doctor_fix_log",
+        payload: {
+          gatewayId,
+          requestId,
+          runId: requestId,
+          stream,
+          seq: sequence += 1,
+          ts: Date.parse(timestamp),
+          text: trimmed,
+        },
+      });
+    }
+  };
+
+  const pump = (stream: NodeJS.ReadableStream | null, label: "stdout" | "stderr"): void => {
+    if (!stream) {
+      return;
+    }
+    stream.on("data", (chunk: Buffer | string) => {
+      const text = typeof chunk === "string" ? chunk : chunk.toString();
+      if (!text.trim()) {
+        return;
+      }
+      const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      buffers[label] += normalized;
+      const parts = buffers[label].split("\n");
+      buffers[label] = parts.pop() ?? "";
+      for (const part of parts) {
+        const line = part.replace(/\u001B\[[0-9;]*[A-Za-z]/g, "").trimEnd();
+        output += `${line}\n`;
+        emitLine(label, line);
+      }
+    });
+    stream.once("end", () => {
+      const trailing = buffers[label].replace(/\u001B\[[0-9;]*[A-Za-z]/g, "").trimEnd();
+      if (trailing) {
+        output += `${trailing}\n`;
+        emitLine(label, trailing);
+      }
+    });
+  };
+
+  pump(child.stdout, "stdout");
+  pump(child.stderr, "stderr");
+
+  return await new Promise<LocalResult>((resolve) => {
+    let settled = false;
+    const finish = (result: LocalResult): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(result);
+    };
+
+    child.once("error", (error) => {
+      if (publishEvent) {
+        publishEvent({
+          type: "event",
+          event: "doctor_fix_log",
+          payload: {
+            gatewayId,
+            requestId,
+            runId: requestId,
+            stream: "stderr",
+            seq: sequence += 1,
+            ts: Date.now(),
+            text: `failed to start: ${String(error)}`,
+          },
+        });
+      }
+      finish({ ok: false, error: errorMessage(error) });
+    });
+
+    child.once("close", (code, signal) => {
+      if (settled) {
+        return;
+      }
+      const exitSummary =
+        typeof code === "number"
+          ? `openclaw doctor --fix exited with code ${code}`
+          : `openclaw doctor --fix exited${signal ? ` with signal ${signal}` : ""}`;
+      if (publishEvent) {
+        publishEvent({
+          type: "event",
+          event: "doctor_fix_log",
+          payload: {
+            gatewayId,
+            requestId,
+            runId: requestId,
+            stream: "status",
+            seq: sequence += 1,
+            ts: Date.now(),
+            text: exitSummary,
+          },
+        });
+      }
+
+      if (code && code !== 0) {
+        finish({
+          ok: false,
+          error: output.trim() ? `${exitSummary}\n${output.trim()}` : exitSummary,
+        });
+        return;
+      }
+
+      finish({
+        ok: true,
+        payload: { output: output.trim() || "openclaw doctor --fix completed." },
+      });
+    });
+  });
 }

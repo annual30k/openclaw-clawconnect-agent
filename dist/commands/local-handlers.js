@@ -3,11 +3,11 @@ import { join } from "path";
 import { homedir } from "os";
 import { createBackup, deleteBackup, listBackups, restoreBackup, updateBackup } from "./backup-manager.js";
 import { readConfig, updateVoiceReplyConfig } from "../config/config.js";
-import { errorMessage, execErrorOutput, openclaw, requestGatewayRemoteRestart, requestGatewayRestart, } from "./local-runtime.js";
+import { errorMessage, execErrorOutput, openclaw, runDoctorFix as runDoctorFixStreaming, requestGatewayRemoteRestart, requestGatewayRestart, } from "./local-runtime.js";
 const OPENCLAW_DIR = join(homedir(), ".openclaw");
 const OPENCLAW_CONFIG = join(OPENCLAW_DIR, "openclaw.json");
 // ---------------------------------------------------------------------------
-export function handleLocalCommand(method, params = undefined) {
+export function handleLocalCommand(method, params = undefined, context = {}) {
     switch (method) {
         case "clawconnect.config":
         case "pocketclaw.config":
@@ -39,9 +39,12 @@ export function handleLocalCommand(method, params = undefined) {
         case "clawconnect.doctor":
         case "pocketclaw.doctor":
         case "clawpilot.doctor": return runDoctor();
+        case "clawconnect.doctor.fix":
+        case "pocketclaw.doctor.fix":
+        case "clawpilot.doctor.fix": return runDoctorFixStreaming(context);
         case "clawconnect.logs":
         case "pocketclaw.logs":
-        case "clawpilot.logs": return readLogs();
+        case "clawpilot.logs": return readLogs(params);
         case "clawconnect.gateway.restart":
         case "pocketclaw.gateway.restart":
         case "clawpilot.gateway.restart": return restartGateway();
@@ -280,7 +283,7 @@ function runDoctor() {
         return output ? { ok: true, payload: { output } } : { ok: false, error: errorMessage(err) };
     }
 }
-function readLogs() {
+function readLogs(_params = undefined) {
     try {
         const logsDir = join(OPENCLAW_DIR, "logs");
         let logFiles = [];
@@ -300,10 +303,25 @@ function readLogs() {
         const logFilesWithMtime = logFiles.map(f => ({ path: f, mtime: statSync(f).mtimeMs }));
         logFilesWithMtime.sort((a, b) => b.mtime - a.mtime);
         const latest = logFilesWithMtime[0].path;
-        const allLines = readFileSync(latest, "utf-8").split("\n");
-        const last100 = allLines.slice(-100).join("\n");
+        const allLines = readFileSync(latest, "utf-8")
+            .replace(/\r\n/g, "\n")
+            .replace(/\r/g, "\n")
+            .split("\n");
+        if (allLines.length > 0 && allLines[allLines.length - 1] === "") {
+            allLines.pop();
+        }
         console.log(`[clawconnect] logs read from ${latest}`);
-        return { ok: true, payload: { output: `[${latest}]\n${last100}` } };
+        return {
+            ok: true,
+            payload: {
+                logPath: latest,
+                lines: allLines,
+                totalLines: allLines.length,
+                returnedLines: allLines.length,
+                truncated: false,
+                output: `[${latest}]\n${allLines.join("\n")}`,
+            },
+        };
     }
     catch (err) {
         return { ok: false, error: errorMessage(err) };

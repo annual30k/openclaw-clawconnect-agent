@@ -435,7 +435,11 @@ export async function runRelayManager(opts) {
                 return;
             }
             // Handle local commands without forwarding to the gateway.
-            const localResult = handleLocalCommand(msg.method, msg.params);
+            const localResult = await handleLocalCommand(msg.method, msg.params, {
+                requestId,
+                gatewayId: opts.gatewayId,
+                publishEvent: (event) => send(event),
+            });
             if (localResult !== null) {
                 if (localResult.ok && isVoiceReplyConfigCommand(msg.method)) {
                     const payload = localResult.payload;
