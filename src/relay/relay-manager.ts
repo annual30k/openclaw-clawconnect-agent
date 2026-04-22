@@ -2,6 +2,7 @@ import { WebSocket } from "ws";
 import { OpenClawGatewayClient } from "./gateway-client.js";
 import { handleLocalCommand } from "../commands/local-handlers.js";
 import { handleProviderCommand } from "../commands/provider-handlers.js";
+import { readConfig, updateVoiceReplyConfig, type VoiceReplyConfig } from "../config/config.js";
 import {
   DEFAULT_GATEWAY_SESSION_DEFAULTS,
   buildContextUsageFingerprint,
@@ -56,6 +57,8 @@ interface FromServer {
   id?: string;
   method: string;
   voiceReplyEnabled?: boolean;
+  voiceReplyVoiceIdentifier?: string;
+  voiceReplyRatePercent?: number;
   params: unknown;
 }
 
@@ -71,6 +74,7 @@ export interface RelayManagerOptions {
   gatewayToken?: string;
   gatewayPassword?: string;
   defaultVoiceReplyEnabled?: boolean;
+  defaultVoiceReplyConfig?: VoiceReplyConfig;
   onConnected?: () => void;
   onDisconnected?: () => void;
 }
@@ -108,6 +112,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     const contextUsageRefreshes = new Map<string, ReturnType<typeof setTimeout>>();
     const contextUsageFingerprints = new Map<string, string>();
     const voiceReplyPreferences = new VoiceReplyPreferenceStore(opts.defaultVoiceReplyEnabled ?? false, sessionDefaults);
+    voiceReplyPreferences.setDefaultVoiceReplySettings(opts.defaultVoiceReplyConfig);
 
     const clearChatFallback = (runId: string): void => {
       const timer = chatFallbacks.get(runId);
@@ -201,6 +206,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             clearChatFallback(runId);
             chatRunContexts.delete(runId);
             if (outcome.kind === "final") {
+              if (shouldUseVoiceReply(runId, context.sessionKey)) {
+                return;
+              }
               send({
                 type: "event",
                 event: "chat",
@@ -274,20 +282,26 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       send({ type: "event", event: "office", payload: officePayload });
     }
 
-    function queueVoiceReply(sessionKey: string, text: string): void {
+    function queueVoiceReply(runId: string | undefined, sessionKey: string, text: string): void {
       const normalizedText = text.trim();
       if (!normalizedText) {
         return;
       }
 
       console.log(`[relay] queueing voice reply sessionKey=${sessionKey} textLength=${normalizedText.length}`);
+      const resolvedSettings = voiceReplyPreferences.resolveSettings(runId, sessionKey);
+      const resolvedRate =
+        typeof resolvedSettings?.ratePercent === "number"
+          ? `${resolvedSettings.ratePercent > 0 ? "+" : ""}${resolvedSettings.ratePercent}%`
+          : undefined;
 
       void sendVoiceReplyCommand(
         {
           text: normalizedText,
           gateway: opts.gatewayId,
           session: sessionKey,
-          voice: process.env.OPENCLAW_TTS_VOICE?.trim() || undefined,
+          voice: resolvedSettings?.voiceIdentifier ?? (process.env.OPENCLAW_TTS_VOICE?.trim() || undefined),
+          rate: resolvedRate ?? (process.env.OPENCLAW_TTS_RATE?.trim() || undefined),
           speaker: (process.env.OPENCLAW_TTS_ENGINE?.trim() as "system" | "espeak" | undefined) || undefined,
         },
       ).catch((error) => {
@@ -381,7 +395,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 if (shouldSendTextReply(runId, resolvedSessionKey)) {
                   send({ type: "event", event, payload: outgoingPayload });
                 } else {
-                  queueVoiceReply(resolvedSessionKey, resolvedText);
+                  queueVoiceReply(runId, resolvedSessionKey, resolvedText);
                 }
                 if (runId) {
                   voiceReplyPreferences.clearRun(runId);
@@ -411,7 +425,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     if (shouldSendTextReply(runId, resolvedSessionKey)) {
                       send({ type: "event", event, payload: outgoingPayload });
                     } else {
-                      queueVoiceReply(resolvedSessionKey, outcome.text);
+                      queueVoiceReply(runId, resolvedSessionKey, outcome.text);
                     }
                     if (runId) {
                       voiceReplyPreferences.clearRun(runId);
@@ -463,11 +477,27 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               chatRunContexts.delete(runId);
               scheduleContextUsageRefresh(p?.sessionKey, 450);
             }
+            const shouldSuppressVoiceReplyText =
+              role === "assistant"
+              && shouldUseVoiceReply(runId, resolvedSessionKey)
+              && state !== "error"
+              && state !== "failed"
+              && state !== "fail"
+              && state !== "aborted";
+
+            if (shouldSuppressVoiceReplyText) {
+              if (shouldPublishOffice) {
+                publishOfficeSnapshot(event, normalizedPayload);
+              }
+              return;
+            }
+
+            if (shouldPublishOffice) {
+              publishOfficeSnapshot(event, normalizedPayload);
+            }
+            send({ type: "event", event, payload: normalizedPayload });
+            return;
           }
-          if (shouldPublishOffice) {
-            publishOfficeSnapshot(event, normalizedPayload);
-          }
-          send({ type: "event", event, payload: normalizedPayload });
         },
       });
 
@@ -512,12 +542,31 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         return;
       }
 
-      // Handle clawpilot.* commands locally without forwarding to the gateway
+      // Handle local commands without forwarding to the gateway.
       const localResult = handleLocalCommand(msg.method, msg.params);
-        if (localResult !== null) {
-          if (requestId) {
-            if (localResult.ok) {
-              send({ type: "res", id: requestId, ok: true, payload: localResult.payload });
+      if (localResult !== null) {
+        if (localResult.ok && isVoiceReplyConfigCommand(msg.method)) {
+          const payload = localResult.payload as
+            | {
+                assistantVoiceReplyVoiceIdentifier?: string | null;
+                assistantVoiceReplyRatePercent?: number | null;
+              }
+            | undefined;
+          voiceReplyPreferences.setDefaultVoiceReplySettings({
+            voiceIdentifier:
+              typeof payload?.assistantVoiceReplyVoiceIdentifier === "string"
+                ? payload.assistantVoiceReplyVoiceIdentifier
+                : undefined,
+            ratePercent:
+              typeof payload?.assistantVoiceReplyRatePercent === "number"
+                ? payload.assistantVoiceReplyRatePercent
+                : undefined,
+          });
+        }
+
+        if (requestId) {
+          if (localResult.ok) {
+            send({ type: "res", id: requestId, ok: true, payload: localResult.payload });
           } else {
             send({ type: "res", id: requestId, ok: false, error: { message: localResult.error } });
           }
@@ -535,6 +584,14 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           ? (params as Record<string, unknown>)
           : undefined;
       const voiceReplyEnabled = typeof msg.voiceReplyEnabled === "boolean" ? msg.voiceReplyEnabled : undefined;
+      const voiceReplyVoiceIdentifier =
+        typeof msg.voiceReplyVoiceIdentifier === "string" && msg.voiceReplyVoiceIdentifier.trim().length > 0
+          ? msg.voiceReplyVoiceIdentifier.trim()
+          : undefined;
+      const voiceReplyRatePercent =
+        typeof msg.voiceReplyRatePercent === "number" && Number.isFinite(msg.voiceReplyRatePercent)
+          ? Math.max(-50, Math.min(50, Math.round(msg.voiceReplyRatePercent)))
+          : undefined;
       const requestSessionKey =
         paramsRecord && typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
           ? paramsRecord.sessionKey.trim()
@@ -544,7 +601,24 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           runId: requestId,
           sessionKey: requestSessionKey,
           enabled: voiceReplyEnabled,
+          voiceIdentifier: voiceReplyVoiceIdentifier,
+          ratePercent: voiceReplyRatePercent,
         });
+        if (voiceReplyVoiceIdentifier !== undefined || voiceReplyRatePercent !== undefined) {
+          try {
+            const config = readConfig();
+            const updatedConfig = updateVoiceReplyConfig(config, {
+              voiceIdentifier: voiceReplyVoiceIdentifier,
+              ratePercent: voiceReplyRatePercent,
+            });
+            voiceReplyPreferences.setDefaultVoiceReplySettings({
+              voiceIdentifier: updatedConfig.assistantVoiceReplyVoiceIdentifier,
+              ratePercent: updatedConfig.assistantVoiceReplyRatePercent,
+            });
+          } catch (error) {
+            console.warn(`[relay] failed to persist voice reply settings: ${String(error)}`);
+          }
+        }
       }
 
       gatewayClient
@@ -570,6 +644,8 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 runId,
                 sessionKey,
                 enabled: voiceReplyEnabled,
+                voiceIdentifier: voiceReplyVoiceIdentifier,
+                ratePercent: voiceReplyRatePercent,
               });
             }
             if (runId) {
@@ -627,6 +703,12 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       // close event will follow
     });
   });
+}
+
+function isVoiceReplyConfigCommand(method: string): boolean {
+  return method === "clawconnect.voiceReply.setConfig"
+    || method === "pocketclaw.voiceReply.setConfig"
+    || method === "clawpilot.voiceReply.setConfig";
 }
 
 export function buildRelayHelloMessage(opts: {

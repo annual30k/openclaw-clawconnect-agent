@@ -1,4 +1,4 @@
-import { readConfig, readGatewayUrl, readGatewayAuth } from "../config/config.js";
+import { readConfig, readGatewayUrl, readGatewayAuth, readVoiceReplyConfig } from "../config/config.js";
 import { runRelayManager } from "../relay/relay-manager.js";
 import { withReconnect } from "../relay/reconnect.js";
 import { t } from "../i18n/index.js";
@@ -10,6 +10,7 @@ export async function runCommand() {
     const gatewayUrl = readGatewayUrl();
     const gatewayAuth = readGatewayAuth(config);
     const defaultVoiceReplyEnabled = parseBooleanEnv(process.env.OPENCLAW_TTS_ENABLED);
+    const defaultVoiceReplyConfig = readVoiceReplyConfig(config);
     console.log(t("run.starting"));
     console.log(t("run.gatewayId", config.gatewayId));
     console.log(t("run.relayServer", config.relayServerUrl));
@@ -22,6 +23,7 @@ export async function runCommand() {
         gatewayToken: gatewayAuth.token,
         gatewayPassword: gatewayAuth.password,
         defaultVoiceReplyEnabled,
+        defaultVoiceReplyConfig,
         onConnected: () => console.log(t("run.connected")),
         onDisconnected: () => console.log(t("run.disconnected")),
     }), {

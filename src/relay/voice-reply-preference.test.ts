@@ -38,3 +38,28 @@ test("voice reply preference store respects explicit session-level disable", () 
   assert.equal(store.shouldUse(undefined, "agent:main:main"), false);
   assert.equal(store.shouldUse("missing-run", "main"), false);
 });
+
+test("voice reply preference store resolves per-run voice settings", () => {
+  const store = new VoiceReplyPreferenceStore(false, {
+    mainSessionKey: "agent:main:main",
+    mainKey: "main",
+    defaultAgentId: "main",
+  });
+
+  store.register({
+    runId: "run-voice",
+    sessionKey: "main",
+    enabled: true,
+    voiceIdentifier: "en-US-AndrewMultilingualNeural",
+    ratePercent: 20,
+  });
+
+  assert.deepEqual(store.resolveSettings("run-voice", "main"), {
+    voiceIdentifier: "en-US-AndrewMultilingualNeural",
+    ratePercent: 20,
+  });
+  assert.deepEqual(store.resolveSettings("missing", "main"), {
+    voiceIdentifier: "en-US-AndrewMultilingualNeural",
+    ratePercent: 20,
+  });
+});

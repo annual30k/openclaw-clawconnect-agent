@@ -3,14 +3,22 @@ export interface ClawConnectConfig {
     gatewayId: string;
     relaySecret: string;
     displayName: string;
+    assistantVoiceReplyVoiceIdentifier?: string;
+    assistantVoiceReplyRatePercent?: number;
     /** Shared token for the local OpenClaw Gateway (gateway.auth.token in openclaw config). */
     gatewayToken?: string;
     /** Password for the local OpenClaw Gateway (used when auth mode is "password"). */
     gatewayPassword?: string;
 }
+export interface VoiceReplyConfig {
+    voiceIdentifier?: string;
+    ratePercent?: number;
+}
 export declare function configExists(): boolean;
 export declare function readConfig(): ClawConnectConfig;
 export declare function writeConfig(config: ClawConnectConfig): void;
+export declare function readVoiceReplyConfig(cfg: ClawConnectConfig): VoiceReplyConfig;
+export declare function updateVoiceReplyConfig(config: ClawConnectConfig, voiceReplyConfig: VoiceReplyConfig): ClawConnectConfig;
 export declare function readGatewayUrl(): string;
 /**
  * Reads the gateway token or password. Priority order:

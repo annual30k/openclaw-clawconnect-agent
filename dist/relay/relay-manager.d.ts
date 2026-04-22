@@ -1,3 +1,4 @@
+import { type VoiceReplyConfig } from "../config/config.js";
 import { type RelaySlashCommandDescriptor } from "./slash-command-catalog.js";
 /** Messages the relay client sends to the relay server. */
 export type RelayHelloMessage = {
@@ -15,6 +16,7 @@ export interface RelayManagerOptions {
     gatewayToken?: string;
     gatewayPassword?: string;
     defaultVoiceReplyEnabled?: boolean;
+    defaultVoiceReplyConfig?: VoiceReplyConfig;
     onConnected?: () => void;
     onDisconnected?: () => void;
 }

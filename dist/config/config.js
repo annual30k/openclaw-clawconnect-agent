@@ -18,6 +18,31 @@ export function writeConfig(config) {
     mkdirSync(CONFIG_DIR, { recursive: true });
     writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
 }
+export function readVoiceReplyConfig(cfg) {
+    return {
+        voiceIdentifier: normalizeVoiceIdentifier(cfg.assistantVoiceReplyVoiceIdentifier),
+        ratePercent: clampRatePercent(cfg.assistantVoiceReplyRatePercent),
+    };
+}
+export function updateVoiceReplyConfig(config, voiceReplyConfig) {
+    const nextConfig = { ...config };
+    const voiceIdentifier = normalizeVoiceIdentifier(voiceReplyConfig.voiceIdentifier);
+    const ratePercent = clampRatePercent(voiceReplyConfig.ratePercent);
+    if (voiceIdentifier === undefined) {
+        delete nextConfig.assistantVoiceReplyVoiceIdentifier;
+    }
+    else {
+        nextConfig.assistantVoiceReplyVoiceIdentifier = voiceIdentifier;
+    }
+    if (ratePercent === undefined) {
+        delete nextConfig.assistantVoiceReplyRatePercent;
+    }
+    else {
+        nextConfig.assistantVoiceReplyRatePercent = ratePercent;
+    }
+    writeConfig(nextConfig);
+    return nextConfig;
+}
 export function readGatewayUrl() {
     try {
         const raw = readFileSync(OPENCLAW_CONFIG_PATH, "utf-8");
@@ -58,5 +83,15 @@ export function readGatewayAuth(cfg) {
         return { token: envToken, password: envPassword };
     }
     return {};
+}
+function normalizeVoiceIdentifier(voiceIdentifier) {
+    const trimmed = voiceIdentifier?.trim() ?? "";
+    return trimmed.length > 0 ? trimmed : undefined;
+}
+function clampRatePercent(ratePercent) {
+    if (typeof ratePercent !== "number" || !Number.isFinite(ratePercent)) {
+        return undefined;
+    }
+    return Math.min(50, Math.max(-50, Math.round(ratePercent)));
 }
 //# sourceMappingURL=config.js.map

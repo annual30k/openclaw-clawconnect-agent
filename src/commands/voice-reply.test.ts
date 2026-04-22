@@ -9,10 +9,11 @@ test("voice reply audio prefers edge synthesis when available", async () => {
     {
       text: "你好，OpenClaw。",
       audioPath: "/tmp/openclaw-voice-reply.mp3",
+      rate: "+15%",
     },
     {
-      synthesizeEdgeTtsImpl: async () => {
-        calls.push("edge");
+      synthesizeEdgeTtsImpl: async (opts) => {
+        calls.push(`edge:${opts.rate ?? "default"}`);
       },
       synthesizeSystemTtsImpl: async () => {
         calls.push("system");
@@ -20,7 +21,7 @@ test("voice reply audio prefers edge synthesis when available", async () => {
     },
   );
 
-  assert.deepEqual(calls, ["edge"]);
+  assert.deepEqual(calls, ["edge:+15%"]);
 });
 
 test("voice reply audio falls back to system TTS when edge synthesis fails", async () => {
@@ -30,6 +31,7 @@ test("voice reply audio falls back to system TTS when edge synthesis fails", asy
     {
       text: "你好，OpenClaw。",
       audioPath: "/tmp/openclaw-voice-reply.mp3",
+      rate: "-20%",
     },
     {
       synthesizeEdgeTtsImpl: async () => {
@@ -38,6 +40,7 @@ test("voice reply audio falls back to system TTS when edge synthesis fails", asy
       },
       synthesizeSystemTtsImpl: async (opts) => {
         calls.push({ name: "system", strict: opts.strict });
+        assert.equal(opts.rate, "-20%");
       },
     },
   );
@@ -68,6 +71,7 @@ test("send-voice-reply uploads the synthesized file after generation", async () 
           session: opts.session,
           durationMs: opts.durationMs,
           transcript: opts.transcript,
+          rate: opts.rate,
         };
         return { ok: true } as never;
       },
@@ -83,5 +87,6 @@ test("send-voice-reply uploads the synthesized file after generation", async () 
     session: "main",
     durationMs: result.durationMs,
     transcript: "Hello, OpenClaw.",
+    rate: undefined,
   });
 });
