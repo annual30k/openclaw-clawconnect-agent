@@ -2,8 +2,8 @@ import { randomUUID } from "crypto";
 import { requestGatewayRestart } from "./local-runtime.js";
 import { PROVIDER_REGISTRY } from "./provider-registry.js";
 import { listProviderEntries, listConfiguredModels, addProvider, deleteProvider, setDefaultProvider, setDefaultModel, } from "./provider-config.js";
-function restartGateway() {
-    const restart = requestGatewayRestart("provider");
+async function restartGateway() {
+    const restart = await requestGatewayRestart("provider");
     if (!restart.ok) {
         console.warn("[provider] gateway restart request failed:", restart.error);
     }

@@ -63,10 +63,10 @@ export function handleLocalCommand(
     case "clawpilot.logs":                return readLogs(params);
     case "clawconnect.gateway.restart":
     case "pocketclaw.gateway.restart":
-    case "clawpilot.gateway.restart":     return restartGateway();
+    case "clawpilot.gateway.restart":     return restartGateway(context);
     case "clawconnect.gateway.remoteRestart":
     case "pocketclaw.gateway.remoteRestart":
-    case "clawpilot.gateway.remoteRestart": return remoteRestartGateway();
+    case "clawpilot.gateway.remoteRestart": return remoteRestartGateway(context);
     case "clawconnect.voiceReply.setConfig":
     case "pocketclaw.voiceReply.setConfig":
     case "clawpilot.voiceReply.setConfig": return updateVoiceReplySettings(params);
@@ -151,7 +151,7 @@ function readOpenclawConfig(): LocalResult {
   }
 }
 
-function fixToolsPermissions202632(): LocalResult {
+async function fixToolsPermissions202632(): Promise<LocalResult> {
   const steps = [
     "config set tools.profile full",
     "config set tools.sessions.visibility all",
@@ -166,7 +166,7 @@ function fixToolsPermissions202632(): LocalResult {
     for (const step of steps) {
       let output = "";
       if (step === "gateway restart") {
-        const restart = requestGatewayRestart("clawconnect");
+        const restart = await requestGatewayRestart("clawconnect");
         if (!restart.ok) {
           throw new Error(restart.error);
         }
@@ -363,12 +363,12 @@ function readLogs(_params: unknown = undefined): LocalResult {
   }
 }
 
-function restartGateway(): LocalResult {
-  return requestGatewayRestart("clawconnect");
+function restartGateway(context: LocalCommandContext = {}): LocalResult | Promise<LocalResult> {
+  return requestGatewayRestart("clawconnect", context);
 }
 
-function remoteRestartGateway(): LocalResult {
-  return requestGatewayRemoteRestart("clawconnect");
+function remoteRestartGateway(context: LocalCommandContext = {}): LocalResult | Promise<LocalResult> {
+  return requestGatewayRemoteRestart("clawconnect", context);
 }
 
 function getOpenclawVersion(): LocalResult {

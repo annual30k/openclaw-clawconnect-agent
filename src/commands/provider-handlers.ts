@@ -11,8 +11,8 @@ import {
   setDefaultModel,
 } from "./provider-config.js";
 
-function restartGateway(): void {
-  const restart = requestGatewayRestart("provider");
+async function restartGateway(): Promise<void> {
+  const restart = await requestGatewayRestart("provider");
   if (!restart.ok) {
     console.warn("[provider] gateway restart request failed:", restart.error);
   }

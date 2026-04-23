@@ -47,10 +47,10 @@ export function handleLocalCommand(method, params = undefined, context = {}) {
         case "clawpilot.logs": return readLogs(params);
         case "clawconnect.gateway.restart":
         case "pocketclaw.gateway.restart":
-        case "clawpilot.gateway.restart": return restartGateway();
+        case "clawpilot.gateway.restart": return restartGateway(context);
         case "clawconnect.gateway.remoteRestart":
         case "pocketclaw.gateway.remoteRestart":
-        case "clawpilot.gateway.remoteRestart": return remoteRestartGateway();
+        case "clawpilot.gateway.remoteRestart": return remoteRestartGateway(context);
         case "clawconnect.voiceReply.setConfig":
         case "pocketclaw.voiceReply.setConfig":
         case "clawpilot.voiceReply.setConfig": return updateVoiceReplySettings(params);
@@ -124,7 +124,7 @@ function readOpenclawConfig() {
         return { ok: false, error: errorMessage(err) };
     }
 }
-function fixToolsPermissions202632() {
+async function fixToolsPermissions202632() {
     const steps = [
         "config set tools.profile full",
         "config set tools.sessions.visibility all",
@@ -137,7 +137,7 @@ function fixToolsPermissions202632() {
         for (const step of steps) {
             let output = "";
             if (step === "gateway restart") {
-                const restart = requestGatewayRestart("clawconnect");
+                const restart = await requestGatewayRestart("clawconnect");
                 if (!restart.ok) {
                     throw new Error(restart.error);
                 }
@@ -327,11 +327,11 @@ function readLogs(_params = undefined) {
         return { ok: false, error: errorMessage(err) };
     }
 }
-function restartGateway() {
-    return requestGatewayRestart("clawconnect");
+function restartGateway(context = {}) {
+    return requestGatewayRestart("clawconnect", context);
 }
-function remoteRestartGateway() {
-    return requestGatewayRemoteRestart("clawconnect");
+function remoteRestartGateway(context = {}) {
+    return requestGatewayRemoteRestart("clawconnect", context);
 }
 function getOpenclawVersion() {
     const candidates = ["--version", "version"];
