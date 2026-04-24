@@ -505,6 +505,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     });
 
     relayWs.on("message", async (raw) => {
+      let requestId: string | undefined;
+      let methodForLog: string | undefined;
+      try {
       let msg: FromServer;
       try {
         msg = JSON.parse(raw.toString()) as FromServer;
@@ -523,7 +526,8 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
       if (msg.type !== "cmd" || !msg.method) return;
 
-      const requestId = msg.id;
+      requestId = msg.id;
+      methodForLog = msg.method;
 
       // Handle clawpilot.provider.* commands locally (async)
       const providerPromise = handleProviderCommand(msg.method, msg.params);
@@ -625,8 +629,12 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         }
       }
 
+      if (!gatewayClient) {
+        throw new Error("gateway not connected");
+      }
+
       gatewayClient
-        ?.request(msg.method, params)
+        .request(msg.method, params)
         .then((result) => {
           let resolvedRunId: string | undefined;
           if ((msg.method === "chat.send" || msg.method === "agent") && params && typeof params === "object" && !Array.isArray(params)) {
@@ -682,6 +690,14 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             send({ type: "res", id: requestId, ok: false, error: { message: String(err) } });
           }
         });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[relay] cmd failed method=${methodForLog ?? "(unknown)"} id=${requestId ?? "(no-id)"}: ${message}`);
+        if (requestId) {
+          voiceReplyPreferences.clearRun(requestId);
+          send({ type: "res", id: requestId, ok: false, error: { message } });
+        }
+      }
     });
 
     relayWs.on("close", (code, reason) => {

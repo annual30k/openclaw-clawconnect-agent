@@ -401,163 +401,179 @@ export async function runRelayManager(opts) {
             gatewayClient.start();
         });
         relayWs.on("message", async (raw) => {
-            let msg;
+            let requestId;
+            let methodForLog;
             try {
-                msg = JSON.parse(raw.toString());
-            }
-            catch {
-                return;
-            }
-            if (msg.type === "heartbeat") {
-                send({ type: "heartbeat" });
-                return;
-            }
-            if (msg.type === "hello") {
-                return;
-            }
-            if (msg.type !== "cmd" || !msg.method)
-                return;
-            const requestId = msg.id;
-            // Handle clawpilot.provider.* commands locally (async)
-            const providerPromise = handleProviderCommand(msg.method, msg.params);
-            if (providerPromise !== null) {
-                const result = await providerPromise;
-                if (requestId) {
-                    send({
-                        type: "res",
-                        id: requestId,
-                        ok: result.ok,
-                        ...(result.ok
-                            ? { payload: result.payload }
-                            : { error: { message: result.error } }),
-                    });
+                let msg;
+                try {
+                    msg = JSON.parse(raw.toString());
                 }
-                return;
-            }
-            // Handle local commands without forwarding to the gateway.
-            const localResult = await handleLocalCommand(msg.method, msg.params, {
-                requestId,
-                gatewayId: opts.gatewayId,
-                publishEvent: (event) => send(event),
-            });
-            if (localResult !== null) {
-                if (localResult.ok && isVoiceReplyConfigCommand(msg.method)) {
-                    const payload = localResult.payload;
-                    voiceReplyPreferences.setDefaultVoiceReplySettings({
-                        voiceIdentifier: typeof payload?.assistantVoiceReplyVoiceIdentifier === "string"
-                            ? payload.assistantVoiceReplyVoiceIdentifier
-                            : undefined,
-                        ratePercent: typeof payload?.assistantVoiceReplyRatePercent === "number"
-                            ? payload.assistantVoiceReplyRatePercent
-                            : undefined,
-                    });
+                catch {
+                    return;
                 }
-                if (requestId) {
-                    if (localResult.ok) {
-                        send({ type: "res", id: requestId, ok: true, payload: localResult.payload });
+                if (msg.type === "heartbeat") {
+                    send({ type: "heartbeat" });
+                    return;
+                }
+                if (msg.type === "hello") {
+                    return;
+                }
+                if (msg.type !== "cmd" || !msg.method)
+                    return;
+                requestId = msg.id;
+                methodForLog = msg.method;
+                // Handle clawpilot.provider.* commands locally (async)
+                const providerPromise = handleProviderCommand(msg.method, msg.params);
+                if (providerPromise !== null) {
+                    const result = await providerPromise;
+                    if (requestId) {
+                        send({
+                            type: "res",
+                            id: requestId,
+                            ok: result.ok,
+                            ...(result.ok
+                                ? { payload: result.payload }
+                                : { error: { message: result.error } }),
+                        });
                     }
-                    else {
-                        send({ type: "res", id: requestId, ok: false, error: { message: localResult.error } });
-                    }
+                    return;
                 }
-                return;
-            }
-            if (msg.method === "chat.send") {
-                msg.params = await prepareChatSendParams(msg.params);
-            }
-            const params = canonicalizeRelayParams(msg.method, msg.params, sessionDefaults);
-            const paramsRecord = params && typeof params === "object" && !Array.isArray(params)
-                ? params
-                : undefined;
-            const voiceReplyEnabled = typeof msg.voiceReplyEnabled === "boolean" ? msg.voiceReplyEnabled : undefined;
-            const voiceReplyVoiceIdentifier = typeof msg.voiceReplyVoiceIdentifier === "string" && msg.voiceReplyVoiceIdentifier.trim().length > 0
-                ? msg.voiceReplyVoiceIdentifier.trim()
-                : undefined;
-            const voiceReplyRatePercent = typeof msg.voiceReplyRatePercent === "number" && Number.isFinite(msg.voiceReplyRatePercent)
-                ? Math.max(-50, Math.min(50, Math.round(msg.voiceReplyRatePercent)))
-                : undefined;
-            const requestSessionKey = paramsRecord && typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
-                ? paramsRecord.sessionKey.trim()
-                : undefined;
-            if (requestId && typeof voiceReplyEnabled === "boolean" && (msg.method === "chat.send" || msg.method === "agent")) {
-                voiceReplyPreferences.register({
-                    runId: requestId,
-                    sessionKey: requestSessionKey,
-                    enabled: voiceReplyEnabled,
-                    voiceIdentifier: voiceReplyVoiceIdentifier,
-                    ratePercent: voiceReplyRatePercent,
+                // Handle local commands without forwarding to the gateway.
+                const localResult = await handleLocalCommand(msg.method, msg.params, {
+                    requestId,
+                    gatewayId: opts.gatewayId,
+                    publishEvent: (event) => send(event),
                 });
-                if (voiceReplyVoiceIdentifier !== undefined || voiceReplyRatePercent !== undefined) {
-                    try {
-                        const config = readConfig();
-                        const updatedConfig = updateVoiceReplyConfig(config, {
-                            voiceIdentifier: voiceReplyVoiceIdentifier,
-                            ratePercent: voiceReplyRatePercent,
-                        });
+                if (localResult !== null) {
+                    if (localResult.ok && isVoiceReplyConfigCommand(msg.method)) {
+                        const payload = localResult.payload;
                         voiceReplyPreferences.setDefaultVoiceReplySettings({
-                            voiceIdentifier: updatedConfig.assistantVoiceReplyVoiceIdentifier,
-                            ratePercent: updatedConfig.assistantVoiceReplyRatePercent,
+                            voiceIdentifier: typeof payload?.assistantVoiceReplyVoiceIdentifier === "string"
+                                ? payload.assistantVoiceReplyVoiceIdentifier
+                                : undefined,
+                            ratePercent: typeof payload?.assistantVoiceReplyRatePercent === "number"
+                                ? payload.assistantVoiceReplyRatePercent
+                                : undefined,
                         });
                     }
-                    catch (error) {
-                        console.warn(`[relay] failed to persist voice reply settings: ${String(error)}`);
+                    if (requestId) {
+                        if (localResult.ok) {
+                            send({ type: "res", id: requestId, ok: true, payload: localResult.payload });
+                        }
+                        else {
+                            send({ type: "res", id: requestId, ok: false, error: { message: localResult.error } });
+                        }
+                    }
+                    return;
+                }
+                if (msg.method === "chat.send") {
+                    msg.params = await prepareChatSendParams(msg.params);
+                }
+                const params = canonicalizeRelayParams(msg.method, msg.params, sessionDefaults);
+                const paramsRecord = params && typeof params === "object" && !Array.isArray(params)
+                    ? params
+                    : undefined;
+                const voiceReplyEnabled = typeof msg.voiceReplyEnabled === "boolean" ? msg.voiceReplyEnabled : undefined;
+                const voiceReplyVoiceIdentifier = typeof msg.voiceReplyVoiceIdentifier === "string" && msg.voiceReplyVoiceIdentifier.trim().length > 0
+                    ? msg.voiceReplyVoiceIdentifier.trim()
+                    : undefined;
+                const voiceReplyRatePercent = typeof msg.voiceReplyRatePercent === "number" && Number.isFinite(msg.voiceReplyRatePercent)
+                    ? Math.max(-50, Math.min(50, Math.round(msg.voiceReplyRatePercent)))
+                    : undefined;
+                const requestSessionKey = paramsRecord && typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
+                    ? paramsRecord.sessionKey.trim()
+                    : undefined;
+                if (requestId && typeof voiceReplyEnabled === "boolean" && (msg.method === "chat.send" || msg.method === "agent")) {
+                    voiceReplyPreferences.register({
+                        runId: requestId,
+                        sessionKey: requestSessionKey,
+                        enabled: voiceReplyEnabled,
+                        voiceIdentifier: voiceReplyVoiceIdentifier,
+                        ratePercent: voiceReplyRatePercent,
+                    });
+                    if (voiceReplyVoiceIdentifier !== undefined || voiceReplyRatePercent !== undefined) {
+                        try {
+                            const config = readConfig();
+                            const updatedConfig = updateVoiceReplyConfig(config, {
+                                voiceIdentifier: voiceReplyVoiceIdentifier,
+                                ratePercent: voiceReplyRatePercent,
+                            });
+                            voiceReplyPreferences.setDefaultVoiceReplySettings({
+                                voiceIdentifier: updatedConfig.assistantVoiceReplyVoiceIdentifier,
+                                ratePercent: updatedConfig.assistantVoiceReplyRatePercent,
+                            });
+                        }
+                        catch (error) {
+                            console.warn(`[relay] failed to persist voice reply settings: ${String(error)}`);
+                        }
                     }
                 }
-            }
-            gatewayClient
-                ?.request(msg.method, params)
-                .then((result) => {
-                let resolvedRunId;
-                if ((msg.method === "chat.send" || msg.method === "agent") && params && typeof params === "object" && !Array.isArray(params)) {
-                    const paramsRecord = params;
-                    const sessionKey = typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
-                        ? paramsRecord.sessionKey.trim()
-                        : sessionDefaults.mainSessionKey;
-                    const resultRecord = result && typeof result === "object" && !Array.isArray(result)
-                        ? result
-                        : undefined;
-                    const runId = typeof resultRecord?.runId === "string" && resultRecord.runId.trim().length > 0
-                        ? resultRecord.runId.trim()
-                        : requestId;
-                    resolvedRunId = runId;
-                    if (runId && typeof voiceReplyEnabled === "boolean") {
-                        voiceReplyPreferences.register({
-                            runId,
-                            sessionKey,
-                            enabled: voiceReplyEnabled,
-                            voiceIdentifier: voiceReplyVoiceIdentifier,
-                            ratePercent: voiceReplyRatePercent,
-                        });
-                    }
-                    if (runId) {
-                        const promptText = typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
-                            ? paramsRecord.message.trim()
+                if (!gatewayClient) {
+                    throw new Error("gateway not connected");
+                }
+                gatewayClient
+                    .request(msg.method, params)
+                    .then((result) => {
+                    let resolvedRunId;
+                    if ((msg.method === "chat.send" || msg.method === "agent") && params && typeof params === "object" && !Array.isArray(params)) {
+                        const paramsRecord = params;
+                        const sessionKey = typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
+                            ? paramsRecord.sessionKey.trim()
+                            : sessionDefaults.mainSessionKey;
+                        const resultRecord = result && typeof result === "object" && !Array.isArray(result)
+                            ? result
                             : undefined;
-                        const runContext = {
-                            sessionKey,
-                            requestedAtMs: Date.now(),
-                            promptText,
-                        };
-                        scheduleChatHistoryFallback(runId, runContext);
+                        const runId = typeof resultRecord?.runId === "string" && resultRecord.runId.trim().length > 0
+                            ? resultRecord.runId.trim()
+                            : requestId;
+                        resolvedRunId = runId;
+                        if (runId && typeof voiceReplyEnabled === "boolean") {
+                            voiceReplyPreferences.register({
+                                runId,
+                                sessionKey,
+                                enabled: voiceReplyEnabled,
+                                voiceIdentifier: voiceReplyVoiceIdentifier,
+                                ratePercent: voiceReplyRatePercent,
+                            });
+                        }
+                        if (runId) {
+                            const promptText = typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
+                                ? paramsRecord.message.trim()
+                                : undefined;
+                            const runContext = {
+                                sessionKey,
+                                requestedAtMs: Date.now(),
+                                promptText,
+                            };
+                            scheduleChatHistoryFallback(runId, runContext);
+                        }
+                        // Let a model switch settle before publishing context usage again.
+                        // Forced refreshes can replay a stale model snapshot and overwrite the new selection.
+                        scheduleContextUsageRefresh(sessionKey, 1200);
                     }
-                    // Let a model switch settle before publishing context usage again.
-                    // Forced refreshes can replay a stale model snapshot and overwrite the new selection.
-                    scheduleContextUsageRefresh(sessionKey, 1200);
-                }
-                if (requestId) {
-                    if (resolvedRunId && resolvedRunId !== requestId) {
+                    if (requestId) {
+                        if (resolvedRunId && resolvedRunId !== requestId) {
+                            voiceReplyPreferences.clearRun(requestId);
+                        }
+                        send({ type: "res", id: requestId, ok: true, payload: result });
+                    }
+                })
+                    .catch((err) => {
+                    console.error(`[relay] cmd failed method=${msg.method} id=${requestId ?? "(no-id)"}: ${String(err)}`);
+                    if (requestId) {
                         voiceReplyPreferences.clearRun(requestId);
+                        send({ type: "res", id: requestId, ok: false, error: { message: String(err) } });
                     }
-                    send({ type: "res", id: requestId, ok: true, payload: result });
-                }
-            })
-                .catch((err) => {
-                console.error(`[relay] cmd failed method=${msg.method} id=${requestId ?? "(no-id)"}: ${String(err)}`);
+                });
+            }
+            catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                console.error(`[relay] cmd failed method=${methodForLog ?? "(unknown)"} id=${requestId ?? "(no-id)"}: ${message}`);
                 if (requestId) {
                     voiceReplyPreferences.clearRun(requestId);
-                    send({ type: "res", id: requestId, ok: false, error: { message: String(err) } });
+                    send({ type: "res", id: requestId, ok: false, error: { message } });
                 }
-            });
+            }
         });
         relayWs.on("close", (code, reason) => {
             console.log(`Relay connection closed: ${code} ${reason.toString()}`);

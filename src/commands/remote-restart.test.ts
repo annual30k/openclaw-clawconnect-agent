@@ -1,24 +1,13 @@
 import assert from "assert/strict";
-import { chmod, mkdtemp, readFile, rename, rm, unlink, writeFile } from "fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "fs/promises";
 import test from "node:test";
 import { tmpdir } from "os";
-import { dirname, join } from "path";
+import { join } from "path";
 
 const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-remote-restart-"));
 const runtimeFile = join(tempDir, "runtime-state.txt");
 const logFile = join(tempDir, "openclaw.log");
-
-const nodeBinDir = dirname(process.execPath);
-const openclawBin = join(nodeBinDir, "openclaw");
-const backupBin = join(nodeBinDir, `openclaw.bak-${process.pid}-${Date.now()}`);
-let hadOriginal = false;
-
-try {
-  await rename(openclawBin, backupBin);
-  hadOriginal = true;
-} catch {
-  hadOriginal = false;
-}
+const openclawBin = join(tempDir, "openclaw");
 
 await writeFile(
   openclawBin,
@@ -37,14 +26,21 @@ exit 0
 );
 await chmod(openclawBin, 0o755);
 
+const originalOpenclawBin = process.env.OPENCLAW_BIN;
 const originalRuntimeFile = process.env.OPENCLAW_RUNTIME_FILE;
 const originalLogFile = process.env.OPENCLAW_LOG_FILE;
+process.env.OPENCLAW_BIN = openclawBin;
 process.env.OPENCLAW_RUNTIME_FILE = runtimeFile;
 process.env.OPENCLAW_LOG_FILE = logFile;
 
 const { handleLocalCommand } = await import(`./local-handlers.js?remote-restart-test=${encodeURIComponent(tempDir)}`);
 
 test.after(async () => {
+  if (originalOpenclawBin === undefined) {
+    delete process.env.OPENCLAW_BIN;
+  } else {
+    process.env.OPENCLAW_BIN = originalOpenclawBin;
+  }
   if (originalRuntimeFile === undefined) {
     delete process.env.OPENCLAW_RUNTIME_FILE;
   } else {
@@ -57,10 +53,6 @@ test.after(async () => {
   }
 
   await rm(tempDir, { recursive: true, force: true });
-  await unlink(openclawBin).catch(() => {});
-  if (hadOriginal) {
-    await rename(backupBin, openclawBin);
-  }
 });
 
 async function setRuntimeState(state: "running" | "stopped" | "not running"): Promise<void> {

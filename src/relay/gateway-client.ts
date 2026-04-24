@@ -173,6 +173,7 @@ export class OpenClawGatewayClient {
     this.ws.on("close", (code, reason) => {
       const reasonText = reason.toString() || `code ${code}`;
       this.teardown();
+      this.flushPending(new Error(`gateway disconnected: ${reasonText}`));
       this.opts.onDisconnected(reasonText);
       this.scheduleReconnect();
     });
