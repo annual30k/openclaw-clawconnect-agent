@@ -21,7 +21,7 @@ program
 program
   .command("pair")
   .description("Register with relay server and display QR code for iOS pairing")
-  .option("-s, --server <url>", "Relay server URL", "http://223.109.141.71")
+  .option("-s, --server <url>", "Relay server URL", "https://clawlinks.cn")
   .option("-n, --name <name>", "Display name for this host")
   .option("--code-only", "Print only the access code and skip QR code output", false)
   .action(async (opts: { server: string; name: string; codeOnly?: boolean }) => {

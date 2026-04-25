@@ -7,7 +7,7 @@ import { hostname } from "os";
 import { getServicePlatform } from "../platform/service-manager.js";
 import { toRelayHttpBase } from "./send-file-utils.js";
 
-const DEFAULT_RELAY_SERVER = "http://223.109.141.71";
+const DEFAULT_RELAY_SERVER = "https://clawlinks.cn";
 
 interface PairOptions {
   server?: string;

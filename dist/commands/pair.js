@@ -6,7 +6,7 @@ import { execSync } from "child_process";
 import { hostname } from "os";
 import { getServicePlatform } from "../platform/service-manager.js";
 import { toRelayHttpBase } from "./send-file-utils.js";
-const DEFAULT_RELAY_SERVER = "http://223.109.141.71";
+const DEFAULT_RELAY_SERVER = "https://clawlinks.cn";
 export async function pairCommand(opts) {
     const relayServerUrl = opts.server ?? DEFAULT_RELAY_SERVER;
     const httpBase = toRelayHttpBase(relayServerUrl);
