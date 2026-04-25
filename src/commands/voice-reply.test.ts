@@ -90,3 +90,29 @@ test("send-voice-reply uploads the synthesized file after generation", async () 
     rate: undefined,
   });
 });
+
+test("send-voice-reply strips markdown formatting and emoji before synthesis", async () => {
+  let synthesizedText: string | undefined;
+  let sendFileTranscript: string | undefined;
+  const input = "这里是 *加粗*，还有 👌 和 [链接](https://example.com) 。";
+
+  await sendVoiceReplyCommand(
+    {
+      text: input,
+      gateway: "gw-1",
+      session: "main",
+    },
+    {
+      synthesizeEdgeTtsImpl: async (opts) => {
+        synthesizedText = opts.text;
+      },
+      sendFileCommandImpl: async (opts) => {
+        sendFileTranscript = opts.transcript;
+        return { ok: true } as never;
+      },
+    },
+  );
+
+  assert.equal(synthesizedText, "这里是 加粗，还有 和 链接 。");
+  assert.equal(sendFileTranscript, input);
+});

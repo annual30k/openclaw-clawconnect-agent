@@ -30,19 +30,23 @@ export async function sendVoiceReplyCommand(
   opts: VoiceReplyCommandOptions,
   deps: VoiceReplyCommandDependencies = {},
 ): Promise<VoiceReplyCommandResult> {
-  const text = normalizeVoiceText(opts.text);
-  if (!text) {
+  const originalText = normalizeVoiceText(opts.text);
+  if (!originalText) {
+    throw new Error("voice_reply_text_required");
+  }
+  const spokenText = stripVoiceReplyFormatting(originalText).replace(/\s+/g, " ").trim();
+  if (!spokenText) {
     throw new Error("voice_reply_text_required");
   }
 
-  const durationMs = estimateSpeechDurationMs(text);
+  const durationMs = estimateSpeechDurationMs(spokenText);
   const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-voice-reply-"));
   const audioPath = join(tempDir, "reply.mp3");
 
   try {
     await synthesizeVoiceReplyAudio(
       {
-        text,
+        text: spokenText,
         audioPath,
         voice: opts.voice,
         rate: opts.rate,
@@ -56,7 +60,7 @@ export async function sendVoiceReplyCommand(
         gateway: opts.gateway,
         session: opts.session,
         durationMs,
-        transcript: opts.text,
+        transcript: originalText,
       },
       deps,
     );
@@ -349,6 +353,33 @@ function getSystemVoiceNames(): Set<string> {
 
 function normalizeVoiceText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function stripVoiceReplyFormatting(text: string): string {
+  return stripMarkdownFormatting(stripEmoji(text));
+}
+
+function stripMarkdownFormatting(text: string): string {
+  return text
+    .replace(/!\[([^\]]*)\]\((?:[^()\\]|\\.|(?:\([^()]*\)))*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\((?:[^()\\]|\\.|(?:\([^()]*\)))*\)/g, "$1")
+    .replace(/```([\s\S]*?)```/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^>\s?/gm, "")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/^\s*\d+[.)]\s+/gm, "")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(\*|_)(.*?)\1/g, "$2")
+    .replace(/~~(.*?)~~/g, "$1")
+    .replace(/[>*_`~]/g, "");
+}
+
+function stripEmoji(text: string): string {
+  return text.replace(
+    /(?:\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?(?:\u200D\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?)*)|(?:[\u{1F1E6}-\u{1F1FF}]{2})/gu,
+    "",
+  );
 }
 
 function parseRatePercent(rate?: string): number | undefined {
