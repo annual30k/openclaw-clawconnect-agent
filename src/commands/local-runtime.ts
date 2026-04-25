@@ -1,7 +1,7 @@
 import { existsSync } from "fs";
-import { dirname } from "path";
+import { dirname, join, resolve } from "path";
 import { homedir } from "os";
-import { execSync, spawn } from "child_process";
+import { execFileSync, execSync, spawn } from "child_process";
 
 export type LocalResult =
   | { ok: true; payload?: unknown }
@@ -41,6 +41,11 @@ const SUBPROCESS_ENV: NodeJS.ProcessEnv = {
   HOME: homedir(),
   PATH: [
     NODE_BIN_DIR,
+    join(homedir(), ".openclaw", "bin"),
+    join(homedir(), ".local", "bin"),
+    join(homedir(), ".npm-global", "bin"),
+    process.env.PNPM_HOME,
+    join(homedir(), ".local", "share", "pnpm"),
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",
     "/usr/local/bin",
@@ -49,24 +54,81 @@ const SUBPROCESS_ENV: NodeJS.ProcessEnv = {
   ].join(":"),
 };
 
-function resolveOpenclawBin(): string {
-  const explicitBin = process.env.OPENCLAW_BIN?.trim();
-  if (explicitBin) {
-    if (existsSync(explicitBin)) {
-      return explicitBin;
+function canRunOpenclawBin(candidate: string): boolean {
+  try {
+    execFileSync(candidate, ["--version"], { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function bundledOpenclawBin(): string | null {
+  const explicitPackageBin = process.env.OPENCLAW_PACKAGE_BIN?.trim();
+  if (explicitPackageBin && existsSync(explicitPackageBin)) {
+    return explicitPackageBin;
+  }
+
+  const candidate = resolve(NODE_BIN_DIR, "..", "lib", "node_modules", "openclaw", "openclaw.mjs");
+  return existsSync(candidate) ? candidate : null;
+}
+
+export function selectOpenclawBinCandidate(
+  options: {
+    explicitBin?: string;
+    pathBin?: string;
+    extraBins?: string[];
+    packageBin?: string | null;
+    exists?: (candidate: string) => boolean;
+    canRun?: (candidate: string) => boolean;
+  },
+): string {
+  const exists = options.exists ?? existsSync;
+  const canRun = options.canRun ?? canRunOpenclawBin;
+  const explicitBin = options.explicitBin?.trim();
+  if (explicitBin && exists(explicitBin) && canRun(explicitBin)) {
+    return explicitBin;
+  }
+
+  const candidates = [
+    options.pathBin,
+    ...(options.extraBins ?? []),
+    options.packageBin ?? undefined,
+  ]
+    .map((candidate) => candidate?.trim())
+    .filter((candidate): candidate is string => Boolean(candidate && exists(candidate)));
+
+  for (const candidate of candidates) {
+    if (canRun(candidate)) {
+      return candidate;
     }
   }
 
+  return "openclaw";
+}
+
+function resolveOpenclawBin(): string {
+  let pathBin: string | undefined;
   try {
     const p = execSync("which openclaw", { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 })
       .toString().trim();
-    if (p && existsSync(p)) {
-      return p;
-    }
+    pathBin = p || undefined;
   } catch {
     // fall through
   }
-  return "openclaw";
+
+  return selectOpenclawBinCandidate({
+    explicitBin: process.env.OPENCLAW_BIN,
+    pathBin,
+    extraBins: [
+      join(homedir(), ".openclaw", "bin", "openclaw"),
+      join(homedir(), ".local", "bin", "openclaw"),
+      join(homedir(), ".npm-global", "bin", "openclaw"),
+      ...(process.env.PNPM_HOME ? [join(process.env.PNPM_HOME, "openclaw")] : []),
+      join(homedir(), ".local", "share", "pnpm", "openclaw"),
+    ],
+    packageBin: bundledOpenclawBin(),
+  });
 }
 
 let cachedOpenclawBin: string | null = null;
