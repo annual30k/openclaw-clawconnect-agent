@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { createRequire } from "module";
+import { DEFAULT_RELAY_SERVER_URL, ensureUserEnvFile, loadAgentEnv } from "./config/env.js";
 import { pairCommand } from "./commands/pair.js";
 import { runCommand } from "./commands/run.js";
 import { sendFileCommand } from "./commands/send-file.js";
@@ -10,6 +11,8 @@ import { setTokenCommand } from "./commands/set-token.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
+ensureUserEnvFile();
+loadAgentEnv();
 
 const program = new Command();
 
@@ -21,10 +24,13 @@ program
 program
   .command("pair")
   .description("Register with relay server and display QR code for iOS pairing")
-  .option("-s, --server <url>", "Relay server URL", "https://clawlinks.cn")
+  .option(
+    "-s, --server <url>",
+    `Relay server URL (default: CLAWCONNECT_RELAY_SERVER_URL or ${DEFAULT_RELAY_SERVER_URL})`
+  )
   .option("-n, --name <name>", "Display name for this host")
   .option("--code-only", "Print only the access code and skip QR code output", false)
-  .action(async (opts: { server: string; name: string; codeOnly?: boolean }) => {
+  .action(async (opts: { server?: string; name?: string; codeOnly?: boolean }) => {
     try {
       await pairCommand(opts);
     } catch (err) {

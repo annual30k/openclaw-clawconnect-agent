@@ -6,20 +6,21 @@ import { execSync } from "child_process";
 import { hostname } from "os";
 import { getServicePlatform } from "../platform/service-manager.js";
 import { toRelayHttpBase } from "./send-file-utils.js";
-const DEFAULT_RELAY_SERVER = "https://clawlinks.cn";
+import { getDefaultRelayServerUrl } from "../config/env.js";
 export async function pairCommand(opts) {
-    const relayServerUrl = opts.server ?? DEFAULT_RELAY_SERVER;
-    const httpBase = toRelayHttpBase(relayServerUrl);
     let gatewayId;
     let relaySecret;
     let accessCode;
     let displayName;
+    let relayServerUrl;
     if (configExists()) {
         const config = readConfig();
+        relayServerUrl = opts.server ?? config.relayServerUrl ?? getDefaultRelayServerUrl();
         gatewayId = config.gatewayId;
         relaySecret = config.relaySecret;
         displayName = opts.name ? sanitizeDisplayName(opts.name) : config.displayName;
         console.log(t("pair.alreadyRegistered", gatewayId));
+        const httpBase = toRelayHttpBase(relayServerUrl);
         const res = await fetch(`${httpBase}/api/relay/accesscode`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -37,8 +38,10 @@ export async function pairCommand(opts) {
         writeConfig({ ...config, relayServerUrl, displayName });
     }
     else {
+        relayServerUrl = opts.server ?? getDefaultRelayServerUrl();
         displayName = opts.name ? sanitizeDisplayName(opts.name) : getDisplayName();
         console.log(t("pair.registering"));
+        const httpBase = toRelayHttpBase(relayServerUrl);
         const res = await fetch(`${httpBase}/api/relay/register`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -55,6 +58,7 @@ export async function pairCommand(opts) {
         writeConfig({ relayServerUrl, gatewayId, relaySecret, displayName });
         console.log(t("pair.registered", gatewayId));
     }
+    const httpBase = toRelayHttpBase(relayServerUrl);
     const qrPayload = JSON.stringify({
         version: 1,
         server: httpBase,

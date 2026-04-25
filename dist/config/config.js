@@ -1,6 +1,7 @@
 import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { DEFAULT_GATEWAY_URL, getConfiguredGatewayUrl } from "./env.js";
 const CONFIG_DIR = join(homedir(), ".clawconnect");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const OPENCLAW_CONFIG_PATH = join(homedir(), ".openclaw", "openclaw.json");
@@ -45,6 +46,10 @@ export function updateVoiceReplyConfig(config, voiceReplyConfig) {
     return nextConfig;
 }
 export function readGatewayUrl() {
+    const configuredGatewayUrl = getConfiguredGatewayUrl();
+    if (configuredGatewayUrl) {
+        return configuredGatewayUrl;
+    }
     try {
         const raw = readFileSync(OPENCLAW_CONFIG_PATH, "utf-8");
         const json = JSON.parse(raw);
@@ -52,7 +57,7 @@ export function readGatewayUrl() {
         return `ws://localhost:${port}`;
     }
     catch {
-        return "ws://localhost:18789";
+        return DEFAULT_GATEWAY_URL;
     }
 }
 /**

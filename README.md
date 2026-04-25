@@ -29,6 +29,26 @@ Options:
 - `-s, --server <url>` — Relay server URL
 - `--code-only` — Print only the access code and skip QR code output
 
+### Environment Configuration
+
+For an installed agent, the CLI creates `~/.clawconnect/.env` with all configurable values documented as comments the first time `clawconnect` runs. You can edit that file to keep defaults in one place:
+
+```bash
+$EDITOR ~/.clawconnect/.env
+```
+
+When developing from this package directory, you can copy `.env.example` to `.env.local`. Existing `~/.clawconnect/.env` files are never overwritten automatically.
+
+Supported values:
+
+- `CLAWCONNECT_RELAY_SERVER_URL` — default relay URL used by `clawconnect pair` when `--server` is omitted
+- `CLAWCONNECT_GATEWAY_URL` — optional local Gateway websocket URL override
+- `CLAWCONNECT_ENV_FILE` — optional explicit env file path. When unset, the agent reads `~/.clawconnect/.env`, then `.env.local`, then `.env`
+- `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD` — Gateway auth fallback
+- `OPENCLAW_TTS_ENABLED`, `OPENCLAW_TTS_VOICE`, `OPENCLAW_TTS_RATE`, `OPENCLAW_TTS_ENGINE` — voice reply defaults
+
+Shell environment variables take priority over env files. Existing pairing credentials in `~/.clawconnect/config.json` still take priority for `clawconnect run`, `status`, and `send-file`; run `clawconnect pair --server <url>` or `clawconnect reset` when you intentionally switch relay servers.
+
 ### Run
 
 Start the host agent:
@@ -164,6 +184,7 @@ clawconnect-agent/
       *.test.ts
     config/
       config.ts
+      env.ts
     i18n/
       index.ts
     platform/
@@ -196,6 +217,7 @@ Tests are colocated with the source as `*.test.ts`. They run with `npm test`, an
 - `src/commands/local-handlers.ts` handles legacy command prefixes and local maintenance actions such as backup, restore, logs, doctor, and gateway restart.
 - `src/commands/local-runtime.ts` resolves the `openclaw` binary and triggers gateway lifecycle actions.
 - `src/commands/provider-handlers.ts` routes provider-specific commands and reuses the same gateway restart path.
+- `src/config/env.ts` loads `.env` files and exposes agent defaults such as relay and Gateway URLs.
 - `src/platform/service-manager.ts` exposes a cross-platform service facade for macOS and Linux.
 - `src/relay/relay-manager.ts` bridges the relay server and the local Gateway, dispatches commands, and handles chat/history fallbacks.
 - `src/relay/gateway-client.ts` manages the websocket connection to OpenClaw Gateway and device authentication.

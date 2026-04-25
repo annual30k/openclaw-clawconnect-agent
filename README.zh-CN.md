@@ -36,6 +36,26 @@ clawconnect pair --code-only
 - `-s, --server <url>`：指定中继服务器地址
 - `--code-only`：只输出访问码，不打印二维码
 
+### 环境配置
+
+本地安装后的 agent 会在第一次运行 `clawconnect` 时自动创建 `~/.clawconnect/.env`，里面会用注释列出所有可配置项。你可以直接编辑这个文件集中维护默认配置：
+
+```bash
+$EDITOR ~/.clawconnect/.env
+```
+
+如果是在这个源码目录里开发，可以把 `.env.example` 复制为 `.env.local`。已有的 `~/.clawconnect/.env` 不会被自动覆盖。
+
+支持的配置项：
+
+- `CLAWCONNECT_RELAY_SERVER_URL`：未传 `--server` 时，`clawconnect pair` 使用的默认中继地址
+- `CLAWCONNECT_GATEWAY_URL`：可选，本机 OpenClaw Gateway WebSocket 地址覆盖值
+- `CLAWCONNECT_ENV_FILE`：可选，显式指定 env 文件路径；未设置时会依次读取 `~/.clawconnect/.env`、`.env.local`、`.env`
+- `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD`：Gateway 鉴权兜底值
+- `OPENCLAW_TTS_ENABLED`、`OPENCLAW_TTS_VOICE`、`OPENCLAW_TTS_RATE`、`OPENCLAW_TTS_ENGINE`：语音回复默认值
+
+Shell 里已经设置的环境变量优先级高于 env 文件。`clawconnect run`、`status`、`send-file` 会继续使用 `~/.clawconnect/config.json` 里已配对保存的 relay；如果要切换中继服务器，请执行 `clawconnect pair --server <url>` 或 `clawconnect reset`。
+
 ### 2. 前台运行
 
 以当前终端前台方式启动代理：
@@ -178,6 +198,7 @@ clawconnect-agent/
       *.test.ts               紧邻源码的单元测试
     config/
       config.ts               配对配置读写
+      env.ts                  env 文件加载和 agent 默认配置
     i18n/
       index.ts                CLI 文案
     platform/
@@ -210,6 +231,7 @@ clawconnect-agent/
 - `src/commands/local-handlers.ts` 负责兼容旧命令前缀，以及备份、恢复、日志、doctor、gateway 重启等本地维护命令。
 - `src/commands/local-runtime.ts` 负责解析 `openclaw` 可执行文件并触发网关生命周期动作。
 - `src/commands/provider-handlers.ts` 负责 provider 专属命令分发，并复用同一套 gateway 重启逻辑。
+- `src/config/env.ts` 负责加载 `.env` 文件，并集中维护 relay、Gateway 等 agent 默认配置。
 - `src/platform/service-manager.ts` 负责 macOS 和 Linux 的跨平台服务管理入口。
 - `src/relay/relay-manager.ts` 负责中继服务器与本地 Gateway 的桥接、命令分发，以及 chat/history 回退处理。
 - `src/relay/gateway-client.ts` 负责连接 OpenClaw Gateway，并处理设备身份认证。
@@ -255,6 +277,7 @@ clawconnect-agent/
 常见文件包括：
 
 - `config.json`：配对配置
+- `.env`：agent 默认环境配置
 - `device-identity.json`：本机身份信息
 - `clawconnect.log`：运行日志
 - `clawconnect-error.log`：错误日志
