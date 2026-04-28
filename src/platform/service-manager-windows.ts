@@ -12,6 +12,23 @@ import type { ServiceStatus } from "./service-manager-common.js";
 
 export const TASK_NAME = "ClawConnectAgent";
 
+function qps(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+export function buildWindowsPowerShellBootstrap(command: string): string {
+  return [
+    // Native process stdout is UTF-8; teach PowerShell to decode it correctly
+    // and keep redirection writes in UTF-8 so log readers see stable text.
+    `$utf8NoBom = [System.Text.UTF8Encoding]::new($false)`,
+    `[Console]::InputEncoding = $utf8NoBom`,
+    `[Console]::OutputEncoding = $utf8NoBom`,
+    `$OutputEncoding = $utf8NoBom`,
+    `$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'`,
+    command,
+  ].join("; ");
+}
+
 /**
  * Build a command-line string suitable for Windows CommandLineToArgvW
  * (used by CreateProcess when schtasks later runs the task).
@@ -129,14 +146,13 @@ export function installWindowsService(): boolean {
       const execPath = args[0];
       const execArgs = args.slice(1);
 
-      // Quote for PowerShell single-quote strings: double embedded ' → ''
-      const qps = (s: string) => `'${s.replace(/'/g, "''")}'`;
-
       // We use 'powershell -WindowStyle Hidden' to launch node without a visible console window.
       // This is the most reliable native way to run a background console app on login.
       // Stdout/stderr are redirected to log files, matching the behavior of the
       // Linux (systemd/nohup) and macOS (launchd) service managers.
-      const innerCmd = `& ${qps(execPath)} ${execArgs.map((a) => qps(a)).join(" ")} >> ${qps(LOG_PATH)} 2>> ${qps(ERROR_LOG_PATH)}`;
+      const innerCmd = buildWindowsPowerShellBootstrap(
+        `& ${qps(execPath)} ${execArgs.map((a) => qps(a)).join(" ")} >> ${qps(LOG_PATH)} 2>> ${qps(ERROR_LOG_PATH)}`
+      );
 
       // The -Argument value uses a PowerShell double-quote string ("" → literal ")
       // so that single quotes from qps() inside it are preserved literally.
@@ -168,7 +184,10 @@ export function installWindowsService(): boolean {
     // Stdout/stderr are redirected to log files via PowerShell >> / 2>> operators.
     const escLogPath = LOG_PATH.replace(/'/g, "''");
     const escErrPath = ERROR_LOG_PATH.replace(/'/g, "''");
-    const fallbackTr = `powershell.exe -WindowStyle Hidden -Command "${cmdLine.replace(/"/g, '\\"')} >> '${escLogPath}' 2>> '${escErrPath}'"`;
+    const fallbackInner = buildWindowsPowerShellBootstrap(
+      `${cmdLine} >> '${escLogPath}' 2>> '${escErrPath}'`
+    );
+    const fallbackTr = `powershell.exe -WindowStyle Hidden -Command "${fallbackInner.replace(/"/g, '\\"')}"`;
 
     execFileSync(
       "schtasks",
