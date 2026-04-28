@@ -1,4 +1,4 @@
-import { readdirSync, statSync, copyFileSync, existsSync, readFileSync } from "fs";
+import { readdirSync, statSync, copyFileSync, existsSync, readFileSync, openSync, readSync, closeSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { createBackup, deleteBackup, listBackups, restoreBackup, updateBackup } from "./backup-manager.js";
@@ -15,6 +15,7 @@ import {
 } from "./local-runtime.js";
 
 const OPENCLAW_DIR = join(homedir(), ".openclaw");
+const CLAWCONNECT_DIR = join(homedir(), ".clawconnect");
 const OPENCLAW_CONFIG = join(OPENCLAW_DIR, "openclaw.json");
 
 // ---------------------------------------------------------------------------
@@ -173,7 +174,7 @@ async function fixToolsPermissions202632(): Promise<LocalResult> {
         const payload = restart.payload as { output?: unknown } | undefined;
         output = typeof payload?.output === "string" ? payload.output.trim() : "";
       } else {
-        output = openclaw(step).toString().trim();
+        output = openclaw(step.split(/\s+/)).toString().trim();
       }
       if (output) {
         outputs.push(output);
@@ -297,7 +298,7 @@ function restoreBackupRecord(params: unknown): LocalResult {
 
 function watchSkill(): LocalResult {
   try {
-    openclaw("config set skills.load.watch true");
+    openclaw(["config", "set", "skills.load.watch", "true"]);
     console.log("[clawconnect] skills.load.watch set to true");
     return { ok: true, payload: { message: "skills.load.watch enabled" } };
   } catch (err) {
@@ -307,7 +308,7 @@ function watchSkill(): LocalResult {
 
 function runDoctor(): LocalResult {
   try {
-    const output = openclaw("doctor").toString();
+    const output = openclaw(["doctor"]).toString();
     console.log("[clawconnect] doctor completed");
     return { ok: true, payload: { output } };
   } catch (err) {
@@ -316,46 +317,128 @@ function runDoctor(): LocalResult {
   }
 }
 
-function readLogs(_params: unknown = undefined): LocalResult {
-  try {
-    const logsDir = join(OPENCLAW_DIR, "logs");
-    let logFiles: string[] = [];
+function stripAnsi(text: string): string {
+  // CSI sequences: ESC [ <params> <final byte>  (final byte 0x40-0x7E)
+  // Covers SGR (m), erase in line/display (K/J), cursor moves, etc.
+  text = text.replace(/\x1B\[[\d;]*[A-Za-z@\[\]\\^_`{|}~-]/g, "");
+  // OSC sequences: ESC ] <params> ST  (ST = BEL \x07 or ESC \)
+  text = text.replace(/\x1B\].*?(?:\x07|\x1B\\)/g, "");
+  return text;
+}
 
-    if (existsSync(logsDir)) {
-      logFiles = readdirSync(logsDir)
-        .filter(f => f.endsWith(".log"))
-        .map(f => join(logsDir, f));
-    } else {
-      logFiles = readdirSync(OPENCLAW_DIR)
-        .filter(f => f.endsWith(".log"))
-        .map(f => join(OPENCLAW_DIR, f));
+function readLogs(params: unknown = undefined): LocalResult {
+  try {
+    const p = params && typeof params === "object" && !Array.isArray(params)
+      ? (params as Record<string, unknown>)
+      : {};
+    const limit = typeof p.limit === "number" ? p.limit : 500;
+
+    const candidates: string[] = [];
+
+    // Primary: ~/.clawconnect/ — where the service (Linux systemd/nohup,
+    // macOS launchd, Windows schtasks) redirects stdout/stderr.
+    if (existsSync(CLAWCONNECT_DIR)) {
+      for (const f of readdirSync(CLAWCONNECT_DIR)) {
+        if (f.endsWith(".log")) candidates.push(join(CLAWCONNECT_DIR, f));
+      }
     }
 
-    if (logFiles.length === 0) {
+    // Fallback: ~/.openclaw/logs/ or ~/.openclaw/*.log — for openclaw
+    // tool logs or legacy installations.
+    const logsDir = join(OPENCLAW_DIR, "logs");
+    if (existsSync(logsDir)) {
+      for (const f of readdirSync(logsDir)) {
+        if (f.endsWith(".log")) candidates.push(join(logsDir, f));
+      }
+    } else if (existsSync(OPENCLAW_DIR)) {
+      for (const f of readdirSync(OPENCLAW_DIR)) {
+        if (f.endsWith(".log")) candidates.push(join(OPENCLAW_DIR, f));
+      }
+    }
+
+    if (candidates.length === 0) {
       return { ok: true, payload: { output: "No log files found." } };
     }
 
-    const logFilesWithMtime = logFiles.map(f => ({ path: f, mtime: statSync(f).mtimeMs }));
-    logFilesWithMtime.sort((a, b) => b.mtime - a.mtime);
-    const latest = logFilesWithMtime[0].path;
-    const allLines = readFileSync(latest, "utf-8")
+    const sorted = candidates
+      .map(f => ({ path: f, mtime: statSync(f).mtimeMs }))
+      .sort((a, b) => {
+        // Prioritize clawconnect.log if mtimes are close (within 1s)
+        const aIsMain = a.path.endsWith("clawconnect.log");
+        const bIsMain = b.path.endsWith("clawconnect.log");
+        if (aIsMain !== bIsMain && Math.abs(a.mtime - b.mtime) < 1000) {
+          return aIsMain ? -1 : 1;
+        }
+        return b.mtime - a.mtime;
+      });
+
+    const latest = sorted[0].path;
+    const stats = statSync(latest);
+    const MAX_READ_SIZE = 1024 * 1024; // 1MB chunk is plenty for the last N lines
+    
+    let buffer: Buffer;
+    let isTailOnly = false;
+    if (stats.size > MAX_READ_SIZE) {
+      const fd = openSync(latest, "r");
+      buffer = Buffer.alloc(MAX_READ_SIZE);
+      readSync(fd, buffer, 0, MAX_READ_SIZE, stats.size - MAX_READ_SIZE);
+      closeSync(fd);
+      isTailOnly = true;
+    } else {
+      buffer = readFileSync(latest);
+    }
+
+    // Detect text encoding of the log file.
+    // ... (rest of the detection logic)
+    let rawContent: string;
+    let encoding: BufferEncoding;
+
+    if (buffer.length >= 2 && buffer[0] === 0xFF && buffer[1] === 0xFE) {
+      // BOM 0xFF 0xFE → UTF-16LE (common on Windows)
+      rawContent = buffer.toString("utf16le");
+      encoding = "utf16le";
+    } else {
+      // Assume UTF-8 first
+      rawContent = buffer.toString("utf-8");
+      encoding = "utf-8";
+
+      // Validate by checking for null characters
+      let nullCount = 0;
+      const checkLength = Math.min(rawContent.length, 200);
+      for (let i = 0; i < checkLength; i++) {
+        if (rawContent.charCodeAt(i) === 0) nullCount++;
+      }
+      if (checkLength > 20 && nullCount > checkLength * 0.1) {
+        rawContent = buffer.toString("utf16le");
+        encoding = "utf16le";
+      }
+    }
+
+    const allLines = rawContent
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n")
       .split("\n");
+
     if (allLines.length > 0 && allLines[allLines.length - 1] === "") {
       allLines.pop();
     }
 
-    console.log(`[clawconnect] logs read from ${latest}`);
+    const totalLines = allLines.length;
+    const startIndex = Math.max(0, totalLines - limit);
+    const lines = allLines.slice(startIndex).map(stripAnsi);
+    const returnedLines = lines.length;
+    const truncated = startIndex > 0;
+
+    console.log(`[clawconnect] logs read from ${latest} (encoding=${encoding}, limit=${limit}, total=${totalLines})`);
     return {
       ok: true,
       payload: {
         logPath: latest,
-        lines: allLines,
-        totalLines: allLines.length,
-        returnedLines: allLines.length,
-        truncated: false,
-        output: `[${latest}]\n${allLines.join("\n")}`,
+        lines,
+        totalLines,
+        returnedLines,
+        truncated,
+        output: `[${latest}]\n${lines.join("\n")}`,
       },
     };
   } catch (err) {
@@ -376,7 +459,7 @@ function getOpenclawVersion(): LocalResult {
 
   for (const args of candidates) {
     try {
-      const output = openclaw(args).toString().trim();
+      const output = openclaw([args]).toString().trim();
       const version = output
         .split("\n")
         .map(line => line.trim())
@@ -405,7 +488,7 @@ function getOpenclawVersion(): LocalResult {
 
 function updateOpenclaw(): LocalResult {
   try {
-    const output = openclaw("update").toString();
+    const output = openclaw(["update"]).toString();
     console.log("[clawconnect] openclaw updated");
     return { ok: true, payload: { output: output || "openclaw updated successfully." } };
   } catch (err) {

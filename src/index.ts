@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { createRequire } from "module";
+import { ensureWindowsConsoleUtf8 } from "./platform/service-manager-common.js";
 import { DEFAULT_RELAY_SERVER_URL, ensureUserEnvFile, loadAgentEnv } from "./config/env.js";
 import { pairCommand } from "./commands/pair.js";
 import { runCommand } from "./commands/run.js";
@@ -13,6 +14,7 @@ const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
 ensureUserEnvFile();
 loadAgentEnv();
+ensureWindowsConsoleUtf8();
 
 const program = new Command();
 
@@ -88,7 +90,7 @@ program
 
 program
   .command("install")
-  .description("Register as a background service (launchd on macOS, systemd --user on Linux)")
+  .description("Register as a background service (launchd on macOS, systemd --user on Linux, Startup on Windows)")
   .action(() => {
     installCommand();
   });

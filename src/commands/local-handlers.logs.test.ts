@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, rm, utimes } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,25 +33,40 @@ test.after(async () => {
   await rm(tempHome, { recursive: true, force: true });
 });
 
-test("logs command returns all log lines from the newest file", () => {
-  const result = handleLocalCommand("clawpilot.logs", { limit: 100 });
+test("logs command returns all log lines from the newest file by default", () => {
+  const result = handleLocalCommand("clawpilot.logs");
   assert.ok(result);
   assert.equal(result?.ok, true);
 
-  const payload = result?.payload as {
-    logPath?: string;
-    lines?: string[];
-    totalLines?: number;
-    returnedLines?: number;
-    truncated?: boolean;
-    output?: string;
-  };
-
+  const payload = result?.payload as any;
   assert.equal(payload.logPath, latestLogPath);
   assert.equal(payload.totalLines, 120);
   assert.equal(payload.returnedLines, 120);
   assert.equal(payload.truncated, false);
-  assert.deepEqual(payload.lines?.slice(0, 3), ["new-1", "new-2", "new-3"]);
-  assert.deepEqual(payload.lines?.slice(-3), ["new-118", "new-119", "new-120"]);
-  assert.match(payload.output ?? "", /^\[/);
+});
+
+test("logs command respects limit parameter", () => {
+  const result = handleLocalCommand("clawpilot.logs", { limit: 10 });
+  assert.ok(result);
+  assert.equal(result?.ok, true);
+
+  const payload = result?.payload as any;
+  assert.equal(payload.returnedLines, 10);
+  assert.equal(payload.truncated, true);
+  assert.equal(payload.lines.length, 10);
+  assert.equal(payload.lines[payload.lines.length - 1], "new-120");
+});
+
+test("logs command strips ANSI codes", async () => {
+  const ansiLogPath = join(logsDir, "ansi.log");
+  await writeFile(ansiLogPath, "\u001b[32mSUCCESS\u001b[39m\n");
+  
+  // Update mtime to make it newest (2 seconds ahead of current to bypass the "prefer main log" logic)
+  const now = Date.now();
+  await utimes(ansiLogPath, new Date(now + 2000), new Date(now + 2000));
+
+  const result = handleLocalCommand("clawpilot.logs");
+  const payload = result?.payload as any;
+  
+  assert.equal(payload.lines[0], "SUCCESS");
 });

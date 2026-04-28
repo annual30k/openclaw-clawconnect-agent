@@ -3,6 +3,10 @@ import { randomUUID, generateKeyPairSync, createPrivateKey, sign, createPublicKe
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import {
+  setRestrictiveDirPermissions,
+  setRestrictiveFilePermissions,
+} from "../platform/service-manager-common.js";
 
 // ---------------------------------------------------------------------------
 // Device identity (Ed25519, persisted across restarts)
@@ -49,8 +53,11 @@ function loadOrCreateDeviceIdentity(): DeviceIdentity {
   const deviceId = createHash("sha256").update(rawPublicKeyBytes(publicKeyPem)).digest("hex");
   const identity: DeviceIdentity = { deviceId, publicKeyPem, privateKeyPem };
 
-  mkdirSync(join(homedir(), ".clawconnect"), { recursive: true });
-  writeFileSync(IDENTITY_PATH, JSON.stringify({ version: 1, ...identity, createdAtMs: Date.now() }, null, 2) + "\n", { mode: 0o600 });
+  const clawconnectDir = join(homedir(), ".clawconnect");
+  mkdirSync(clawconnectDir, { recursive: true });
+  writeFileSync(IDENTITY_PATH, JSON.stringify({ version: 1, ...identity, createdAtMs: Date.now() }, null, 2) + "\n", "utf8");
+  setRestrictiveDirPermissions(clawconnectDir);
+  setRestrictiveFilePermissions(IDENTITY_PATH);
   return identity;
 }
 

@@ -108,7 +108,7 @@ function sanitizeDisplayName(name: string): string {
     .replace(/[\u2018\u2019\u201C\u201D]/g, "'") // Smart quotes -> regular quotes
     .replace(/[\u2013\u2014]/g, "-") // En/em dashes -> regular dash
     .replace(/[\u00A0]/g, " ") // Non-breaking space -> regular space
-    .replace(/[^\x20-\x7E]/g, ""); // Remove any other non-ASCII characters
+    .replace(/[\x00-\x1F\x7F]/g, ""); // Remove control characters only
 }
 
 function getDisplayName(): string {

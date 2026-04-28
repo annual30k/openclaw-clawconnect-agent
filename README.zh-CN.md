@@ -1,6 +1,6 @@
 # ClawConnect Agent 使用说明
 
-`ClawConnect Agent` 是运行在 macOS 或 Linux 主机上的 OpenClaw 远程连接代理，用于把本机 OpenClaw Gateway 接入你的中继站，供移动端远程访问。
+`ClawConnect Agent` 是运行在 macOS、Linux 或 Windows 主机上的 OpenClaw 远程连接代理，用于把本机 OpenClaw Gateway 接入你的中继站，供移动端远程访问。
 
 ## 安装
 
@@ -95,6 +95,7 @@ clawconnect install
 - macOS：安装为 `launchd` 用户服务
 - Linux：优先使用 `systemd --user`
 - 如果 Linux 当前环境不支持 `systemd --user`，会自动回退到 `nohup`
+- Windows：注册为 Windows Task Scheduler 任务，登录时自动静默启动（`powershell -WindowStyle Hidden`）
 
 在不支持 `systemd --user` 的 Linux 环境下，会生成一个备用启动脚本：
 
@@ -232,7 +233,7 @@ clawconnect-agent/
 - `src/commands/local-runtime.ts` 负责解析 `openclaw` 可执行文件并触发网关生命周期动作。
 - `src/commands/provider-handlers.ts` 负责 provider 专属命令分发，并复用同一套 gateway 重启逻辑。
 - `src/config/env.ts` 负责加载 `.env` 文件，并集中维护 relay、Gateway 等 agent 默认配置。
-- `src/platform/service-manager.ts` 负责 macOS 和 Linux 的跨平台服务管理入口。
+- `src/platform/service-manager.ts` 负责 macOS、Linux 和 Windows 的跨平台服务管理入口。
 - `src/relay/relay-manager.ts` 负责中继服务器与本地 Gateway 的桥接、命令分发，以及 chat/history 回退处理。
 - `src/relay/gateway-client.ts` 负责连接 OpenClaw Gateway，并处理设备身份认证。
 - `src/relay/session-context.ts` 负责读取会话默认值和上下文使用量快照。
@@ -285,7 +286,7 @@ clawconnect-agent/
 
 ## 前置要求
 
-- macOS 或 Linux
+- macOS、Linux 或 Windows 10 / Server 2016+
 - Node.js `18+`
 - 本机已安装并可运行 `openclaw`
 - 本机 OpenClaw Gateway 能正常启动

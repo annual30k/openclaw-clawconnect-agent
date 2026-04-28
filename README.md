@@ -1,6 +1,6 @@
 # ClawConnect Agent
 
-> OpenClaw host agent for macOS and Linux hosts — connects your gateway machine to your ClawConnect relay server.
+> OpenClaw host agent for macOS, Linux and Windows hosts — connects your gateway machine to your ClawConnect relay server.
 
 ## Installation
 
@@ -83,6 +83,7 @@ clawconnect install
 
 - macOS: installs a `launchd` user agent
 - Linux: prefers `systemd --user`, and falls back to `nohup` when `systemctl --user` is unavailable
+- Windows: registers a Windows Task Scheduler task that auto-starts at logon with silent console (`powershell -WindowStyle Hidden`)
 
 On Linux hosts without `systemd --user`, `clawconnect install` will generate a fallback launcher at:
 
@@ -218,7 +219,7 @@ Tests are colocated with the source as `*.test.ts`. They run with `npm test`, an
 - `src/commands/local-runtime.ts` resolves the `openclaw` binary and triggers gateway lifecycle actions.
 - `src/commands/provider-handlers.ts` routes provider-specific commands and reuses the same gateway restart path.
 - `src/config/env.ts` loads `.env` files and exposes agent defaults such as relay and Gateway URLs.
-- `src/platform/service-manager.ts` exposes a cross-platform service facade for macOS and Linux.
+- `src/platform/service-manager.ts` exposes a cross-platform service facade for macOS, Linux, and Windows.
 - `src/relay/relay-manager.ts` bridges the relay server and the local Gateway, dispatches commands, and handles chat/history fallbacks.
 - `src/relay/gateway-client.ts` manages the websocket connection to OpenClaw Gateway and device authentication.
 - `src/relay/session-context.ts` reads session defaults and context usage snapshots.
@@ -251,7 +252,7 @@ Tests are colocated with the source as `*.test.ts`. They run with `npm test`, an
 
 ## Requirements
 
-- macOS or Linux
+- macOS, Linux, or Windows 10 / Server 2016+
 - Node.js 18+
 
 ## License

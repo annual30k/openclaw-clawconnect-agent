@@ -19,6 +19,9 @@ export interface RelayManagerOptions {
     defaultVoiceReplyConfig?: VoiceReplyConfig;
     onConnected?: () => void;
     onDisconnected?: () => void;
+    /** Optional abort signal.  When aborted the relay WebSocket is closed
+     *  cleanly (code 1001) and the retry loop stops. */
+    signal?: AbortSignal;
 }
 /**
  * Connects to the cloud relay server and the local OpenClaw Gateway,

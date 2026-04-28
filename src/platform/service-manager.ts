@@ -19,6 +19,13 @@ import {
   stopLinuxService,
   uninstallLinuxService,
 } from "./service-manager-linux.js";
+import {
+  getWindowsServiceStatus,
+  installWindowsService,
+  restartWindowsService,
+  stopWindowsService,
+  uninstallWindowsService,
+} from "./service-manager-windows.js";
 import type { ServicePlatform, ServiceStatus } from "./service-manager-common.js";
 
 export type { ServicePlatform, ServiceStatus } from "./service-manager-common.js";
@@ -111,6 +118,8 @@ export function installService(): boolean {
       return installMacService();
     case "linux":
       return installLinuxService();
+    case "windows":
+      return installWindowsService();
     default:
       return false;
   }
@@ -122,6 +131,8 @@ export function restartService(): boolean {
       return restartMacService();
     case "linux":
       return restartLinuxService();
+    case "windows":
+      return restartWindowsService();
     default:
       return false;
   }
@@ -133,6 +144,8 @@ export function stopService(): boolean {
       return uninstallMacArtifacts();
     case "linux":
       return stopLinuxService();
+    case "windows":
+      return stopWindowsService();
     default:
       return false;
   }
@@ -144,6 +157,8 @@ export function uninstallService(): boolean {
       return uninstallMacArtifacts();
     case "linux":
       return uninstallLinuxService();
+    case "windows":
+      return uninstallWindowsService();
     default:
       return false;
   }
@@ -176,6 +191,10 @@ export function getServiceStatus(): ServiceStatus {
     return getLinuxServiceStatus();
   }
 
+  if (platform === "windows") {
+    return getWindowsServiceStatus();
+  }
+
   return {
     platform,
     installed: false,
@@ -193,4 +212,5 @@ export const servicePaths = {
   linuxServicePath: LINUX_SERVICE_PATH,
   linuxNohupPidPath: LINUX_NOHUP_PID_PATH,
   linuxNohupStartScriptPath: LINUX_NOHUP_START_SCRIPT_PATH,
+  windowsServicePath: "",
 };

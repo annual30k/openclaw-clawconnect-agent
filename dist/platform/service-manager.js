@@ -3,6 +3,7 @@ import { homedir } from "os";
 import { join } from "path";
 import { detectPlatform, ensureLogDir, ERROR_LOG_PATH, getProgramArgs, LINUX_NOHUP_PID_PATH, LINUX_NOHUP_START_SCRIPT_PATH, LINUX_SERVICE_PATH, LOG_PATH, run, } from "./service-manager-common.js";
 import { getLinuxServiceStatus, installLinuxService, restartLinuxService, stopLinuxService, uninstallLinuxService, } from "./service-manager-linux.js";
+import { getWindowsServiceStatus, installWindowsService, restartWindowsService, stopWindowsService, uninstallWindowsService, } from "./service-manager-windows.js";
 const MAC_LABEL = "com.openclaw.clawconnect.agent";
 const MAC_LABEL_OLD = "com.rethinkingstudio.clawpilot";
 const MAC_PLIST_DIR = join(homedir(), "Library", "LaunchAgents");
@@ -86,6 +87,8 @@ export function installService() {
             return installMacService();
         case "linux":
             return installLinuxService();
+        case "windows":
+            return installWindowsService();
         default:
             return false;
     }
@@ -96,6 +99,8 @@ export function restartService() {
             return restartMacService();
         case "linux":
             return restartLinuxService();
+        case "windows":
+            return restartWindowsService();
         default:
             return false;
     }
@@ -106,6 +111,8 @@ export function stopService() {
             return uninstallMacArtifacts();
         case "linux":
             return stopLinuxService();
+        case "windows":
+            return stopWindowsService();
         default:
             return false;
     }
@@ -116,6 +123,8 @@ export function uninstallService() {
             return uninstallMacArtifacts();
         case "linux":
             return uninstallLinuxService();
+        case "windows":
+            return uninstallWindowsService();
         default:
             return false;
     }
@@ -145,6 +154,9 @@ export function getServiceStatus() {
     if (platform === "linux") {
         return getLinuxServiceStatus();
     }
+    if (platform === "windows") {
+        return getWindowsServiceStatus();
+    }
     return {
         platform,
         installed: false,
@@ -161,5 +173,6 @@ export const servicePaths = {
     linuxServicePath: LINUX_SERVICE_PATH,
     linuxNohupPidPath: LINUX_NOHUP_PID_PATH,
     linuxNohupStartScriptPath: LINUX_NOHUP_START_SCRIPT_PATH,
+    windowsServicePath: "",
 };
 //# sourceMappingURL=service-manager.js.map

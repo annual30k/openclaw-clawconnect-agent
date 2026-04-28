@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "fs";
+import { execSync } from "child_process";
 import { configExists, readConfig, readGatewayUrl } from "../config/config.js";
 import { t } from "../i18n/index.js";
 import { getServiceStatus } from "../platform/service-manager.js";
@@ -62,7 +63,26 @@ function readHealth(logPath) {
     };
 }
 function readTailLines(path, maxLines) {
-    const raw = readFileSync(path, "utf-8");
+    let raw;
+    try {
+        raw = readFileSync(path, "utf-8");
+    }
+    catch {
+        // Windows: agent process may hold the log file with exclusive write lock,
+        // causing EBUSY/EPERM on read. Attempt to read via 'type' command which 
+        // often bypasses simple write locks.
+        if (process.platform === "win32") {
+            try {
+                raw = execSync(`type "${path}"`, { stdio: "pipe", windowsHide: true }).toString();
+            }
+            catch {
+                return [];
+            }
+        }
+        else {
+            return [];
+        }
+    }
     const lines = raw.split(/\r?\n/).filter(Boolean);
     return lines.slice(-maxLines);
 }

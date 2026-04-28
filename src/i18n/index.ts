@@ -1,3 +1,5 @@
+import { execFileSync } from "child_process";
+
 type Locale = "en" | "zh";
 type MsgFn = (...args: string[]) => string;
 type MsgValue = string | MsgFn;
@@ -148,7 +150,26 @@ const zh: Record<string, MsgValue> = {
 
 function detectLocale(): Locale {
   const lang = process.env.LANG ?? process.env.LC_ALL ?? process.env.LANGUAGE ?? "";
-  return lang.toLowerCase().startsWith("zh") ? "zh" : "en";
+  if (lang.toLowerCase().startsWith("zh")) return "zh";
+
+  // Windows: LANG/LC_ALL are rarely set — query the system locale via PowerShell
+  if (process.platform === "win32") {
+    try {
+      const locale = execFileSync(
+        "powershell",
+        ["-NoProfile", "-Command", "(Get-Culture).Name"],
+        { stdio: "pipe", timeout: 3000 }
+      )
+        .toString()
+        .trim()
+        .toLowerCase();
+      if (locale.startsWith("zh")) return "zh";
+    } catch {
+      // Non-fatal: fall back to English
+    }
+  }
+
+  return "en";
 }
 
 const locale: Locale = detectLocale();

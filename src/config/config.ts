@@ -1,7 +1,11 @@
-import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { DEFAULT_GATEWAY_URL, getConfiguredGatewayUrl } from "./env.js";
+import {
+  setRestrictiveDirPermissions,
+  setRestrictiveFilePermissions,
+} from "../platform/service-manager-common.js";
 
 const CONFIG_DIR = join(homedir(), ".clawconnect");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
@@ -38,9 +42,10 @@ export function readConfig(): ClawConnectConfig {
 }
 
 export function writeConfig(config: ClawConnectConfig): void {
-  mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { encoding: "utf-8", mode: 0o600 });
-  chmodSync(CONFIG_PATH, 0o600);
+  mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+  setRestrictiveDirPermissions(CONFIG_DIR);
+  setRestrictiveFilePermissions(CONFIG_PATH);
 }
 
 export function readVoiceReplyConfig(cfg: ClawConnectConfig): VoiceReplyConfig {

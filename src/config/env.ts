@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join, resolve } from "path";
+import { setRestrictiveFilePermissions } from "../platform/service-manager-common.js";
 
 export const DEFAULT_RELAY_SERVER_URL = "https://clawlinks.cn";
 export const DEFAULT_GATEWAY_URL = "ws://localhost:18789";
@@ -71,8 +72,9 @@ export function ensureUserEnvFile(path = getUserEnvPath()): boolean {
   if (existsSync(path)) {
     return false;
   }
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  writeFileSync(path, AGENT_ENV_TEMPLATE, { encoding: "utf-8", mode: 0o600 });
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, AGENT_ENV_TEMPLATE, "utf-8");
+  setRestrictiveFilePermissions(path);
   return true;
 }
 

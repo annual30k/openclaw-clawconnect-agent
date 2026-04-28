@@ -1,4 +1,5 @@
 import { existsSync, unlinkSync } from "fs";
+import { execFileSync } from "child_process";
 import { join } from "path";
 import { homedir } from "os";
 import { t } from "../i18n/index.js";
@@ -17,6 +18,14 @@ export function isInstalled(): boolean {
   if (platform === "macos") return existsSync(servicePaths.macPlistPath);
   if (platform === "linux") {
     return existsSync(servicePaths.linuxServicePath) || existsSync(servicePaths.linuxNohupStartScriptPath);
+  }
+  if (platform === "windows") {
+    try {
+      execFileSync("schtasks", ["/query", "/tn", "ClawConnectAgent"], { stdio: "pipe" });
+      return true;
+    } catch {
+      return false;
+    }
   }
   return false;
 }
@@ -44,6 +53,8 @@ export function installCommand(): void {
     console.log(t("install.serviceFileWritten", servicePaths.linuxServicePath));
     console.log(t("install.startManually", "systemctl --user daemon-reload && systemctl --user enable --now clawconnect-agent.service"));
     console.log(t("install.startManually", `bash "${servicePaths.linuxNohupStartScriptPath}"`));
+  } else if (platform === "windows") {
+    console.log(t("install.startManually", 'schtasks /run /tn "ClawConnectAgent"'));
   }
 }
 
@@ -113,6 +124,8 @@ function platformName(platform: ReturnType<typeof getServicePlatform>): string {
       return "launchd";
     case "linux":
       return "systemd/nohup";
+    case "windows":
+      return "Windows Task Scheduler";
     default:
       return process.platform;
   }

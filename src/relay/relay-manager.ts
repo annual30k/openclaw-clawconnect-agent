@@ -77,6 +77,9 @@ export interface RelayManagerOptions {
   defaultVoiceReplyConfig?: VoiceReplyConfig;
   onConnected?: () => void;
   onDisconnected?: () => void;
+  /** Optional abort signal.  When aborted the relay WebSocket is closed
+   *  cleanly (code 1001) and the retry loop stops. */
+  signal?: AbortSignal;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +105,15 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       console.error("Failed to create relay WebSocket:", err);
       resolve(true);
       return;
+    }
+
+    // If a shutdown signal was provided, close the relay cleanly when fired.
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        relayWs.close(1001, "shutdown");
+      } else {
+        opts.signal.addEventListener("abort", () => relayWs.close(1001, "shutdown"), { once: true });
+      }
     }
 
     let gatewayClient: OpenClawGatewayClient | null = null;
@@ -715,7 +727,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       contextUsageRefreshes.clear();
       // Code 4000 = server kicked us because another relay client took over.
       // Stop retrying so the two instances don't bounce each other forever.
-      resolve(code !== 4000);
+      // Also stop retrying when the shutdown signal was received.
+      const intentional = opts.signal?.aborted || code === 4000;
+      resolve(!intentional);
     });
 
     relayWs.on("error", (err) => {

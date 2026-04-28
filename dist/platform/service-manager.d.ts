@@ -13,4 +13,5 @@ export declare const servicePaths: {
     linuxServicePath: string;
     linuxNohupPidPath: string;
     linuxNohupStartScriptPath: string;
+    windowsServicePath: string;
 };

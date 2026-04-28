@@ -1,3 +1,4 @@
+import { execFileSync } from "child_process";
 const en = {
     // pair
     "pair.alreadyRegistered": (id) => `Gateway already registered (id=${id}). Refreshing access code…`,
@@ -134,7 +135,23 @@ const zh = {
 };
 function detectLocale() {
     const lang = process.env.LANG ?? process.env.LC_ALL ?? process.env.LANGUAGE ?? "";
-    return lang.toLowerCase().startsWith("zh") ? "zh" : "en";
+    if (lang.toLowerCase().startsWith("zh"))
+        return "zh";
+    // Windows: LANG/LC_ALL are rarely set — query the system locale via PowerShell
+    if (process.platform === "win32") {
+        try {
+            const locale = execFileSync("powershell", ["-NoProfile", "-Command", "(Get-Culture).Name"], { stdio: "pipe", timeout: 3000 })
+                .toString()
+                .trim()
+                .toLowerCase();
+            if (locale.startsWith("zh"))
+                return "zh";
+        }
+        catch {
+            // Non-fatal: fall back to English
+        }
+    }
+    return "en";
 }
 const locale = detectLocale();
 const msgs = locale === "zh" ? zh : en;

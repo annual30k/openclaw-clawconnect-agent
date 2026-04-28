@@ -1,5 +1,5 @@
 import { existsSync } from "fs";
-import { dirname, join, resolve } from "path";
+import { delimiter, dirname, join, resolve } from "path";
 import { homedir } from "os";
 import { execFileSync, execSync, spawn } from "child_process";
 
@@ -35,28 +35,60 @@ export type LocalCommandContext = {
 // ---------------------------------------------------------------------------
 
 const NODE_BIN_DIR = dirname(process.execPath);
+const IS_WINDOWS = process.platform === "win32";
 
-const SUBPROCESS_ENV: NodeJS.ProcessEnv = {
-  ...process.env,
-  HOME: homedir(),
-  PATH: [
+const SUBPROCESS_ENV: NodeJS.ProcessEnv = (() => {
+  // On Windows, environment variables are case-insensitive.  process.env may
+  // contain both `PATH` and `Path`, and spreading both into the child-process
+  // environment block can lead to unpredictable path resolution.
+  // Build the env object by hand, skipping all case variants of PATH.
+  const env: NodeJS.ProcessEnv = {};
+  const seen = new Set<string>();
+  for (const [key, value] of Object.entries(process.env)) {
+    const upper = key.toUpperCase();
+    if (upper === "PATH") continue; // will be set explicitly below
+    if (!seen.has(upper)) {
+      seen.add(upper);
+      env[key] = value;
+    }
+  }
+
+  env.HOME = homedir();
+  if (IS_WINDOWS) {
+    env.SystemRoot = process.env.SystemRoot;
+  }
+  env.PATH = [
     NODE_BIN_DIR,
     join(homedir(), ".openclaw", "bin"),
     join(homedir(), ".local", "bin"),
     join(homedir(), ".npm-global", "bin"),
     process.env.PNPM_HOME,
     join(homedir(), ".local", "share", "pnpm"),
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/local/bin",
-    "/usr/local/sbin",
-    process.env.PATH ?? "/usr/bin:/bin",
-  ].join(":"),
-};
+    ...(IS_WINDOWS
+      ? []
+      : [
+          "/opt/homebrew/bin",
+          "/opt/homebrew/sbin",
+          "/usr/local/bin",
+          "/usr/local/sbin",
+          "/usr/bin",
+          "/bin",
+        ]),
+    process.env.PATH ?? (IS_WINDOWS ? "" : "/usr/bin:/bin"),
+  ]
+    .filter(Boolean)
+    .join(delimiter);
+
+  return env;
+})();
 
 function canRunOpenclawBin(candidate: string): boolean {
   try {
-    execFileSync(candidate, ["--version"], { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 });
+    if (IS_WINDOWS && (candidate.endsWith(".js") || candidate.endsWith(".mjs"))) {
+      execFileSync(process.execPath, [candidate, "--version"], { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 });
+    } else {
+      execFileSync(candidate, ["--version"], { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 });
+    }
     return true;
   } catch {
     return false;
@@ -69,8 +101,18 @@ function bundledOpenclawBin(): string | null {
     return explicitPackageBin;
   }
 
+  // On Windows, node_modules might be in a different structure if globally installed.
   const candidate = resolve(NODE_BIN_DIR, "..", "lib", "node_modules", "openclaw", "openclaw.mjs");
-  return existsSync(candidate) ? candidate : null;
+  if (existsSync(candidate)) return candidate;
+  
+  const winCandidate = resolve(NODE_BIN_DIR, "node_modules", "openclaw", "openclaw.mjs");
+  if (IS_WINDOWS && existsSync(winCandidate)) return winCandidate;
+
+  // Windows npm global install path: %APPDATA%\npm\node_modules\...
+  const winNpmGlobalCandidate = join(process.env.APPDATA ?? homedir(), "npm", "node_modules", "openclaw", "openclaw.mjs");
+  if (IS_WINDOWS && existsSync(winNpmGlobalCandidate)) return winNpmGlobalCandidate;
+
+  return null;
 }
 
 export function selectOpenclawBinCandidate(
@@ -110,23 +152,28 @@ export function selectOpenclawBinCandidate(
 function resolveOpenclawBin(): string {
   let pathBin: string | undefined;
   try {
-    const p = execSync("which openclaw", { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 })
+    const whichCmd = IS_WINDOWS ? "where openclaw" : "which openclaw";
+    const p = execSync(whichCmd, { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 })
       .toString().trim();
-    pathBin = p || undefined;
+    // 'where' might return multiple lines, take the first one.
+    pathBin = p.split(/\r?\n/)[0] || undefined;
   } catch {
     // fall through
   }
 
+  const extraBins = [
+    join(homedir(), ".openclaw", "bin", IS_WINDOWS ? "openclaw.cmd" : "openclaw"),
+    join(homedir(), ".openclaw", "bin", "openclaw"),
+    join(homedir(), ".local", "bin", "openclaw"),
+    join(homedir(), ".npm-global", "bin", "openclaw"),
+    ...(process.env.PNPM_HOME ? [join(process.env.PNPM_HOME, "openclaw")] : []),
+    join(homedir(), ".local", "share", "pnpm", "openclaw"),
+  ];
+
   return selectOpenclawBinCandidate({
     explicitBin: process.env.OPENCLAW_BIN,
     pathBin,
-    extraBins: [
-      join(homedir(), ".openclaw", "bin", "openclaw"),
-      join(homedir(), ".local", "bin", "openclaw"),
-      join(homedir(), ".npm-global", "bin", "openclaw"),
-      ...(process.env.PNPM_HOME ? [join(process.env.PNPM_HOME, "openclaw")] : []),
-      join(homedir(), ".local", "share", "pnpm", "openclaw"),
-    ],
+    extraBins,
     packageBin: bundledOpenclawBin(),
   });
 }
@@ -156,13 +203,25 @@ export function errorMessage(err: unknown): string {
 }
 
 /** Run openclaw with the resolved path and the enriched subprocess environment. */
-export function openclaw(args: string): Buffer {
-  return execSync(`"${getOpenclawBin()}" ${args}`, { stdio: "pipe", env: SUBPROCESS_ENV });
+export function openclaw(args: string[]): Buffer {
+  const bin = getOpenclawBin();
+  if (IS_WINDOWS && (bin.endsWith(".js") || bin.endsWith(".mjs"))) {
+    return execFileSync(process.execPath, [bin, ...args], { stdio: "pipe", env: SUBPROCESS_ENV });
+  }
+  return execFileSync(bin, args, { stdio: "pipe", env: SUBPROCESS_ENV });
 }
 
 function launchGatewayLifecycleCommand(action: "start" | "restart", source = "clawconnect"): LocalResult {
   try {
-    const child = spawn(getOpenclawBin(), ["gateway", action], {
+    const openclawBin = getOpenclawBin();
+    const spawnArgs = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
+      ? [openclawBin, "gateway", action]
+      : ["gateway", action];
+    const spawnExe = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
+      ? process.execPath
+      : openclawBin;
+
+    const child = spawn(spawnExe, spawnArgs, {
       env: SUBPROCESS_ENV,
       stdio: "ignore",
       detached: true,
@@ -207,7 +266,7 @@ export function resolveGatewayRemoteRestartAction(runtime: GatewayRuntimeState):
 
 function readGatewayRuntimeState(): GatewayRuntimeState {
   try {
-    const output = openclaw("gateway status --no-probe").toString();
+    const output = openclaw(["gateway", "status", "--no-probe"]).toString();
     return parseGatewayRuntimeState(output);
   } catch (err) {
     return parseGatewayRuntimeState(execErrorOutput(err));
@@ -235,7 +294,14 @@ export async function runGatewayLifecycleStreaming(
   context: LocalCommandContext = {}
 ): Promise<LocalResult> {
   const openclawBin = getOpenclawBin();
-  const child = spawn(openclawBin, ["gateway", action], {
+  const spawnArgs = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
+    ? [openclawBin, "gateway", action]
+    : ["gateway", action];
+  const spawnExe = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
+    ? process.execPath
+    : openclawBin;
+
+  const child = spawn(spawnExe, spawnArgs, {
     env: SUBPROCESS_ENV,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
@@ -378,7 +444,14 @@ export async function runGatewayLifecycleStreaming(
 
 export async function runDoctorFix(context: LocalCommandContext = {}): Promise<LocalResult> {
   const openclawBin = getOpenclawBin();
-  const child = spawn(openclawBin, ["doctor", "--fix"], {
+  const spawnArgs = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
+    ? [openclawBin, "doctor", "--fix"]
+    : ["doctor", "--fix"];
+  const spawnExe = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
+    ? process.execPath
+    : openclawBin;
+
+  const child = spawn(spawnExe, spawnArgs, {
     env: SUBPROCESS_ENV,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
