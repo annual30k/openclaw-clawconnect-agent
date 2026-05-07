@@ -318,6 +318,20 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         },
       ).catch((error) => {
         console.warn(`[relay] voice reply generation failed sessionKey=${sessionKey}: ${String(error)}`);
+        send({
+          type: "event",
+          event: "chat",
+          payload: {
+            runId,
+            sessionKey,
+            state: "final",
+            role: "assistant",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: normalizedText }],
+            },
+          },
+        });
       });
     }
 
