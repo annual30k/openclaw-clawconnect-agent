@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import {
+  buildWindowsDirAclGrants,
+  buildWindowsFileAclGrant,
   detectPlatform,
   ensureLogDir,
   ERROR_LOG_PATH,
@@ -11,6 +13,8 @@ import {
   LINUX_SERVICE_PATH,
   LOG_PATH,
   run,
+  setRestrictiveDirPermissions,
+  setRestrictiveFilePermissions,
 } from "./service-manager-common.js";
 import {
   getLinuxServiceStatus,
@@ -29,6 +33,12 @@ import {
 import type { ServicePlatform, ServiceStatus } from "./service-manager-common.js";
 
 export type { ServicePlatform, ServiceStatus } from "./service-manager-common.js";
+export {
+  buildWindowsDirAclGrants,
+  buildWindowsFileAclGrant,
+  setRestrictiveDirPermissions,
+  setRestrictiveFilePermissions,
+} from "./service-manager-common.js";
 
 const MAC_LABEL = "com.openclaw.clawconnect.agent";
 const MAC_LABEL_OLD = "com.rethinkingstudio.clawpilot";

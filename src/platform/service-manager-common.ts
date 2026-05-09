@@ -92,12 +92,24 @@ export function ensureWindowsConsoleUtf8(): void {
   }
 }
 
+export function buildWindowsFileAclGrant(username: string): string {
+  return `${username}:(M)`;
+}
+
+export function buildWindowsDirAclGrants(username: string): string[] {
+  return [
+    `${username}:(M)`,
+    `${username}:(OI)(CI)(M)`,
+  ];
+}
+
 /**
  * Restrict a file's permissions to the owning user only.
  *
  * - On Unix: chmod 0o600 (owner read + write).
  * - On Windows: `icacls` removes inherited ACEs and grants only the
- *   current user Read + Write access.  This prevents other processes
+ *   current user Modify access. This preserves delete rights while still
+ *   preventing other processes
  *   (including other user sessions) from reading sensitive tokens or
  *   private keys, closing the false‑security gap where `{ mode: 0o600 }`
  *   is silently ignored on Windows.
@@ -120,7 +132,7 @@ export function setRestrictiveFilePermissions(filePath: string): void {
     if (!username) return;
     execFileSync(
       "icacls",
-      [filePath, "/inheritance:r", "/grant", `${username}:(R,W)`],
+      [filePath, "/inheritance:r", "/grant:r", buildWindowsFileAclGrant(username)],
       { stdio: "pipe", timeout: 5000 },
     );
   } catch {
@@ -134,7 +146,7 @@ export function setRestrictiveFilePermissions(filePath: string): void {
  *
  * - On Unix: chmod 0o700 (owner read + write + execute/traverse).
  * - On Windows: `icacls` removes inherited ACEs and grants the current
- *   user Read, Write, and eXecute (traverse) rights, inherited by both
+ *   user Modify rights on the directory and inherited by both
  *   child files (OI) and child directories (CI).
  */
 export function setRestrictiveDirPermissions(dirPath: string): void {
@@ -152,7 +164,7 @@ export function setRestrictiveDirPermissions(dirPath: string): void {
     if (!username) return;
     execFileSync(
       "icacls",
-      [dirPath, "/inheritance:r", "/grant", `${username}:(OI)(CI)(RX,W)`],
+      [dirPath, "/inheritance:r", "/grant:r", ...buildWindowsDirAclGrants(username)],
       { stdio: "pipe", timeout: 5000 },
     );
   } catch {

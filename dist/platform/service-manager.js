@@ -4,6 +4,7 @@ import { join } from "path";
 import { detectPlatform, ensureLogDir, ERROR_LOG_PATH, getProgramArgs, LINUX_NOHUP_PID_PATH, LINUX_NOHUP_START_SCRIPT_PATH, LINUX_SERVICE_PATH, LOG_PATH, run, } from "./service-manager-common.js";
 import { getLinuxServiceStatus, installLinuxService, restartLinuxService, stopLinuxService, uninstallLinuxService, } from "./service-manager-linux.js";
 import { getWindowsServiceStatus, installWindowsService, restartWindowsService, stopWindowsService, uninstallWindowsService, } from "./service-manager-windows.js";
+export { buildWindowsDirAclGrants, buildWindowsFileAclGrant, setRestrictiveDirPermissions, setRestrictiveFilePermissions, } from "./service-manager-common.js";
 const MAC_LABEL = "com.openclaw.clawconnect.agent";
 const MAC_LABEL_OLD = "com.rethinkingstudio.clawpilot";
 const MAC_PLIST_DIR = join(homedir(), "Library", "LaunchAgents");

@@ -3,7 +3,11 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { resolveServiceEntryPath } from "./service-manager-common.js";
+import {
+  buildWindowsDirAclGrants,
+  buildWindowsFileAclGrant,
+  resolveServiceEntryPath,
+} from "./service-manager-common.js";
 
 test("resolveServiceEntryPath prefers dist/index.js when it exists", () => {
   const root = mkdtempSync(join(tmpdir(), "clawconnect-service-"));
@@ -27,4 +31,15 @@ test("resolveServiceEntryPath falls back when dist entry is missing", () => {
   writeFileSync(srcPath, "// src placeholder", "utf-8");
 
   assert.equal(resolveServiceEntryPath(srcPath), srcPath);
+});
+
+test("Windows file ACL grant keeps delete permission available", () => {
+  assert.equal(buildWindowsFileAclGrant("Administrator"), "Administrator:(M)");
+});
+
+test("Windows directory ACL grants apply modify access to the directory and children", () => {
+  assert.deepEqual(buildWindowsDirAclGrants("Administrator"), [
+    "Administrator:(M)",
+    "Administrator:(OI)(CI)(M)",
+  ]);
 });

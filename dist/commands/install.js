@@ -3,7 +3,7 @@ import { execFileSync } from "child_process";
 import { join } from "path";
 import { homedir } from "os";
 import { t } from "../i18n/index.js";
-import { getServicePlatform, getServiceStatus, installService, restartService, stopService, uninstallService, servicePaths, } from "../platform/service-manager.js";
+import { getServicePlatform, getServiceStatus, installService, restartService, setRestrictiveFilePermissions, stopService, uninstallService, servicePaths, } from "../platform/service-manager.js";
 export function isInstalled() {
     const platform = getServicePlatform();
     if (platform === "macos")
@@ -95,6 +95,11 @@ export function resetCommand() {
     const configPath = join(homedir(), ".clawconnect", "config.json");
     if (existsSync(configPath)) {
         try {
+            if (process.platform === "win32") {
+                // Older Windows installs granted read/write but not delete.
+                // Repair the ACL before removing the file so reset can self-heal.
+                setRestrictiveFilePermissions(configPath);
+            }
             unlinkSync(configPath);
             console.log(t("install.configRemoved", configPath));
         }

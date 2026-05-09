@@ -8,6 +8,7 @@ import {
   getServiceStatus,
   installService,
   restartService,
+  setRestrictiveFilePermissions,
   stopService,
   uninstallService,
   servicePaths,
@@ -106,6 +107,11 @@ export function resetCommand(): void {
   const configPath = join(homedir(), ".clawconnect", "config.json");
   if (existsSync(configPath)) {
     try {
+      if (process.platform === "win32") {
+        // Older Windows installs granted read/write but not delete.
+        // Repair the ACL before removing the file so reset can self-heal.
+        setRestrictiveFilePermissions(configPath);
+      }
       unlinkSync(configPath);
       console.log(t("install.configRemoved", configPath));
     } catch (err) {
