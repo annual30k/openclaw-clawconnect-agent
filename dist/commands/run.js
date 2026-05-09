@@ -34,7 +34,7 @@ export async function runCommand() {
         relayServerUrl: config.relayServerUrl,
         gatewayId: config.gatewayId,
         relaySecret: config.relaySecret,
-        gatewayUrl,
+        gatewayUrl: () => readGatewayUrl(),
         gatewayToken: gatewayAuth.token,
         gatewayPassword: gatewayAuth.password,
         defaultVoiceReplyEnabled,

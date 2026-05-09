@@ -1,5 +1,5 @@
 export interface GatewayClientOptions {
-    url: string;
+    url: string | (() => string);
     token?: string;
     password?: string;
     role?: string;
@@ -32,6 +32,7 @@ export declare class OpenClawGatewayClient {
     stop(): void;
     send(method: string, params?: unknown): void;
     request<T = unknown>(method: string, params?: unknown): Promise<T>;
+    private resolveUrl;
     private sendConnect;
     private handleMessage;
     private startTickWatch;

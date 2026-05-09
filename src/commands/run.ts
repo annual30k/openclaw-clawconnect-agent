@@ -43,7 +43,7 @@ export async function runCommand(): Promise<void> {
         relayServerUrl: config.relayServerUrl,
         gatewayId: config.gatewayId,
         relaySecret: config.relaySecret,
-        gatewayUrl,
+        gatewayUrl: () => readGatewayUrl(),
         gatewayToken: gatewayAuth.token,
         gatewayPassword: gatewayAuth.password,
         defaultVoiceReplyEnabled,

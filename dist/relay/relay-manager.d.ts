@@ -12,7 +12,7 @@ export interface RelayManagerOptions {
     relayServerUrl: string;
     gatewayId: string;
     relaySecret: string;
-    gatewayUrl: string;
+    gatewayUrl: string | (() => string);
     gatewayToken?: string;
     gatewayPassword?: string;
     defaultVoiceReplyEnabled?: boolean;

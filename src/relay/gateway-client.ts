@@ -128,7 +128,7 @@ const PROTOCOL_VERSION = 3;
 // ---------------------------------------------------------------------------
 
 export interface GatewayClientOptions {
-  url: string;
+  url: string | (() => string);
   token?: string;
   password?: string;
   role?: string;
@@ -163,7 +163,7 @@ export class OpenClawGatewayClient {
 
   start(): void {
     if (this.stopped) return;
-    this.ws = new WebSocket(this.opts.url, { maxPayload: 25 * 1024 * 1024 });
+    this.ws = new WebSocket(this.resolveUrl(), { maxPayload: 25 * 1024 * 1024 });
 
     this.ws.on("open", () => {
       this.connectNonce = null;
@@ -220,6 +220,10 @@ export class OpenClawGatewayClient {
   }
 
   // -------------------------------------------------------------------------
+
+  private resolveUrl(): string {
+    return typeof this.opts.url === "function" ? this.opts.url() : this.opts.url;
+  }
 
   private sendConnect(): void {
     if (this.connectSent) return;

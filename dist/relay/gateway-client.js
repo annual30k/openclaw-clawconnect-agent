@@ -88,7 +88,7 @@ export class OpenClawGatewayClient {
     start() {
         if (this.stopped)
             return;
-        this.ws = new WebSocket(this.opts.url, { maxPayload: 25 * 1024 * 1024 });
+        this.ws = new WebSocket(this.resolveUrl(), { maxPayload: 25 * 1024 * 1024 });
         this.ws.on("open", () => {
             this.connectNonce = null;
             this.connectSent = false;
@@ -137,6 +137,9 @@ export class OpenClawGatewayClient {
         return p;
     }
     // -------------------------------------------------------------------------
+    resolveUrl() {
+        return typeof this.opts.url === "function" ? this.opts.url() : this.opts.url;
+    }
     sendConnect() {
         if (this.connectSent)
             return;
