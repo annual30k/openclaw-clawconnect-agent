@@ -16,6 +16,8 @@ import {
 } from "./service-manager-common.js";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 
+const SERVICE_WORKING_DIRECTORY = LOG_DIR;
+
 function canUseSystemdUser(): boolean {
   if (!commandExists("systemctl")) return false;
   try {
@@ -61,7 +63,8 @@ function writeLinuxNohupStartScript(): void {
   const script = `#!/usr/bin/env bash
 set -euo pipefail
 
-mkdir -p ${shellEscape(LOG_DIR)}
+mkdir -p ${shellEscape(SERVICE_WORKING_DIRECTORY)}
+cd ${shellEscape(SERVICE_WORKING_DIRECTORY)}
 if [ -f ${shellEscape(LINUX_NOHUP_PID_PATH)} ]; then
   pid="$(cat ${shellEscape(LINUX_NOHUP_PID_PATH)} 2>/dev/null || true)"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -92,7 +95,7 @@ Type=simple
 ExecStart=${args}
 Restart=always
 RestartSec=5
-WorkingDirectory=${shellEscape(process.cwd())}
+WorkingDirectory=${shellEscape(SERVICE_WORKING_DIRECTORY)}
 StandardOutput=append:${LOG_PATH}
 StandardError=append:${ERROR_LOG_PATH}
 

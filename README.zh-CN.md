@@ -149,7 +149,21 @@ clawconnect uninstall
 clawconnect reset
 ```
 
-### 10. 发送文件/图片
+### 10. 升级到最新版本
+
+升级全局 npm 安装的包；如果已安装后台服务，会在升级成功后自动重启服务：
+
+```bash
+clawconnect update
+```
+
+说明：
+
+- `update` 底层执行的是 `npm install -g clawconnect-agent@latest`
+- 如果你当前运行的是本地源码目录，而不是全局 npm 安装，这个命令只会升级全局包
+- 如果你的 npm 全局目录需要更高权限，请按终端提示手动执行对应命令
+
+### 11. 发送文件/图片
 
 把本地图片或其他文件发到已配对的聊天会话：
 

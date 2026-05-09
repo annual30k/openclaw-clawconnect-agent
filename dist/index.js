@@ -9,6 +9,7 @@ import { sendFileCommand } from "./commands/send-file.js";
 import { installCommand, uninstallCommand, stopCommand, restartCommand, resetCommand } from "./commands/install.js";
 import { statusCommand } from "./commands/status.js";
 import { setTokenCommand } from "./commands/set-token.js";
+import { updateCommand } from "./commands/update.js";
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
 ensureUserEnvFile();
@@ -114,6 +115,18 @@ program
     .description("Clear saved config and stop service — use when switching servers or on auth errors")
     .action(() => {
     resetCommand();
+});
+program
+    .command("update")
+    .description("Upgrade the globally installed clawconnect-agent package to the latest npm version")
+    .action(() => {
+    try {
+        updateCommand(import.meta.url);
+    }
+    catch (err) {
+        console.error("Error:", err instanceof Error ? err.message : err);
+        process.exit(1);
+    }
 });
 program.parse(process.argv);
 //# sourceMappingURL=index.js.map

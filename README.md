@@ -137,6 +137,19 @@ Stop the service and clear local pairing config:
 clawconnect reset
 ```
 
+### Update to the Latest Version
+
+Upgrade the globally installed npm package and restart the background service automatically when one is installed:
+
+```bash
+clawconnect update
+```
+
+Notes:
+- `update` runs `npm install -g clawconnect-agent@latest` under the hood.
+- If you are running from a local source checkout instead of a global npm install, this command upgrades only the global package.
+- If your npm global prefix requires elevated permissions, rerun the printed command with the privileges appropriate for your machine.
+
 ### Send Files / Images
 
 Send a local file into the paired chat session:
