@@ -10,6 +10,7 @@ import { installCommand, uninstallCommand, stopCommand, restartCommand, resetCom
 import { statusCommand } from "./commands/status.js";
 import { setTokenCommand } from "./commands/set-token.js";
 import { updateCommand } from "./commands/update.js";
+import { setActiveProfile } from "./config/profile.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
@@ -18,6 +19,30 @@ loadAgentEnv();
 ensureWindowsConsoleUtf8();
 
 const program = new Command();
+const profileOption = ["-p, --profile <name>", "Profile name (for example: hermes, openclaw)"] as const;
+const LOCAL_RELAY_SERVER_URL = "http://127.0.0.1:8080";
+
+type PairCliOptions = {
+  server?: string;
+  name?: string;
+  gatewayType?: string;
+  profile?: string;
+  codeOnly?: boolean;
+  local?: boolean;
+};
+
+async function runPairCommand(opts: PairCliOptions): Promise<void> {
+  setActiveProfile(opts.profile);
+  await pairCommand({
+    ...opts,
+    server: opts.local ? LOCAL_RELAY_SERVER_URL : opts.server,
+  });
+}
+
+function runWithProfile(profile: string, action: () => void): void {
+  setActiveProfile(profile);
+  action();
+}
 
 program
   .name("clawconnect")
@@ -33,10 +58,58 @@ program
   )
   .option("-n, --name <name>", "Display name for this host")
   .option("--gateway-type <type>", "Gateway type: openclaw or hermes", "openclaw")
+  .option(...profileOption)
+  .option("--local", `Use local relay server (${LOCAL_RELAY_SERVER_URL})`, false)
   .option("--code-only", "Print only the access code and skip QR code output", false)
-  .action(async (opts: { server?: string; name?: string; gatewayType?: string; codeOnly?: boolean }) => {
+  .action(async (opts: PairCliOptions) => {
     try {
-      await pairCommand(opts);
+      await runPairCommand(opts);
+    } catch (err) {
+      console.error("Error:", err instanceof Error ? err.message : err);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("pair-openclaw")
+  .description("Shortcut: pair an OpenClaw gateway using profile 'openclaw'")
+  .option(
+    "-s, --server <url>",
+    `Relay server URL (default: CLAWCONNECT_RELAY_SERVER_URL or ${DEFAULT_RELAY_SERVER_URL})`
+  )
+  .option("-n, --name <name>", "Display name for this host", "Mac OpenClaw")
+  .option("--local", `Use local relay server (${LOCAL_RELAY_SERVER_URL})`, false)
+  .option("--code-only", "Print only the access code and skip QR code output", false)
+  .action(async (opts: PairCliOptions) => {
+    try {
+      await runPairCommand({
+        ...opts,
+        profile: "openclaw",
+        gatewayType: "openclaw",
+      });
+    } catch (err) {
+      console.error("Error:", err instanceof Error ? err.message : err);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("pair-hermes")
+  .description("Shortcut: pair a Hermes Agent gateway using profile 'hermes'")
+  .option(
+    "-s, --server <url>",
+    `Relay server URL (default: CLAWCONNECT_RELAY_SERVER_URL or ${DEFAULT_RELAY_SERVER_URL})`
+  )
+  .option("-n, --name <name>", "Display name for this host", "Mac Hermes Agent")
+  .option("--local", `Use local relay server (${LOCAL_RELAY_SERVER_URL})`, false)
+  .option("--code-only", "Print only the access code and skip QR code output", false)
+  .action(async (opts: PairCliOptions) => {
+    try {
+      await runPairCommand({
+        ...opts,
+        profile: "hermes",
+        gatewayType: "hermes",
+      });
     } catch (err) {
       console.error("Error:", err instanceof Error ? err.message : err);
       process.exit(1);
@@ -49,9 +122,11 @@ program
   .argument("<path>", "Path to the local file")
   .option("-g, --gateway <id>", "Override gateway ID from local config")
   .option("-s, --session <key>", "Target chat session key (defaults to the latest active session)")
+  .option(...profileOption)
   .option("--json", "Print the upload result as JSON", false)
-  .action(async (filePath: string, opts: { gateway?: string; session?: string; json?: boolean }) => {
+  .action(async (filePath: string, opts: { gateway?: string; session?: string; profile?: string; json?: boolean }) => {
     try {
+      setActiveProfile(opts.profile);
       await sendFileCommand({
         filePath,
         gateway: opts.gateway,
@@ -67,8 +142,10 @@ program
 program
   .command("run")
   .description("Run relay client in foreground (used by the background service manager)")
-  .action(async () => {
+  .option(...profileOption)
+  .action(async (opts: { profile?: string }) => {
     try {
+      setActiveProfile(opts.profile);
       await runCommand();
     } catch (err) {
       console.error("Error:", err instanceof Error ? err.message : err);
@@ -79,43 +156,91 @@ program
 program
   .command("stop")
   .description("Stop relay client background service")
-  .action(() => {
+  .option(...profileOption)
+  .action((opts: { profile?: string }) => {
+    setActiveProfile(opts.profile);
     stopCommand();
+  });
+
+program
+  .command("stop-openclaw")
+  .description("Shortcut: stop the OpenClaw profile service")
+  .action(() => {
+    runWithProfile("openclaw", stopCommand);
+  });
+
+program
+  .command("stop-hermes")
+  .description("Shortcut: stop the Hermes Agent profile service")
+  .action(() => {
+    runWithProfile("hermes", stopCommand);
   });
 
 program
   .command("status")
   .description("Show pairing config, gateway URL, and background service status")
+  .option(...profileOption)
+  .action((opts: { profile?: string }) => {
+    setActiveProfile(opts.profile === "all" ? undefined : opts.profile);
+    statusCommand(opts);
+  });
+
+program
+  .command("status-all")
+  .description("Shortcut: show all paired ClawConnect profiles")
   .action(() => {
-    statusCommand();
+    setActiveProfile(undefined);
+    statusCommand({ profile: "all" });
   });
 
 program
   .command("install")
   .description("Register as a background service (launchd on macOS, systemd --user on Linux, Startup on Windows)")
-  .action(() => {
+  .option(...profileOption)
+  .action((opts: { profile?: string }) => {
+    setActiveProfile(opts.profile);
     installCommand();
   });
 
 program
   .command("restart")
   .description("Restart the relay background service")
-  .action(() => {
+  .option(...profileOption)
+  .action((opts: { profile?: string }) => {
+    setActiveProfile(opts.profile);
     restartCommand();
+  });
+
+program
+  .command("restart-openclaw")
+  .description("Shortcut: restart the OpenClaw profile service")
+  .action(() => {
+    runWithProfile("openclaw", restartCommand);
+  });
+
+program
+  .command("restart-hermes")
+  .description("Shortcut: restart the Hermes Agent profile service")
+  .action(() => {
+    runWithProfile("hermes", restartCommand);
   });
 
 program
   .command("uninstall")
   .description("Remove background service")
-  .action(() => {
+  .option(...profileOption)
+  .action((opts: { profile?: string }) => {
+    setActiveProfile(opts.profile);
     uninstallCommand();
   });
 
 program
   .command("set-token")
   .description("Set the local OpenClaw gateway token (needed when using token auth)")
-  .action(async () => {
+  .option(...profileOption)
+  .action(async (opts: { profile?: string }) => {
     try {
+      setActiveProfile(opts.profile);
       await setTokenCommand();
     } catch (err) {
       console.error("Error:", err instanceof Error ? err.message : err);
@@ -126,7 +251,9 @@ program
 program
   .command("reset")
   .description("Clear saved config and stop service — use when switching servers or on auth errors")
-  .action(() => {
+  .option(...profileOption)
+  .action((opts: { profile?: string }) => {
+    setActiveProfile(opts.profile);
     resetCommand();
   });
 

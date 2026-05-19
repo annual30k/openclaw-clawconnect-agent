@@ -16,9 +16,10 @@ export interface VoiceReplyConfig {
     voiceIdentifier?: string;
     ratePercent?: number;
 }
-export declare function configExists(): boolean;
-export declare function readConfig(): ClawConnectConfig;
-export declare function writeConfig(config: ClawConnectConfig): void;
+export declare function getConfigPath(profile?: string): string;
+export declare function configExists(profile?: string): boolean;
+export declare function readConfig(profile?: string): ClawConnectConfig;
+export declare function writeConfig(config: ClawConnectConfig, profile?: string): void;
 export declare function readVoiceReplyConfig(cfg: ClawConnectConfig): VoiceReplyConfig;
 export declare function updateVoiceReplyConfig(config: ClawConnectConfig, voiceReplyConfig: VoiceReplyConfig): ClawConnectConfig;
 export declare function readGatewayUrl(): string;

@@ -27,7 +27,85 @@ clawconnect pair --code-only
 Options:
 - `-n, --name <name>` — Display name for this host
 - `-s, --server <url>` — Relay server URL
+- `-p, --profile <name>` — Local profile name. Use separate profiles when pairing more than one gateway type on the same host
+- `--gateway-type <type>` — Gateway type: `openclaw` or `hermes`
 - `--code-only` — Print only the access code and skip QR code output
+
+### Pair OpenClaw and Hermes Agent on the Same Host
+
+Use separate ClawConnect profiles so OpenClaw and Hermes Agent do not share the same local config, log file, or background service.
+
+Pair OpenClaw:
+
+```bash
+clawconnect pair-openclaw
+```
+
+Pair Hermes Agent:
+
+```bash
+clawconnect pair-hermes
+```
+
+When using the local development relay at `http://127.0.0.1:8080`, add `--local`:
+
+```bash
+clawconnect pair-openclaw --local
+clawconnect pair-hermes --local
+```
+
+The shortcut commands expand to the profile-aware form below.
+
+OpenClaw:
+
+```bash
+clawconnect pair \
+  --profile openclaw \
+  --server http://127.0.0.1:8080 \
+  --gateway-type openclaw \
+  --name "Mac OpenClaw"
+```
+
+Hermes Agent:
+
+```bash
+clawconnect pair \
+  --profile hermes \
+  --server http://127.0.0.1:8080 \
+  --gateway-type hermes \
+  --name "Mac Hermes Agent"
+```
+
+After each command, scan the QR code in the mobile app or enter the printed access code. The pairing payload includes `gatewayType`, and the relay rejects mismatched pairing attempts so an OpenClaw mobile gateway cannot bind to a Hermes Agent host, or the reverse.
+
+Check both instances:
+
+```bash
+clawconnect status-all
+```
+
+Restart or stop a single instance:
+
+```bash
+clawconnect restart-openclaw
+clawconnect restart-hermes
+clawconnect stop-openclaw
+clawconnect stop-hermes
+```
+
+Profile config files:
+
+```text
+~/.clawconnect/profiles/openclaw/config.json
+~/.clawconnect/profiles/hermes/config.json
+```
+
+macOS launchd service labels:
+
+```text
+com.openclaw.clawconnect.agent.openclaw
+com.openclaw.clawconnect.agent.hermes
+```
 
 ### Environment Configuration
 
@@ -47,7 +125,7 @@ Supported values:
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD` — Gateway auth fallback
 - `OPENCLAW_TTS_ENABLED`, `OPENCLAW_TTS_VOICE`, `OPENCLAW_TTS_RATE`, `OPENCLAW_TTS_ENGINE` — voice reply defaults
 
-Shell environment variables take priority over env files. Existing pairing credentials in `~/.clawconnect/config.json` still take priority for `clawconnect run`, `status`, and `send-file`; run `clawconnect pair --server <url>` or `clawconnect reset` when you intentionally switch relay servers.
+Shell environment variables take priority over env files. Existing pairing credentials in `~/.clawconnect/config.json` or `~/.clawconnect/profiles/<profile>/config.json` still take priority for `clawconnect run`, `status`, and `send-file`; run `clawconnect pair --profile <name> --server <url>` or `clawconnect reset --profile <name>` when you intentionally switch relay servers.
 
 ### Run
 

@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   buildWindowsDirAclGrants,
   buildWindowsFileAclGrant,
+  getProgramArgs,
   resolveServiceEntryPath,
 } from "./service-manager-common.js";
 
@@ -42,4 +43,9 @@ test("Windows directory ACL grants apply modify access to the directory and chil
     "Administrator:(M)",
     "Administrator:(OI)(CI)(M)",
   ]);
+});
+
+test("getProgramArgs includes profile for multi-instance services", () => {
+  const args = getProgramArgs("hermes");
+  assert.deepEqual(args.slice(-3), ["run", "--profile", "hermes"]);
 });

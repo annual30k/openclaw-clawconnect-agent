@@ -3,24 +3,30 @@ import { join } from "path";
 import { homedir } from "os";
 import { DEFAULT_GATEWAY_URL, getConfiguredGatewayUrl } from "./env.js";
 import { setRestrictiveDirPermissions, setRestrictiveFilePermissions, } from "../platform/service-manager-common.js";
-const CONFIG_DIR = join(homedir(), ".clawconnect");
-const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+import { CLAWCONNECT_HOME, profileConfigPath, profileRoot } from "./profile.js";
 const OPENCLAW_CONFIG_PATH = join(homedir(), ".openclaw", "openclaw.json");
-export function configExists() {
-    return existsSync(CONFIG_PATH);
+export function getConfigPath(profile) {
+    return profileConfigPath(profile);
 }
-export function readConfig() {
-    if (!existsSync(CONFIG_PATH)) {
-        throw new Error(`Config not found at ${CONFIG_PATH}. Run 'clawconnect pair' first.`);
+export function configExists(profile) {
+    return existsSync(profileConfigPath(profile));
+}
+export function readConfig(profile) {
+    const configPath = profileConfigPath(profile);
+    if (!existsSync(configPath)) {
+        throw new Error(`Config not found at ${configPath}. Run 'clawconnect pair' first.`);
     }
-    const raw = readFileSync(CONFIG_PATH, "utf-8");
+    const raw = readFileSync(configPath, "utf-8");
     return JSON.parse(raw);
 }
-export function writeConfig(config) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
-    writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
-    setRestrictiveDirPermissions(CONFIG_DIR);
-    setRestrictiveFilePermissions(CONFIG_PATH);
+export function writeConfig(config, profile) {
+    const root = profileRoot(profile);
+    const configPath = profileConfigPath(profile);
+    mkdirSync(root, { recursive: true });
+    writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+    setRestrictiveDirPermissions(CLAWCONNECT_HOME);
+    setRestrictiveDirPermissions(root);
+    setRestrictiveFilePermissions(configPath);
 }
 export function readVoiceReplyConfig(cfg) {
     return {

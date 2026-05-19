@@ -34,7 +34,85 @@ clawconnect pair --code-only
 
 - `-n, --name <name>`：指定这台主机在移动端显示的名称
 - `-s, --server <url>`：指定中继服务器地址
+- `-p, --profile <name>`：指定本机配置 profile；同一台主机同时配对 OpenClaw 和 Hermes Agent 时必须分开
+- `--gateway-type <type>`：指定网关类型，可选 `openclaw` 或 `hermes`
 - `--code-only`：只输出访问码，不打印二维码
+
+### 2. 同时配对 OpenClaw 和 Hermes Agent
+
+同一台电脑上同时运行 OpenClaw 和 Hermes Agent 时，必须使用不同的 `--profile`。这样两条链路会使用不同的本地配置、日志和后台服务，避免 OpenClaw 与 Hermes Agent 串到一起。
+
+配对 OpenClaw：
+
+```bash
+clawconnect pair-openclaw
+```
+
+配对 Hermes Agent：
+
+```bash
+clawconnect pair-hermes
+```
+
+如果使用本地开发 Relay `http://127.0.0.1:8080`，加一个 `--local` 即可：
+
+```bash
+clawconnect pair-openclaw --local
+clawconnect pair-hermes --local
+```
+
+上面的快捷命令等价于下面的完整写法。
+
+OpenClaw：
+
+```bash
+clawconnect pair \
+  --profile openclaw \
+  --server http://127.0.0.1:8080 \
+  --gateway-type openclaw \
+  --name "Mac OpenClaw"
+```
+
+Hermes Agent：
+
+```bash
+clawconnect pair \
+  --profile hermes \
+  --server http://127.0.0.1:8080 \
+  --gateway-type hermes \
+  --name "Mac Hermes Agent"
+```
+
+每条命令执行后，使用移动端扫码，或在移动端输入终端打印的配对码。配对 payload 会带上 `gatewayType`，Relay 会校验手机端请求的类型和主机注册的类型是否一致；类型不一致会拒绝绑定，避免 OpenClaw 手机网关绑定到 Hermes Agent 主机，或反过来绑定错误。
+
+查看两个实例：
+
+```bash
+clawconnect status-all
+```
+
+单独重启或停止某一个实例：
+
+```bash
+clawconnect restart-openclaw
+clawconnect restart-hermes
+clawconnect stop-openclaw
+clawconnect stop-hermes
+```
+
+本机配置文件位置：
+
+```text
+~/.clawconnect/profiles/openclaw/config.json
+~/.clawconnect/profiles/hermes/config.json
+```
+
+macOS 后台服务名：
+
+```text
+com.openclaw.clawconnect.agent.openclaw
+com.openclaw.clawconnect.agent.hermes
+```
 
 ### 环境配置
 
@@ -54,9 +132,9 @@ $EDITOR ~/.clawconnect/.env
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD`：Gateway 鉴权兜底值
 - `OPENCLAW_TTS_ENABLED`、`OPENCLAW_TTS_VOICE`、`OPENCLAW_TTS_RATE`、`OPENCLAW_TTS_ENGINE`：语音回复默认值
 
-Shell 里已经设置的环境变量优先级高于 env 文件。`clawconnect run`、`status`、`send-file` 会继续使用 `~/.clawconnect/config.json` 里已配对保存的 relay；如果要切换中继服务器，请执行 `clawconnect pair --server <url>` 或 `clawconnect reset`。
+Shell 里已经设置的环境变量优先级高于 env 文件。`clawconnect run`、`status`、`send-file` 会继续使用 `~/.clawconnect/config.json` 或 `~/.clawconnect/profiles/<profile>/config.json` 里已配对保存的 relay；如果要切换中继服务器，请执行 `clawconnect pair --profile <name> --server <url>` 或 `clawconnect reset --profile <name>`。
 
-### 2. 前台运行
+### 3. 前台运行
 
 以当前终端前台方式启动代理：
 
@@ -74,7 +152,7 @@ OPENCLAW_TTS_ENABLED=1 clawconnect run
 
 未设置这个开关时，助手回复保持纯文字。
 
-### 3. 查看状态
+### 4. 查看状态
 
 查看当前配对信息、网关地址和后台服务状态：
 
@@ -82,7 +160,7 @@ OPENCLAW_TTS_ENABLED=1 clawconnect run
 clawconnect status
 ```
 
-### 4. 安装后台服务
+### 5. 安装后台服务
 
 将代理安装成后台常驻服务：
 
@@ -109,7 +187,7 @@ clawconnect install
 bash ~/.clawconnect/clawconnect-start.sh
 ```
 
-### 5. 停止服务
+### 6. 停止服务
 
 停止后台代理服务：
 
@@ -117,7 +195,7 @@ bash ~/.clawconnect/clawconnect-start.sh
 clawconnect stop
 ```
 
-### 6. 重启服务
+### 7. 重启服务
 
 重启后台代理服务：
 
@@ -125,7 +203,7 @@ clawconnect stop
 clawconnect restart
 ```
 
-### 7. 设置 Gateway Token
+### 8. 设置 Gateway Token
 
 当本机 Gateway 使用 token 鉴权时，可以手动保存 token：
 
@@ -133,7 +211,7 @@ clawconnect restart
 clawconnect set-token
 ```
 
-### 8. 卸载服务
+### 9. 卸载服务
 
 移除后台服务定义，但保留本地配置：
 
@@ -141,7 +219,7 @@ clawconnect set-token
 clawconnect uninstall
 ```
 
-### 9. 重置配对
+### 10. 重置配对
 
 停止服务并清除本地配对配置：
 
@@ -149,7 +227,7 @@ clawconnect uninstall
 clawconnect reset
 ```
 
-### 10. 升级到最新版本
+### 11. 升级到最新版本
 
 升级全局 npm 安装的包；如果已安装后台服务，会在升级成功后自动重启服务：
 
@@ -163,7 +241,7 @@ clawconnect update
 - 如果你当前运行的是本地源码目录，而不是全局 npm 安装，这个命令只会升级全局包
 - 如果你的 npm 全局目录需要更高权限，请按终端提示手动执行对应命令
 
-### 11. 发送文件/图片
+### 12. 发送文件/图片
 
 把本地图片或其他文件发到已配对的聊天会话：
 

@@ -13,6 +13,7 @@ interface PairOptions {
   name?: string;
   codeOnly?: boolean;
   gatewayType?: string;
+  profile?: string;
 }
 
 export async function pairCommand(opts: PairOptions): Promise<void> {

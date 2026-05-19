@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { detectPlatform, ensureLogDir, ERROR_LOG_PATH, getProgramArgs, LINUX_NOHUP_PID_PATH, LINUX_NOHUP_START_SCRIPT_PATH, LINUX_SERVICE_PATH, LOG_PATH, run, } from "./service-manager-common.js";
+import { detectPlatform, ensureLogDir, getProfileErrorLogPath, getProfileLogPath, getProgramArgs, LINUX_NOHUP_PID_PATH, LINUX_NOHUP_START_SCRIPT_PATH, LINUX_SERVICE_PATH, run, } from "./service-manager-common.js";
+import { getActiveProfile, normalizeProfileName, profileDisplayName } from "../config/profile.js";
 import { getLinuxServiceStatus, installLinuxService, restartLinuxService, stopLinuxService, uninstallLinuxService, } from "./service-manager-linux.js";
 import { getWindowsServiceStatus, installWindowsService, restartWindowsService, stopWindowsService, uninstallWindowsService, } from "./service-manager-windows.js";
 export { buildWindowsDirAclGrants, buildWindowsFileAclGrant, setRestrictiveDirPermissions, setRestrictiveFilePermissions, } from "./service-manager-common.js";
@@ -10,15 +11,27 @@ const MAC_LABEL_OLD = "com.rethinkingstudio.clawpilot";
 const MAC_PLIST_DIR = join(homedir(), "Library", "LaunchAgents");
 const MAC_PLIST_PATH = join(MAC_PLIST_DIR, `${MAC_LABEL}.plist`);
 const MAC_PLIST_PATH_OLD = join(MAC_PLIST_DIR, `${MAC_LABEL_OLD}.plist`);
-function installMacService() {
-    const argsXml = getProgramArgs().map((arg) => `    <string>${arg}</string>`).join("\n");
+function macLabel(profile) {
+    const normalized = normalizeProfileName(profile ?? getActiveProfile());
+    return normalized ? `${MAC_LABEL}.${normalized}` : MAC_LABEL;
+}
+function macPlistPath(profile) {
+    return join(MAC_PLIST_DIR, `${macLabel(profile)}.plist`);
+}
+function installMacService(profile) {
+    const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+    const label = macLabel(profile);
+    const plistPath = macPlistPath(profile);
+    const logPath = getProfileLogPath(profile);
+    const errorLogPath = getProfileErrorLogPath(profile);
+    const argsXml = getProgramArgs(resolvedProfile).map((arg) => `    <string>${arg}</string>`).join("\n");
     const plistContent = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${MAC_LABEL}</string>
+  <string>${label}</string>
   <key>ProgramArguments</key>
   <array>
 ${argsXml}
@@ -28,64 +41,78 @@ ${argsXml}
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${LOG_PATH}</string>
+  <string>${logPath}</string>
   <key>StandardErrorPath</key>
-  <string>${ERROR_LOG_PATH}</string>
+  <string>${errorLogPath}</string>
 </dict>
 </plist>`;
     mkdirSync(MAC_PLIST_DIR, { recursive: true });
-    ensureLogDir();
+    ensureLogDir(profile);
     try {
-        run(`launchctl unload -w "${MAC_PLIST_PATH}"`);
+        run(`launchctl unload -w "${plistPath}"`);
     }
     catch {
         // Ignore if not loaded.
     }
-    writeFileSync(MAC_PLIST_PATH, plistContent, "utf-8");
+    writeFileSync(plistPath, plistContent, "utf-8");
     try {
-        run(`launchctl load -w "${MAC_PLIST_PATH}"`, "inherit");
+        run(`launchctl load -w "${plistPath}"`, "inherit");
         return true;
     }
     catch {
         return false;
     }
 }
-function uninstallMacArtifacts() {
+function uninstallMacArtifacts(profile) {
     let changed = false;
+    const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+    const label = macLabel(profile);
+    const plistPath = macPlistPath(profile);
     try {
-        run(`launchctl unload -w "${MAC_PLIST_PATH}"`);
+        run(`launchctl unload -w "${plistPath}"`);
         changed = true;
     }
     catch {
         // ignore
     }
-    if (existsSync(MAC_PLIST_PATH)) {
-        unlinkSync(MAC_PLIST_PATH);
+    if (existsSync(plistPath)) {
+        unlinkSync(plistPath);
         changed = true;
     }
-    try {
-        run(`launchctl unload -w "${MAC_PLIST_PATH_OLD}"`);
-        changed = true;
+    if (!resolvedProfile) {
+        try {
+            run(`launchctl unload -w "${MAC_PLIST_PATH_OLD}"`);
+            changed = true;
+        }
+        catch {
+            // ignore
+        }
+        if (existsSync(MAC_PLIST_PATH_OLD)) {
+            unlinkSync(MAC_PLIST_PATH_OLD);
+            changed = true;
+        }
     }
-    catch {
-        // ignore
-    }
-    if (existsSync(MAC_PLIST_PATH_OLD)) {
-        unlinkSync(MAC_PLIST_PATH_OLD);
-        changed = true;
+    else {
+        try {
+            run(`launchctl remove ${label}`);
+            changed = true;
+        }
+        catch {
+            // ignore
+        }
     }
     return changed;
 }
-function restartMacService() {
-    return installMacService();
+function restartMacService(profile) {
+    return installMacService(profile);
 }
 export function getServicePlatform() {
     return detectPlatform();
 }
-export function installService() {
+export function installService(profile) {
     switch (detectPlatform()) {
         case "macos":
-            return installMacService();
+            return installMacService(profile);
         case "linux":
             return installLinuxService();
         case "windows":
@@ -94,10 +121,10 @@ export function installService() {
             return false;
     }
 }
-export function restartService() {
+export function restartService(profile) {
     switch (detectPlatform()) {
         case "macos":
-            return restartMacService();
+            return restartMacService(profile);
         case "linux":
             return restartLinuxService();
         case "windows":
@@ -106,10 +133,10 @@ export function restartService() {
             return false;
     }
 }
-export function stopService() {
+export function stopService(profile) {
     switch (detectPlatform()) {
         case "macos":
-            return uninstallMacArtifacts();
+            return uninstallMacArtifacts(profile);
         case "linux":
             return stopLinuxService();
         case "windows":
@@ -118,10 +145,10 @@ export function stopService() {
             return false;
     }
 }
-export function uninstallService() {
+export function uninstallService(profile) {
     switch (detectPlatform()) {
         case "macos":
-            return uninstallMacArtifacts();
+            return uninstallMacArtifacts(profile);
         case "linux":
             return uninstallLinuxService();
         case "windows":
@@ -130,12 +157,15 @@ export function uninstallService() {
             return false;
     }
 }
-export function getServiceStatus() {
+export function getServiceStatus(profile) {
+    const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
     const platform = detectPlatform();
     if (platform === "macos") {
+        const label = macLabel(resolvedProfile);
+        const plistPath = macPlistPath(resolvedProfile);
         let running = false;
         try {
-            run(`launchctl list ${MAC_LABEL}`);
+            run(`launchctl list ${label}`);
             running = true;
         }
         catch {
@@ -143,13 +173,13 @@ export function getServiceStatus() {
         }
         return {
             platform,
-            installed: existsSync(MAC_PLIST_PATH),
+            installed: existsSync(plistPath),
             running,
-            serviceName: MAC_LABEL,
+            serviceName: label,
             manager: "launchd",
-            servicePath: MAC_PLIST_PATH,
-            logPath: LOG_PATH,
-            startHint: `launchctl start ${MAC_LABEL}`,
+            servicePath: plistPath,
+            logPath: getProfileLogPath(resolvedProfile),
+            startHint: `launchctl start ${label}`,
         };
     }
     if (platform === "linux") {
@@ -164,16 +194,21 @@ export function getServiceStatus() {
         running: false,
         serviceName: "",
         manager: "unsupported",
-        logPath: LOG_PATH,
+        logPath: getProfileLogPath(resolvedProfile),
     };
 }
-export const servicePaths = {
-    logPath: LOG_PATH,
-    errorLogPath: ERROR_LOG_PATH,
-    macPlistPath: MAC_PLIST_PATH,
-    linuxServicePath: LINUX_SERVICE_PATH,
-    linuxNohupPidPath: LINUX_NOHUP_PID_PATH,
-    linuxNohupStartScriptPath: LINUX_NOHUP_START_SCRIPT_PATH,
-    windowsServicePath: "",
-};
+export function getServicePaths(profile) {
+    const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+    return {
+        profile: profileDisplayName(resolvedProfile),
+        logPath: getProfileLogPath(resolvedProfile),
+        errorLogPath: getProfileErrorLogPath(resolvedProfile),
+        macPlistPath: macPlistPath(resolvedProfile),
+        linuxServicePath: LINUX_SERVICE_PATH,
+        linuxNohupPidPath: LINUX_NOHUP_PID_PATH,
+        linuxNohupStartScriptPath: LINUX_NOHUP_START_SCRIPT_PATH,
+        windowsServicePath: "",
+    };
+}
+export const servicePaths = getServicePaths();
 //# sourceMappingURL=service-manager.js.map

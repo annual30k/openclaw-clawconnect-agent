@@ -6,9 +6,8 @@ import {
   setRestrictiveDirPermissions,
   setRestrictiveFilePermissions,
 } from "../platform/service-manager-common.js";
+import { CLAWCONNECT_HOME, profileConfigPath, profileRoot } from "./profile.js";
 
-const CONFIG_DIR = join(homedir(), ".clawconnect");
-const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const OPENCLAW_CONFIG_PATH = join(homedir(), ".openclaw", "openclaw.json");
 
 export interface ClawConnectConfig {
@@ -31,23 +30,31 @@ export interface VoiceReplyConfig {
   ratePercent?: number;
 }
 
-export function configExists(): boolean {
-  return existsSync(CONFIG_PATH);
+export function getConfigPath(profile?: string): string {
+  return profileConfigPath(profile);
 }
 
-export function readConfig(): ClawConnectConfig {
-  if (!existsSync(CONFIG_PATH)) {
-    throw new Error(`Config not found at ${CONFIG_PATH}. Run 'clawconnect pair' first.`);
+export function configExists(profile?: string): boolean {
+  return existsSync(profileConfigPath(profile));
+}
+
+export function readConfig(profile?: string): ClawConnectConfig {
+  const configPath = profileConfigPath(profile);
+  if (!existsSync(configPath)) {
+    throw new Error(`Config not found at ${configPath}. Run 'clawconnect pair' first.`);
   }
-  const raw = readFileSync(CONFIG_PATH, "utf-8");
+  const raw = readFileSync(configPath, "utf-8");
   return JSON.parse(raw) as ClawConnectConfig;
 }
 
-export function writeConfig(config: ClawConnectConfig): void {
-  mkdirSync(CONFIG_DIR, { recursive: true });
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
-  setRestrictiveDirPermissions(CONFIG_DIR);
-  setRestrictiveFilePermissions(CONFIG_PATH);
+export function writeConfig(config: ClawConnectConfig, profile?: string): void {
+  const root = profileRoot(profile);
+  const configPath = profileConfigPath(profile);
+  mkdirSync(root, { recursive: true });
+  writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+  setRestrictiveDirPermissions(CLAWCONNECT_HOME);
+  setRestrictiveDirPermissions(root);
+  setRestrictiveFilePermissions(configPath);
 }
 
 export function readVoiceReplyConfig(cfg: ClawConnectConfig): VoiceReplyConfig {

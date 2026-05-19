@@ -2,6 +2,11 @@ import { execFileSync, execSync } from "child_process";
 import { chmodSync, existsSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import {
+  profileErrorLogPath,
+  profileLogPath,
+  profileRoot,
+} from "../config/profile.js";
 
 export type ServicePlatform = "macos" | "linux" | "windows" | "unsupported";
 
@@ -16,9 +21,9 @@ export interface ServiceStatus {
   startHint?: string;
 }
 
-export const LOG_DIR = join(homedir(), ".clawconnect");
-export const LOG_PATH = join(LOG_DIR, "clawconnect.log");
-export const ERROR_LOG_PATH = join(LOG_DIR, "clawconnect-error.log");
+export const LOG_DIR = profileRoot(undefined);
+export const LOG_PATH = profileLogPath(undefined);
+export const ERROR_LOG_PATH = profileErrorLogPath(undefined);
 
 export const LINUX_SERVICE_NAME = "clawconnect-agent.service";
 export const LINUX_SYSTEMD_USER_DIR = join(homedir(), ".config", "systemd", "user");
@@ -68,14 +73,27 @@ export function resolveServiceEntryPath(scriptPath: string): string {
   return scriptPath;
 }
 
-export function getProgramArgs(): string[] {
+export function getProgramArgs(profile?: string): string[] {
   const nodeBin = process.execPath;
   const scriptPath = resolveServiceEntryPath(process.argv[1]);
-  return nodeBin === scriptPath ? [scriptPath, "run"] : [nodeBin, scriptPath, "run"];
+  const baseArgs = nodeBin === scriptPath ? [scriptPath, "run"] : [nodeBin, scriptPath, "run"];
+  return profile ? [...baseArgs, "--profile", profile] : baseArgs;
 }
 
-export function ensureLogDir(): void {
-  mkdirSync(LOG_DIR, { recursive: true });
+export function getProfileLogDir(profile?: string): string {
+  return profileRoot(profile);
+}
+
+export function getProfileLogPath(profile?: string): string {
+  return profileLogPath(profile);
+}
+
+export function getProfileErrorLogPath(profile?: string): string {
+  return profileErrorLogPath(profile);
+}
+
+export function ensureLogDir(profile?: string): void {
+  mkdirSync(getProfileLogDir(profile), { recursive: true });
 }
 
 export function ensureWindowsConsoleUtf8(): void {

@@ -3,6 +3,7 @@ interface PairOptions {
     name?: string;
     codeOnly?: boolean;
     gatewayType?: string;
+    profile?: string;
 }
 export declare function pairCommand(opts: PairOptions): Promise<void>;
 export {};

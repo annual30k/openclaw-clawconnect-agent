@@ -1,17 +1,35 @@
 import { existsSync, readFileSync } from "fs";
 import { execSync } from "child_process";
 import { configExists, readConfig, readGatewayUrl } from "../config/config.js";
+import { listProfileNames, profileDisplayName } from "../config/profile.js";
 import { t } from "../i18n/index.js";
 import { getServiceStatus } from "../platform/service-manager.js";
-export function statusCommand() {
+export function statusCommand(opts = {}) {
+    if (opts.profile === "all") {
+        const profiles = listProfileNames();
+        if (profiles.length === 0) {
+            statusCommand({ profile: undefined });
+            return;
+        }
+        profiles.forEach((profile, index) => {
+            if (index > 0)
+                console.log("");
+            statusOne(profile === "default" ? undefined : profile);
+        });
+        return;
+    }
+    statusOne(opts.profile);
+}
+function statusOne(profile) {
     console.log(t("status.title"));
+    console.log(`Profile:  ${profileDisplayName(profile)}`);
     let gatewayType = "openclaw";
-    if (!configExists()) {
+    if (!configExists(profile)) {
         console.log(t("status.notPaired"));
     }
     else {
         try {
-            const config = readConfig();
+            const config = readConfig(profile);
             gatewayType = config.gatewayType === "hermes" ? "hermes" : "openclaw";
             console.log(t("status.paired"));
             console.log(t("status.displayName", config.displayName));
@@ -26,7 +44,7 @@ export function statusCommand() {
     if (gatewayType === "openclaw") {
         console.log(t("status.gateway", readGatewayUrl()));
     }
-    const service = getServiceStatus();
+    const service = getServiceStatus(profile);
     if (service.platform === "unsupported") {
         console.log(t("status.serviceUnsupported", process.platform));
         console.log("");

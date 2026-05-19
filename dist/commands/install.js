@@ -1,11 +1,11 @@
 import { existsSync, unlinkSync } from "fs";
 import { execFileSync } from "child_process";
-import { join } from "path";
-import { homedir } from "os";
 import { t } from "../i18n/index.js";
-import { getServicePlatform, getServiceStatus, installService, restartService, setRestrictiveFilePermissions, stopService, uninstallService, servicePaths, } from "../platform/service-manager.js";
+import { getServicePlatform, getServiceStatus, getServicePaths, installService, restartService, setRestrictiveFilePermissions, stopService, uninstallService, } from "../platform/service-manager.js";
+import { profileConfigPath, profileDisplayName } from "../config/profile.js";
 export function isInstalled() {
     const platform = getServicePlatform();
+    const servicePaths = getServicePaths();
     if (platform === "macos")
         return existsSync(servicePaths.macPlistPath);
     if (platform === "linux") {
@@ -32,9 +32,11 @@ export function installCommand() {
     const started = installService();
     if (started) {
         const service = getServiceStatus();
+        console.log(`Profile: ${profileDisplayName(servicePathsProfile())}`);
         console.log(t("install.serviceStarted", service.manager));
         return;
     }
+    const servicePaths = getServicePaths();
     console.log(t("install.installFailed", platformName(platform)));
     if (platform === "macos") {
         console.log(t("install.serviceFileWritten", servicePaths.macPlistPath));
@@ -92,7 +94,7 @@ export function stopCommand() {
 }
 export function resetCommand() {
     stopCommand();
-    const configPath = join(homedir(), ".clawconnect", "config.json");
+    const configPath = profileConfigPath();
     if (existsSync(configPath)) {
         try {
             if (process.platform === "win32") {
@@ -111,6 +113,10 @@ export function resetCommand() {
         console.log(t("install.noConfig"));
     }
     console.log(t("install.resetComplete"));
+}
+function servicePathsProfile() {
+    const profile = getServicePaths().profile;
+    return profile === "default" ? undefined : profile;
 }
 function platformName(platform) {
     switch (platform) {

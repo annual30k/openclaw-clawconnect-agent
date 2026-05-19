@@ -1,21 +1,21 @@
 import { existsSync, unlinkSync } from "fs";
 import { execFileSync } from "child_process";
-import { join } from "path";
-import { homedir } from "os";
 import { t } from "../i18n/index.js";
 import {
   getServicePlatform,
   getServiceStatus,
+  getServicePaths,
   installService,
   restartService,
   setRestrictiveFilePermissions,
   stopService,
   uninstallService,
-  servicePaths,
 } from "../platform/service-manager.js";
+import { profileConfigPath, profileDisplayName } from "../config/profile.js";
 
 export function isInstalled(): boolean {
   const platform = getServicePlatform();
+  const servicePaths = getServicePaths();
   if (platform === "macos") return existsSync(servicePaths.macPlistPath);
   if (platform === "linux") {
     return existsSync(servicePaths.linuxServicePath) || existsSync(servicePaths.linuxNohupStartScriptPath);
@@ -42,10 +42,12 @@ export function installCommand(): void {
   const started = installService();
   if (started) {
     const service = getServiceStatus();
+    console.log(`Profile: ${profileDisplayName(servicePathsProfile())}`);
     console.log(t("install.serviceStarted", service.manager));
     return;
   }
 
+  const servicePaths = getServicePaths();
   console.log(t("install.installFailed", platformName(platform)));
   if (platform === "macos") {
     console.log(t("install.serviceFileWritten", servicePaths.macPlistPath));
@@ -104,7 +106,7 @@ export function stopCommand(): void {
 export function resetCommand(): void {
   stopCommand();
 
-  const configPath = join(homedir(), ".clawconnect", "config.json");
+  const configPath = profileConfigPath();
   if (existsSync(configPath)) {
     try {
       if (process.platform === "win32") {
@@ -122,6 +124,11 @@ export function resetCommand(): void {
   }
 
   console.log(t("install.resetComplete"));
+}
+
+function servicePathsProfile(): string | undefined {
+  const profile = getServicePaths().profile;
+  return profile === "default" ? undefined : profile;
 }
 
 function platformName(platform: ReturnType<typeof getServicePlatform>): string {
