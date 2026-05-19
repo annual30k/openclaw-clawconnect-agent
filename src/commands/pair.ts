@@ -114,16 +114,14 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
   installCommand();
 }
 
-function normalizeGatewayType(value: PairOptions["gatewayType"]): "openclaw" | "hermes" | "devtool" {
-  return value === "hermes" || value === "devtool" ? value : "openclaw";
+function normalizeGatewayType(value: PairOptions["gatewayType"]): "openclaw" | "hermes" {
+  return value === "hermes" ? value : "openclaw";
 }
 
-function capabilitiesForGatewayType(gatewayType: "openclaw" | "hermes" | "devtool"): string[] {
+function capabilitiesForGatewayType(gatewayType: "openclaw" | "hermes"): string[] {
   switch (gatewayType) {
     case "hermes":
       return ["chat", "files", "logs", "restart", "sessions", "skills", "gateway_service"];
-    case "devtool":
-      return ["devtools", "files", "logs"];
     case "openclaw":
     default:
       return ["chat", "skills", "schedules", "logs", "files"];

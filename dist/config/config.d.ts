@@ -3,7 +3,7 @@ export interface ClawConnectConfig {
     gatewayId: string;
     relaySecret: string;
     displayName: string;
-    gatewayType?: "openclaw" | "hermes" | "devtool";
+    gatewayType?: "openclaw" | "hermes";
     capabilities?: string[];
     assistantVoiceReplyVoiceIdentifier?: string;
     assistantVoiceReplyRatePercent?: number;

@@ -32,7 +32,7 @@ program
     `Relay server URL (default: CLAWCONNECT_RELAY_SERVER_URL or ${DEFAULT_RELAY_SERVER_URL})`
   )
   .option("-n, --name <name>", "Display name for this host")
-  .option("--gateway-type <type>", "Gateway type: openclaw, hermes, or devtool", "openclaw")
+  .option("--gateway-type <type>", "Gateway type: openclaw or hermes", "openclaw")
   .option("--code-only", "Print only the access code and skip QR code output", false)
   .action(async (opts: { server?: string; name?: string; gatewayType?: string; codeOnly?: boolean }) => {
     try {

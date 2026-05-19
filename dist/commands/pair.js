@@ -88,14 +88,12 @@ export async function pairCommand(opts) {
     installCommand();
 }
 function normalizeGatewayType(value) {
-    return value === "hermes" || value === "devtool" ? value : "openclaw";
+    return value === "hermes" ? value : "openclaw";
 }
 function capabilitiesForGatewayType(gatewayType) {
     switch (gatewayType) {
         case "hermes":
             return ["chat", "files", "logs", "restart", "sessions", "skills", "gateway_service"];
-        case "devtool":
-            return ["devtools", "files", "logs"];
         case "openclaw":
         default:
             return ["chat", "skills", "schedules", "logs", "files"];

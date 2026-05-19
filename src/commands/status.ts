@@ -8,7 +8,7 @@ type HealthState = {
   kind: "ok" | "warn" | "error" | "unknown";
   detail?: string;
 };
-type GatewayType = "openclaw" | "hermes" | "devtool";
+type GatewayType = "openclaw" | "hermes";
 
 export function statusCommand(): void {
   console.log(t("status.title"));
@@ -19,7 +19,7 @@ export function statusCommand(): void {
   } else {
     try {
       const config = readConfig();
-      gatewayType = config.gatewayType ?? "openclaw";
+      gatewayType = config.gatewayType === "hermes" ? "hermes" : "openclaw";
       console.log(t("status.paired"));
       console.log(t("status.displayName", config.displayName));
       console.log(t("status.gatewayId", config.gatewayId));
@@ -125,9 +125,6 @@ function parseGatewayHealth(lines: string[], gatewayType: GatewayType): HealthSt
   if (gatewayType === "hermes") {
     return parseHermesAgentHealth(lines);
   }
-  if (gatewayType === "devtool") {
-    return parseDevtoolAgentHealth(lines);
-  }
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     const line = lines[i];
     if (line.includes("Gateway connected.")) {
@@ -169,19 +166,6 @@ function parseHermesAgentHealth(lines: string[]): HealthState {
     ? lines[closedIndex].replace(/^.*Hermes relay connection closed:\s*/, "").trim() || "disconnected"
     : "disconnected";
   return { kind: "error", detail };
-}
-
-function parseDevtoolAgentHealth(lines: string[]): HealthState {
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = lines[i];
-    if (line.includes("Relay connected.")) {
-      return { kind: "ok", detail: "connected" };
-    }
-    if (line.includes("Relay disconnected.") || line.includes("Relay connection closed:")) {
-      return { kind: "warn", detail: "disconnected" };
-    }
-  }
-  return { kind: "unknown", detail: "no agent events yet" };
 }
 
 function classifyGatewayDetail(line: string): HealthState["kind"] {
