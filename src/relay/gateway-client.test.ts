@@ -71,6 +71,48 @@ test("gateway client resolves the websocket URL before each reconnect", async ()
   }
 });
 
+test("gateway client advertises a protocol range for older and newer OpenClaw gateways", async () => {
+  const server = new WebSocketServer({ port: 0 });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+
+  let connectParams: { minProtocol?: number; maxProtocol?: number } | undefined;
+  let connected = false;
+  server.on("connection", (socket) => {
+    socket.on("message", (raw) => {
+      const msg = JSON.parse(raw.toString()) as {
+        type?: string;
+        id?: string;
+        method?: string;
+        params?: { minProtocol?: number; maxProtocol?: number };
+      };
+      if (msg.type === "req" && msg.method === "connect" && msg.id) {
+        connectParams = msg.params;
+        socket.send(JSON.stringify({ type: "res", id: msg.id, ok: true, payload: {} }));
+      }
+    });
+  });
+
+  const client = new OpenClawGatewayClient({
+    url: `ws://127.0.0.1:${address.port}`,
+    token: "test-token",
+    onConnected: () => { connected = true; },
+    onEvent: () => undefined,
+    onDisconnected: () => undefined,
+  });
+
+  try {
+    client.start();
+    await waitFor(() => connected && connectParams !== undefined);
+
+    assert.equal(connectParams?.minProtocol, 3);
+    assert.equal(connectParams?.maxProtocol, 4);
+  } finally {
+    client.stop();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
 function createConnectAckServer(): {
   url: string;
   activeSocket?: import("ws").WebSocket;

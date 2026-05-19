@@ -1,5 +1,6 @@
 import { readConfig, readGatewayUrl, readGatewayAuth, readVoiceReplyConfig } from "../config/config.js";
 import { runRelayManager } from "../relay/relay-manager.js";
+import { runHermesRelayManager } from "../hermes/hermes-relay-manager.js";
 import { withReconnect } from "../relay/reconnect.js";
 import { t } from "../i18n/index.js";
 import { createInterface } from "readline";
@@ -10,6 +11,7 @@ function parseBooleanEnv(value: string | undefined): boolean {
 
 export async function runCommand(): Promise<void> {
   const config = readConfig();
+  const gatewayType = config.gatewayType ?? "openclaw";
   const gatewayUrl = readGatewayUrl();
   const gatewayAuth = readGatewayAuth(config);
   const defaultVoiceReplyEnabled = parseBooleanEnv(process.env.OPENCLAW_TTS_ENABLED);
@@ -35,11 +37,27 @@ export async function runCommand(): Promise<void> {
   console.log(t("run.starting"));
   console.log(t("run.gatewayId", config.gatewayId));
   console.log(t("run.relayServer", config.relayServerUrl));
-  console.log(t("run.gatewayUrl", gatewayUrl));
+  if (gatewayType === "hermes") {
+    console.log("  Gateway type: hermes");
+  } else {
+    console.log(t("run.gatewayUrl", gatewayUrl));
+  }
 
   await withReconnect(
-    () =>
-      runRelayManager({
+    () => {
+      if (gatewayType === "hermes") {
+        return runHermesRelayManager({
+          relayServerUrl: config.relayServerUrl,
+          gatewayId: config.gatewayId,
+          relaySecret: config.relaySecret,
+          displayName: config.displayName,
+          capabilities: config.capabilities,
+          signal: shutdown.signal,
+          onConnected: () => console.log(t("run.connected")),
+          onDisconnected: () => console.log(t("run.disconnected")),
+        });
+      }
+      return runRelayManager({
         relayServerUrl: config.relayServerUrl,
         gatewayId: config.gatewayId,
         relaySecret: config.relaySecret,
@@ -51,7 +69,8 @@ export async function runCommand(): Promise<void> {
         signal: shutdown.signal,
         onConnected: () => console.log(t("run.connected")),
         onDisconnected: () => console.log(t("run.disconnected")),
-      }),
+      });
+    },
     {
       onRetry: (attempt, delayMs) => {
         console.log(t("run.retry", String(attempt), String(delayMs)));

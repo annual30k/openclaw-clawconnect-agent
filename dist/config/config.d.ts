@@ -3,6 +3,8 @@ export interface ClawConnectConfig {
     gatewayId: string;
     relaySecret: string;
     displayName: string;
+    gatewayType?: "openclaw" | "hermes" | "devtool";
+    capabilities?: string[];
     assistantVoiceReplyVoiceIdentifier?: string;
     assistantVoiceReplyRatePercent?: number;
     /** Shared token for the local OpenClaw Gateway (gateway.auth.token in openclaw config). */

@@ -68,3 +68,29 @@ test("buildOfficeEventPayload derives syncing and offline states for lifecycle e
   assert.deepEqual(offline?.office.kind, "offline");
   assert.equal(offline?.office.detail, "主机暂时离线");
 });
+
+test("buildOfficeEventPayload accepts Hermes final chat payloads", () => {
+  const payload = buildOfficeEventPayload(
+    "chat",
+    {
+      sessionKey: "main",
+      role: "assistant",
+      state: "final",
+      currentModel: "gpt-5.5",
+      contextUsage: 54000,
+      contextLimit: 272000,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "天气表格已生成" }],
+      },
+    },
+    () => "2026-05-19T07:10:00.000Z",
+  );
+
+  assert.equal(payload?.sessionKey, "main");
+  assert.equal(payload?.currentModel, "gpt-5.5");
+  assert.equal(payload?.contextUsage, 54000);
+  assert.equal(payload?.contextLimit, 272000);
+  assert.equal(payload?.office.kind, "idle");
+  assert.equal(payload?.office.updatedAt, "2026-05-19T07:10:00.000Z");
+});

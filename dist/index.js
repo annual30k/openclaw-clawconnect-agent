@@ -25,6 +25,7 @@ program
     .description("Register with relay server and display QR code for iOS pairing")
     .option("-s, --server <url>", `Relay server URL (default: CLAWCONNECT_RELAY_SERVER_URL or ${DEFAULT_RELAY_SERVER_URL})`)
     .option("-n, --name <name>", "Display name for this host")
+    .option("--gateway-type <type>", "Gateway type: openclaw, hermes, or devtool", "openclaw")
     .option("--code-only", "Print only the access code and skip QR code output", false)
     .action(async (opts) => {
     try {

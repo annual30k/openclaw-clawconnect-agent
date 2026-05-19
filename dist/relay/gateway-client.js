@@ -66,7 +66,8 @@ function buildSignedDevice(identity, opts) {
         nonce: opts.nonce,
     };
 }
-const PROTOCOL_VERSION = 3;
+const MIN_PROTOCOL_VERSION = 3;
+const MAX_PROTOCOL_VERSION = 4;
 export class OpenClawGatewayClient {
     opts;
     ws = null;
@@ -168,8 +169,8 @@ export class OpenClawGatewayClient {
             nonce,
         });
         const params = {
-            minProtocol: PROTOCOL_VERSION,
-            maxProtocol: PROTOCOL_VERSION,
+            minProtocol: MIN_PROTOCOL_VERSION,
+            maxProtocol: MAX_PROTOCOL_VERSION,
             role,
             scopes,
             caps,

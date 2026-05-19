@@ -12,6 +12,7 @@ interface PairOptions {
   server?: string;
   name?: string;
   codeOnly?: boolean;
+  gatewayType?: string;
 }
 
 export async function pairCommand(opts: PairOptions): Promise<void> {
@@ -20,9 +21,14 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
   let accessCode: string;
   let displayName: string;
   let relayServerUrl: string;
+  const gatewayType = normalizeGatewayType(opts.gatewayType);
+  const capabilities = capabilitiesForGatewayType(gatewayType);
 
-  if (configExists()) {
-    const config = readConfig();
+  const existingConfig = configExists() ? readConfig() : null;
+  const existingGatewayType = existingConfig?.gatewayType ?? "openclaw";
+
+  if (existingConfig && existingGatewayType === gatewayType) {
+    const config = existingConfig;
     relayServerUrl = opts.server ?? config.relayServerUrl ?? getDefaultRelayServerUrl();
     gatewayId = config.gatewayId;
     relaySecret = config.relaySecret;
@@ -48,9 +54,12 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
     const data = (await res.json()) as { accessCode: string };
     accessCode = data.accessCode;
 
-    writeConfig({ ...config, relayServerUrl, displayName });
+    writeConfig({ ...config, relayServerUrl, displayName, gatewayType: config.gatewayType ?? gatewayType, capabilities: config.capabilities ?? capabilities });
   } else {
-    relayServerUrl = opts.server ?? getDefaultRelayServerUrl();
+    if (existingConfig && existingGatewayType !== gatewayType) {
+      console.log(`Existing ${existingGatewayType} gateway config found; registering a new ${gatewayType} gateway.`);
+    }
+    relayServerUrl = opts.server ?? existingConfig?.relayServerUrl ?? getDefaultRelayServerUrl();
     displayName = opts.name ? sanitizeDisplayName(opts.name) : getDisplayName();
     console.log(t("pair.registering"));
 
@@ -58,7 +67,7 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
     const res = await fetch(`${httpBase}/api/relay/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ displayName }),
+      body: JSON.stringify({ displayName, gatewayType, capabilities }),
     });
 
     if (!res.ok) {
@@ -76,18 +85,21 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
     relaySecret = data.relaySecret;
     accessCode = data.accessCode;
 
-    writeConfig({ relayServerUrl, gatewayId, relaySecret, displayName });
+    writeConfig({ relayServerUrl, gatewayId, relaySecret, displayName, gatewayType, capabilities });
 
     console.log(t("pair.registered", gatewayId));
   }
 
   const httpBase = toRelayHttpBase(relayServerUrl);
   const qrPayload = JSON.stringify({
+    type: "clawlink_pairing",
     version: 1,
     server: httpBase,
     gatewayId,
     accessCode,
     displayName,
+    gatewayType,
+    capabilities,
   });
 
   if (opts.codeOnly) {
@@ -100,6 +112,22 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
 
   console.log(t("pair.installingService"));
   installCommand();
+}
+
+function normalizeGatewayType(value: PairOptions["gatewayType"]): "openclaw" | "hermes" | "devtool" {
+  return value === "hermes" || value === "devtool" ? value : "openclaw";
+}
+
+function capabilitiesForGatewayType(gatewayType: "openclaw" | "hermes" | "devtool"): string[] {
+  switch (gatewayType) {
+    case "hermes":
+      return ["chat", "files", "logs", "restart", "sessions", "skills", "gateway_service"];
+    case "devtool":
+      return ["devtools", "files", "logs"];
+    case "openclaw":
+    default:
+      return ["chat", "skills", "schedules", "logs", "files"];
+  }
 }
 
 function sanitizeDisplayName(name: string): string {

@@ -13,8 +13,12 @@ export async function pairCommand(opts) {
     let accessCode;
     let displayName;
     let relayServerUrl;
-    if (configExists()) {
-        const config = readConfig();
+    const gatewayType = normalizeGatewayType(opts.gatewayType);
+    const capabilities = capabilitiesForGatewayType(gatewayType);
+    const existingConfig = configExists() ? readConfig() : null;
+    const existingGatewayType = existingConfig?.gatewayType ?? "openclaw";
+    if (existingConfig && existingGatewayType === gatewayType) {
+        const config = existingConfig;
         relayServerUrl = opts.server ?? config.relayServerUrl ?? getDefaultRelayServerUrl();
         gatewayId = config.gatewayId;
         relaySecret = config.relaySecret;
@@ -35,17 +39,20 @@ export async function pairCommand(opts) {
         }
         const data = (await res.json());
         accessCode = data.accessCode;
-        writeConfig({ ...config, relayServerUrl, displayName });
+        writeConfig({ ...config, relayServerUrl, displayName, gatewayType: config.gatewayType ?? gatewayType, capabilities: config.capabilities ?? capabilities });
     }
     else {
-        relayServerUrl = opts.server ?? getDefaultRelayServerUrl();
+        if (existingConfig && existingGatewayType !== gatewayType) {
+            console.log(`Existing ${existingGatewayType} gateway config found; registering a new ${gatewayType} gateway.`);
+        }
+        relayServerUrl = opts.server ?? existingConfig?.relayServerUrl ?? getDefaultRelayServerUrl();
         displayName = opts.name ? sanitizeDisplayName(opts.name) : getDisplayName();
         console.log(t("pair.registering"));
         const httpBase = toRelayHttpBase(relayServerUrl);
         const res = await fetch(`${httpBase}/api/relay/register`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ displayName }),
+            body: JSON.stringify({ displayName, gatewayType, capabilities }),
         });
         if (!res.ok) {
             const body = await res.text();
@@ -55,16 +62,19 @@ export async function pairCommand(opts) {
         gatewayId = data.gatewayId;
         relaySecret = data.relaySecret;
         accessCode = data.accessCode;
-        writeConfig({ relayServerUrl, gatewayId, relaySecret, displayName });
+        writeConfig({ relayServerUrl, gatewayId, relaySecret, displayName, gatewayType, capabilities });
         console.log(t("pair.registered", gatewayId));
     }
     const httpBase = toRelayHttpBase(relayServerUrl);
     const qrPayload = JSON.stringify({
+        type: "clawlink_pairing",
         version: 1,
         server: httpBase,
         gatewayId,
         accessCode,
         displayName,
+        gatewayType,
+        capabilities,
     });
     if (opts.codeOnly) {
         console.log(accessCode);
@@ -76,6 +86,20 @@ export async function pairCommand(opts) {
     }
     console.log(t("pair.installingService"));
     installCommand();
+}
+function normalizeGatewayType(value) {
+    return value === "hermes" || value === "devtool" ? value : "openclaw";
+}
+function capabilitiesForGatewayType(gatewayType) {
+    switch (gatewayType) {
+        case "hermes":
+            return ["chat", "files", "logs", "restart", "sessions", "skills", "gateway_service"];
+        case "devtool":
+            return ["devtools", "files", "logs"];
+        case "openclaw":
+        default:
+            return ["chat", "skills", "schedules", "logs", "files"];
+    }
 }
 function sanitizeDisplayName(name) {
     // Replace smart quotes and other problematic characters with regular ones

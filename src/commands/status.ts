@@ -8,25 +8,31 @@ type HealthState = {
   kind: "ok" | "warn" | "error" | "unknown";
   detail?: string;
 };
+type GatewayType = "openclaw" | "hermes" | "devtool";
 
 export function statusCommand(): void {
   console.log(t("status.title"));
 
+  let gatewayType: GatewayType = "openclaw";
   if (!configExists()) {
     console.log(t("status.notPaired"));
   } else {
     try {
       const config = readConfig();
+      gatewayType = config.gatewayType ?? "openclaw";
       console.log(t("status.paired"));
       console.log(t("status.displayName", config.displayName));
       console.log(t("status.gatewayId", config.gatewayId));
+      console.log(t("status.gatewayType", gatewayType));
       console.log(t("status.relayServer", config.relayServerUrl));
     } catch {
       console.log(t("status.configCorrupted"));
     }
   }
 
-  console.log(t("status.gateway", readGatewayUrl()));
+  if (gatewayType === "openclaw") {
+    console.log(t("status.gateway", readGatewayUrl()));
+  }
 
   const service = getServiceStatus();
   if (service.platform === "unsupported") {
@@ -42,9 +48,9 @@ export function statusCommand(): void {
   } else if (service.running) {
     console.log(t("status.serviceRunning", service.manager));
     console.log(t("status.serviceLog", service.logPath));
-    const health = readHealth(service.logPath);
+    const health = readHealth(service.logPath, gatewayType);
     console.log(formatHealthLine("status.relayHealth", health.relay));
-    console.log(formatHealthLine("status.gatewayHealth", health.gateway));
+    console.log(formatHealthLine(gatewayType === "openclaw" ? "status.gatewayHealth" : "status.agentHealth", health.gateway));
   } else {
     console.log(t("status.serviceNotRunning"));
     if (service.servicePath) {
@@ -58,7 +64,7 @@ export function statusCommand(): void {
   console.log("");
 }
 
-function readHealth(logPath: string): { relay: HealthState; gateway: HealthState } {
+export function readHealth(logPath: string, gatewayType: GatewayType = "openclaw"): { relay: HealthState; gateway: HealthState } {
   if (!existsSync(logPath)) {
     return {
       relay: { kind: "unknown", detail: "log missing" },
@@ -69,7 +75,7 @@ function readHealth(logPath: string): { relay: HealthState; gateway: HealthState
   const lines = readTailLines(logPath, 400);
   return {
     relay: parseRelayHealth(lines),
-    gateway: parseGatewayHealth(lines),
+    gateway: parseGatewayHealth(lines, gatewayType),
   };
 }
 
@@ -115,7 +121,13 @@ function parseRelayHealth(lines: string[]): HealthState {
   return { kind: "error", detail };
 }
 
-function parseGatewayHealth(lines: string[]): HealthState {
+function parseGatewayHealth(lines: string[], gatewayType: GatewayType): HealthState {
+  if (gatewayType === "hermes") {
+    return parseHermesAgentHealth(lines);
+  }
+  if (gatewayType === "devtool") {
+    return parseDevtoolAgentHealth(lines);
+  }
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     const line = lines[i];
     if (line.includes("Gateway connected.")) {
@@ -141,6 +153,35 @@ function parseGatewayHealth(lines: string[]): HealthState {
     }
   }
   return { kind: "unknown", detail: "no gateway events yet" };
+}
+
+function parseHermesAgentHealth(lines: string[]): HealthState {
+  const connectedIndex = findLastIndex(lines, (line) => line.includes("Connected to relay server (hermes gatewayId="));
+  const closedIndex = findLastIndex(lines, (line) => line.includes("Hermes relay connection closed:"));
+
+  if (connectedIndex === -1 && closedIndex === -1) {
+    return { kind: "unknown", detail: "no Hermes agent events yet" };
+  }
+  if (connectedIndex > closedIndex) {
+    return { kind: "ok", detail: "connected" };
+  }
+  const detail = closedIndex >= 0
+    ? lines[closedIndex].replace(/^.*Hermes relay connection closed:\s*/, "").trim() || "disconnected"
+    : "disconnected";
+  return { kind: "error", detail };
+}
+
+function parseDevtoolAgentHealth(lines: string[]): HealthState {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (line.includes("Relay connected.")) {
+      return { kind: "ok", detail: "connected" };
+    }
+    if (line.includes("Relay disconnected.") || line.includes("Relay connection closed:")) {
+      return { kind: "warn", detail: "disconnected" };
+    }
+  }
+  return { kind: "unknown", detail: "no agent events yet" };
 }
 
 function classifyGatewayDetail(line: string): HealthState["kind"] {

@@ -96,7 +96,7 @@ function buildSignedDevice(identity: DeviceIdentity, opts: {
 }
 
 // ---------------------------------------------------------------------------
-// Wire frame types (OpenClaw protocol v3)
+// Wire frame types (OpenClaw protocol v3-v4)
 // ---------------------------------------------------------------------------
 
 interface ReqFrame {
@@ -121,7 +121,8 @@ interface EvtFrame {
   seq?: number;
 }
 
-const PROTOCOL_VERSION = 3;
+const MIN_PROTOCOL_VERSION = 3;
+const MAX_PROTOCOL_VERSION = 4;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -252,8 +253,8 @@ export class OpenClawGatewayClient {
     });
 
     const params = {
-      minProtocol: PROTOCOL_VERSION,
-      maxProtocol: PROTOCOL_VERSION,
+      minProtocol: MIN_PROTOCOL_VERSION,
+      maxProtocol: MAX_PROTOCOL_VERSION,
       role,
       scopes,
       caps,
