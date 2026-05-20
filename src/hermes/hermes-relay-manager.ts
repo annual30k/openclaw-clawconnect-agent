@@ -74,7 +74,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         type: "hello",
         platform: `${process.platform} (Hermes)`,
         agentVersion: "hermes",
-        capabilities: opts.capabilities ?? ["chat", "files", "logs", "restart", "sessions", "skills", "gateway_service"],
+        capabilities: opts.capabilities ?? ["chat", "files", "logs", "restart", "sessions", "skills", "models", "gateway_service"],
       });
       send({ type: "gateway_connected" });
       send({
@@ -325,11 +325,14 @@ async function attachRecentMobileFiles(
   if (pending.length === 0) {
     return params;
   }
-  recentMobileFiles.delete(sessionKey);
   const existing = Array.isArray(record.attachments) ? record.attachments : [];
+  recentMobileFiles.delete(sessionKey);
+  if (existing.length > 0) {
+    return record;
+  }
   return {
     ...record,
-    attachments: [...existing, ...pending],
+    attachments: pending,
   };
 }
 

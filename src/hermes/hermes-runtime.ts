@@ -189,6 +189,11 @@ export function handleHermesCommand(
       return runHermesSkillsInstall(params);
     case "hermes.skills.uninstall":
       return runHermesSkillsUninstall(params);
+    case "hermes.model.list":
+      return runHermesModelList();
+    case "hermes.model.select":
+    case "hermes.model.setDefault":
+      return runHermesModelSelect(params);
     case "hermes.mcp.list":
       return runHermesMcpList();
     case "hermes.mcp.test":
@@ -494,6 +499,180 @@ export function parseHermesSessionUsageSnapshot(output: string): HermesUsageSnap
   });
 }
 
+type HermesModelListItem = {
+  providerId: string;
+  provider: string;
+  modelId: string;
+  alias: string;
+  name: string;
+  contextWindow: string;
+  tags: string[];
+  isSelected: boolean;
+  isDefault: boolean;
+};
+
+function runHermesModelList(): LocalResult {
+  try {
+    const config = readHermesConfigSnapshot();
+    const current = readHermesStatusSnapshot();
+    const providerIds = hermesConfiguredProviderIds(config, current.provider);
+    const cache = readHermesModelsDevCache();
+    const items: HermesModelListItem[] = [];
+    const selectedProvider = current.provider ?? config.provider;
+    const selectedModel = current.currentModel ?? config.model;
+
+    for (const providerId of providerIds) {
+      const providerRecord = toRecord(cache?.[providerId] ?? cache?.[hermesModelsDevProviderId(providerId)]);
+      const models = toRecord(providerRecord.models);
+      const providerName = selectedProvider && normalizedProviderMatches(providerId, selectedProvider)
+        ? selectedProvider
+        : stringValue(providerRecord.name) ?? providerId;
+      for (const [modelId, rawModel] of Object.entries(models)) {
+        const modelRecord = toRecord(rawModel);
+        if (!isHermesChatModel(modelId, modelRecord)) {
+          continue;
+        }
+        const name = stringValue(modelRecord.name) ?? modelId;
+        const contextWindow = firstPositiveInteger(
+          toRecord(modelRecord.limit).context,
+          toRecord(modelRecord.limit).input,
+          modelRecord.contextWindow,
+          modelRecord.context_window,
+          modelRecord.contextLength,
+          modelRecord.context_length,
+          modelRecord.maxInputTokens,
+          modelRecord.max_input_tokens,
+        );
+        const tags = [
+          modelId,
+          ...compactStringArray([
+            stringValue(modelRecord.family),
+            booleanValue(modelRecord.reasoning) ? "reasoning" : undefined,
+            booleanValue(modelRecord.tool_call) ? "tools" : undefined,
+            booleanValue(modelRecord.attachment) ? "attachments" : undefined,
+          ]),
+        ];
+        const selected = normalizedProviderMatches(providerId, selectedProvider)
+          && normalizeModelId(modelId) === normalizeModelId(selectedModel);
+        items.push({
+          providerId,
+          provider: providerName,
+          modelId,
+          alias: modelId,
+          name,
+          contextWindow: contextWindow === undefined ? "--" : String(contextWindow),
+          tags,
+          isSelected: selected,
+          isDefault: selected,
+        });
+      }
+    }
+
+    if (items.length === 0 && selectedModel) {
+      items.push({
+        providerId: selectedProvider ?? config.provider ?? "hermes",
+        provider: selectedProvider ?? config.provider ?? "Hermes",
+        modelId: selectedModel,
+        alias: selectedModel,
+        name: selectedModel,
+        contextWindow: "--",
+        tags: [selectedModel],
+        isSelected: true,
+        isDefault: true,
+      });
+    }
+
+    return { ok: true, payload: { items } };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function runHermesModelSelect(params: unknown): LocalResult {
+  const record = params && typeof params === "object" && !Array.isArray(params)
+    ? (params as Record<string, unknown>)
+    : {};
+  const providerId = typeof record.providerId === "string" ? record.providerId.trim() : "";
+  const modelId = typeof record.modelId === "string" ? record.modelId.trim() : "";
+  const modelAlias = typeof record.modelAlias === "string" ? record.modelAlias.trim() : "";
+  const modelName = typeof record.modelName === "string" ? record.modelName.trim() : "";
+  const resolvedModel = modelId || modelAlias || modelName;
+  if (!resolvedModel) {
+    return { ok: false, error: "modelId is required" };
+  }
+
+  try {
+    runHermes(["config", "set", "model.default", resolvedModel], 10_000);
+    if (providerId) {
+      runHermes(["config", "set", "model.provider", providerId], 10_000);
+    }
+    const snapshot = readHermesStatusSnapshot();
+    return {
+      ok: true,
+      payload: {
+        providerId: providerId || snapshot.provider,
+        modelId: resolvedModel,
+        modelAlias: modelAlias || modelName || resolvedModel,
+        currentModel: snapshot.currentModel ?? resolvedModel,
+        provider: snapshot.provider ?? providerId,
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function readHermesModelsDevCache(): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(HERMES_MODELS_DEV_CACHE_FILE, "utf8")) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readHermesConfigSnapshot(): { model?: string; provider?: string; providers: string[] } {
+  try {
+    const raw = readFileSync(join(HERMES_HOME_DIR, "config.yaml"), "utf8");
+    const model = raw.match(/^\s{2}default:\s*(.+)\s*$/m)?.[1]?.trim().replace(/^['"]|['"]$/g, "");
+    const provider = raw.match(/^\s{2}provider:\s*(.+)\s*$/m)?.[1]?.trim().replace(/^['"]|['"]$/g, "");
+    const providers: string[] = [];
+    const providerBlock = raw.match(/^providers:\s*\n([\s\S]*?)(?=^[^\s#][^:\n]*:|\Z)/m)?.[1] ?? "";
+    for (const match of providerBlock.matchAll(/^\s{2}([^:\s][^:]*):\s*$/gm)) {
+      providers.push(match[1].trim());
+    }
+    return { model, provider, providers };
+  } catch {
+    return { providers: [] };
+  }
+}
+
+function hermesConfiguredProviderIds(config: { provider?: string; providers: string[] }, currentProvider?: string): string[] {
+  const ids: string[] = [];
+  for (const candidate of [config.provider, ...config.providers]) {
+    if (candidate && candidate.trim().length > 0 && !ids.some((id) => normalizedProviderMatches(id, candidate))) {
+      ids.push(candidate.trim());
+    }
+  }
+  if (currentProvider && !ids.some((id) => normalizedProviderMatches(id, currentProvider))) {
+    ids.push(currentProvider.trim());
+  }
+  return ids;
+}
+
+function isHermesChatModel(modelId: string, modelRecord: Record<string, unknown>): boolean {
+  const family = stringValue(modelRecord.family)?.toLowerCase() ?? "";
+  const normalizedId = modelId.toLowerCase();
+  if (family.includes("embedding") || normalizedId.includes("embedding")) {
+    return false;
+  }
+  const modalities = toRecord(modelRecord.modalities);
+  const output = Array.isArray(modalities.output) ? modalities.output : undefined;
+  return !output || output.includes("text");
+}
+
 async function latestHermesSessionId(): Promise<string | undefined> {
   const sessions = await listHermesSessions();
   return sessions[0]?.hermesSessionId;
@@ -598,6 +777,16 @@ function normalizeModelId(model: string | undefined): string {
   const normalized = model?.trim().toLowerCase() ?? "";
   const slashIndex = normalized.lastIndexOf("/");
   return slashIndex >= 0 ? normalized.slice(slashIndex + 1) : normalized;
+}
+
+function normalizeProviderId(provider: string | undefined): string {
+  return provider?.trim().toLowerCase().replace(/[^a-z0-9]+/g, "") ?? "";
+}
+
+function normalizedProviderMatches(left: string | undefined, right: string | undefined): boolean {
+  const normalizedLeft = normalizeProviderId(left);
+  const normalizedRight = normalizeProviderId(right);
+  return normalizedLeft.length > 0 && normalizedLeft === normalizedRight;
 }
 
 function runHermesOutput(args: string[], timeoutMs = DEFAULT_TIMEOUT_MS): LocalResult {
@@ -1053,6 +1242,14 @@ function numberParam(record: Record<string, unknown>, key: string): number | und
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function booleanValue(value: unknown): boolean {
+  return value === true;
+}
+
+function compactStringArray(values: Array<string | undefined>): string[] {
+  return values.filter((value): value is string => typeof value === "string" && value.trim().length > 0);
 }
 
 function nonNegativeInteger(value: unknown): number | undefined {
