@@ -17,11 +17,20 @@ import {
 const IS_WINDOWS = process.platform === "win32";
 const HERMES_INBOX_DIR = join(homedir(), ".clawconnect", "hermes", "inbox");
 const HERMES_HOME_DIR = process.env.HERMES_HOME?.trim() || join(homedir(), ".hermes");
+const CODEX_HOME_DIR = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex");
 const HERMES_CRON_JOBS_FILE = join(HERMES_HOME_DIR, "cron", "jobs.json");
 const HERMES_LOG_DIR = join(HERMES_HOME_DIR, "logs");
+const HERMES_AGENT_LOG_FILE = join(HERMES_LOG_DIR, "agent.log");
 const HERMES_MODELS_DEV_CACHE_FILE = join(HERMES_HOME_DIR, "models_dev_cache.json");
+const HERMES_AUTH_FILE = join(HERMES_HOME_DIR, "auth.json");
+const CODEX_AUTH_FILE = join(CODEX_HOME_DIR, "auth.json");
+const CODEX_CONFIG_FILE = join(CODEX_HOME_DIR, "config.toml");
+const CODEX_MODELS_CACHE_FILE = join(CODEX_HOME_DIR, "models_cache.json");
+const CODEX_MODELS_API_URL = "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
+const CODEX_MODEL_FALLBACKS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"];
 const DEFAULT_TIMEOUT_MS = 120_000;
 const CHAT_TIMEOUT_MS = 30 * 60_000;
+const HERMES_TYPING_MARKER = "[[clawlink:typing]]";
 const CLAWCONNECT_MOBILE_BRIDGE_HINT = [
   "[ClawConnect mobile bridge]",
   "You are connected to a mobile chat client through ClawConnect.",
@@ -63,6 +72,13 @@ export type HermesUsageSnapshot = {
   contextUsage?: number;
   contextLimit?: number;
   hermesSessionId?: string;
+};
+
+export type HermesToolLogEvent = {
+  toolName: string;
+  phase: "streaming" | "completed" | "failed";
+  text: string;
+  isError?: boolean;
 };
 
 export function resolveHermesBin(): string {
@@ -288,6 +304,44 @@ async function runHermesChatStreaming(
   let seq = 0;
   let stdoutLineBuffer = "";
   let inSecurityReview = false;
+  let hasPublishedAssistantText = false;
+  let streamQueue = Promise.resolve();
+  const toolCallIdsByName = new Map<string, string>();
+  let toolCallCounter = 0;
+
+  const publishToolLogEvent = (event: HermesToolLogEvent): void => {
+    let toolCallId = toolCallIdsByName.get(event.toolName);
+    if (!toolCallId) {
+      toolCallCounter += 1;
+      toolCallId = `${runId}:hermes-tool-${toolCallCounter}`;
+      toolCallIdsByName.set(event.toolName, toolCallId);
+    }
+    if (event.phase === "completed" || event.phase === "failed") {
+      toolCallIdsByName.delete(event.toolName);
+    }
+    context.publishEvent?.({
+      type: "event",
+      event: "chat",
+      payload: {
+        runId,
+        sessionKey,
+        stream: "tool",
+        state: event.phase,
+        phase: event.phase,
+        role: "tool",
+        seq: seq += 1,
+        ts: Date.now(),
+        data: {
+          phase: event.phase,
+          tool_call_id: toolCallId,
+          tool_name: event.toolName,
+          text: event.text,
+          is_error: event.isError === true,
+        },
+      },
+    });
+  };
+  const toolLogWatcher = createHermesToolLogWatcher(publishToolLogEvent);
 
   const filterChatLine = (line: string): string | null => {
     const clean = stripAnsi(line).trim();
@@ -304,6 +358,50 @@ async function runHermesChatStreaming(
     return line;
   };
 
+  const enqueueAssistantText = (text: string): void => {
+    hasPublishedAssistantText = true;
+    output += text;
+    streamQueue = streamQueue.then(async () => {
+      const chunks = splitTypewriterChunks(text);
+      const delayMs = typewriterDelayMs(text.length);
+      for (const delta of chunks) {
+        context.publishEvent?.({
+          type: "event",
+          event: "chat",
+          payload: {
+            runId,
+            sessionKey,
+            state: "streaming",
+            role: "assistant",
+            seq: seq += 1,
+            delta,
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: delta }],
+            },
+          },
+        });
+        if (delayMs > 0) {
+          await sleep(delayMs);
+        }
+      }
+    }).catch((error) => {
+      context.publishEvent?.({
+        type: "event",
+        event: "maintenance_log",
+        payload: {
+          gatewayId: context.gatewayId,
+          requestId: context.requestId,
+          runId,
+          stream: "stderr",
+          seq: seq += 1,
+          ts: Date.now(),
+          text: `Hermes stream publish failed: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      });
+    });
+  };
+
   const publishText = (text: string): void => {
     stdoutLineBuffer += text;
     const lines = stdoutLineBuffer.split(/\r?\n/);
@@ -318,22 +416,7 @@ async function runHermesChatStreaming(
       return;
     }
     const chunk = `${clean}\n`;
-    output += chunk;
-    context.publishEvent?.({
-      type: "event",
-      event: "chat",
-      payload: {
-        runId,
-        sessionKey,
-        state: "streaming",
-        role: "assistant",
-        seq: seq += 1,
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: chunk }],
-        },
-      },
-    });
+    enqueueAssistantText(chunk);
   };
 
   const flushStdoutLineBuffer = (): void => {
@@ -345,22 +428,7 @@ async function runHermesChatStreaming(
     if (!clean.trim()) {
       return;
     }
-    output += clean;
-    context.publishEvent?.({
-      type: "event",
-      event: "chat",
-      payload: {
-        runId,
-        sessionKey,
-        state: "streaming",
-        role: "assistant",
-        seq: seq += 1,
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: clean }],
-        },
-      },
-    });
+    enqueueAssistantText(clean);
   };
 
   const publishStderr = (text: string): void => {
@@ -384,29 +452,196 @@ async function runHermesChatStreaming(
     });
   };
 
+  const publishTypingMarker = (): void => {
+    if (hasPublishedAssistantText) {
+      return;
+    }
+    context.publishEvent?.({
+      type: "event",
+      event: "chat",
+      payload: {
+        runId,
+        sessionKey,
+        state: "streaming",
+        role: "assistant",
+        seq: seq += 1,
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: HERMES_TYPING_MARKER }],
+        },
+      },
+    });
+  };
+
   child.stdout?.on("data", (chunk) => publishText(chunk.toString()));
   child.stderr?.on("data", (chunk) => publishStderr(chunk.toString()));
+  toolLogWatcher.start();
+  publishTypingMarker();
 
   return await new Promise<string>((resolveOutput, rejectOutput) => {
+    const typingTimer = setInterval(publishTypingMarker, 5000);
+    typingTimer.unref?.();
     const timeout = setTimeout(() => {
+      clearInterval(typingTimer);
+      toolLogWatcher.stop();
       child.kill("SIGTERM");
       rejectOutput(new Error("hermes_chat_timeout"));
     }, CHAT_TIMEOUT_MS);
+    timeout.unref?.();
     child.once("error", (error) => {
+      clearInterval(typingTimer);
       clearTimeout(timeout);
+      toolLogWatcher.stop();
       rejectOutput(error);
     });
     child.once("close", (code, signal) => {
-      clearTimeout(timeout);
-      flushStdoutLineBuffer();
-      if (code && code !== 0) {
-        const reason = stderr.trim() || output.trim() || `hermes chat exited with code ${code}`;
-        rejectOutput(new Error(signal ? `${reason} (${signal})` : reason));
-        return;
-      }
-      resolveOutput(output);
+      void (async () => {
+        clearInterval(typingTimer);
+        clearTimeout(timeout);
+        toolLogWatcher.stop();
+        flushStdoutLineBuffer();
+        await streamQueue;
+        if (code && code !== 0) {
+          const reason = stderr.trim() || output.trim() || `hermes chat exited with code ${code}`;
+          rejectOutput(new Error(signal ? `${reason} (${signal})` : reason));
+          return;
+        }
+        resolveOutput(output);
+      })().catch(rejectOutput);
     });
   });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
+function createHermesToolLogWatcher(onEvent: (event: HermesToolLogEvent) => void): {
+  start: () => void;
+  stop: () => void;
+} {
+  let offset = 0;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    offset = statSync(HERMES_AGENT_LOG_FILE).size;
+  } catch {
+    offset = 0;
+  }
+
+  const poll = (): void => {
+    let content = "";
+    try {
+      const bytes = readFileSync(HERMES_AGENT_LOG_FILE);
+      if (bytes.length < offset) {
+        offset = 0;
+      }
+      if (bytes.length === offset) {
+        return;
+      }
+      content = bytes.subarray(offset).toString("utf8");
+      offset = bytes.length;
+    } catch {
+      return;
+    }
+    for (const line of content.split(/\r?\n/)) {
+      const event = parseHermesToolLogLine(line);
+      if (event) {
+        onEvent(event);
+      }
+    }
+  };
+
+  return {
+    start: () => {
+      if (timer) {
+        return;
+      }
+      timer = setInterval(poll, 250);
+      timer.unref?.();
+    },
+    stop: () => {
+      poll();
+      if (timer) {
+        clearInterval(timer);
+        timer = undefined;
+      }
+    },
+  };
+}
+
+export function parseHermesToolLogLine(line: string): HermesToolLogEvent | null {
+  const clean = stripAnsi(line).trim();
+  if (!clean) {
+    return null;
+  }
+
+  const executor = clean.match(/\bagent\.tool_executor:\s*tool\s+([A-Za-z0-9_.-]+)\s+(.+)$/i);
+  if (executor) {
+    const toolName = normalizeHermesToolName(executor[1] ?? "tool");
+    const detail = (executor[2] ?? "").trim();
+    const failed = /\b(?:failed|error|errored|denied|aborted)\b/i.test(detail);
+    return {
+      toolName,
+      phase: failed ? "failed" : "completed",
+      text: `${toolName} ${detail}`.trim(),
+      isError: failed,
+    };
+  }
+
+  const toolLogger = clean.match(/\btools\.([A-Za-z0-9_.-]+):\s*(.+)$/i);
+  if (!toolLogger) {
+    return null;
+  }
+  const loggerName = toolLogger[1] ?? "tool";
+  if (!/(?:_tool|_tools)$/i.test(loggerName)) {
+    return null;
+  }
+  let toolName = normalizeHermesToolName(loggerName);
+  let detail = (toolLogger[2] ?? "").trim();
+  if (/\b(?:Manually cleaned up environment|Cleaned \d+ environments?)\b/i.test(detail)) {
+    return null;
+  }
+  const nestedTool = detail.match(/^([A-Za-z0-9_.-]+):\s*(.+)$/);
+  if (nestedTool) {
+    toolName = normalizeHermesToolName(nestedTool[1] ?? toolName);
+    detail = (nestedTool[2] ?? "").trim();
+  }
+  if (!detail) {
+    return null;
+  }
+  return {
+    toolName,
+    phase: "streaming",
+    text: `${toolName}: ${detail}`,
+  };
+}
+
+function normalizeHermesToolName(rawName: string): string {
+  const normalized = rawName
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .replace(/_tools$/i, "")
+    .replace(/_tool$/i, "");
+  return normalized || "tool";
+}
+
+function splitTypewriterChunks(text: string): string[] {
+  const chars = Array.from(text);
+  if (chars.length <= 24) {
+    return [text];
+  }
+  const chunkSize = chars.length > 800 ? 32 : chars.length > 320 ? 20 : 12;
+  const chunks: string[] = [];
+  for (let index = 0; index < chars.length; index += chunkSize) {
+    chunks.push(chars.slice(index, index + chunkSize).join(""));
+  }
+  return chunks;
+}
+
+function typewriterDelayMs(textLength: number): number {
+  if (textLength > 1200) return 8;
+  if (textLength > 400) return 14;
+  return 22;
 }
 
 export async function listHermesSessions(): Promise<ReturnType<typeof parseHermesSessionsList>> {
@@ -511,7 +746,7 @@ type HermesModelListItem = {
   isDefault: boolean;
 };
 
-function runHermesModelList(): LocalResult {
+async function runHermesModelList(): Promise<LocalResult> {
   try {
     const config = readHermesConfigSnapshot();
     const current = readHermesStatusSnapshot();
@@ -522,6 +757,17 @@ function runHermesModelList(): LocalResult {
     const selectedModel = current.currentModel ?? config.model;
 
     for (const providerId of providerIds) {
+      if (isOpenAICodexProvider(providerId)) {
+        items.push(...await buildCodexModelListItems({
+          providerId,
+          providerName: selectedProvider && normalizedProviderMatches(providerId, selectedProvider)
+            ? selectedProvider
+            : "OpenAI Codex",
+          selectedProvider,
+          selectedModel,
+        }));
+        continue;
+      }
       const providerRecord = toRecord(cache?.[providerId] ?? cache?.[hermesModelsDevProviderId(providerId)]);
       const models = toRecord(providerRecord.models);
       const providerName = selectedProvider && normalizedProviderMatches(providerId, selectedProvider)
@@ -588,7 +834,7 @@ function runHermesModelList(): LocalResult {
   }
 }
 
-function runHermesModelSelect(params: unknown): LocalResult {
+async function runHermesModelSelect(params: unknown): Promise<LocalResult> {
   const record = params && typeof params === "object" && !Array.isArray(params)
     ? (params as Record<string, unknown>)
     : {};
@@ -602,6 +848,15 @@ function runHermesModelSelect(params: unknown): LocalResult {
   }
 
   try {
+    if (providerId && isOpenAICodexProvider(providerId)) {
+      const availableModels = await listAvailableCodexModelIds();
+      if (!availableModels.some((candidate) => normalizeModelId(candidate) === normalizeModelId(resolvedModel))) {
+        return {
+          ok: false,
+          error: `Hermes Codex 当前账号不可用模型 ${resolvedModel}。可用模型：${availableModels.join(", ")}`,
+        };
+      }
+    }
     runHermes(["config", "set", "model.default", resolvedModel], 10_000);
     if (providerId) {
       runHermes(["config", "set", "model.provider", providerId], 10_000);
@@ -631,6 +886,174 @@ function readHermesModelsDevCache(): Record<string, unknown> | undefined {
   } catch {
     return undefined;
   }
+}
+
+async function buildCodexModelListItems(options: {
+  providerId: string;
+  providerName: string;
+  selectedProvider?: string;
+  selectedModel?: string;
+}): Promise<HermesModelListItem[]> {
+  const modelIds = await listAvailableCodexModelIds();
+  const selectedMatchesProvider = normalizedProviderMatches(options.providerId, options.selectedProvider);
+  const selectedModelAvailable = selectedMatchesProvider
+    && modelIds.some((modelId) => normalizeModelId(modelId) === normalizeModelId(options.selectedModel));
+  const effectiveSelectedModel = selectedModelAvailable ? options.selectedModel : modelIds[0];
+  return modelIds.map((modelId) => {
+    const selected = normalizeModelId(modelId) === normalizeModelId(effectiveSelectedModel);
+    const contextLimit = readHermesContextLimit(modelId, options.providerId);
+    return {
+      providerId: options.providerId,
+      provider: options.providerName,
+      modelId,
+      alias: modelId,
+      name: displayCodexModelName(modelId),
+      contextWindow: contextLimit === undefined ? "--" : String(contextLimit),
+      tags: [modelId, "codex", "reasoning", "tools"],
+      isSelected: selected,
+      isDefault: selected,
+    };
+  });
+}
+
+async function listAvailableCodexModelIds(): Promise<string[]> {
+  const liveModels = await fetchCodexModelIds(readCodexAccessToken());
+  return uniqueModelIds([
+    ...liveModels,
+    ...readCodexModelIdsFromCache(),
+    ...CODEX_MODEL_FALLBACKS,
+  ]);
+}
+
+async function fetchCodexModelIds(accessToken: string | undefined): Promise<string[]> {
+  if (!accessToken) {
+    return [];
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  timeout.unref?.();
+  try {
+    const response = await fetch(CODEX_MODELS_API_URL, {
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        accept: "application/json",
+        "chatgpt-account-id": readCodexAccountId(),
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return [];
+    }
+    const payload = toRecord(await response.json());
+    const models = Array.isArray(payload.models) ? payload.models : [];
+    return sortCodexModelRecords(models).map((model) => model.slug);
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function sortCodexModelRecords(values: unknown[]): Array<{ slug: string; priority: number }> {
+  return values
+    .map((value) => {
+      const record = toRecord(value);
+      const slug = stringValue(record.slug) ?? stringValue(record.id) ?? stringValue(record.model);
+      const visibility = stringValue(record.visibility)?.toLowerCase();
+      if (!slug || visibility === "hide" || visibility === "hidden") {
+        return undefined;
+      }
+      return {
+        slug,
+        priority: nonNegativeInteger(record.priority) ?? Number.MAX_SAFE_INTEGER,
+      };
+    })
+    .filter((value): value is { slug: string; priority: number } => value !== undefined)
+    .sort((left, right) => left.priority - right.priority || left.slug.localeCompare(right.slug));
+}
+
+function readCodexModelIdsFromCache(): string[] {
+  const modelIds: string[] = [];
+  try {
+    const config = readFileSync(CODEX_CONFIG_FILE, "utf8");
+    const configured = config.match(/^\s*model\s*=\s*["']([^"']+)["']/m)?.[1]?.trim();
+    if (configured) {
+      modelIds.push(configured);
+    }
+  } catch {
+    // optional cache
+  }
+  try {
+    const cache = toRecord(JSON.parse(readFileSync(CODEX_MODELS_CACHE_FILE, "utf8")) as unknown);
+    const models = Array.isArray(cache.models) ? cache.models : [];
+    modelIds.push(...sortCodexModelRecords(models).map((model) => model.slug));
+  } catch {
+    // optional cache
+  }
+  return modelIds;
+}
+
+function readCodexAccessToken(): string | undefined {
+  return readHermesCodexAccessToken() ?? readCodexAuthAccessToken(CODEX_AUTH_FILE);
+}
+
+function readHermesCodexAccessToken(): string | undefined {
+  try {
+    const auth = toRecord(JSON.parse(readFileSync(HERMES_AUTH_FILE, "utf8")) as unknown);
+    const provider = toRecord(toRecord(auth.providers)["openai-codex"]);
+    const token = stringValue(toRecord(provider.tokens).access_token) ?? stringValue(provider.access_token);
+    if (token) {
+      return token;
+    }
+    const pool = toRecord(auth.credential_pool)["openai-codex"];
+    const first = Array.isArray(pool) ? toRecord(pool[0]) : toRecord(pool);
+    return stringValue(first.access_token) ?? stringValue(toRecord(first.tokens).access_token);
+  } catch {
+    return undefined;
+  }
+}
+
+function readCodexAuthAccessToken(filePath: string): string | undefined {
+  try {
+    const auth = toRecord(JSON.parse(readFileSync(filePath, "utf8")) as unknown);
+    return stringValue(toRecord(auth.tokens).access_token) ?? stringValue(auth.access_token);
+  } catch {
+    return undefined;
+  }
+}
+
+function readCodexAccountId(): string {
+  try {
+    const auth = toRecord(JSON.parse(readFileSync(CODEX_AUTH_FILE, "utf8")) as unknown);
+    return stringValue(auth.account_id)
+      ?? stringValue(auth.chatgpt_account_id)
+      ?? stringValue(toRecord(auth.tokens).account_id)
+      ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function uniqueModelIds(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const modelId = value.trim();
+    const key = normalizeModelId(modelId);
+    if (!modelId || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(modelId);
+  }
+  return result;
+}
+
+function displayCodexModelName(modelId: string): string {
+  return modelId
+    .split("-")
+    .map((part) => part.length === 0 ? part : `${part[0].toUpperCase()}${part.slice(1)}`)
+    .join(" ");
 }
 
 function readHermesConfigSnapshot(): { model?: string; provider?: string; providers: string[] } {
@@ -781,6 +1204,11 @@ function normalizeModelId(model: string | undefined): string {
 
 function normalizeProviderId(provider: string | undefined): string {
   return provider?.trim().toLowerCase().replace(/[^a-z0-9]+/g, "") ?? "";
+}
+
+function isOpenAICodexProvider(provider: string | undefined): boolean {
+  const normalized = normalizeProviderId(provider);
+  return normalized === "openaicodex" || normalized === "codex";
 }
 
 function normalizedProviderMatches(left: string | undefined, right: string | undefined): boolean {
@@ -1762,8 +2190,13 @@ function hasDeliverableSendIntent(message: string): boolean {
     "发", "发送", "传", "上传", "转发", "分享", "发给", "传给", "send", "upload", "attach", "share", "deliver",
   ].join("|");
 
+  if (new RegExp(`(你.{0,6}(能|可以|会)|能不能|可不可以|能否|是否|会不会|支持).{0,30}(${sendVerbs}).{0,30}(${deliverableWords}).{0,8}(吗|么|嘛|\\?|？)?`).test(text)) {
+    return false;
+  }
+
   const directChinesePatterns = [
     new RegExp(`(把|将).{0,50}(${deliverableWords}).{0,30}(${sendVerbs})(给我|到手机|到移动端|过来|回来|一下|给这边)?`),
+    new RegExp(`(${sendVerbs})(这张|这个|这份|该|那张|那份|一张|几张|一些|些|一下)?[^，。,.!?？]{0,24}(${deliverableWords})(给我|到手机|到移动端|过来|回来|一下|给这边)?`),
     new RegExp(`(${sendVerbs})(给我|到手机|到移动端|过来|回来).{0,50}(${deliverableWords})?`),
     new RegExp(`(给我|帮我).{0,20}(${sendVerbs}).{0,50}(${deliverableWords})`),
   ];

@@ -2,6 +2,7 @@ import { statSync } from "fs";
 import { WebSocket } from "ws";
 import { sendFileCommand } from "../commands/send-file.js";
 import { buildOfficeEventPayload } from "../relay/office-payload.js";
+import { prepareVoiceSendParams, voiceInputSetupMessage } from "../relay/voice-input.js";
 import {
   collectHermesUsageSnapshot,
   handleHermesCommand,
@@ -74,7 +75,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         type: "hello",
         platform: `${process.platform} (Hermes)`,
         agentVersion: "hermes",
-        capabilities: opts.capabilities ?? ["chat", "files", "logs", "restart", "sessions", "skills", "models", "gateway_service"],
+        capabilities: opts.capabilities ?? ["chat", "files", "logs", "restart", "sessions", "skills", "models", "gateway_service", "voice_input"],
       });
       send({ type: "gateway_connected" });
       send({
@@ -98,6 +99,8 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
     relayWs.on("message", async (raw) => {
       let requestId: string | undefined;
       let methodForLog = "";
+      let acknowledgedChatRun: { runId: string; sessionKey: string } | undefined;
+      let voiceInputRun: { runId: string; sessionKey: string } | undefined;
       try {
         let msg: FromServer;
         try {
@@ -140,14 +143,28 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           return;
         }
 
+        if (msg.method === "chat.voice.send" || msg.method === "hermes.voice.send") {
+          voiceInputRun = {
+            runId: requestId ?? `hermes-${Date.now()}`,
+            sessionKey: resolveHermesRelaySessionKey(msg.params),
+          };
+          msg.params = await prepareVoiceSendParams(msg.params);
+          msg.method = "chat.send";
+        }
+
         if (msg.method !== "chat.send" && msg.method !== "agent" && msg.method !== "hermes.chat.send") {
           throw new Error(`Unsupported Hermes command: ${msg.method}`);
         }
 
-        const runId = requestId ?? `hermes-${Date.now()}`;
         const paramsWithFiles = await attachRecentMobileFiles(msg.params, recentMobileFiles, opts);
+        const runId = requestId ?? `hermes-${Date.now()}`;
+        const sessionKey = resolveHermesRelaySessionKey(paramsWithFiles);
+        if (requestId) {
+          acknowledgedChatRun = { runId, sessionKey };
+          send({ type: "res", id: requestId, ok: true, payload: acknowledgedChatRun });
+        }
         const chat = await runHermesChat(paramsWithFiles, {
-          requestId,
+          requestId: runId,
           gatewayId: opts.gatewayId,
           publishEvent: (event) => {
             send(event);
@@ -199,13 +216,36 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           }
         }
 
-        if (requestId) {
+        if (requestId && !acknowledgedChatRun) {
           send({ type: "res", id: requestId, ok: true, payload: { runId, sessionKey: chat.sessionKey } });
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[hermes-relay] cmd failed method=${methodForLog || "(unknown)"} id=${requestId ?? "(no-id)"}: ${message}`);
-        if (requestId) {
+        const setupMessage = voiceInputSetupMessage(error);
+        const chatRun = setupMessage ? (acknowledgedChatRun ?? voiceInputRun) : acknowledgedChatRun;
+        if (chatRun) {
+          const errorPayload = {
+            runId: chatRun.runId,
+            sessionKey: chatRun.sessionKey,
+            state: "error",
+            role: "assistant",
+            errorMessage: setupMessage ?? message,
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: setupMessage ?? message }],
+            },
+          };
+          send({
+            type: "event",
+            event: "chat",
+            payload: errorPayload,
+          });
+          publishHermesOfficeSnapshot(send, "chat", errorPayload);
+          if (setupMessage && requestId && !acknowledgedChatRun) {
+            send({ type: "res", id: requestId, ok: true, payload: chatRun });
+          }
+        } else if (requestId) {
           send({ type: "res", id: requestId, ok: false, error: { message } });
         }
       }
@@ -334,6 +374,14 @@ async function attachRecentMobileFiles(
     ...record,
     attachments: pending,
   };
+}
+
+function resolveHermesRelaySessionKey(params: unknown): string {
+  const record = params && typeof params === "object" && !Array.isArray(params)
+    ? (params as Record<string, unknown>)
+    : {};
+  const sessionKey = typeof record.sessionKey === "string" ? record.sessionKey.trim() : "";
+  return sessionKey || "main";
 }
 
 function extractFileBlock(payload: unknown): Record<string, unknown> | undefined {

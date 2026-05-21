@@ -124,6 +124,7 @@ Supported values:
 - `CLAWCONNECT_ENV_FILE` — optional explicit env file path. When unset, the agent reads `~/.clawconnect/.env`, then `.env.local`, then `.env`
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD` — Gateway auth fallback
 - `OPENCLAW_TTS_ENABLED`, `OPENCLAW_TTS_VOICE`, `OPENCLAW_TTS_RATE`, `OPENCLAW_TTS_ENGINE` — voice reply defaults
+- `OPENCLAW_ASR_COMMAND` — host-side speech-to-text command for ClawLink `chat.voice.send` messages. The agent saves the audio to a temporary file and runs this command; it must print the transcript to stdout. Placeholders: `{file}`, `{language}`, `{mimeType}`
 
 Shell environment variables take priority over env files. Existing pairing credentials in `~/.clawconnect/config.json` or `~/.clawconnect/profiles/<profile>/config.json` still take priority for `clawconnect run`, `status`, and `send-file`; run `clawconnect pair --profile <name> --server <url>` or `clawconnect reset --profile <name>` when you intentionally switch relay servers.
 
@@ -142,6 +143,14 @@ OPENCLAW_TTS_ENABLED=1 clawconnect run
 ```
 
 When this flag is not set, assistant replies stay text-only.
+
+Optional: let ClawLink send raw voice messages and have the host transcribe them before forwarding text to OpenClaw or Hermes Agent:
+
+```bash
+OPENCLAW_ASR_COMMAND='/usr/local/bin/transcribe-audio {file} {language}' clawconnect run
+```
+
+If `OPENCLAW_ASR_COMMAND` is not configured, voice messages fail with `voice_asr_not_configured`.
 
 ### Check Status
 

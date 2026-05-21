@@ -122,10 +122,10 @@ function normalizeGatewayType(value: PairOptions["gatewayType"]): "openclaw" | "
 function capabilitiesForGatewayType(gatewayType: "openclaw" | "hermes"): string[] {
   switch (gatewayType) {
     case "hermes":
-      return ["chat", "files", "logs", "restart", "sessions", "skills", "gateway_service"];
+      return ["chat", "files", "logs", "restart", "sessions", "skills", "gateway_service", "voice_input"];
     case "openclaw":
     default:
-      return ["chat", "skills", "schedules", "logs", "files"];
+      return ["chat", "skills", "schedules", "logs", "files", "voice_input"];
   }
 }
 

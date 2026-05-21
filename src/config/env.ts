@@ -43,6 +43,11 @@ CLAWCONNECT_RELAY_SERVER_URL=https://clawlinks.cn
 # OPENCLAW_TTS_RATE=
 # OPENCLAW_TTS_ENGINE=
 
+# Optional: host-side speech-to-text for ClawLink voice messages.
+# Command must print the transcript to stdout. Available placeholders:
+# {file}, {language}, {mimeType}
+# OPENCLAW_ASR_COMMAND=/usr/local/bin/transcribe-audio {file} {language}
+
 # Optional: override how local maintenance commands find the OpenClaw CLI.
 # OPENCLAW_BIN=/usr/local/bin/openclaw
 # OPENCLAW_PACKAGE_BIN=/path/to/openclaw/package/dist/index.js

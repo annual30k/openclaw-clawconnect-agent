@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   extractDeliverablePaths,
+  parseHermesToolLogLine,
   parseHermesSkillsList,
   parseHermesSessionUsageSnapshot,
   parseHermesStatusSnapshot,
@@ -62,6 +63,18 @@ test("extractDeliverablePaths requires the latest user to ask for sending files"
     assert.deepEqual(
       extractDeliverablePaths(`文件路径：${docPath}`, { userMessage: "只要把这个文件发给我" }),
       [docPath],
+    );
+    assert.deepEqual(
+      extractDeliverablePaths(`图片路径：${imagePath}`, { userMessage: "发图片" }),
+      [imagePath],
+    );
+    assert.deepEqual(
+      extractDeliverablePaths(`图片路径：${imagePath}`, { userMessage: "发送这张图到手机" }),
+      [imagePath],
+    );
+    assert.deepEqual(
+      extractDeliverablePaths(`图片路径：${imagePath}`, { userMessage: "你能发图片吗" }),
+      [],
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -130,6 +143,67 @@ test("parseHermesSessionUsageSnapshot reads session token usage", () => {
   assert.equal(snapshot.currentModel, "gpt-5.5");
   assert.equal(snapshot.contextUsage, 4527);
   assert.equal(snapshot.contextLimit, 128000);
+});
+
+test("parseHermesToolLogLine converts terminal tool logs to tool stream events", () => {
+  const start = parseHermesToolLogLine(
+    "2026-05-21 09:06:53,185 INFO [session] tools.terminal_tool: Creating new local environment for task default...",
+  );
+  const completed = parseHermesToolLogLine(
+    "2026-05-21 09:06:53,871 INFO [session] agent.tool_executor: tool terminal completed (0.69s, 62 chars)",
+  );
+
+  assert.deepEqual(start, {
+    toolName: "terminal",
+    phase: "streaming",
+    text: "terminal: Creating new local environment for task default...",
+  });
+  assert.deepEqual(completed, {
+    toolName: "terminal",
+    phase: "completed",
+    text: "terminal completed (0.69s, 62 chars)",
+    isError: false,
+  });
+});
+
+test("parseHermesToolLogLine converts nested vision tool logs", () => {
+  const event = parseHermesToolLogLine(
+    "2026-05-21 11:11:42,993 INFO [session] tools.vision_tools: vision_analyze: native fast path enabled",
+  );
+
+  assert.deepEqual(event, {
+    toolName: "vision_analyze",
+    phase: "streaming",
+    text: "vision_analyze: native fast path enabled",
+  });
+});
+
+test("parseHermesToolLogLine marks tool executor errors as failed", () => {
+  const event = parseHermesToolLogLine(
+    "2026-05-21 09:00:00,000 ERROR [session] agent.tool_executor: tool browser_navigate returned error: browser unavailable",
+  );
+
+  assert.deepEqual(event, {
+    toolName: "browser_navigate",
+    phase: "failed",
+    text: "browser_navigate returned error: browser unavailable",
+    isError: true,
+  });
+});
+
+test("parseHermesToolLogLine ignores internal environment maintenance logs", () => {
+  assert.equal(
+    parseHermesToolLogLine(
+      "2026-05-21 09:06:53,407 INFO [session] tools.environments.base: Session snapshot created (session=7f5745625abe, cwd=/)",
+    ),
+    null,
+  );
+  assert.equal(
+    parseHermesToolLogLine(
+      "2026-05-21 09:06:54,000 INFO [session] tools.terminal_tool: Manually cleaned up environment for task: default",
+    ),
+    null,
+  );
 });
 
 test("parseHermesSkillsList enriches rows from SKILL.md frontmatter", () => {

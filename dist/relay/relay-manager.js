@@ -9,6 +9,7 @@ import { appendUniqueSuffix, extractChatRole, extractChatText, normalizeChatEven
 import { extractHistoryOutcome, withTimeout } from "./chat-history.js";
 import { buildOfficeEventPayload } from "./office-payload.js";
 import { prepareChatSendParams } from "./chat-send-attachments.js";
+import { prepareVoiceSendParams, voiceInputSetupMessage } from "./voice-input.js";
 import { sendVoiceReplyCommand } from "../commands/voice-reply.js";
 import { OPENCLAW_SLASH_COMMAND_CATALOG, } from "./slash-command-catalog.js";
 // ---------------------------------------------------------------------------
@@ -255,7 +256,7 @@ export async function runRelayManager(opts) {
             send(buildRelayHelloMessage({
                 platform: process.platform,
                 agentVersion: "1.0.0",
-                capabilities: ["chat", "skills", "schedules", "logs", "files"],
+                capabilities: ["chat", "skills", "schedules", "logs", "files", "voice_input"],
             }));
             // Start the persistent gateway connection as soon as we're connected
             // to the relay server. Its lifetime is tied to this relay session.
@@ -426,6 +427,7 @@ export async function runRelayManager(opts) {
         relayWs.on("message", async (raw) => {
             let requestId;
             let methodForLog;
+            let voiceInputRun;
             try {
                 let msg;
                 try {
@@ -488,6 +490,20 @@ export async function runRelayManager(opts) {
                         }
                     }
                     return;
+                }
+                if (msg.method === "chat.voice.send") {
+                    const voiceParamsRecord = msg.params && typeof msg.params === "object" && !Array.isArray(msg.params)
+                        ? msg.params
+                        : {};
+                    const voiceSessionKey = typeof voiceParamsRecord.sessionKey === "string" && voiceParamsRecord.sessionKey.trim().length > 0
+                        ? voiceParamsRecord.sessionKey.trim()
+                        : sessionDefaults.mainSessionKey;
+                    voiceInputRun = {
+                        runId: requestId ?? `voice-${Date.now()}`,
+                        sessionKey: voiceSessionKey,
+                    };
+                    msg.params = await prepareVoiceSendParams(msg.params);
+                    msg.method = "chat.send";
                 }
                 if (msg.method === "chat.send") {
                     msg.params = await prepareChatSendParams(msg.params);
@@ -592,7 +608,29 @@ export async function runRelayManager(opts) {
             catch (err) {
                 const message = err instanceof Error ? err.message : String(err);
                 console.error(`[relay] cmd failed method=${methodForLog ?? "(unknown)"} id=${requestId ?? "(no-id)"}: ${message}`);
-                if (requestId) {
+                const setupMessage = voiceInputSetupMessage(err);
+                if (setupMessage && voiceInputRun) {
+                    send({
+                        type: "event",
+                        event: "chat",
+                        payload: {
+                            runId: voiceInputRun.runId,
+                            sessionKey: voiceInputRun.sessionKey,
+                            state: "error",
+                            role: "assistant",
+                            errorMessage: setupMessage,
+                            message: {
+                                role: "assistant",
+                                content: [{ type: "text", text: setupMessage }],
+                            },
+                        },
+                    });
+                    if (requestId) {
+                        voiceReplyPreferences.clearRun(requestId);
+                        send({ type: "res", id: requestId, ok: true, payload: voiceInputRun });
+                    }
+                }
+                else if (requestId) {
                     voiceReplyPreferences.clearRun(requestId);
                     send({ type: "res", id: requestId, ok: false, error: { message } });
                 }

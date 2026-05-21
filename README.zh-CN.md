@@ -131,6 +131,7 @@ $EDITOR ~/.clawconnect/.env
 - `CLAWCONNECT_ENV_FILE`：可选，显式指定 env 文件路径；未设置时会依次读取 `~/.clawconnect/.env`、`.env.local`、`.env`
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD`：Gateway 鉴权兜底值
 - `OPENCLAW_TTS_ENABLED`、`OPENCLAW_TTS_VOICE`、`OPENCLAW_TTS_RATE`、`OPENCLAW_TTS_ENGINE`：语音回复默认值
+- `OPENCLAW_ASR_COMMAND`：宿主机语音转文字命令。ClawLink 发送 `chat.voice.send` 后，agent 会把音频保存到临时文件，并执行这个命令；命令必须把识别文本输出到 stdout。可用占位符：`{file}`、`{language}`、`{mimeType}`
 
 Shell 里已经设置的环境变量优先级高于 env 文件。`clawconnect run`、`status`、`send-file` 会继续使用 `~/.clawconnect/config.json` 或 `~/.clawconnect/profiles/<profile>/config.json` 里已配对保存的 relay；如果要切换中继服务器，请执行 `clawconnect pair --profile <name> --server <url>` 或 `clawconnect reset --profile <name>`。
 
@@ -151,6 +152,14 @@ OPENCLAW_TTS_ENABLED=1 clawconnect run
 ```
 
 未设置这个开关时，助手回复保持纯文字。
+
+如果需要让手机端直接发送语音、由宿主机识别后再转发给 OpenClaw 或 Hermes Agent，请配置本机 ASR 命令：
+
+```bash
+OPENCLAW_ASR_COMMAND='/usr/local/bin/transcribe-audio {file} {language}' clawconnect run
+```
+
+未配置 `OPENCLAW_ASR_COMMAND` 时，宿主机收到语音消息会返回 `voice_asr_not_configured`。
 
 ### 4. 查看状态
 
