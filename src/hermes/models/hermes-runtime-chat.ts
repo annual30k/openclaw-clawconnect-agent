@@ -28,6 +28,9 @@ import type { HermesChatResult, HermesToolLogEvent, HermesUsageSnapshot } from "
 import { collectHermesUsageSnapshot, listHermesSessions, readHermesStatusSnapshot } from "./hermes-runtime-usage.js";
 import { compactStringArray, sanitizeFileName } from "./hermes-runtime-values.js";
 
+const HERMES_ASSISTANT_DELTA_FLUSH_MS = 120;
+const HERMES_ASSISTANT_DELTA_MAX_BYTES = 4096;
+
 export async function runHermesChat(
   params: unknown,
   context: LocalCommandContext = {},
@@ -85,6 +88,8 @@ async function runHermesChatStreaming(
   let stderr = "";
   let seq = 0;
   let stdoutLineBuffer = "";
+  let pendingAssistantDelta = "";
+  let assistantDeltaFlushTimer: NodeJS.Timeout | undefined;
   let inSecurityReview = false;
   let hasPublishedAssistantText = false;
   const toolCallIdsByName = new Map<string, string>();
@@ -139,9 +144,21 @@ async function runHermesChatStreaming(
     return line;
   };
 
-  const publishAssistantDelta = (text: string): void => {
-    hasPublishedAssistantText = true;
-    output += text;
+  const clearAssistantDeltaFlushTimer = (): void => {
+    if (!assistantDeltaFlushTimer) {
+      return;
+    }
+    clearTimeout(assistantDeltaFlushTimer);
+    assistantDeltaFlushTimer = undefined;
+  };
+
+  const flushAssistantDelta = (): void => {
+    clearAssistantDeltaFlushTimer();
+    if (!pendingAssistantDelta) {
+      return;
+    }
+    const delta = pendingAssistantDelta;
+    pendingAssistantDelta = "";
     const timestampMs = Date.now();
     try {
       context.publishEvent?.({
@@ -152,7 +169,7 @@ async function runHermesChatStreaming(
           sessionKey,
           seq: seq += 1,
           timestampMs,
-          delta: text,
+          delta,
         }),
       });
     } catch (error) {
@@ -169,6 +186,20 @@ async function runHermesChatStreaming(
           text: `Hermes stream publish failed: ${error instanceof Error ? error.message : String(error)}`,
         },
       });
+    }
+  };
+
+  const publishAssistantDelta = (text: string): void => {
+    hasPublishedAssistantText = true;
+    output += text;
+    pendingAssistantDelta += text;
+    if (Buffer.byteLength(pendingAssistantDelta, "utf8") >= HERMES_ASSISTANT_DELTA_MAX_BYTES) {
+      flushAssistantDelta();
+      return;
+    }
+    if (!assistantDeltaFlushTimer) {
+      assistantDeltaFlushTimer = setTimeout(flushAssistantDelta, HERMES_ASSISTANT_DELTA_FLUSH_MS);
+      assistantDeltaFlushTimer.unref?.();
     }
   };
 
@@ -247,6 +278,7 @@ async function runHermesChatStreaming(
     typingTimer.unref?.();
     const timeout = setTimeout(() => {
       clearInterval(typingTimer);
+      clearAssistantDeltaFlushTimer();
       toolLogWatcher.stop();
       child.kill("SIGTERM");
       rejectOutput(new Error("hermes_chat_timeout"));
@@ -255,6 +287,7 @@ async function runHermesChatStreaming(
     child.once("error", (error) => {
       clearInterval(typingTimer);
       clearTimeout(timeout);
+      clearAssistantDeltaFlushTimer();
       toolLogWatcher.stop();
       rejectOutput(error);
     });
@@ -264,6 +297,7 @@ async function runHermesChatStreaming(
         clearTimeout(timeout);
         toolLogWatcher.stop();
         flushStdoutLineBuffer();
+        flushAssistantDelta();
         if (code && code !== 0) {
           const reason = stderr.trim() || output.trim() || `hermes chat exited with code ${code}`;
           rejectOutput(new Error(signal ? `${reason} (${signal})` : reason));

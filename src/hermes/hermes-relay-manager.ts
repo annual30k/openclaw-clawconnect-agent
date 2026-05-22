@@ -1,6 +1,7 @@
 import { statSync } from "fs";
 import { WebSocket } from "ws";
 import { sendFileCommand } from "../commands/send-file.js";
+import type { SendFileCommandOptions } from "../commands/send-file.js";
 import { buildOfficeEventPayload } from "../relay/office-payload.js";
 import {
   buildMobileAssistantErrorPayload,
@@ -203,12 +204,12 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           if (artifactKey && sentArtifacts.has(artifactKey)) {
             continue;
           }
-          await sendFileCommand({
-            filePath: artifactPath,
-            gateway: opts.gatewayId,
-            session: chat.sessionKey,
-            json: true,
-          }, {
+          await sendFileCommand(buildHermesArtifactSendOptions({
+            artifactPath,
+            gatewayId: opts.gatewayId,
+            sessionKey: chat.sessionKey,
+            runId,
+          }), {
             stdout: { write: () => true },
             stderr: { write: (chunk) => {
               const text = String(chunk).trim();
@@ -262,8 +263,41 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
   });
 }
 
-function publishHermesOfficeSnapshot(send: (message: ToServer) => void, eventName: string | undefined, payload: unknown): void {
+export function buildHermesArtifactSendOptions(params: {
+  artifactPath: string;
+  gatewayId: string;
+  sessionKey: string;
+  runId: string;
+}): SendFileCommandOptions {
+  return {
+    filePath: params.artifactPath,
+    gateway: params.gatewayId,
+    session: params.sessionKey,
+    json: true,
+    sourceRunId: params.runId,
+  };
+}
+
+export function shouldPublishHermesOfficeSnapshot(eventName: string | undefined, payload: unknown): boolean {
   if (eventName !== "chat" && eventName !== "agent" && eventName !== "context_usage") {
+    return false;
+  }
+
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return false;
+  }
+
+  const state = typeof (payload as Record<string, unknown>).state === "string"
+    ? ((payload as Record<string, unknown>).state as string).trim().toLowerCase()
+    : "";
+  return state !== "delta";
+}
+
+function publishHermesOfficeSnapshot(send: (message: ToServer) => void, eventName: string | undefined, payload: unknown): void {
+  if (!shouldPublishHermesOfficeSnapshot(eventName, payload)) {
+    return;
+  }
+  if (!eventName) {
     return;
   }
   const officePayload = buildOfficeEventPayload(eventName, payload, () => new Date().toISOString());
