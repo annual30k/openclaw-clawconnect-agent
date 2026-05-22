@@ -19,10 +19,19 @@ export async function prepareHermesVoiceInputCommand(
     method: "chat.send",
     params: await prepareVoiceSendParams(params),
     run: {
-      runId: options.requestId ?? `hermes-${Date.now()}`,
+      runId: resolveHermesVoiceInputRunId(params, options.requestId),
       sessionKey: resolveHermesVoiceInputSessionKey(params),
     },
   };
+}
+
+export function resolveHermesVoiceInputRunId(params: unknown, requestId?: string): string {
+  const record = params && typeof params === "object" && !Array.isArray(params)
+    ? (params as Record<string, unknown>)
+    : {};
+  const idempotencyKey = typeof record.idempotencyKey === "string" ? record.idempotencyKey.trim() : "";
+  const relayRequestId = typeof requestId === "string" ? requestId.trim() : "";
+  return idempotencyKey || relayRequestId || `hermes-${Date.now()}`;
 }
 
 export function resolveHermesVoiceInputSessionKey(params: unknown): string {

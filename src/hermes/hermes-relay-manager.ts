@@ -157,7 +157,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         }
 
         const paramsWithFiles = await attachRecentMobileFiles(msg.params, recentMobileFiles, opts);
-        const runId = requestId ?? `hermes-${Date.now()}`;
+        const runId = voiceInputRun?.runId ?? requestId ?? `hermes-${Date.now()}`;
         const sessionKey = resolveHermesRelaySessionKey(paramsWithFiles);
         if (requestId) {
           acknowledgedChatRun = { runId, sessionKey };
