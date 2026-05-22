@@ -36,10 +36,16 @@ export function extractHistoryOutcome(
   if (userIndex === -1) {
     return null;
   }
+  if (hasUnresolvedUserBefore(messages, userIndex)) {
+    return null;
+  }
 
   let latestError: string | null = null;
   for (let index = userIndex + 1; index < messages.length; index += 1) {
     const message = messages[index];
+    if (message.role === "user") {
+      return null;
+    }
     if (message.role !== "assistant") {
       continue;
     }
@@ -57,6 +63,19 @@ export function extractHistoryOutcome(
   }
 
   return latestError ? { kind: "error", errorMessage: latestError } : null;
+}
+
+function hasUnresolvedUserBefore(messages: HistoryMessage[], userIndex: number): boolean {
+  for (let index = userIndex - 1; index >= 0; index -= 1) {
+    const role = messages[index]?.role;
+    if (role === "assistant") {
+      return false;
+    }
+    if (role === "user") {
+      return true;
+    }
+  }
+  return false;
 }
 
 export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {

@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  buildHermesAssistantDeltaPayload,
+  buildHermesRuntimeContextHint,
   extractDeliverablePaths,
   parseHermesToolLogLine,
   parseHermesSkillsList,
@@ -12,6 +14,10 @@ import {
   stripHermesSecurityReviewNotices,
   stripHermesSessionResumeNotices,
 } from "./hermes-runtime.js";
+import {
+  hermesModelListResultFromPayload,
+  modelItemsFromHermesModelOptionsPayload,
+} from "./models/hermes-runtime-models.js";
 import { mergeLiveHermesSessionsWithStoredAliases, parseHermesSessionsList } from "./hermes-session-store.js";
 
 test("extractDeliverablePaths returns existing supported artifact paths", () => {
@@ -81,6 +87,29 @@ test("extractDeliverablePaths requires the latest user to ask for sending files"
   }
 });
 
+test("Hermes assistant stream payload mirrors OpenClaw chat delta shape", () => {
+  const payload = buildHermesAssistantDeltaPayload({
+    runId: "run-1",
+    sessionKey: "main",
+    seq: 7,
+    timestampMs: 123456,
+    delta: "hello",
+  });
+
+  assert.equal(payload.runId, "run-1");
+  assert.equal(payload.sessionKey, "main");
+  assert.equal(payload.state, "delta");
+  assert.equal(payload.role, "assistant");
+  assert.equal(payload.seq, 7);
+  assert.equal(payload.ts, 123456);
+  assert.equal(payload.delta, "hello");
+  assert.deepEqual(payload.message, {
+    role: "assistant",
+    timestamp: 123456,
+    content: [{ type: "text", text: "hello" }],
+  });
+});
+
 test("stripHermesSessionResumeNotices removes Hermes resume banners", () => {
   const output = stripHermesSessionResumeNotices([
     "↻ Resumed session 20260519_015943_72d864 (3 user messages, 6 total messages)",
@@ -143,6 +172,74 @@ test("parseHermesSessionUsageSnapshot reads session token usage", () => {
   assert.equal(snapshot.currentModel, "gpt-5.5");
   assert.equal(snapshot.contextUsage, 4527);
   assert.equal(snapshot.contextLimit, 128000);
+});
+
+test("buildHermesRuntimeContextHint includes current model and provider", () => {
+  const hint = buildHermesRuntimeContextHint({
+    currentModel: "gpt-5.4",
+    provider: "OpenAI Codex",
+  });
+
+  assert.equal(hint, [
+    "[Hermes runtime context]",
+    "Current runtime: model=gpt-5.4, provider=OpenAI Codex.",
+    "If the user asks which model or provider is currently being used, answer from this runtime context.",
+  ].join("\n"));
+});
+
+test("buildHermesRuntimeContextHint omits empty snapshots", () => {
+  assert.equal(buildHermesRuntimeContextHint({}), undefined);
+});
+
+test("model options use Hermes provider payload without Codex fallback", () => {
+  const items = modelItemsFromHermesModelOptionsPayload({
+    provider: "minimax-oauth",
+    model: "MiniMax-M2.7",
+    providers: [
+      {
+        slug: "minimax-oauth",
+        name: "MiniMax",
+        is_current: true,
+        source: "hermes",
+        models: ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
+      },
+    ],
+  });
+
+  assert.deepEqual(items.map((item) => item.providerId), ["minimax-oauth", "minimax-oauth"]);
+  assert.deepEqual(items.map((item) => item.modelId), ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"]);
+  assert.equal(items[0]?.isSelected, true);
+  assert.equal(items.some((item) => item.providerId === "openai-codex"), false);
+});
+
+test("Codex provider models come from Hermes payload rather than fixed fallback list", () => {
+  const items = modelItemsFromHermesModelOptionsPayload({
+    provider: "openai-codex",
+    model: "custom-codex-from-hermes",
+    providers: [
+      {
+        slug: "openai-codex",
+        name: "OpenAI Codex",
+        is_current: true,
+        source: "hermes",
+        models: ["custom-codex-from-hermes"],
+      },
+    ],
+  });
+
+  assert.deepEqual(items.map((item) => item.modelId), ["custom-codex-from-hermes"]);
+  assert.equal(items[0]?.isSelected, true);
+});
+
+test("Hermes model list does not synthesize fallback models when Hermes returns none", () => {
+  const result = hermesModelListResultFromPayload(
+    { provider: "openai-codex", model: "gpt-5.5", providers: [] },
+    { provider: "openai-codex", currentModel: "gpt-5.5" },
+    { provider: "openai-codex", model: "gpt-5.5" },
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /Hermes.*model/i);
 });
 
 test("parseHermesToolLogLine converts terminal tool logs to tool stream events", () => {

@@ -20,6 +20,7 @@ export interface SendFileCommandOptions {
   json?: boolean;
   durationMs?: number;
   transcript?: string;
+  sourceRunId?: string;
 }
 
 export interface SendFileCommandDependencies {
@@ -46,6 +47,7 @@ export interface SendFileResult {
   sha256: string;
   chunkSize: number;
   totalChunks: number;
+  sourceRunId?: string;
   expiresAt: string;
   downloadPath: string;
   downloadUrl: string;
@@ -87,6 +89,7 @@ type FileUploadCompleteResponse = {
     downloadUrl?: string;
     chunkSize: number;
     totalChunks: number;
+    sourceRunId?: string;
   };
 };
 
@@ -174,6 +177,7 @@ export async function sendFileCommand(
           sha256,
           senderDisplayName: config.displayName,
           transcript: typeof opts.transcript === "string" ? opts.transcript.trim() : undefined,
+          sourceRunId: normalizeOptionalText(opts.sourceRunId),
           clientCreatedAt,
         }),
       }, "init upload"),
@@ -253,6 +257,7 @@ export async function sendFileCommand(
     sha256: payload.sha256,
     chunkSize,
     totalChunks,
+    sourceRunId: normalizeOptionalText(payload.sourceRunId) ?? normalizeOptionalText(opts.sourceRunId),
     expiresAt: payload.expiresAt,
     downloadPath,
     downloadUrl,
@@ -275,6 +280,11 @@ export async function sendFileCommand(
   }
 
   return result;
+}
+
+function normalizeOptionalText(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 async function computeSha256(filePath: string): Promise<string> {

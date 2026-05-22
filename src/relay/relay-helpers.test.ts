@@ -63,6 +63,30 @@ test("history helper resolves final and error assistant outcomes after the match
   });
 });
 
+test("history helper does not resolve outcomes across ambiguous consecutive user messages", () => {
+  const firstContext = {
+    sessionKey: "agent:main:main",
+    requestedAtMs: 1_000,
+    promptText: "first voice",
+  };
+  const secondContext = {
+    sessionKey: "agent:main:main",
+    requestedAtMs: 1_100,
+    promptText: "second voice",
+  };
+  const ambiguousHistory: HistoryResponse = {
+    messages: [
+      { role: "user", timestamp: 1_050, content: [{ type: "text", text: "first voice" }] },
+      { role: "user", timestamp: 1_150, content: [{ type: "text", text: "second voice" }] },
+      { role: "assistant", timestamp: 1_250, content: [{ type: "text", text: "first answer" }] },
+      { role: "assistant", timestamp: 1_350, content: [{ type: "text", text: "second answer" }] },
+    ],
+  };
+
+  assert.equal(extractHistoryOutcome(ambiguousHistory, firstContext), null);
+  assert.equal(extractHistoryOutcome(ambiguousHistory, secondContext), null);
+});
+
 test("session context helpers extract defaults and canonicalize main-session aliases", () => {
   const defaults = extractGatewaySessionDefaults({
     snapshot: {

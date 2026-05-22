@@ -9,8 +9,10 @@ import { appendUniqueSuffix, extractChatRole, extractChatText, normalizeChatEven
 import { extractHistoryOutcome, withTimeout } from "./chat-history.js";
 import { buildOfficeEventPayload } from "./office-payload.js";
 import { prepareChatSendParams } from "./chat-send-attachments.js";
-import { prepareVoiceSendParams, voiceInputSetupMessage } from "./voice-input.js";
+import { prepareOpenClawVoiceInputCommand } from "./openclaw-voice-input.js";
+import { voiceInputSetupMessage } from "./voice-input.js";
 import { sendVoiceReplyCommand } from "../commands/voice-reply.js";
+import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
 import { OPENCLAW_SLASH_COMMAND_CATALOG, } from "./slash-command-catalog.js";
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -256,7 +258,7 @@ export async function runRelayManager(opts) {
             send(buildRelayHelloMessage({
                 platform: process.platform,
                 agentVersion: "1.0.0",
-                capabilities: ["chat", "skills", "schedules", "logs", "files", "voice_input"],
+                capabilities: gatewayCapabilitiesForType("openclaw"),
             }));
             // Start the persistent gateway connection as soon as we're connected
             // to the relay server. Its lifetime is tied to this relay session.
@@ -492,18 +494,13 @@ export async function runRelayManager(opts) {
                     return;
                 }
                 if (msg.method === "chat.voice.send") {
-                    const voiceParamsRecord = msg.params && typeof msg.params === "object" && !Array.isArray(msg.params)
-                        ? msg.params
-                        : {};
-                    const voiceSessionKey = typeof voiceParamsRecord.sessionKey === "string" && voiceParamsRecord.sessionKey.trim().length > 0
-                        ? voiceParamsRecord.sessionKey.trim()
-                        : sessionDefaults.mainSessionKey;
-                    voiceInputRun = {
-                        runId: requestId ?? `voice-${Date.now()}`,
-                        sessionKey: voiceSessionKey,
-                    };
-                    msg.params = await prepareVoiceSendParams(msg.params);
-                    msg.method = "chat.send";
+                    const voiceInput = await prepareOpenClawVoiceInputCommand(msg.params, {
+                        requestId,
+                        sessionDefaults,
+                    });
+                    voiceInputRun = voiceInput.run;
+                    msg.params = voiceInput.params;
+                    msg.method = voiceInput.method;
                 }
                 if (msg.method === "chat.send") {
                     msg.params = await prepareChatSendParams(msg.params);

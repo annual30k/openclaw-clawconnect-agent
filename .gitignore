@@ -4,5 +4,8 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-dist/
+dist/*
+!dist/runtime-adapters.d.ts
+!dist/runtime-adapters.js
+!dist/runtime-adapters.js.map
 *.tgz

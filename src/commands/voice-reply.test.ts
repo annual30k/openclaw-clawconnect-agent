@@ -59,6 +59,7 @@ test("send-voice-reply uploads the synthesized file after generation", async () 
       text: "Hello, OpenClaw.",
       gateway: "gw-1",
       session: "main",
+      sourceRunId: "run-voice-1",
     },
     {
       synthesizeEdgeTtsImpl: async () => {
@@ -71,6 +72,7 @@ test("send-voice-reply uploads the synthesized file after generation", async () 
           session: opts.session,
           durationMs: opts.durationMs,
           transcript: opts.transcript,
+          sourceRunId: opts.sourceRunId,
           rate: opts.rate,
         };
         return { ok: true } as never;
@@ -87,6 +89,7 @@ test("send-voice-reply uploads the synthesized file after generation", async () 
     session: "main",
     durationMs: result.durationMs,
     transcript: "Hello, OpenClaw.",
+    sourceRunId: "run-voice-1",
     rate: undefined,
   });
 });

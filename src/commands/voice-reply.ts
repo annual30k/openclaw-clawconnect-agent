@@ -7,7 +7,7 @@ import { sendFileCommand, type SendFileCommandOptions, type SendFileCommandDepen
 
 const execFile = promisify(execFileCb);
 
-export interface VoiceReplyCommandOptions extends Pick<SendFileCommandOptions, "gateway" | "session"> {
+export interface VoiceReplyCommandOptions extends Pick<SendFileCommandOptions, "gateway" | "session" | "sourceRunId"> {
   text: string;
   voice?: string;
   rate?: string;
@@ -61,6 +61,7 @@ export async function sendVoiceReplyCommand(
         session: opts.session,
         durationMs,
         transcript: originalText,
+        sourceRunId: opts.sourceRunId,
       },
       deps,
     );

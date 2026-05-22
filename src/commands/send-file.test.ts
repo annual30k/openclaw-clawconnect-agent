@@ -50,6 +50,7 @@ test("send-file uploads chunks and finalizes the transfer", async () => {
         assert.equal(initBody.sizeBytes, fileBytes.byteLength);
         assert.equal(initBody.senderDisplayName, "Host Mac");
         assert.equal(initBody.transcript, "这是要展示的转写文本");
+        assert.equal(initBody.sourceRunId, "run-voice-1");
         assert.equal(initBody.sha256, expectedSha256);
         assert.equal(typeof initBody.clientCreatedAt, "string");
 
@@ -136,7 +137,14 @@ test("send-file uploads chunks and finalizes the transfer", async () => {
 
   try {
     const result = await sendFileCommand(
-      { filePath, gateway: "gw-1", session: "main", json: true, transcript: "这是要展示的转写文本" },
+      {
+        filePath,
+        gateway: "gw-1",
+        session: "main",
+        json: true,
+        transcript: "这是要展示的转写文本",
+        sourceRunId: "run-voice-1",
+      },
       {
         loadConfig: () => ({
           relayServerUrl: baseUrl,

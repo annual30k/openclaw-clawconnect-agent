@@ -24,8 +24,10 @@ import {
 import { extractHistoryOutcome, withTimeout, type ChatRunContext, type HistoryResponse } from "./chat-history.js";
 import { buildOfficeEventPayload } from "./office-payload.js";
 import { prepareChatSendParams } from "./chat-send-attachments.js";
-import { prepareVoiceSendParams, voiceInputSetupMessage } from "./voice-input.js";
+import { prepareOpenClawVoiceInputCommand } from "./openclaw-voice-input.js";
+import { voiceInputSetupMessage } from "./voice-input.js";
 import { sendVoiceReplyCommand } from "../commands/voice-reply.js";
+import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
 import {
   OPENCLAW_SLASH_COMMAND_CATALOG,
   type RelaySlashCommandDescriptor,
@@ -351,7 +353,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         buildRelayHelloMessage({
           platform: process.platform,
           agentVersion: "1.0.0",
-          capabilities: ["chat", "skills", "schedules", "logs", "files", "voice_input"],
+          capabilities: gatewayCapabilitiesForType("openclaw"),
         }),
       );
 
@@ -611,18 +613,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       }
 
       if (msg.method === "chat.voice.send") {
-        const voiceParamsRecord = msg.params && typeof msg.params === "object" && !Array.isArray(msg.params)
-          ? msg.params as Record<string, unknown>
-          : {};
-        const voiceSessionKey = typeof voiceParamsRecord.sessionKey === "string" && voiceParamsRecord.sessionKey.trim().length > 0
-          ? voiceParamsRecord.sessionKey.trim()
-          : sessionDefaults.mainSessionKey;
-        voiceInputRun = {
-          runId: requestId ?? `voice-${Date.now()}`,
-          sessionKey: voiceSessionKey,
-        };
-        msg.params = await prepareVoiceSendParams(msg.params);
-        msg.method = "chat.send";
+        const voiceInput = await prepareOpenClawVoiceInputCommand(msg.params, {
+          requestId,
+          sessionDefaults,
+        });
+        voiceInputRun = voiceInput.run;
+        msg.params = voiceInput.params;
+        msg.method = voiceInput.method;
       }
 
       if (msg.method === "chat.send") {

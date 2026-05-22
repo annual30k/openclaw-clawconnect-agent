@@ -7,6 +7,7 @@ import { hostname } from "os";
 import { getServicePlatform } from "../platform/service-manager.js";
 import { toRelayHttpBase } from "./send-file-utils.js";
 import { getDefaultRelayServerUrl } from "../config/env.js";
+import { gatewayCapabilitiesForType, normalizeGatewayType } from "../gateway-profiles.js";
 export async function pairCommand(opts) {
     let gatewayId;
     let relaySecret;
@@ -14,7 +15,7 @@ export async function pairCommand(opts) {
     let displayName;
     let relayServerUrl;
     const gatewayType = normalizeGatewayType(opts.gatewayType);
-    const capabilities = capabilitiesForGatewayType(gatewayType);
+    const capabilities = gatewayCapabilitiesForType(gatewayType);
     const existingConfig = configExists() ? readConfig() : null;
     const existingGatewayType = existingConfig?.gatewayType ?? "openclaw";
     if (existingConfig && existingGatewayType === gatewayType) {
@@ -86,18 +87,6 @@ export async function pairCommand(opts) {
     }
     console.log(t("pair.installingService"));
     installCommand();
-}
-function normalizeGatewayType(value) {
-    return value === "hermes" ? value : "openclaw";
-}
-function capabilitiesForGatewayType(gatewayType) {
-    switch (gatewayType) {
-        case "hermes":
-            return ["chat", "files", "logs", "restart", "sessions", "skills", "gateway_service", "voice_input"];
-        case "openclaw":
-        default:
-            return ["chat", "skills", "schedules", "logs", "files", "voice_input"];
-    }
 }
 function sanitizeDisplayName(name) {
     // Replace smart quotes and other problematic characters with regular ones
