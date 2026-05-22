@@ -2,6 +2,11 @@ import { statSync } from "fs";
 import { WebSocket } from "ws";
 import { sendFileCommand } from "../commands/send-file.js";
 import { buildOfficeEventPayload } from "../relay/office-payload.js";
+import {
+  buildMobileAssistantErrorPayload,
+  buildMobileAssistantFinalPayload,
+  resolveMobileChatRun,
+} from "../relay/mobile-chat-run-bridge.js";
 import { voiceInputSetupMessage } from "../relay/voice-input.js";
 import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
 import { prepareHermesVoiceInputCommand, resolveHermesVoiceInputSessionKey } from "./hermes-voice-input.js";
@@ -157,8 +162,14 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         }
 
         const paramsWithFiles = await attachRecentMobileFiles(msg.params, recentMobileFiles, opts);
-        const runId = voiceInputRun?.runId ?? requestId ?? `hermes-${Date.now()}`;
-        const sessionKey = resolveHermesRelaySessionKey(paramsWithFiles);
+        const run = resolveMobileChatRun({
+          preferredRunId: voiceInputRun?.runId,
+          requestId,
+          sessionKey: resolveHermesRelaySessionKey(paramsWithFiles),
+          fallbackPrefix: "hermes",
+        });
+        const runId = run.runId;
+        const sessionKey = run.sessionKey;
         if (requestId) {
           acknowledgedChatRun = { runId, sessionKey };
           send({ type: "res", id: requestId, ok: true, payload: acknowledgedChatRun });
@@ -171,20 +182,14 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
             publishHermesOfficeSnapshot(send, event.event, event.payload);
           },
         });
-        const finalChatPayload = {
-          runId,
-          sessionKey: chat.sessionKey,
-          state: "final",
-          role: "assistant",
+        const finalChatPayload = buildMobileAssistantFinalPayload({
+          run: { runId, sessionKey: chat.sessionKey },
+          text: chat.output,
           currentModel: chat.usage?.currentModel,
           provider: chat.usage?.provider,
           contextUsage: chat.usage?.contextUsage,
           contextLimit: chat.usage?.contextLimit,
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: chat.output }],
-          },
-        };
+        });
         send({
           type: "event",
           event: "chat",
@@ -225,17 +230,10 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         const setupMessage = voiceInputSetupMessage(error);
         const chatRun = setupMessage ? (acknowledgedChatRun ?? voiceInputRun) : acknowledgedChatRun;
         if (chatRun) {
-          const errorPayload = {
-            runId: chatRun.runId,
-            sessionKey: chatRun.sessionKey,
-            state: "error",
-            role: "assistant",
+          const errorPayload = buildMobileAssistantErrorPayload({
+            run: chatRun,
             errorMessage: setupMessage ?? message,
-            message: {
-              role: "assistant",
-              content: [{ type: "text", text: setupMessage ?? message }],
-            },
-          };
+          });
           send({
             type: "event",
             event: "chat",

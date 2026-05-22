@@ -5,6 +5,10 @@ import { mkdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { spawn } from "child_process";
 import type { LocalCommandContext } from "../../commands/local-runtime.js";
+import {
+  buildMobileAssistantDeltaPayload,
+  buildMobileAssistantStreamingPayload,
+} from "../../relay/mobile-chat-run-bridge.js";
 import { getMappedHermesSessionId, rememberHermesSession } from "../hermes-session-store.js";
 import { extractDeliverablePaths } from "./hermes-runtime-artifacts.js";
 import {
@@ -225,17 +229,11 @@ async function runHermesChatStreaming(
     context.publishEvent?.({
       type: "event",
       event: "chat",
-      payload: {
-        runId,
-        sessionKey,
-        state: "streaming",
-        role: "assistant",
+      payload: buildMobileAssistantStreamingPayload({
+        run: { runId, sessionKey },
         seq: seq += 1,
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: HERMES_TYPING_MARKER }],
-        },
-      },
+        text: HERMES_TYPING_MARKER,
+      }),
     });
   };
 
@@ -284,20 +282,12 @@ export function buildHermesAssistantDeltaPayload(params: {
   timestampMs: number;
   delta: string;
 }) {
-  return {
-    runId: params.runId,
-    sessionKey: params.sessionKey,
-    state: "delta",
-    role: "assistant",
+  return buildMobileAssistantDeltaPayload({
+    run: { runId: params.runId, sessionKey: params.sessionKey },
     seq: params.seq,
-    ts: params.timestampMs,
+    timestampMs: params.timestampMs,
     delta: params.delta,
-    message: {
-      role: "assistant",
-      timestamp: params.timestampMs,
-      content: [{ type: "text", text: params.delta }],
-    },
-  };
+  });
 }
 
 function createHermesToolLogWatcher(onEvent: (event: HermesToolLogEvent) => void): {

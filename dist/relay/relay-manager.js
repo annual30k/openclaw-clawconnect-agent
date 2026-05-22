@@ -5,6 +5,7 @@ import { handleProviderCommand } from "../commands/provider-handlers.js";
 import { DEFAULT_GATEWAY_SESSION_DEFAULTS, buildContextUsageFingerprint, readContextUsageSnapshot, canonicalizeRelayParams, canonicalizeSessionKey, extractGatewaySessionDefaults, } from "./session-context.js";
 import { appendUniqueSuffix, extractChatRole, extractChatText, normalizeChatEventPayload, normalizeChatState, withMessageText, } from "./chat-payload.js";
 import { extractHistoryOutcome, withTimeout } from "./chat-history.js";
+import { buildMobileAssistantErrorPayload, buildMobileAssistantFinalPayload, } from "./mobile-chat-run-bridge.js";
 import { buildOfficeEventPayload } from "./office-payload.js";
 import { prepareChatSendParams } from "./chat-send-attachments.js";
 import { prepareOpenClawVoiceInputCommand } from "./openclaw-voice-input.js";
@@ -136,29 +137,20 @@ export async function runRelayManager(opts) {
                         send({
                             type: "event",
                             event: "chat",
-                            payload: {
-                                runId,
-                                sessionKey: context.sessionKey,
-                                state: "final",
-                                role: "assistant",
-                                message: {
-                                    role: "assistant",
-                                    content: [{ type: "text", text: outcome.text }],
-                                },
-                            },
+                            payload: buildMobileAssistantFinalPayload({
+                                run: { runId, sessionKey: context.sessionKey },
+                                text: outcome.text,
+                            }),
                         });
                         return;
                     }
                     send({
                         type: "event",
                         event: "chat",
-                        payload: {
-                            runId,
-                            sessionKey: context.sessionKey,
-                            state: "error",
-                            role: "assistant",
+                        payload: buildMobileAssistantErrorPayload({
+                            run: { runId, sessionKey: context.sessionKey },
                             errorMessage: outcome.errorMessage,
-                        },
+                        }),
                     });
                 })
                     .catch((err) => {
@@ -466,17 +458,10 @@ export async function runRelayManager(opts) {
                     send({
                         type: "event",
                         event: "chat",
-                        payload: {
-                            runId: voiceInputRun.runId,
-                            sessionKey: voiceInputRun.sessionKey,
-                            state: "error",
-                            role: "assistant",
+                        payload: buildMobileAssistantErrorPayload({
+                            run: voiceInputRun,
                             errorMessage: setupMessage,
-                            message: {
-                                role: "assistant",
-                                content: [{ type: "text", text: setupMessage }],
-                            },
-                        },
+                        }),
                     });
                     if (requestId) {
                         send({ type: "res", id: requestId, ok: true, payload: voiceInputRun });

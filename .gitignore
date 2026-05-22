@@ -8,4 +8,9 @@ dist/*
 !dist/runtime-adapters.d.ts
 !dist/runtime-adapters.js
 !dist/runtime-adapters.js.map
+!dist/relay/
+dist/relay/*
+!dist/relay/mobile-chat-run-bridge.d.ts
+!dist/relay/mobile-chat-run-bridge.js
+!dist/relay/mobile-chat-run-bridge.js.map
 *.tgz
