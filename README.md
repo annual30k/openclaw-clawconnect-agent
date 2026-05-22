@@ -123,7 +123,6 @@ Supported values:
 - `CLAWCONNECT_GATEWAY_URL` — optional local Gateway websocket URL override
 - `CLAWCONNECT_ENV_FILE` — optional explicit env file path. When unset, the agent reads `~/.clawconnect/.env`, then `.env.local`, then `.env`
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD` — Gateway auth fallback
-- `OPENCLAW_TTS_ENABLED`, `OPENCLAW_TTS_VOICE`, `OPENCLAW_TTS_RATE`, `OPENCLAW_TTS_ENGINE` — voice reply defaults
 - `OPENCLAW_ASR_COMMAND` — host-side speech-to-text command for ClawLink `chat.voice.send` messages. The agent saves the audio to a temporary file and runs this command; it must print the transcript to stdout. Placeholders: `{file}`, `{language}`, `{mimeType}`
 
 Shell environment variables take priority over env files. Existing pairing credentials in `~/.clawconnect/config.json` or `~/.clawconnect/profiles/<profile>/config.json` still take priority for `clawconnect run`, `status`, and `send-file`; run `clawconnect pair --profile <name> --server <url>` or `clawconnect reset --profile <name>` when you intentionally switch relay servers.
@@ -135,14 +134,6 @@ Start the host agent:
 ```bash
 clawconnect run
 ```
-
-Optional: enable assistant voice replies only when you want audio output by setting:
-
-```bash
-OPENCLAW_TTS_ENABLED=1 clawconnect run
-```
-
-When this flag is not set, assistant replies stay text-only.
 
 Optional: let ClawLink send raw voice messages and have the host transcribe them before forwarding text to OpenClaw or Hermes Agent:
 
@@ -254,8 +245,6 @@ Notes:
 - `send-file` uploads through the relay and posts a file message to mobile.
 - Image MIME types render as preview cards in the iPhone chat UI.
 - `chat.send` attachments are local staging references, not the cross-device file transfer path.
-- Voice replies are disabled by default; set `OPENCLAW_TTS_ENABLED=1` to have the agent synthesize assistant replies as audio files.
-- The agent now prefers `edge-tts-universal` for synthesis and falls back to the computer's built-in TTS on failure.
 
 ## Project Structure
 

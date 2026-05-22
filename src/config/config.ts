@@ -17,17 +17,10 @@ export interface ClawConnectConfig {
   displayName: string;
   gatewayType?: "openclaw" | "hermes";
   capabilities?: string[];
-  assistantVoiceReplyVoiceIdentifier?: string;
-  assistantVoiceReplyRatePercent?: number;
   /** Shared token for the local OpenClaw Gateway (gateway.auth.token in openclaw config). */
   gatewayToken?: string;
   /** Password for the local OpenClaw Gateway (used when auth mode is "password"). */
   gatewayPassword?: string;
-}
-
-export interface VoiceReplyConfig {
-  voiceIdentifier?: string;
-  ratePercent?: number;
 }
 
 export function getConfigPath(profile?: string): string {
@@ -55,34 +48,6 @@ export function writeConfig(config: ClawConnectConfig, profile?: string): void {
   setRestrictiveDirPermissions(CLAWCONNECT_HOME);
   setRestrictiveDirPermissions(root);
   setRestrictiveFilePermissions(configPath);
-}
-
-export function readVoiceReplyConfig(cfg: ClawConnectConfig): VoiceReplyConfig {
-  return {
-    voiceIdentifier: normalizeVoiceIdentifier(cfg.assistantVoiceReplyVoiceIdentifier),
-    ratePercent: clampRatePercent(cfg.assistantVoiceReplyRatePercent),
-  };
-}
-
-export function updateVoiceReplyConfig(config: ClawConnectConfig, voiceReplyConfig: VoiceReplyConfig): ClawConnectConfig {
-  const nextConfig: ClawConnectConfig = { ...config };
-  const voiceIdentifier = normalizeVoiceIdentifier(voiceReplyConfig.voiceIdentifier);
-  const ratePercent = clampRatePercent(voiceReplyConfig.ratePercent);
-
-  if (voiceIdentifier === undefined) {
-    delete nextConfig.assistantVoiceReplyVoiceIdentifier;
-  } else {
-    nextConfig.assistantVoiceReplyVoiceIdentifier = voiceIdentifier;
-  }
-
-  if (ratePercent === undefined) {
-    delete nextConfig.assistantVoiceReplyRatePercent;
-  } else {
-    nextConfig.assistantVoiceReplyRatePercent = ratePercent;
-  }
-
-  writeConfig(nextConfig);
-  return nextConfig;
 }
 
 export function readGatewayUrl(): string {
@@ -128,16 +93,4 @@ export function readGatewayAuth(cfg: ClawConnectConfig): { token?: string; passw
     return { token: envToken, password: envPassword };
   }
   return {};
-}
-
-function normalizeVoiceIdentifier(voiceIdentifier: string | undefined): string | undefined {
-  const trimmed = voiceIdentifier?.trim() ?? "";
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function clampRatePercent(ratePercent: number | undefined): number | undefined {
-  if (typeof ratePercent !== "number" || !Number.isFinite(ratePercent)) {
-    return undefined;
-  }
-  return Math.min(50, Math.max(-50, Math.round(ratePercent)));
 }

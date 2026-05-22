@@ -1,19 +1,14 @@
-import { readConfig, readGatewayUrl, readGatewayAuth, readVoiceReplyConfig } from "../config/config.js";
+import { readConfig, readGatewayUrl, readGatewayAuth } from "../config/config.js";
 import { getGatewayRuntimeAdapter } from "../runtime-adapters.js";
 import { withReconnect } from "../relay/reconnect.js";
 import { t } from "../i18n/index.js";
 import { createInterface } from "readline";
-function parseBooleanEnv(value) {
-    return /^(1|true|yes|on)$/i.test((value ?? "").trim());
-}
 export async function runCommand() {
     const config = readConfig();
     const gatewayType = config.gatewayType ?? "openclaw";
     const runtimeAdapter = getGatewayRuntimeAdapter(gatewayType);
     const gatewayUrl = readGatewayUrl();
     const gatewayAuth = readGatewayAuth(config);
-    const defaultVoiceReplyEnabled = parseBooleanEnv(process.env.OPENCLAW_TTS_ENABLED);
-    const defaultVoiceReplyConfig = readVoiceReplyConfig(config);
     // ── Shutdown signal ──────────────────────────────────────────────────
     // SIGTERM / SIGINT → gracefully close the relay WebSocket so the server
     // knows we disconnected intentionally, and the retry loop stops.
@@ -41,8 +36,6 @@ export async function runCommand() {
         config,
         gatewayUrl: () => readGatewayUrl(),
         gatewayAuth,
-        defaultVoiceReplyEnabled,
-        defaultVoiceReplyConfig,
         signal: shutdown.signal,
         onConnected: () => console.log(t("run.connected")),
         onDisconnected: () => console.log(t("run.disconnected")),

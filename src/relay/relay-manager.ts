@@ -2,7 +2,6 @@ import { WebSocket } from "ws";
 import { OpenClawGatewayClient } from "./gateway-client.js";
 import { handleLocalCommand } from "../commands/local-handlers.js";
 import { handleProviderCommand } from "../commands/provider-handlers.js";
-import { readConfig, updateVoiceReplyConfig, type VoiceReplyConfig } from "../config/config.js";
 import {
   DEFAULT_GATEWAY_SESSION_DEFAULTS,
   buildContextUsageFingerprint,
@@ -12,7 +11,6 @@ import {
   extractGatewaySessionDefaults,
   type GatewaySessionDefaults,
 } from "./session-context.js";
-import { VoiceReplyPreferenceStore } from "./voice-reply-preference.js";
 import {
   appendUniqueSuffix,
   extractChatRole,
@@ -26,7 +24,6 @@ import { buildOfficeEventPayload } from "./office-payload.js";
 import { prepareChatSendParams } from "./chat-send-attachments.js";
 import { prepareOpenClawVoiceInputCommand } from "./openclaw-voice-input.js";
 import { voiceInputSetupMessage } from "./voice-input.js";
-import { sendVoiceReplyCommand } from "../commands/voice-reply.js";
 import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
 import {
   OPENCLAW_SLASH_COMMAND_CATALOG,
@@ -59,9 +56,6 @@ interface FromServer {
   type: "cmd" | "hello" | "heartbeat";
   id?: string;
   method: string;
-  voiceReplyEnabled?: boolean;
-  voiceReplyVoiceIdentifier?: string;
-  voiceReplyRatePercent?: number;
   params: unknown;
 }
 
@@ -76,8 +70,6 @@ export interface RelayManagerOptions {
   gatewayUrl: string | (() => string);
   gatewayToken?: string;
   gatewayPassword?: string;
-  defaultVoiceReplyEnabled?: boolean;
-  defaultVoiceReplyConfig?: VoiceReplyConfig;
   onConnected?: () => void;
   onDisconnected?: () => void;
   /** Optional abort signal.  When aborted the relay WebSocket is closed
@@ -126,8 +118,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     const chatRunContexts = new Map<string, ChatRunContext>();
     const contextUsageRefreshes = new Map<string, ReturnType<typeof setTimeout>>();
     const contextUsageFingerprints = new Map<string, string>();
-    const voiceReplyPreferences = new VoiceReplyPreferenceStore(opts.defaultVoiceReplyEnabled ?? false, sessionDefaults);
-    voiceReplyPreferences.setDefaultVoiceReplySettings(opts.defaultVoiceReplyConfig);
 
     const clearChatFallback = (runId: string): void => {
       const timer = chatFallbacks.get(runId);
@@ -221,9 +211,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             clearChatFallback(runId);
             chatRunContexts.delete(runId);
             if (outcome.kind === "final") {
-              if (shouldUseVoiceReply(runId, context.sessionKey)) {
-                return;
-              }
               send({
                 type: "event",
                 event: "chat",
@@ -275,7 +262,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         const nextDefaults = extractGatewaySessionDefaults(payload);
         if (nextDefaults) {
           sessionDefaults = nextDefaults;
-          voiceReplyPreferences.setSessionDefaults(sessionDefaults);
         }
         scheduleContextUsageRefresh(sessionDefaults.mainSessionKey, 50, true);
       } catch (err) {
@@ -295,55 +281,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         return;
       }
       send({ type: "event", event: "office", payload: officePayload });
-    }
-
-    function queueVoiceReply(runId: string | undefined, sessionKey: string, text: string): void {
-      const normalizedText = text.trim();
-      if (!normalizedText) {
-        return;
-      }
-
-      console.log(`[relay] queueing voice reply sessionKey=${sessionKey} textLength=${normalizedText.length}`);
-      const resolvedSettings = voiceReplyPreferences.resolveSettings(runId, sessionKey);
-      const resolvedRate =
-        typeof resolvedSettings?.ratePercent === "number"
-          ? `${resolvedSettings.ratePercent > 0 ? "+" : ""}${resolvedSettings.ratePercent}%`
-          : undefined;
-
-      void sendVoiceReplyCommand(
-        {
-          text: normalizedText,
-          gateway: opts.gatewayId,
-          session: sessionKey,
-          voice: resolvedSettings?.voiceIdentifier ?? (process.env.OPENCLAW_TTS_VOICE?.trim() || undefined),
-          rate: resolvedRate ?? (process.env.OPENCLAW_TTS_RATE?.trim() || undefined),
-          speaker: (process.env.OPENCLAW_TTS_ENGINE?.trim() as "system" | "espeak" | undefined) || undefined,
-        },
-      ).catch((error) => {
-        console.warn(`[relay] voice reply generation failed sessionKey=${sessionKey}: ${String(error)}`);
-        send({
-          type: "event",
-          event: "chat",
-          payload: {
-            runId,
-            sessionKey,
-            state: "final",
-            role: "assistant",
-            message: {
-              role: "assistant",
-              content: [{ type: "text", text: normalizedText }],
-            },
-          },
-        });
-      });
-    }
-
-    function shouldUseVoiceReply(runId: string | undefined, sessionKey?: string): boolean {
-      return voiceReplyPreferences.shouldUse(runId, sessionKey);
-    }
-
-    function shouldSendTextReply(runId: string | undefined, sessionKey?: string): boolean {
-      return !shouldUseVoiceReply(runId, sessionKey);
     }
 
     relayWs.on("open", () => {
@@ -421,14 +358,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 if (shouldPublishOffice) {
                   publishOfficeSnapshot(event, outgoingPayload);
                 }
-                if (shouldSendTextReply(runId, resolvedSessionKey)) {
-                  send({ type: "event", event, payload: outgoingPayload });
-                } else {
-                  queueVoiceReply(runId, resolvedSessionKey, resolvedText);
-                }
-                if (runId) {
-                  voiceReplyPreferences.clearRun(runId);
-                }
+                send({ type: "event", event, payload: outgoingPayload });
                 return;
               }
 
@@ -451,14 +381,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     if (shouldPublishOffice) {
                       publishOfficeSnapshot(event, outgoingPayload);
                     }
-                    if (shouldSendTextReply(runId, resolvedSessionKey)) {
-                      send({ type: "event", event, payload: outgoingPayload });
-                    } else {
-                      queueVoiceReply(runId, resolvedSessionKey, outcome.text);
-                    }
-                    if (runId) {
-                      voiceReplyPreferences.clearRun(runId);
-                    }
+                    send({ type: "event", event, payload: outgoingPayload });
                     return;
                   }
                   if (outcome?.kind === "error") {
@@ -475,24 +398,17 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                       event,
                       payload: outgoingPayload,
                     });
-                    if (runId) {
-                      voiceReplyPreferences.clearRun(runId);
-                    }
                     return;
                   }
                   if (shouldPublishOffice) {
                     publishOfficeSnapshot(event, normalizedPayload);
                   }
                   send({ type: "event", event, payload: normalizedPayload });
-                  if (runId) {
-                    voiceReplyPreferences.clearRun(runId);
-                  }
                 })
                 .catch((err) => {
                   console.error(`[relay] chat.history fetch failed: ${err}`);
                   if (runId) {
                     chatRunContexts.delete(runId);
-                    voiceReplyPreferences.clearRun(runId);
                   }
                   if (shouldPublishOffice) {
                     publishOfficeSnapshot(event, normalizedPayload);
@@ -506,21 +422,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               chatRunContexts.delete(runId);
               scheduleContextUsageRefresh(p?.sessionKey, 450);
             }
-            const shouldSuppressVoiceReplyText =
-              role === "assistant"
-              && shouldUseVoiceReply(runId, resolvedSessionKey)
-              && state !== "error"
-              && state !== "failed"
-              && state !== "fail"
-              && state !== "aborted";
-
-            if (shouldSuppressVoiceReplyText) {
-              if (shouldPublishOffice) {
-                publishOfficeSnapshot(event, normalizedPayload);
-              }
-              return;
-            }
-
             if (shouldPublishOffice) {
               publishOfficeSnapshot(event, normalizedPayload);
             }
@@ -583,25 +484,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         publishEvent: (event) => send(event),
       });
       if (localResult !== null) {
-        if (localResult.ok && isVoiceReplyConfigCommand(msg.method)) {
-          const payload = localResult.payload as
-            | {
-                assistantVoiceReplyVoiceIdentifier?: string | null;
-                assistantVoiceReplyRatePercent?: number | null;
-              }
-            | undefined;
-          voiceReplyPreferences.setDefaultVoiceReplySettings({
-            voiceIdentifier:
-              typeof payload?.assistantVoiceReplyVoiceIdentifier === "string"
-                ? payload.assistantVoiceReplyVoiceIdentifier
-                : undefined,
-            ratePercent:
-              typeof payload?.assistantVoiceReplyRatePercent === "number"
-                ? payload.assistantVoiceReplyRatePercent
-                : undefined,
-          });
-        }
-
         if (requestId) {
           if (localResult.ok) {
             send({ type: "res", id: requestId, ok: true, payload: localResult.payload });
@@ -631,43 +513,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         params && typeof params === "object" && !Array.isArray(params)
           ? (params as Record<string, unknown>)
           : undefined;
-      const voiceReplyEnabled = typeof msg.voiceReplyEnabled === "boolean" ? msg.voiceReplyEnabled : undefined;
-      const voiceReplyVoiceIdentifier =
-        typeof msg.voiceReplyVoiceIdentifier === "string" && msg.voiceReplyVoiceIdentifier.trim().length > 0
-          ? msg.voiceReplyVoiceIdentifier.trim()
-          : undefined;
-      const voiceReplyRatePercent =
-        typeof msg.voiceReplyRatePercent === "number" && Number.isFinite(msg.voiceReplyRatePercent)
-          ? Math.max(-50, Math.min(50, Math.round(msg.voiceReplyRatePercent)))
-          : undefined;
-      const requestSessionKey =
-        paramsRecord && typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
-          ? paramsRecord.sessionKey.trim()
-          : undefined;
-      if (requestId && typeof voiceReplyEnabled === "boolean" && (msg.method === "chat.send" || msg.method === "agent")) {
-        voiceReplyPreferences.register({
-          runId: requestId,
-          sessionKey: requestSessionKey,
-          enabled: voiceReplyEnabled,
-          voiceIdentifier: voiceReplyVoiceIdentifier,
-          ratePercent: voiceReplyRatePercent,
-        });
-        if (voiceReplyVoiceIdentifier !== undefined || voiceReplyRatePercent !== undefined) {
-          try {
-            const config = readConfig();
-            const updatedConfig = updateVoiceReplyConfig(config, {
-              voiceIdentifier: voiceReplyVoiceIdentifier,
-              ratePercent: voiceReplyRatePercent,
-            });
-            voiceReplyPreferences.setDefaultVoiceReplySettings({
-              voiceIdentifier: updatedConfig.assistantVoiceReplyVoiceIdentifier,
-              ratePercent: updatedConfig.assistantVoiceReplyRatePercent,
-            });
-          } catch (error) {
-            console.warn(`[relay] failed to persist voice reply settings: ${String(error)}`);
-          }
-        }
-      }
 
       if (!gatewayClient) {
         throw new Error("gateway not connected");
@@ -691,15 +536,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 ? resultRecord.runId.trim()
                 : requestId;
             resolvedRunId = runId;
-            if (runId && typeof voiceReplyEnabled === "boolean") {
-              voiceReplyPreferences.register({
-                runId,
-                sessionKey,
-                enabled: voiceReplyEnabled,
-                voiceIdentifier: voiceReplyVoiceIdentifier,
-                ratePercent: voiceReplyRatePercent,
-              });
-            }
             if (runId) {
               const promptText =
                 typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
@@ -717,16 +553,12 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             scheduleContextUsageRefresh(sessionKey, 1200);
           }
           if (requestId) {
-            if (resolvedRunId && resolvedRunId !== requestId) {
-              voiceReplyPreferences.clearRun(requestId);
-            }
             send({ type: "res", id: requestId, ok: true, payload: result });
           }
         })
         .catch((err: unknown) => {
           console.error(`[relay] cmd failed method=${msg.method} id=${requestId ?? "(no-id)"}: ${String(err)}`);
           if (requestId) {
-            voiceReplyPreferences.clearRun(requestId);
             send({ type: "res", id: requestId, ok: false, error: { message: String(err) } });
           }
         });
@@ -751,11 +583,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             },
           });
           if (requestId) {
-            voiceReplyPreferences.clearRun(requestId);
             send({ type: "res", id: requestId, ok: true, payload: voiceInputRun });
           }
         } else if (requestId) {
-          voiceReplyPreferences.clearRun(requestId);
           send({ type: "res", id: requestId, ok: false, error: { message } });
         }
       }
@@ -786,12 +616,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       // close event will follow
     });
   });
-}
-
-function isVoiceReplyConfigCommand(method: string): boolean {
-  return method === "clawconnect.voiceReply.setConfig"
-    || method === "pocketclaw.voiceReply.setConfig"
-    || method === "clawpilot.voiceReply.setConfig";
 }
 
 export function buildRelayHelloMessage(opts: {

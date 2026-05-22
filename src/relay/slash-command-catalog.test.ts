@@ -8,6 +8,7 @@ test("OpenClaw slash command catalog includes the upstream builtin surface", () 
 
   assert.ok(commands.length >= 30);
   assert.equal(new Set(commands).size, commands.length);
+  assert.equal(commands.includes("/tts"), false);
 
   for (const command of [
     "/help",

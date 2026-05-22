@@ -76,12 +76,6 @@ export const OPENCLAW_SLASH_COMMAND_CATALOG = [
   },
   {
     source: "OpenClaw",
-    command: "/tts",
-    title: "tts",
-    detail: "Control text-to-speech (TTS).",
-  },
-  {
-    source: "OpenClaw",
     command: "/whoami",
     title: "whoami",
     detail: "Show your sender id.",

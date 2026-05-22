@@ -1,12 +1,8 @@
-import { readConfig, readGatewayUrl, readGatewayAuth, readVoiceReplyConfig } from "../config/config.js";
+import { readConfig, readGatewayUrl, readGatewayAuth } from "../config/config.js";
 import { getGatewayRuntimeAdapter } from "../runtime-adapters.js";
 import { withReconnect } from "../relay/reconnect.js";
 import { t } from "../i18n/index.js";
 import { createInterface } from "readline";
-
-function parseBooleanEnv(value: string | undefined): boolean {
-  return /^(1|true|yes|on)$/i.test((value ?? "").trim());
-}
 
 export async function runCommand(): Promise<void> {
   const config = readConfig();
@@ -14,8 +10,6 @@ export async function runCommand(): Promise<void> {
   const runtimeAdapter = getGatewayRuntimeAdapter(gatewayType);
   const gatewayUrl = readGatewayUrl();
   const gatewayAuth = readGatewayAuth(config);
-  const defaultVoiceReplyEnabled = parseBooleanEnv(process.env.OPENCLAW_TTS_ENABLED);
-  const defaultVoiceReplyConfig = readVoiceReplyConfig(config);
 
   // ── Shutdown signal ──────────────────────────────────────────────────
   // SIGTERM / SIGINT → gracefully close the relay WebSocket so the server
@@ -49,8 +43,6 @@ export async function runCommand(): Promise<void> {
       config,
       gatewayUrl: () => readGatewayUrl(),
       gatewayAuth,
-      defaultVoiceReplyEnabled,
-      defaultVoiceReplyConfig,
       signal: shutdown.signal,
       onConnected: () => console.log(t("run.connected")),
       onDisconnected: () => console.log(t("run.disconnected")),

@@ -1,4 +1,4 @@
-import type { ClawConnectConfig, VoiceReplyConfig } from "./config/config.js";
+import type { ClawConnectConfig } from "./config/config.js";
 import { runHermesRelayManager } from "./hermes/hermes-relay-manager.js";
 import { runRelayManager } from "./relay/relay-manager.js";
 import type { GatewayType } from "./gateway-profiles.js";
@@ -7,8 +7,6 @@ export type GatewayRuntimeContext = {
   config: ClawConnectConfig;
   gatewayUrl: () => string;
   gatewayAuth: { token?: string; password?: string };
-  defaultVoiceReplyEnabled: boolean;
-  defaultVoiceReplyConfig: VoiceReplyConfig;
   signal: AbortSignal;
   onConnected: () => void;
   onDisconnected: () => void;
@@ -30,8 +28,6 @@ const OPENCLAW_RUNTIME_ADAPTER: GatewayRuntimeAdapter = {
     gatewayUrl: context.gatewayUrl,
     gatewayToken: context.gatewayAuth.token,
     gatewayPassword: context.gatewayAuth.password,
-    defaultVoiceReplyEnabled: context.defaultVoiceReplyEnabled,
-    defaultVoiceReplyConfig: context.defaultVoiceReplyConfig,
     signal: context.signal,
     onConnected: context.onConnected,
     onDisconnected: context.onDisconnected,

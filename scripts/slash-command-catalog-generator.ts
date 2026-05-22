@@ -22,6 +22,7 @@ const defaultOpenClawRegistryPath = resolve(
   "../../openclaw/src/auto-reply/commands-registry.shared.ts",
 );
 const defaultOutputPath = resolve(repoRoot, "src/relay/slash-command-catalog.generated.ts");
+const REMOVED_OPENCLAW_SLASH_COMMANDS = new Set(["/tts"]);
 
 function skipParentheses(node: ts.Expression): ts.Expression {
   let current = node;
@@ -189,6 +190,9 @@ function extractOpenClawBuiltinCommands(sourceText: string): SlashCommandDescrip
     for (const alias of aliases) {
       const command = normalizeCommand(alias);
       const commandKey = command.toLowerCase();
+      if (REMOVED_OPENCLAW_SLASH_COMMANDS.has(commandKey)) {
+        continue;
+      }
       if (seen.has(commandKey)) {
         continue;
       }

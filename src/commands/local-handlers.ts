@@ -2,7 +2,6 @@ import { readdirSync, statSync, copyFileSync, existsSync, readFileSync, openSync
 import { join } from "path";
 import { homedir } from "os";
 import { createBackup, deleteBackup, listBackups, restoreBackup, updateBackup } from "./backup-manager.js";
-import { readConfig, updateVoiceReplyConfig } from "../config/config.js";
 import {
   LocalCommandContext,
   LocalResult,
@@ -68,9 +67,6 @@ export function handleLocalCommand(
     case "clawconnect.gateway.remoteRestart":
     case "pocketclaw.gateway.remoteRestart":
     case "clawpilot.gateway.remoteRestart": return remoteRestartGateway(context);
-    case "clawconnect.voiceReply.setConfig":
-    case "pocketclaw.voiceReply.setConfig":
-    case "clawpilot.voiceReply.setConfig": return updateVoiceReplySettings(params);
     case "clawconnect.version":
     case "pocketclaw.version":
     case "clawpilot.version":             return getOpenclawVersion();
@@ -227,30 +223,6 @@ function restoreConfig(): LocalResult {
     copyFileSync(latest.path, OPENCLAW_CONFIG);
     console.log(`[clawconnect] Config restored from ${latest.name}`);
     return { ok: true, payload: { restoredFrom: latest.name } };
-  } catch (err) {
-    return { ok: false, error: errorMessage(err) };
-  }
-}
-
-function updateVoiceReplySettings(params: unknown): LocalResult {
-  try {
-    const config = readConfig();
-    const p = params && typeof params === "object" && !Array.isArray(params)
-      ? (params as Record<string, unknown>)
-      : {};
-    const voiceIdentifier = typeof p.voiceReplyVoiceIdentifier === "string" ? p.voiceReplyVoiceIdentifier : undefined;
-    const ratePercent = typeof p.voiceReplyRatePercent === "number" ? p.voiceReplyRatePercent : undefined;
-    const updated = updateVoiceReplyConfig(config, {
-      voiceIdentifier,
-      ratePercent,
-    });
-    return {
-      ok: true,
-      payload: {
-        assistantVoiceReplyVoiceIdentifier: updated.assistantVoiceReplyVoiceIdentifier ?? null,
-        assistantVoiceReplyRatePercent: updated.assistantVoiceReplyRatePercent ?? null,
-      },
-    };
   } catch (err) {
     return { ok: false, error: errorMessage(err) };
   }

@@ -1,4 +1,4 @@
-import type { ClawConnectConfig, VoiceReplyConfig } from "./config/config.js";
+import type { ClawConnectConfig } from "./config/config.js";
 import type { GatewayType } from "./gateway-profiles.js";
 export type GatewayRuntimeContext = {
     config: ClawConnectConfig;
@@ -7,8 +7,6 @@ export type GatewayRuntimeContext = {
         token?: string;
         password?: string;
     };
-    defaultVoiceReplyEnabled: boolean;
-    defaultVoiceReplyConfig: VoiceReplyConfig;
     signal: AbortSignal;
     onConnected: () => void;
     onDisconnected: () => void;

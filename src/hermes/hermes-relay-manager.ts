@@ -1,7 +1,6 @@
 import { statSync } from "fs";
 import { WebSocket } from "ws";
 import { sendFileCommand } from "../commands/send-file.js";
-import { sendVoiceReplyCommand } from "../commands/voice-reply.js";
 import { buildOfficeEventPayload } from "../relay/office-payload.js";
 import { voiceInputSetupMessage } from "../relay/voice-input.js";
 import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
@@ -28,21 +27,6 @@ interface FromServer {
   params?: unknown;
   event?: string;
   payload?: unknown;
-  voiceReplyEnabled?: boolean;
-  voiceReplyVoiceIdentifier?: string;
-  voiceReplyRatePercent?: number;
-}
-
-export type HermesVoiceReplyRequest = {
-  enabled: boolean;
-  voiceIdentifier?: string;
-  ratePercent?: number;
-};
-
-export type HermesVoiceReplyDependencies = {
-  sendVoiceReplyCommandImpl?: typeof sendVoiceReplyCommand;
-  env?: Pick<NodeJS.ProcessEnv, "OPENCLAW_TTS_ENGINE">;
-  warn?: (message: string) => void;
 };
 
 export interface HermesRelayManagerOptions {
@@ -175,7 +159,6 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         const paramsWithFiles = await attachRecentMobileFiles(msg.params, recentMobileFiles, opts);
         const runId = requestId ?? `hermes-${Date.now()}`;
         const sessionKey = resolveHermesRelaySessionKey(paramsWithFiles);
-        const voiceReply = resolveHermesVoiceReplyRequest(msg);
         if (requestId) {
           acknowledgedChatRun = { runId, sessionKey };
           send({ type: "res", id: requestId, ok: true, payload: acknowledgedChatRun });
@@ -202,30 +185,12 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
             content: [{ type: "text", text: chat.output }],
           },
         };
-        if (voiceReply?.enabled) {
-          await sendHermesVoiceReply({
-            runId,
-            sessionKey: chat.sessionKey,
-            text: chat.output,
-            voiceReply,
-            gatewayId: opts.gatewayId,
-            fallback: () => {
-              send({
-                type: "event",
-                event: "chat",
-                payload: finalChatPayload,
-              });
-              publishHermesOfficeSnapshot(send, "chat", finalChatPayload);
-            },
-          });
-        } else {
-          send({
-            type: "event",
-            event: "chat",
-            payload: finalChatPayload,
-          });
-          publishHermesOfficeSnapshot(send, "chat", finalChatPayload);
-        }
+        send({
+          type: "event",
+          event: "chat",
+          payload: finalChatPayload,
+        });
+        publishHermesOfficeSnapshot(send, "chat", finalChatPayload);
 
         for (const artifactPath of chat.artifactPaths) {
           const artifactKey = artifactDeliveryKey(chat.sessionKey, artifactPath);
@@ -297,63 +262,6 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
       console.error("Hermes relay WebSocket error:", error.message);
     });
   });
-}
-
-export function resolveHermesVoiceReplyRequest(message: {
-  method?: string;
-  voiceReplyEnabled?: boolean;
-  voiceReplyVoiceIdentifier?: string;
-  voiceReplyRatePercent?: number;
-}): HermesVoiceReplyRequest | undefined {
-  if (message.method !== "chat.send" && message.method !== "agent" && message.method !== "hermes.chat.send") {
-    return undefined;
-  }
-  if (typeof message.voiceReplyEnabled !== "boolean") {
-    return undefined;
-  }
-  const voiceIdentifier =
-    typeof message.voiceReplyVoiceIdentifier === "string" && message.voiceReplyVoiceIdentifier.trim().length > 0
-      ? message.voiceReplyVoiceIdentifier.trim()
-      : undefined;
-  const ratePercent =
-    typeof message.voiceReplyRatePercent === "number" && Number.isFinite(message.voiceReplyRatePercent)
-      ? Math.max(-50, Math.min(50, Math.round(message.voiceReplyRatePercent)))
-      : undefined;
-  return {
-    enabled: message.voiceReplyEnabled,
-    ...(voiceIdentifier ? { voiceIdentifier } : {}),
-    ...(ratePercent !== undefined ? { ratePercent } : {}),
-  };
-}
-
-export async function sendHermesVoiceReply(opts: {
-  runId: string;
-  sessionKey: string;
-  text: string;
-  voiceReply: HermesVoiceReplyRequest;
-  gatewayId: string;
-  fallback: () => void;
-}, deps: HermesVoiceReplyDependencies = {}): Promise<void> {
-  const resolvedRate =
-    typeof opts.voiceReply.ratePercent === "number"
-      ? `${opts.voiceReply.ratePercent > 0 ? "+" : ""}${opts.voiceReply.ratePercent}%`
-      : undefined;
-  const env = deps.env ?? process.env;
-
-  try {
-    await (deps.sendVoiceReplyCommandImpl ?? sendVoiceReplyCommand)({
-      text: opts.text,
-      gateway: opts.gatewayId,
-      session: opts.sessionKey,
-      voice: opts.voiceReply.voiceIdentifier,
-      rate: resolvedRate,
-      sourceRunId: opts.runId,
-      speaker: (env.OPENCLAW_TTS_ENGINE?.trim() as "system" | "espeak" | undefined) || undefined,
-    });
-  } catch (error) {
-    (deps.warn ?? console.warn)(`[hermes-relay] voice reply generation failed runId=${opts.runId}: ${String(error)}`);
-    opts.fallback();
-  }
 }
 
 function publishHermesOfficeSnapshot(send: (message: ToServer) => void, eventName: string | undefined, payload: unknown): void {

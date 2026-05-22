@@ -37,12 +37,6 @@ CLAWCONNECT_RELAY_SERVER_URL=https://clawlinks.cn
 # OPENCLAW_GATEWAY_TOKEN=
 # OPENCLAW_GATEWAY_PASSWORD=
 
-# Optional: assistant voice replies.
-# OPENCLAW_TTS_ENABLED=0
-# OPENCLAW_TTS_VOICE=Ting-Ting
-# OPENCLAW_TTS_RATE=
-# OPENCLAW_TTS_ENGINE=
-
 # Optional: host-side speech-to-text for ClawLink voice messages.
 # Command must print the transcript to stdout. Available placeholders:
 # {file}, {language}, {mimeType}

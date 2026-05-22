@@ -10,8 +10,6 @@ const OPENCLAW_RUNTIME_ADAPTER = {
         gatewayUrl: context.gatewayUrl,
         gatewayToken: context.gatewayAuth.token,
         gatewayPassword: context.gatewayAuth.password,
-        defaultVoiceReplyEnabled: context.defaultVoiceReplyEnabled,
-        defaultVoiceReplyConfig: context.defaultVoiceReplyConfig,
         signal: context.signal,
         onConnected: context.onConnected,
         onDisconnected: context.onDisconnected,

@@ -130,7 +130,6 @@ $EDITOR ~/.clawconnect/.env
 - `CLAWCONNECT_GATEWAY_URL`：可选，本机 OpenClaw Gateway WebSocket 地址覆盖值
 - `CLAWCONNECT_ENV_FILE`：可选，显式指定 env 文件路径；未设置时会依次读取 `~/.clawconnect/.env`、`.env.local`、`.env`
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD`：Gateway 鉴权兜底值
-- `OPENCLAW_TTS_ENABLED`、`OPENCLAW_TTS_VOICE`、`OPENCLAW_TTS_RATE`、`OPENCLAW_TTS_ENGINE`：语音回复默认值
 - `OPENCLAW_ASR_COMMAND`：宿主机语音转文字命令。ClawLink 发送 `chat.voice.send` 后，agent 会把音频保存到临时文件，并执行这个命令；命令必须把识别文本输出到 stdout。可用占位符：`{file}`、`{language}`、`{mimeType}`
 
 Shell 里已经设置的环境变量优先级高于 env 文件。`clawconnect run`、`status`、`send-file` 会继续使用 `~/.clawconnect/config.json` 或 `~/.clawconnect/profiles/<profile>/config.json` 里已配对保存的 relay；如果要切换中继服务器，请执行 `clawconnect pair --profile <name> --server <url>` 或 `clawconnect reset --profile <name>`。
@@ -144,14 +143,6 @@ clawconnect run
 ```
 
 适合调试中继连接、本地 Gateway 鉴权和日志输出。
-
-如果需要语音播报助手回复，可以显式开启：
-
-```bash
-OPENCLAW_TTS_ENABLED=1 clawconnect run
-```
-
-未设置这个开关时，助手回复保持纯文字。
 
 如果需要让手机端直接发送语音、由宿主机识别后再转发给 OpenClaw 或 Hermes Agent，请配置本机 ASR 命令：
 
@@ -269,8 +260,6 @@ clawconnect send-file ~/Pictures/demo.jpg
 - `send-file` 会先把文件上传到 relay，再把文件消息发到手机端。
 - 图片类型会在 iPhone 聊天里显示预览图，其他类型则显示文件卡片。
 - `chat.send` 的 `attachments` 目前只是本地落盘引用，不是跨设备文件传输入口。
-- 默认不启用语音回复；只有设置 `OPENCLAW_TTS_ENABLED=1` 时，agent 才会把助手回复合成为音频文件。
-- 语音合成优先使用 `edge-tts-universal`，如果生成失败则回退到电脑自带的 TTS。
 
 ## 代码结构
 

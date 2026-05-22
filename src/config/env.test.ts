@@ -11,12 +11,12 @@ test("parseEnvFile handles comments, exports, and quotes", () => {
 # ignored
 CLAWCONNECT_RELAY_SERVER_URL=https://relay.example # inline comment
 export CLAWCONNECT_GATEWAY_URL="ws://localhost:19000"
-OPENCLAW_TTS_VOICE='Ting-Ting'
+OPENCLAW_ASR_COMMAND='transcribe {file}'
 `),
     {
       CLAWCONNECT_RELAY_SERVER_URL: "https://relay.example",
       CLAWCONNECT_GATEWAY_URL: "ws://localhost:19000",
-      OPENCLAW_TTS_VOICE: "Ting-Ting",
+      OPENCLAW_ASR_COMMAND: "transcribe {file}",
     }
   );
 });
