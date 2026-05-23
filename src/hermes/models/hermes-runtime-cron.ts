@@ -1,5 +1,6 @@
 
 import { execFileSync } from "child_process";
+import { existsSync, readFileSync } from "fs";
 import { readFile } from "fs/promises";
 import type { LocalResult } from "../../commands/local-runtime.js";
 import {
@@ -27,8 +28,12 @@ export function runHermesCronCreate(params: unknown): LocalResult {
   if (!schedule || !prompt) {
     return { ok: false, error: "schedule_and_prompt_required" };
   }
-  const args = ["cron", "create", schedule, prompt];
   const name = stringParam(record, "name", "title");
+  const duplicate = findDuplicateHermesCronJobPayload({ name, prompt, schedule });
+  if (duplicate) {
+    return { ok: true, payload: { ...duplicate, deduplicated: true } };
+  }
+  const args = ["cron", "create", schedule, prompt];
   if (name) args.push("--name", name);
   const output = runHermes(args, DEFAULT_TIMEOUT_MS);
   const createdId = output.match(/Created job:\s*([A-Za-z0-9_-]+)/)?.[1];
@@ -84,19 +89,33 @@ export function runHermesCronRun(params: unknown): LocalResult {
 async function readHermesCronJobs(includeDisabled = true): Promise<Array<Record<string, unknown>>> {
   try {
     const raw = await readFile(HERMES_CRON_JOBS_FILE, "utf8");
-    const parsed = JSON.parse(raw) as { jobs?: unknown } | unknown[];
-    const jobs = Array.isArray(parsed)
-      ? parsed
-      : parsed && typeof parsed === "object" && Array.isArray(parsed.jobs)
-        ? parsed.jobs
-        : [];
-    return jobs
-      .filter((job): job is Record<string, unknown> => Boolean(job) && typeof job === "object" && !Array.isArray(job))
-      .filter((job) => includeDisabled || job.enabled !== false)
-      .map(normalizeHermesCronJob);
+    return parseHermesCronJobs(raw, includeDisabled);
   } catch {
     return [];
   }
+}
+
+function readHermesCronJobsSync(includeDisabled = true): Array<Record<string, unknown>> {
+  try {
+    return existsSync(HERMES_CRON_JOBS_FILE)
+      ? parseHermesCronJobs(readFileSync(HERMES_CRON_JOBS_FILE, "utf8"), includeDisabled)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseHermesCronJobs(raw: string, includeDisabled = true): Array<Record<string, unknown>> {
+  const parsed = JSON.parse(raw) as { jobs?: unknown } | unknown[];
+  const jobs = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === "object" && Array.isArray(parsed.jobs)
+      ? parsed.jobs
+      : [];
+  return jobs
+    .filter((job): job is Record<string, unknown> => Boolean(job) && typeof job === "object" && !Array.isArray(job))
+    .filter((job) => includeDisabled || job.enabled !== false)
+    .map(normalizeHermesCronJob);
 }
 
 function findHermesCronJobPayload(id?: string): Record<string, unknown> | undefined {
@@ -114,6 +133,35 @@ function findHermesCronJobPayload(id?: string): Record<string, unknown> | undefi
   } catch {
     return undefined;
   }
+}
+
+function findDuplicateHermesCronJobPayload(candidate: {
+  name?: string;
+  prompt: string;
+  schedule: string;
+}): Record<string, unknown> | undefined {
+  return readHermesCronJobsSync(true).find((job) => isDuplicateHermesCronJob(job, candidate));
+}
+
+export function isDuplicateHermesCronJob(
+  job: Record<string, unknown>,
+  candidate: { name?: string; prompt: string; schedule: string },
+): boolean {
+  const raw = toRecord(job.raw);
+  const existingName = stringParam(raw, "name") ?? stringParam(job, "name");
+  if (candidate.name && existingName && normalizeCronText(candidate.name) !== normalizeCronText(existingName)) {
+    return false;
+  }
+
+  const existingPrompt = stringParam(raw, "prompt") ?? stringParam(toRecord(job.payload), "message", "text");
+  if (!existingPrompt || !areDuplicateCronPrompts(existingPrompt, candidate.prompt)) {
+    return false;
+  }
+
+  const existingSchedule = stringParam(raw, "schedule_display")
+    ?? stringParam(toRecord(raw.schedule), "display", "expr")
+    ?? scheduleStringFromNormalizedJob(job);
+  return areDuplicateCronSchedules(existingSchedule, candidate.schedule);
 }
 
 function normalizeHermesCronJob(job: Record<string, unknown>): Record<string, unknown> {
@@ -151,6 +199,19 @@ function normalizeHermesCronJob(job: Record<string, unknown>): Record<string, un
   };
 }
 
+function scheduleStringFromNormalizedJob(job: Record<string, unknown>): string | undefined {
+  const schedule = toRecord(job.schedule);
+  const kind = stringParam(schedule, "kind");
+  if (kind === "every") {
+    const everyMs = numberParam(schedule, "everyMs");
+    return everyMs ? `every ${Math.max(1, Math.round(everyMs / 60_000))}m` : undefined;
+  }
+  if (kind === "cron") {
+    return stringParam(schedule, "expr", "value");
+  }
+  return stringParam(schedule, "at");
+}
+
 function dateMs(value: unknown): number | undefined {
   if (typeof value !== "string" || !value.trim()) return undefined;
   const parsed = Date.parse(value);
@@ -174,6 +235,76 @@ function hermesScheduleFromParams(record: Record<string, unknown>): string | und
     return stringParam(schedule, "expr", "value");
   }
   return undefined;
+}
+
+function areDuplicateCronSchedules(left: string | undefined, right: string): boolean {
+  const leftFingerprint = cronScheduleFingerprint(left);
+  const rightFingerprint = cronScheduleFingerprint(right);
+  if (!leftFingerprint || !rightFingerprint) {
+    return normalizeCronText(left ?? "") === normalizeCronText(right);
+  }
+  if (leftFingerprint === rightFingerprint) {
+    return true;
+  }
+  return leftFingerprint === "daily" && rightFingerprint === "daily";
+}
+
+function cronScheduleFingerprint(value: string | undefined): string | undefined {
+  const normalized = value?.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!normalized) return undefined;
+  const everyMatch = normalized.match(/^(?:every\s*)?(\d+)\s*m(?:in(?:ute)?s?)?$/);
+  if (everyMatch) {
+    const minutes = Number.parseInt(everyMatch[1] ?? "", 10);
+    return minutes === 1440 ? "daily" : `every:${minutes}`;
+  }
+  const hourlyCronMatch = normalized.match(/^(\d{1,2})\s+(\d{1,2})\s+\*\s+\*\s+\*$/);
+  if (hourlyCronMatch) {
+    return "daily";
+  }
+  return normalized;
+}
+
+function areDuplicateCronPrompts(left: string, right: string): boolean {
+  const normalizedLeft = normalizeCronPrompt(left);
+  const normalizedRight = normalizeCronPrompt(right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  if (normalizedLeft === normalizedRight) return true;
+  if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) return true;
+  return ngramOverlapRatio(normalizedLeft, normalizedRight, 3) >= 0.55;
+}
+
+function normalizeCronPrompt(value: string): string {
+  return normalizeCronText(value)
+    .replace(/^你是每日/, "每日")
+    .replace(/^每天执行一次/, "")
+    .replace(/^每天/, "");
+}
+
+function normalizeCronText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[\s"'“”‘’.,，。:：;；!！?？()（）[\]【】{}<>《》|、\\/-]+/g, "");
+}
+
+function ngramOverlapRatio(left: string, right: string, size: number): number {
+  const leftGrams = ngrams(left, size);
+  const rightGrams = ngrams(right, size);
+  const smallerSize = Math.min(leftGrams.size, rightGrams.size);
+  if (smallerSize === 0) return 0;
+  let overlap = 0;
+  for (const gram of leftGrams) {
+    if (rightGrams.has(gram)) overlap += 1;
+  }
+  return overlap / smallerSize;
+}
+
+function ngrams(value: string, size: number): Set<string> {
+  if (value.length <= size) return new Set([value]);
+  const grams = new Set<string>();
+  for (let index = 0; index <= value.length - size; index += 1) {
+    grams.add(value.slice(index, index + size));
+  }
+  return grams;
 }
 
 function promptFromCronParams(record: Record<string, unknown>): string | undefined {

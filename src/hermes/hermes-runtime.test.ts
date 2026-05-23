@@ -7,6 +7,7 @@ import {
   buildHermesAssistantDeltaPayload,
   buildHermesRuntimeContextHint,
   extractDeliverablePaths,
+  isDuplicateHermesCronJob,
   isHermesSlashCommandMessage,
   parseHermesToolLogLine,
   parseHermesSkillsList,
@@ -247,6 +248,36 @@ test("selectHermesSessionForCompletedChat keeps explicit resume binding", () => 
   });
 
   assert.equal(selected?.hermesSessionId, "20260521_080012_48f5ae");
+});
+
+test("isDuplicateHermesCronJob treats equivalent daily weather jobs as duplicates", () => {
+  const existing = {
+    name: "福州每日天气简报",
+    schedule: { kind: "cron", expr: "0 7 * * *" },
+    payload: {
+      message: [
+        "每天执行一次天气简报任务。请查询中国福建省福州市当天最新可获取的天气预报，并用中文简要汇报，适合手机阅读。",
+        "要求：天气状况、最高/最低温、降雨概率、风力、空气质量、出门建议。",
+      ].join("\n"),
+    },
+    raw: {
+      name: "福州每日天气简报",
+      prompt: [
+        "每天执行一次天气简报任务。请查询中国福建省福州市当天最新可获取的天气预报，并用中文简要汇报，适合手机阅读。",
+        "要求：天气状况、最高/最低温、降雨概率、风力、空气质量、出门建议。",
+      ].join("\n"),
+      schedule_display: "0 7 * * *",
+    },
+  };
+
+  assert.equal(isDuplicateHermesCronJob(existing, {
+    name: "福州每日天气简报",
+    prompt: [
+      "你是每日天气简报任务。请查询中国福建省福州市当天最新可获取的天气预报，并用中文简要汇报，适合手机阅读。",
+      "要求：天气状况、最高/最低温、降雨概率、风力、空气质量、出门建议。仅输出最终中文简报。",
+    ].join("\n"),
+    schedule: "every 1440m",
+  }), true);
 });
 
 test("model options use Hermes provider payload without Codex fallback", () => {

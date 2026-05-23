@@ -26,5 +26,6 @@ export {
   parseHermesStatusSnapshot,
   readHermesStatusSnapshot,
 } from "./models/hermes-runtime-usage.js";
+export { isDuplicateHermesCronJob } from "./models/hermes-runtime-cron.js";
 export { parseHermesSkillsList } from "./models/hermes-runtime-skills.js";
 export { extractDeliverablePaths } from "./models/hermes-runtime-artifacts.js";
