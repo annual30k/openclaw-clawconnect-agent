@@ -133,13 +133,13 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
 
-export function runHermesPython(script: string): string {
+export function runHermesPython(script: string, extraEnv: NodeJS.ProcessEnv = {}): string {
   const venvPython = join(HERMES_HOME_DIR, "hermes-agent", "venv", "bin", "python");
   const python = process.env.HERMES_PYTHON?.trim()
     || (existsSync(venvPython) ? venvPython : join(homedir(), ".local", "bin", "python3.11"));
   return execFileSync(python, ["-c", script], {
     cwd: join(HERMES_HOME_DIR, "hermes-agent"),
-    env: SUBPROCESS_ENV,
+    env: { ...SUBPROCESS_ENV, ...extraEnv },
     stdio: "pipe",
     timeout: DEFAULT_TIMEOUT_MS,
   }).toString();

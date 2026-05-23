@@ -12,7 +12,6 @@ import {
 import { voiceInputSetupMessage } from "../relay/voice-input.js";
 import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
 import { runHermesPython } from "./models/hermes-runtime-process.js";
-import { forgetHermesSession } from "./hermes-session-store.js";
 import { prepareHermesVoiceInputCommand, resolveHermesVoiceInputSessionKey } from "./hermes-voice-input.js";
 import {
   collectHermesUsageSnapshot,
@@ -108,7 +107,6 @@ type HermesSlashCommandCollector = () => readonly RelaySlashCommandDescriptor[];
 const DEFAULT_HERMES_SLASH_COMMAND_SEARCH_LIMIT = 16;
 const MAX_HERMES_SLASH_COMMAND_SEARCH_LIMIT = 50;
 const MAX_HERMES_SLASH_COMMAND_SEARCH_OFFSET = 10_000;
-const HERMES_NEW_SESSION_RESET_TEXT = "新会话已开始。有什么需要我帮你处理的？";
 let hermesSlashCommandCatalogCache: RelaySlashCommandDescriptor[] | undefined;
 
 export interface HermesSlashCommandSearchResult {
@@ -177,21 +175,6 @@ export function buildHermesRelayHelloMessage(opts: {
     capabilities: opts.capabilities,
     ...(opts.slashCommands && opts.slashCommands.length > 0 ? { slashCommands: opts.slashCommands } : {}),
   };
-}
-
-export function isHermesNewSessionResetParams(params: unknown): boolean {
-  if (!params || typeof params !== "object" || Array.isArray(params)) {
-    return false;
-  }
-  const message = (params as Record<string, unknown>).message;
-  return typeof message === "string" && message.trim().toLowerCase() === "/new";
-}
-
-export function buildHermesNewSessionResetPayload(run: { runId: string; sessionKey: string }) {
-  return buildMobileAssistantFinalPayload({
-    run,
-    text: HERMES_NEW_SESSION_RESET_TEXT,
-  });
 }
 
 function parseHermesSlashCommandCatalog(rawOutput: string): RelaySlashCommandDescriptor[] {
@@ -512,18 +495,6 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           acknowledgedChatRun = { runId, sessionKey };
           send({ type: "res", id: requestId, ok: true, payload: acknowledgedChatRun });
         }
-        if (isHermesNewSessionResetParams(msg.params)) {
-          await forgetHermesSession(sessionKey);
-          const resetPayload = buildHermesNewSessionResetPayload({ runId, sessionKey });
-          send({
-            type: "event",
-            event: "chat",
-            payload: resetPayload,
-          });
-          publishHermesOfficeSnapshot(send, "chat", resetPayload);
-          return;
-        }
-
         const paramsWithFiles = await attachRecentMobileFiles(msg.params, recentMobileFiles, opts);
         const chat = await runHermesChat(paramsWithFiles, {
           requestId: runId,

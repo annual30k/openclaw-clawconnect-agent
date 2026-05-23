@@ -14,8 +14,10 @@ export { handleHermesCommand } from "./models/hermes-runtime-command-router.js";
 export {
   buildHermesAssistantDeltaPayload,
   buildHermesRuntimeContextHint,
+  isHermesSlashCommandMessage,
   parseHermesToolLogLine,
   runHermesChat,
+  selectHermesSessionForCompletedChat,
 } from "./models/hermes-runtime-chat.js";
 export {
   collectHermesUsageSnapshot,

@@ -7,10 +7,12 @@ import {
   buildHermesAssistantDeltaPayload,
   buildHermesRuntimeContextHint,
   extractDeliverablePaths,
+  isHermesSlashCommandMessage,
   parseHermesToolLogLine,
   parseHermesSkillsList,
   parseHermesSessionUsageSnapshot,
   parseHermesStatusSnapshot,
+  selectHermesSessionForCompletedChat,
   stripHermesSecurityReviewNotices,
   stripHermesSessionResumeNotices,
 } from "./hermes-runtime.js";
@@ -189,6 +191,62 @@ test("buildHermesRuntimeContextHint includes current model and provider", () => 
 
 test("buildHermesRuntimeContextHint omits empty snapshots", () => {
   assert.equal(buildHermesRuntimeContextHint({}), undefined);
+});
+
+test("Hermes slash command detection matches terminal command input", () => {
+  assert.equal(isHermesSlashCommandMessage("/new"), true);
+  assert.equal(isHermesSlashCommandMessage(" /model openai/gpt-5.5 "), true);
+  assert.equal(isHermesSlashCommandMessage("/reload-mcp"), true);
+  assert.equal(isHermesSlashCommandMessage("/tmp/report.txt"), false);
+  assert.equal(isHermesSlashCommandMessage("please run /new"), false);
+});
+
+test("selectHermesSessionForCompletedChat ignores unrelated latest existing session", () => {
+  const oldWeather = {
+    sessionKey: "ios-old",
+    hermesSessionId: "20260521_080012_48f5ae",
+    displayName: "每天早上查看中国福建省福州市当天的天气预报",
+    lastActivityAt: "2026-05-23T06:33:00.000Z",
+    kind: "hermes" as const,
+  };
+  const newHello = {
+    sessionKey: "hermes:20260523_143347_e56b96",
+    hermesSessionId: "20260523_143347_e56b96",
+    displayName: "你好 [Hermes runtime context]",
+    label: "你好",
+    lastActivityAt: "2026-05-23T06:32:59.000Z",
+    kind: "hermes" as const,
+  };
+
+  const selected = selectHermesSessionForCompletedChat([oldWeather, newHello], {
+    beforeSessions: [oldWeather],
+    userMessage: "你好",
+  });
+
+  assert.equal(selected?.hermesSessionId, "20260523_143347_e56b96");
+});
+
+test("selectHermesSessionForCompletedChat keeps explicit resume binding", () => {
+  const resumed = {
+    sessionKey: "ios-current",
+    hermesSessionId: "20260521_080012_48f5ae",
+    displayName: "继续旧会话",
+    kind: "hermes" as const,
+  };
+  const otherLatest = {
+    sessionKey: "hermes:20260523_143347_e56b96",
+    hermesSessionId: "20260523_143347_e56b96",
+    displayName: "别的新会话",
+    kind: "hermes" as const,
+  };
+
+  const selected = selectHermesSessionForCompletedChat([otherLatest, resumed], {
+    resume: "20260521_080012_48f5ae",
+    beforeSessions: [resumed],
+    userMessage: "继续",
+  });
+
+  assert.equal(selected?.hermesSessionId, "20260521_080012_48f5ae");
 });
 
 test("model options use Hermes provider payload without Codex fallback", () => {

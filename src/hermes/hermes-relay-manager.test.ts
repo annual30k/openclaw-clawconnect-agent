@@ -3,10 +3,8 @@ import { test } from "node:test";
 
 import {
   buildHermesArtifactSendOptions,
-  buildHermesNewSessionResetPayload,
   buildHermesRelayHelloMessage,
   collectHermesSlashCommandCatalog,
-  isHermesNewSessionResetParams,
   searchHermesSlashCommandCatalog,
   shouldPublishHermesOfficeSnapshot,
 } from "./hermes-relay-manager.js";
@@ -46,26 +44,6 @@ test("Hermes office snapshots skip high-frequency assistant deltas", () => {
       message: { content: [{ type: "text", text: "done" }] },
     }),
     true,
-  );
-});
-
-test("Hermes /new reset payload does not carry stale context usage", () => {
-  assert.equal(isHermesNewSessionResetParams({ message: " /NEW ", sessionKey: "ios-1" }), true);
-  assert.equal(isHermesNewSessionResetParams({ message: "/new keep this text", sessionKey: "ios-1" }), false);
-  assert.equal(isHermesNewSessionResetParams({ message: "/model", sessionKey: "ios-1" }), false);
-
-  assert.deepEqual(
-    buildHermesNewSessionResetPayload({ runId: "run-1", sessionKey: "ios-1" }),
-    {
-      runId: "run-1",
-      sessionKey: "ios-1",
-      state: "final",
-      role: "assistant",
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text: "新会话已开始。有什么需要我帮你处理的？" }],
-      },
-    },
   );
 });
 
