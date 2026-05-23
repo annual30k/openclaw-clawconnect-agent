@@ -612,6 +612,14 @@ export function parseHermesToolLogLine(line: string): HermesToolLogEvent | null 
   if (executor) {
     const toolName = normalizeHermesToolName(executor[1] ?? "tool");
     const detail = (executor[2] ?? "").trim();
+    if (/\b(?:running|started|executing|start)\b/i.test(detail)) {
+      return {
+        toolName,
+        phase: "streaming",
+        text: `${toolName} ${detail}`.trim(),
+        isError: false,
+      };
+    }
     const failed = /\b(?:failed|error|errored|denied|aborted)\b/i.test(detail);
     return {
       toolName,

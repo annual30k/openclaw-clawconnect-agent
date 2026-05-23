@@ -332,6 +332,9 @@ test("Hermes model list does not synthesize fallback models when Hermes returns 
 });
 
 test("parseHermesToolLogLine converts terminal tool logs to tool stream events", () => {
+  const running = parseHermesToolLogLine(
+    "2026-05-21 09:06:53,100 INFO [session] agent.tool_executor: tool terminal running"
+  );
   const start = parseHermesToolLogLine(
     "2026-05-21 09:06:53,185 INFO [session] tools.terminal_tool: Creating new local environment for task default...",
   );
@@ -339,6 +342,12 @@ test("parseHermesToolLogLine converts terminal tool logs to tool stream events",
     "2026-05-21 09:06:53,871 INFO [session] agent.tool_executor: tool terminal completed (0.69s, 62 chars)",
   );
 
+  assert.deepEqual(running, {
+    toolName: "terminal",
+    phase: "streaming",
+    text: "terminal running",
+    isError: false,
+  });
   assert.deepEqual(start, {
     toolName: "terminal",
     phase: "streaming",

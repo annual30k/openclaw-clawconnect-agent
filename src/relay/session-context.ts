@@ -77,13 +77,24 @@ export async function readContextUsageSnapshot(
   if (typeof entry.sessionId === "string" && entry.sessionId.trim().length > 0) {
       const transcriptUsage = await readUsageFromSessionLog(sessionKey, entry.sessionId.trim(), entry, defaults);
       if (transcriptUsage) {
+        if (contextUsage === undefined || contextUsage === 0 || transcriptUsage.promptTokens > contextUsage) {
+          contextUsage = transcriptUsage.promptTokens;
+        }
         promptTokens = transcriptUsage.promptTokens;
         totalTokens = transcriptUsage.total;
-        contextUsage = transcriptUsage.promptTokens;
         if (!currentModel && transcriptUsage.model) {
           currentModel = transcriptUsage.model;
         }
       }
+  }
+
+  if (contextUsage !== undefined && contextUsage > 0) {
+    if (promptTokens === undefined || promptTokens === 0) {
+      promptTokens = contextUsage;
+    }
+    if (totalTokens === undefined || totalTokens === 0) {
+      totalTokens = contextUsage;
+    }
   }
 
   if (!currentModel && !contextLimit && contextUsage === undefined) {

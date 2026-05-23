@@ -81,7 +81,7 @@ test("readContextUsageSnapshot preserves a zero-token current session", () => {
       "node",
       ["--import", "tsx", "--input-type=module", "-e", script],
       {
-        cwd: "/Users/qiuqiquan/Desktop/openClaw/PocketClaw/clawconnect-agent",
+        cwd: process.cwd(),
         env: {
           ...process.env,
           HOME: tempHome,
