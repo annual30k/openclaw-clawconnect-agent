@@ -21,6 +21,42 @@ test("readHealth recognizes Hermes relay manager connection as agent health", ()
   assert.deepEqual(health.gateway, { kind: "ok", detail: "connected" });
 });
 
+test("readHealth treats Hermes relay reconnection as recovered after stale replacement close", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawconnect-status-"));
+  const logPath = join(dir, "clawconnect.log");
+  writeFileSync(logPath, [
+    "Starting ClawConnect host agent...",
+    "  Gateway type: hermes",
+    "Connected to relay server (hermes gatewayId=gw_1)",
+    "Relay connected.",
+    "Hermes relay connection closed: 4000 replaced_by_new_host",
+    "Relay disconnected. Reconnecting...",
+    "Relay connected.",
+  ].join("\n"));
+
+  const health = readHealth(logPath, "hermes");
+
+  assert.deepEqual(health.relay, { kind: "ok", detail: "connected" });
+  assert.deepEqual(health.gateway, { kind: "ok", detail: "connected" });
+});
+
+test("readHealth reports Hermes replacement close when no later relay connection exists", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawconnect-status-"));
+  const logPath = join(dir, "clawconnect.log");
+  writeFileSync(logPath, [
+    "Starting ClawConnect host agent...",
+    "  Gateway type: hermes",
+    "Connected to relay server (hermes gatewayId=gw_1)",
+    "Relay connected.",
+    "Hermes relay connection closed: 4000 replaced_by_new_host",
+  ].join("\n"));
+
+  const health = readHealth(logPath, "hermes");
+
+  assert.deepEqual(health.relay, { kind: "error", detail: "4000 replaced_by_new_host" });
+  assert.deepEqual(health.gateway, { kind: "error", detail: "4000 replaced_by_new_host" });
+});
+
 test("readHealth keeps OpenClaw gateway event parsing for OpenClaw configs", () => {
   const dir = mkdtempSync(join(tmpdir(), "clawconnect-status-"));
   const logPath = join(dir, "clawconnect.log");

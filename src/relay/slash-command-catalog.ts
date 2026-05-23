@@ -1,6 +1,6 @@
 import { OPENCLAW_SLASH_COMMAND_CATALOG as GENERATED_OPENCLAW_SLASH_COMMAND_CATALOG } from "./slash-command-catalog.generated.js";
 
-export type RelaySlashCommandSource = "OpenClaw" | "ClawConnect";
+export type RelaySlashCommandSource = "OpenClaw" | "Hermes" | "ClawConnect";
 
 export interface RelaySlashCommandDescriptor {
   source: RelaySlashCommandSource;

@@ -92,7 +92,7 @@ export function readHealth(logPath: string, gatewayType: GatewayType = "openclaw
 
   const lines = readTailLines(logPath, 400);
   return {
-    relay: parseRelayHealth(lines),
+    relay: parseRelayHealth(lines, gatewayType),
     gateway: parseGatewayHealth(lines, gatewayType),
   };
 }
@@ -119,11 +119,14 @@ function readTailLines(path: string, maxLines: number): string[] {
   return lines.slice(-maxLines);
 }
 
-function parseRelayHealth(lines: string[]): HealthState {
+function parseRelayHealth(lines: string[], gatewayType: GatewayType): HealthState {
   const connectedIndex = findLastIndex(lines, (line) => line.includes("Relay connected."));
   const disconnectedIndex = findLastIndex(
     lines,
-    (line) => line.includes("Relay disconnected.") || line.includes("Relay connection closed:")
+    (line) =>
+      line.includes("Relay disconnected.") ||
+      line.includes("Relay connection closed:") ||
+      (gatewayType === "hermes" && line.includes("Hermes relay connection closed:"))
   );
 
   if (connectedIndex === -1 && disconnectedIndex === -1) {
@@ -133,8 +136,8 @@ function parseRelayHealth(lines: string[]): HealthState {
     return { kind: "ok", detail: "connected" };
   }
   const line = disconnectedIndex >= 0 ? lines[disconnectedIndex] : "";
-  const detail = line.includes("Relay connection closed:")
-    ? line.replace(/^.*Relay connection closed:\s*/, "").trim()
+  const detail = line.includes("Relay connection closed:") || line.includes("Hermes relay connection closed:")
+    ? line.replace(/^.*(?:Hermes relay connection closed:|Relay connection closed:)\s*/, "").trim()
     : "disconnected";
   return { kind: "error", detail };
 }
@@ -171,7 +174,12 @@ function parseGatewayHealth(lines: string[], gatewayType: GatewayType): HealthSt
 }
 
 function parseHermesAgentHealth(lines: string[]): HealthState {
-  const connectedIndex = findLastIndex(lines, (line) => line.includes("Connected to relay server (hermes gatewayId="));
+  const connectedIndex = findLastIndex(
+    lines,
+    (line) =>
+      line.includes("Connected to relay server (hermes gatewayId=") ||
+      line.includes("Relay connected.")
+  );
   const closedIndex = findLastIndex(lines, (line) => line.includes("Hermes relay connection closed:"));
 
   if (connectedIndex === -1 && closedIndex === -1) {

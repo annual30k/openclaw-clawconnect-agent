@@ -14,7 +14,7 @@ import {
   runHermesCronRun,
   runHermesCronUpdate,
 } from "./hermes-runtime-cron.js";
-import { runHermesLifecycle } from "./hermes-runtime-lifecycle.js";
+import { runClawConnectProfileRestart, runHermesLifecycle } from "./hermes-runtime-lifecycle.js";
 import { runHermesModelList, runHermesModelSelect } from "./hermes-runtime-models.js";
 import { runHermesLogs } from "./hermes-runtime-command-utils.js";
 import {
@@ -110,7 +110,7 @@ export function handleHermesCommand(
       return runHermesLifecycle("stop", context);
     case "hermes.gateway.restart":
     case "hermes.agent.restart":
-      return runHermesLifecycle("restart", context);
+      return runClawConnectProfileRestart(context);
     case "hermes.backup.create":
       return runHermesBackupCreate(params);
     case "hermes.backup.list":
