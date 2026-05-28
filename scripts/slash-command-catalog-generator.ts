@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -21,7 +21,7 @@ const defaultOpenClawRegistryPath = resolve(
   repoRoot,
   "../../openclaw/src/auto-reply/commands-registry.shared.ts",
 );
-const defaultOutputPath = resolve(repoRoot, "src/relay/slash-command-catalog.generated.ts");
+const defaultOutputPath = resolve(repoRoot, "src/openclaw/relay/slash-command-catalog.generated.ts");
 const REMOVED_OPENCLAW_SLASH_COMMANDS = new Set(["/tts"]);
 
 function skipParentheses(node: ts.Expression): ts.Expression {
@@ -245,6 +245,7 @@ export function writeOpenClawSlashCommandCatalog(options: SlashCommandCatalogGen
   const outputPath = options.outputPath ?? defaultOutputPath;
   const commands = loadOpenClawSlashCommandCatalog(options);
   const rendered = renderOpenClawSlashCommandCatalogSource(commands);
+  mkdirSync(dirname(outputPath), { recursive: true });
   writeFileSync(outputPath, rendered, "utf8");
   return { outputPath, commands };
 }

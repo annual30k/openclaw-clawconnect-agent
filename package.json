@@ -30,7 +30,7 @@
     "postbuild": "node -e \"require('fs').chmodSync('dist/index.js', 0o755)\"",
     "sync:slash-commands": "tsx scripts/sync-slash-command-catalog.ts",
     "prepack": "npm run build",
-    "test": "node --test --import tsx src/*.test.ts src/commands/*.test.ts src/config/*.test.ts src/platform/*.test.ts src/relay/*.test.ts src/hermes/*.test.ts",
+    "test": "node --test --import tsx src/*.test.ts src/commands/*.test.ts src/config/*.test.ts src/core/*.test.ts src/core/**/*.test.ts src/openclaw/*.test.ts src/openclaw/**/*.test.ts src/platform/*.test.ts src/hermes/*.test.ts",
     "test:e2e": "tsx scripts/e2e-protocol-smoke.ts",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js"

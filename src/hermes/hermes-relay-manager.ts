@@ -1,17 +1,23 @@
 import { statSync } from "fs";
 import { WebSocket } from "ws";
-import { sendFileCommand } from "../commands/send-file.js";
-import type { SendFileCommandOptions } from "../commands/send-file.js";
-import { buildOfficeEventPayload } from "../relay/office-payload.js";
-import type { RelaySlashCommandDescriptor } from "../relay/slash-command-catalog.js";
+import { uploadFileToRelay, type FileUploadRequest } from "../core/relay/file-upload.js";
+import {
+  bindRelayAbortSignal,
+  buildRelayUrl,
+  parseRelayFrame,
+  sendRelayJson,
+  shouldRetryRelayClose,
+} from "../core/relay/relay-server-connection.js";
+import { buildOfficeEventPayload } from "../core/relay/office-payload.js";
+import type { RelaySlashCommandDescriptor } from "../core/relay/slash-command-types.js";
 import {
   buildMobileAssistantErrorPayload,
   buildMobileAssistantFinalPayload,
   resolveMobileChatRun,
-} from "../relay/mobile-chat-run-bridge.js";
-import { voiceInputSetupMessage } from "../relay/voice-input.js";
+} from "../core/relay/mobile-chat-run-bridge.js";
+import { voiceInputSetupMessage } from "../core/relay/voice-input.js";
 import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
-import { runHermesPython } from "./models/hermes-runtime-process.js";
+import { runHermesPython } from "./runtime/hermes-runtime-process.js";
 import { prepareHermesVoiceInputCommand, resolveHermesVoiceInputSessionKey } from "./hermes-voice-input.js";
 import {
   collectHermesUsageSnapshot,
@@ -370,18 +376,10 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
       return;
     }
 
-    if (opts.signal) {
-      if (opts.signal.aborted) {
-        relayWs.close(1001, "shutdown");
-      } else {
-        opts.signal.addEventListener("abort", () => relayWs.close(1001, "shutdown"), { once: true });
-      }
-    }
+    bindRelayAbortSignal(relayWs, opts.signal);
 
     const send = (message: ToServer): void => {
-      if (relayWs.readyState === WebSocket.OPEN) {
-        relayWs.send(JSON.stringify(message));
-      }
+      sendRelayJson(relayWs, message);
     };
 
     relayWs.on("open", () => {
@@ -418,10 +416,8 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
       let acknowledgedChatRun: { runId: string; sessionKey: string } | undefined;
       let voiceInputRun: { runId: string; sessionKey: string } | undefined;
       try {
-        let msg: FromServer;
-        try {
-          msg = JSON.parse(raw.toString()) as FromServer;
-        } catch {
+        const msg = parseRelayFrame<FromServer>(raw);
+        if (!msg) {
           return;
         }
 
@@ -525,19 +521,14 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           if (artifactKey && sentArtifacts.has(artifactKey)) {
             continue;
           }
-          await sendFileCommand(buildHermesArtifactSendOptions({
+          await uploadFileToRelay(buildHermesArtifactUploadRequest({
             artifactPath,
+            relayServerUrl: opts.relayServerUrl,
+            relaySecret: opts.relaySecret,
             gatewayId: opts.gatewayId,
             sessionKey: chat.sessionKey,
             runId,
-          }), {
-            stdout: { write: () => true },
-            stderr: { write: (chunk) => {
-              const text = String(chunk).trim();
-              if (text) console.log(text);
-              return true;
-            } },
-          });
+          }));
           if (artifactKey) {
             sentArtifacts.set(artifactKey, Date.now());
           }
@@ -574,8 +565,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
     relayWs.on("close", (code, reason) => {
       console.log(`Hermes relay connection closed: ${code} ${reason.toString()}`);
       opts.onDisconnected?.();
-      const intentional = opts.signal?.aborted || code === 4000;
-      resolve(!intentional);
+      resolve(shouldRetryRelayClose(code, opts.signal));
     });
 
     relayWs.on("error", (error) => {
@@ -584,17 +574,20 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
   });
 }
 
-export function buildHermesArtifactSendOptions(params: {
+export function buildHermesArtifactUploadRequest(params: {
   artifactPath: string;
+  relayServerUrl: string;
+  relaySecret: string;
   gatewayId: string;
   sessionKey: string;
   runId: string;
-}): SendFileCommandOptions {
+}): FileUploadRequest {
   return {
+    relayServerUrl: params.relayServerUrl,
+    relaySecret: params.relaySecret,
+    gatewayId: params.gatewayId,
+    sessionKey: params.sessionKey,
     filePath: params.artifactPath,
-    gateway: params.gatewayId,
-    session: params.sessionKey,
-    json: true,
     sourceRunId: params.runId,
   };
 }
@@ -673,11 +666,6 @@ async function publishHermesUsageSnapshot(send: (message: ToServer) => void): Pr
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[hermes-relay] usage snapshot failed: ${message}`);
   }
-}
-
-function buildRelayUrl(serverUrl: string, gatewayId: string, relaySecret: string): string {
-  const base = serverUrl.replace(/\/+$/, "").replace(/^http/, "ws");
-  return `${base}/relay/${gatewayId}?secret=${encodeURIComponent(relaySecret)}`;
 }
 
 async function rememberMobileFileEvent(

@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { Writable } from "stream";
-import { calculateChunkCount, inferMimeType, normalizeSessionKey, toRelayHttpBase } from "./send-file-utils.js";
+import { calculateChunkCount, inferMimeType, normalizeSessionKey, toRelayHttpBase } from "../core/relay/file-upload-utils.js";
 import { sendFileCommand } from "./send-file.js";
 
 test("utility helpers normalize relay URLs and chunk counts", () => {

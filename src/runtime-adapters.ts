@@ -1,6 +1,6 @@
 import type { ClawConnectConfig } from "./config/config.js";
 import { runHermesRelayManager } from "./hermes/hermes-relay-manager.js";
-import { runRelayManager } from "./relay/relay-manager.js";
+import { runRelayManager } from "./openclaw/relay-manager.js";
 import type { GatewayType } from "./gateway-profiles.js";
 
 export type GatewayRuntimeContext = {

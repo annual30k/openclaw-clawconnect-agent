@@ -1,4 +1,4 @@
-import { prepareVoiceSendParams } from "../relay/voice-input.js";
+import { prepareVoiceSendParams } from "../core/relay/voice-input.js";
 export async function prepareHermesVoiceInputCommand(params, options) {
     return {
         method: "chat.send",

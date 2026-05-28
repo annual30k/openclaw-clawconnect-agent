@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
-  buildHermesArtifactSendOptions,
+  buildHermesArtifactUploadRequest,
   buildHermesRelayHelloMessage,
   collectHermesSlashCommandCatalog,
   searchHermesSlashCommandCatalog,
@@ -10,21 +10,25 @@ import {
 } from "./hermes-relay-manager.js";
 
 test("Hermes artifact uploads are linked to the assistant source run", () => {
-  assert.deepEqual(
-    buildHermesArtifactSendOptions({
+  const request = buildHermesArtifactUploadRequest({
       artifactPath: "/tmp/reply.jpg",
+      relayServerUrl: "https://relay.example",
+      relaySecret: "secret-1",
       gatewayId: "gw-1",
       sessionKey: "main",
       runId: "run-voice-1",
-    }),
-    {
-      filePath: "/tmp/reply.jpg",
-      gateway: "gw-1",
-      session: "main",
-      json: true,
-      sourceRunId: "run-voice-1",
-    },
-  );
+    });
+  assert.deepEqual(request, {
+    relayServerUrl: "https://relay.example",
+    relaySecret: "secret-1",
+    gatewayId: "gw-1",
+    sessionKey: "main",
+    filePath: "/tmp/reply.jpg",
+    sourceRunId: "run-voice-1",
+  });
+  assert.equal("json" in request, false);
+  assert.equal("gateway" in request, false);
+  assert.equal("session" in request, false);
 });
 
 test("Hermes office snapshots skip high-frequency assistant deltas", () => {

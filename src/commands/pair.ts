@@ -1,11 +1,13 @@
-import { configExists, readConfig, writeConfig } from "../config/config.js";
+import { copyFileSync, existsSync } from "fs";
+import { dirname, join } from "path";
+import { configExists, getConfigPath, readConfig, writeConfig, type ClawConnectConfig } from "../config/config.js";
 import { installCommand } from "./install.js";
 import qrcodeTerminal from "qrcode-terminal";
 import { t } from "../i18n/index.js";
 import { execSync } from "child_process";
 import { hostname } from "os";
 import { getServicePlatform } from "../platform/service-manager.js";
-import { toRelayHttpBase } from "./send-file-utils.js";
+import { toRelayHttpBase } from "../core/relay/file-upload-utils.js";
 import { getDefaultRelayServerUrl } from "../config/env.js";
 import { gatewayCapabilitiesForType, normalizeGatewayType } from "../gateway-profiles.js";
 
@@ -28,10 +30,16 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
 
   const existingConfig = configExists() ? readConfig() : null;
   const existingGatewayType = existingConfig?.gatewayType ?? "openclaw";
+  const requestedRelayServerUrl = opts.server ?? getDefaultRelayServerUrl();
+  const canReuseExistingConfig = shouldReuseExistingPairing(
+    existingConfig,
+    gatewayType,
+    requestedRelayServerUrl
+  );
 
-  if (existingConfig && existingGatewayType === gatewayType) {
+  if (existingConfig && canReuseExistingConfig) {
     const config = existingConfig;
-    relayServerUrl = opts.server ?? config.relayServerUrl ?? getDefaultRelayServerUrl();
+    relayServerUrl = requestedRelayServerUrl;
     gatewayId = config.gatewayId;
     relaySecret = config.relaySecret;
     displayName = opts.name ? sanitizeDisplayName(opts.name) : config.displayName;
@@ -60,9 +68,16 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
   } else {
     if (existingConfig && existingGatewayType !== gatewayType) {
       console.log(`Existing ${existingGatewayType} gateway config found; registering a new ${gatewayType} gateway.`);
+    } else if (existingConfig && !sameRelayServer(existingConfig.relayServerUrl, requestedRelayServerUrl)) {
+      console.log(`Existing ${gatewayType} gateway config is for ${toRelayHttpBase(existingConfig.relayServerUrl)}.`);
+      console.log(`Requested relay is ${toRelayHttpBase(requestedRelayServerUrl)}; registering a new ${gatewayType} gateway.`);
     }
-    relayServerUrl = opts.server ?? existingConfig?.relayServerUrl ?? getDefaultRelayServerUrl();
-    displayName = opts.name ? sanitizeDisplayName(opts.name) : getDisplayName();
+    const backupPath = existingConfig ? backupExistingConfig() : undefined;
+    if (backupPath) {
+      console.log(`Previous config backed up to ${backupPath}`);
+    }
+    relayServerUrl = requestedRelayServerUrl;
+    displayName = opts.name ? sanitizeDisplayName(opts.name) : existingConfig?.displayName ?? getDisplayName();
     console.log(t("pair.registering"));
 
     const httpBase = toRelayHttpBase(relayServerUrl);
@@ -114,6 +129,63 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
 
   console.log(t("pair.installingService"));
   installCommand();
+}
+
+export function sameRelayServer(left: string, right: string): boolean {
+  return normalizeRelayServerIdentity(left) === normalizeRelayServerIdentity(right);
+}
+
+export function shouldReuseExistingPairing(
+  config: ClawConnectConfig | null,
+  gatewayType: "openclaw" | "hermes",
+  requestedRelayServerUrl: string
+): boolean {
+  if (!config) return false;
+  return (config.gatewayType ?? "openclaw") === gatewayType
+    && sameRelayServer(config.relayServerUrl, requestedRelayServerUrl);
+}
+
+export function normalizeRelayServerIdentity(relayServerUrl: string): string {
+  const parsed = new URL(toRelayHttpBase(relayServerUrl));
+  const protocol = parsed.protocol.toLowerCase();
+  const host = normalizeRelayHost(parsed.hostname);
+  const port = parsed.port || (protocol === "https:" ? "443" : "80");
+  const pathname = parsed.pathname.replace(/\/+$/, "");
+  return `${protocol}//${host}:${port}${pathname}`;
+}
+
+function normalizeRelayHost(hostname: string): string {
+  const lower = hostname.toLowerCase();
+  if (lower === "localhost" || lower === "::1" || lower === "[::1]") {
+    return "127.0.0.1";
+  }
+  return lower;
+}
+
+function backupExistingConfig(): string | undefined {
+  const configPath = getConfigPath();
+  if (!existsSync(configPath)) {
+    return undefined;
+  }
+  const backupPath = join(
+    dirname(configPath),
+    `config.json.server-switch-${formatBackupTimestamp(new Date())}.bak`
+  );
+  copyFileSync(configPath, backupPath);
+  return backupPath;
+}
+
+function formatBackupTimestamp(date: Date): string {
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    "-",
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+  ].join("");
 }
 
 function sanitizeDisplayName(name: string): string {

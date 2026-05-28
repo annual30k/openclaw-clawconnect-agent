@@ -2,15 +2,15 @@ export type {
   HermesChatResult,
   HermesToolLogEvent,
   HermesUsageSnapshot,
-} from "./models/hermes-runtime-types.js";
+} from "./runtime/hermes-runtime-types.js";
 export {
   resolveHermesBin,
   runHermes,
   runHermesWithInput,
   stripHermesSecurityReviewNotices,
   stripHermesSessionResumeNotices,
-} from "./models/hermes-runtime-process.js";
-export { handleHermesCommand } from "./models/hermes-runtime-command-router.js";
+} from "./runtime/hermes-runtime-process.js";
+export { handleHermesCommand } from "./runtime/hermes-runtime-command-router.js";
 export {
   buildHermesAssistantDeltaPayload,
   buildHermesRuntimeContextHint,
@@ -18,14 +18,14 @@ export {
   parseHermesToolLogLine,
   runHermesChat,
   selectHermesSessionForCompletedChat,
-} from "./models/hermes-runtime-chat.js";
+} from "./runtime/hermes-runtime-chat.js";
 export {
   collectHermesUsageSnapshot,
   listHermesSessions,
   parseHermesSessionUsageSnapshot,
   parseHermesStatusSnapshot,
   readHermesStatusSnapshot,
-} from "./models/hermes-runtime-usage.js";
-export { isDuplicateHermesCronJob } from "./models/hermes-runtime-cron.js";
-export { parseHermesSkillsList } from "./models/hermes-runtime-skills.js";
-export { extractDeliverablePaths } from "./models/hermes-runtime-artifacts.js";
+} from "./runtime/hermes-runtime-usage.js";
+export { isDuplicateHermesCronJob } from "./runtime/hermes-runtime-cron.js";
+export { parseHermesSkillsList } from "./runtime/hermes-runtime-skills.js";
+export { extractDeliverablePaths } from "./runtime/hermes-runtime-artifacts.js";

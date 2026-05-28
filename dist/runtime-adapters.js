@@ -1,5 +1,5 @@
 import { runHermesRelayManager } from "./hermes/hermes-relay-manager.js";
-import { runRelayManager } from "./relay/relay-manager.js";
+import { runRelayManager } from "./openclaw/relay-manager.js";
 const OPENCLAW_RUNTIME_ADAPTER = {
     type: "openclaw",
     logsGatewayUrl: true,

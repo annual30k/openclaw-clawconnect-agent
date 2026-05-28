@@ -130,7 +130,8 @@ $EDITOR ~/.clawconnect/.env
 - `CLAWCONNECT_GATEWAY_URL`：可选，本机 OpenClaw Gateway WebSocket 地址覆盖值
 - `CLAWCONNECT_ENV_FILE`：可选，显式指定 env 文件路径；未设置时会依次读取 `~/.clawconnect/.env`、`.env.local`、`.env`
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD`：Gateway 鉴权兜底值
-- `OPENCLAW_ASR_COMMAND`：宿主机语音转文字命令。ClawLink 发送 `chat.voice.send` 后，agent 会把音频保存到临时文件，并执行这个命令；命令必须把识别文本输出到 stdout。可用占位符：`{file}`、`{language}`、`{mimeType}`
+- `CLAWCONNECT_ASR_COMMAND`：宿主机语音转文字命令。ClawLink 发送 `chat.voice.send` 后，agent 会把音频保存到临时文件，并执行这个命令；命令必须把识别文本输出到 stdout。可用占位符：`{file}`、`{language}`、`{mimeType}`
+- `OPENCLAW_ASR_COMMAND`：旧版语音转文字命令兜底值；同时设置时优先使用 `CLAWCONNECT_ASR_COMMAND`
 
 Shell 里已经设置的环境变量优先级高于 env 文件。`clawconnect run`、`status`、`send-file` 会继续使用 `~/.clawconnect/config.json` 或 `~/.clawconnect/profiles/<profile>/config.json` 里已配对保存的 relay；如果要切换中继服务器，请执行 `clawconnect pair --profile <name> --server <url>` 或 `clawconnect reset --profile <name>`。
 
@@ -147,10 +148,10 @@ clawconnect run
 如果需要让手机端直接发送语音、由宿主机识别后再转发给 OpenClaw 或 Hermes Agent，请配置本机 ASR 命令：
 
 ```bash
-OPENCLAW_ASR_COMMAND='/usr/local/bin/transcribe-audio {file} {language}' clawconnect run
+CLAWCONNECT_ASR_COMMAND='/usr/local/bin/transcribe-audio {file} {language}' clawconnect run
 ```
 
-未配置 `OPENCLAW_ASR_COMMAND` 时，宿主机收到语音消息会返回 `voice_asr_not_configured`。
+未配置 `CLAWCONNECT_ASR_COMMAND`，且也没有旧版 `OPENCLAW_ASR_COMMAND` 兜底时，宿主机收到语音消息会返回 `voice_asr_not_configured`。
 
 ### 4. 查看状态
 
@@ -279,34 +280,58 @@ clawconnect-agent/
       status.ts               查看配对与服务状态
       install.ts              install / restart / stop / uninstall / reset
       set-token.ts            手动保存 Gateway Token
-      local-handlers.ts       兼容旧命令前缀和本地维护命令
-      local-runtime.ts        解析 OpenClaw 可执行文件并触发网关生命周期
-      provider-handlers.ts    provider 命令分发和网关重启
-      provider-config.ts      provider 配置读写
-      provider-registry.ts    provider 注册信息
-      backup-manager.ts       本地配置备份管理
-      send-file-utils.ts      relay 地址和文件传输辅助
       *.test.ts               紧邻源码的单元测试
+    core/
+      command-types.ts        共享本地命令结果和上下文类型
+      relay/
+        file-upload.ts              纯 relay 文件上传服务
+        file-upload-utils.ts        relay 地址和文件传输辅助
+        relay-server-connection.ts  relay URL、JSON 帧、abort 和 close retry 辅助
+        reconnect.ts                重连策略
+        office-payload.ts           office/status payload 构造
+        mobile-chat-run-bridge.ts   移动端 chat run payload 转换
+        voice-input.ts              共享语音输入 / ASR 参数处理
+        attachment-staging.ts       附件 MIME 和暂存路径辅助
+        chat-payload.ts             聊天 payload 归一化
+        slash-command-types.ts      slash command 共享类型
     config/
       config.ts               配对配置读写
       env.ts                  env 文件加载和 agent 默认配置
+    hermes/
+      hermes-relay-manager.ts Hermes relay 桥接
+      hermes-runtime.ts       Hermes runtime 聚合入口
+      hermes-session-store.ts Hermes 会话别名存储
+      hermes-voice-input.ts   Hermes 语音输入适配
+      runtime/
+        hermes-runtime-*.ts   Hermes CLI/Python、chat、cron、skills、models、usage 等执行模块
     i18n/
       index.ts                CLI 文案
+    openclaw/
+      relay-manager.ts        OpenClaw 中继服务器桥接与命令分发
+      gateway-client.ts       连接并认证本地 OpenClaw Gateway
+      session-store.ts        OpenClaw 最新会话推断
+      runtime/
+        local-runtime.ts      解析 OpenClaw 可执行文件并触发网关生命周期
+      handlers/
+        local-handlers.ts     兼容旧命令前缀和本地维护命令
+        provider-handlers.ts  provider 命令分发和网关重启
+      config/
+        provider-config.ts    provider 配置读写
+        provider-registry.ts  provider 注册信息
+      backups/
+        backup-manager.ts     本地配置备份管理
+      relay/
+        session-context.ts    会话默认值和上下文使用量快照
+        chat-history.ts       历史消息回退
+        chat-send-attachments.ts 发送带附件消息的参数准备
+        openclaw-voice-input.ts  OpenClaw 语音命令适配
+        slash-command-catalog.ts OpenClaw slash command 目录
+        slash-command-catalog.generated.ts 生成的 OpenClaw slash command 目录
     platform/
       service-manager.ts              跨平台服务入口
       service-manager-common.ts       通用平台辅助常量
       service-manager-linux.ts        Linux systemd/nohup 逻辑
       *.test.ts                       平台层单元测试
-    relay/
-      gateway-client.ts       连接并认证本地 OpenClaw Gateway
-      relay-manager.ts        中继服务器桥接与命令分发
-      session-context.ts      会话默认值和上下文使用量快照
-      chat-payload.ts         聊天 payload 归一化
-      chat-history.ts         历史消息回退
-      attachment-staging.ts   附件本地落盘
-      chat-send-attachments.ts 发送带附件消息的参数准备
-      reconnect.ts            重连策略
-      *.test.ts               relay 层单元测试
 ```
 
 测试文件和源码采用邻近放置的方式，统一以 `*.test.ts` 命名。它们会被 `npm test` 执行，但不会进入发布包。
@@ -316,18 +341,23 @@ clawconnect-agent/
 - `src/index.ts` 是 CLI 入口，负责命令注册和顶层错误处理。
 - `src/commands/pair.ts` 负责主机配对、保存 relay 配置，并在配对后安装后台服务。
 - `src/commands/run.ts` 负责前台启动 relay 循环，供服务管理或调试使用。
-- `src/commands/send-file.ts` 负责把本地文件或图片上传到已配对的聊天会话。
+- `src/commands/send-file.ts` 是发送本地文件或图片到已配对聊天会话的 CLI wrapper。
 - `src/commands/install.ts` 负责后台服务的安装、重启、停止、卸载和重置。
 - `src/commands/set-token.ts` 负责在需要 token 鉴权时保存本地 Gateway Token。
-- `src/commands/local-handlers.ts` 负责兼容旧命令前缀，以及备份、恢复、日志、doctor、gateway 重启等本地维护命令。
-- `src/commands/local-runtime.ts` 负责解析 `openclaw` 可执行文件并触发网关生命周期动作。
-- `src/commands/provider-handlers.ts` 负责 provider 专属命令分发，并复用同一套 gateway 重启逻辑。
+- `src/core/relay/file-upload.ts` 是纯程序化 relay 文件上传服务，供 CLI 和 Hermes artifact delivery 复用。
+- `src/core/relay/relay-server-connection.ts` 提供共享 relay URL、JSON 帧、abort close 和 close retry 判断。
+- `src/core/relay/office-payload.ts`、`mobile-chat-run-bridge.ts`、`voice-input.ts`、`attachment-staging.ts`、`chat-payload.ts` 是 gateway-neutral 的 relay 工具。
+- `src/openclaw/handlers/local-handlers.ts` 负责兼容旧命令前缀，以及备份、恢复、日志、doctor、gateway 重启等本地维护命令。
+- `src/openclaw/runtime/local-runtime.ts` 负责解析 `openclaw` 可执行文件并触发网关生命周期动作。
+- `src/openclaw/handlers/provider-handlers.ts` 负责 provider 专属命令分发，并复用同一套 gateway 重启逻辑。
+- `src/openclaw/relay-manager.ts` 负责中继服务器与本地 OpenClaw Gateway 的桥接、命令分发，以及 chat/history 回退处理。
+- `src/openclaw/gateway-client.ts` 负责连接 OpenClaw Gateway，并处理设备身份认证。
+- `src/openclaw/relay/session-context.ts` 负责读取会话默认值和上下文使用量快照。
+- `src/openclaw/relay/chat-history.ts`、`chat-send-attachments.ts` 负责 OpenClaw 专属历史回退和 `chat.send` 附件暂存。
+- `src/hermes/hermes-relay-manager.ts` 负责 Hermes runtime 与 relay server 的桥接。
+- `src/hermes/runtime/` 放置 Hermes CLI/Python、chat、cron、skills、models、sessions、usage 和 lifecycle 等执行模块。
 - `src/config/env.ts` 负责加载 `.env` 文件，并集中维护 relay、Gateway 等 agent 默认配置。
 - `src/platform/service-manager.ts` 负责 macOS、Linux 和 Windows 的跨平台服务管理入口。
-- `src/relay/relay-manager.ts` 负责中继服务器与本地 Gateway 的桥接、命令分发，以及 chat/history 回退处理。
-- `src/relay/gateway-client.ts` 负责连接 OpenClaw Gateway，并处理设备身份认证。
-- `src/relay/session-context.ts` 负责读取会话默认值和上下文使用量快照。
-- `src/relay/chat-payload.ts`、`src/relay/chat-history.ts`、`src/relay/attachment-staging.ts`、`src/relay/chat-send-attachments.ts` 负责聊天数据归一化、历史回退和附件暂存。
 - `src/config/config.ts` 负责读写 `~/.clawconnect` 下的本地配对配置。
 - `src/i18n/index.ts` 负责 CLI 文案。
 
@@ -335,15 +365,17 @@ clawconnect-agent/
 
 - `pairCommand()` 负责主机配对、生成配对 payload，并持久化 relay 配置。
 - `runCommand()` 负责启动前台 relay 客户端循环，供后台服务使用。
-- `sendFileCommand()` 负责暂存本地文件并上传到已配对的聊天会话。
+- `sendFileCommand()` 负责 CLI 配置、会话默认值和输出格式，并委托 `uploadFileToRelay()` 上传。
+- `uploadFileToRelay()` 使用显式 relay URL、secret、gateway ID 和 session key 上传文件。
 - `installCommand()`、`restartCommand()`、`stopCommand()`、`uninstallCommand()`、`resetCommand()` 负责服务生命周期管理。
 - `statusCommand()` 负责打印配对配置、Gateway 状态和服务健康信息。
 - `setTokenCommand()` 负责保存本地 OpenClaw Gateway Token。
-- `handleLocalCommand()` 和 `handleProviderCommand()` 负责在转发前处理本地控制平面命令。
+- `handleLocalCommand()` 和 `handleProviderCommand()` 负责在转发前处理 OpenClaw 本地控制平面命令。
 - `OpenClawGatewayClient` 负责管理 Gateway WebSocket、重连和请求/响应帧。
 - `canonicalizeRelayParams()`、`extractGatewaySessionDefaults()`、`buildContextUsageFingerprint()` 负责统一 relay 协议 payload。
 - `normalizeChatEventPayload()`、`extractChatText()`、`extractHistoryOutcome()`、`withMessageText()` 负责稳定聊天事件与历史回退结果。
 - `buildAttachmentStagingPath()` 和 `resolveAttachmentFileName()` 负责附件暂存路径和文件名处理。
+- `buildRelayUrl()`、`sendRelayJson()`、`parseRelayFrame()`、`shouldRetryRelayClose()` 负责 OpenClaw 和 Hermes 共享的窄 relay transport 行为。
 - `getServiceStatus()`、`installService()`、`restartService()`、`stopService()`、`uninstallService()` 负责跨平台服务控制。
 
 ## 工作原理

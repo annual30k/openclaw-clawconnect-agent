@@ -1,6 +1,6 @@
 import { readConfig, readGatewayUrl, readGatewayAuth } from "../config/config.js";
 import { getGatewayRuntimeAdapter } from "../runtime-adapters.js";
-import { withReconnect } from "../relay/reconnect.js";
+import { withReconnect } from "../core/relay/reconnect.js";
 import { t } from "../i18n/index.js";
 import { createInterface } from "readline";
 export async function runCommand() {

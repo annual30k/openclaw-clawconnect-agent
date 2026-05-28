@@ -20,7 +20,7 @@ import {
 import {
   hermesModelListResultFromPayload,
   modelItemsFromHermesModelOptionsPayload,
-} from "./models/hermes-runtime-models.js";
+} from "./runtime/hermes-runtime-models.js";
 import { mergeLiveHermesSessionsWithStoredAliases, parseHermesSessionsList } from "./hermes-session-store.js";
 
 test("extractDeliverablePaths returns existing supported artifact paths", () => {
