@@ -5,6 +5,9 @@ import {
   buildHermesArtifactUploadRequest,
   buildHermesRelayHelloMessage,
   collectHermesSlashCommandCatalog,
+  rememberActiveHermesChatRun,
+  resolveHermesChatPreferredRunId,
+  resolveHermesAbortRun,
   searchHermesSlashCommandCatalog,
   shouldPublishHermesOfficeSnapshot,
 } from "./hermes-relay-manager.js";
@@ -48,6 +51,45 @@ test("Hermes office snapshots skip high-frequency assistant deltas", () => {
       message: { content: [{ type: "text", text: "done" }] },
     }),
     true,
+  );
+});
+
+test("Hermes abort lookup accepts the mobile idempotency key", () => {
+  const controller = new AbortController();
+  const activeRuns = new Map();
+  const run = {
+    runId: "server-run-1",
+    sessionKey: "main",
+  };
+
+  rememberActiveHermesChatRun(
+    activeRuns,
+    run,
+    { idempotencyKey: "client-run-1" },
+    "relay-request-1",
+    controller,
+  );
+
+  const resolved = resolveHermesAbortRun({ idempotencyKey: "client-run-1" }, activeRuns);
+  assert.equal(resolved?.controller, controller);
+  assert.equal(resolved?.run.runId, "server-run-1");
+});
+
+test("Hermes chat run prefers the mobile idempotency key over relay request id", () => {
+  assert.equal(
+    resolveHermesChatPreferredRunId({
+      idempotencyKey: "mobile-run-1",
+      runId: "",
+    }),
+    "mobile-run-1",
+  );
+  assert.equal(
+    resolveHermesChatPreferredRunId({ runId: "explicit-run-1", idempotencyKey: "mobile-run-1" }),
+    "explicit-run-1",
+  );
+  assert.equal(
+    resolveHermesChatPreferredRunId({ idempotencyKey: "mobile-run-1" }, { runId: "voice-run-1", sessionKey: "main" }),
+    "voice-run-1",
   );
 });
 

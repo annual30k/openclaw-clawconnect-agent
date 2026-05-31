@@ -289,6 +289,17 @@ async function readSessionStoreEntry(
       return directEntry;
     }
 
+    const agentId = resolveAgentIdFromSessionKey(sessionKey, defaults);
+    const agentQualifiedKey = sessionKey.startsWith("agent:")
+      ? undefined
+      : `agent:${agentId}:${sessionKey}`;
+    if (agentQualifiedKey) {
+      const agentQualifiedEntry = parsed?.[agentQualifiedKey];
+      if (agentQualifiedEntry && typeof agentQualifiedEntry === "object") {
+        return agentQualifiedEntry;
+      }
+    }
+
     const mainAliases = new Set([sessionKey, defaults.mainSessionKey, defaults.mainKey, "main"]);
     const defaultAgentMainKey = defaults.defaultAgentId ? `agent:${defaults.defaultAgentId}:main` : undefined;
     if (defaultAgentMainKey) {

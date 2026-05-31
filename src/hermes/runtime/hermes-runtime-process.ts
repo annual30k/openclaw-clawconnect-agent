@@ -86,8 +86,13 @@ export function runHermesWithInput(args: string[], input: string, timeoutMs = DE
 
 export function stripHermesSessionResumeNotices(output: string): string {
   return output
-    .split(/\r?\n/)
-    .filter((line) => !/^\s*↻?\s*Resumed session\b/i.test(stripAnsi(line).trim()))
+    .split(/\r?\n|\r/)
+    .filter((line) => {
+      const clean = stripAnsi(line).trim();
+      return !/^\s*↻?\s*Resumed session\b/i.test(clean)
+        && !/^session_id:\s*\S+/i.test(clean)
+        && !/^Error:\s*'NoneType'\s+object\s+is\s+not\s+iterable\s*$/i.test(clean);
+    })
     .join("\n");
 }
 
@@ -98,6 +103,9 @@ export function stripHermesSecurityReviewNotices(output: string): string {
 
   for (const line of lines) {
     const clean = stripAnsi(line).trim();
+    if (isHermesCommandDeniedTimeoutLine(clean)) {
+      continue;
+    }
     if (/DANGEROUS COMMAND:\s*Security scan/i.test(clean)) {
       inSecurityReview = true;
       continue;
@@ -114,6 +122,11 @@ export function stripHermesSecurityReviewNotices(output: string): string {
   return kept.join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
+export function isHermesCommandDeniedTimeoutLine(line: string): boolean {
+  const clean = stripAnsi(line).trim();
+  return /\bTimeout\b\s*[–—-]\s*denying command\b/i.test(clean);
+}
+
 export function sanitizeHermesChatOutput(output: string): string {
   return stripHermesSecurityReviewNotices(stripHermesSessionResumeNotices(stripAnsi(output)));
 }
@@ -127,6 +140,12 @@ export function errorMessageWithOutput(error: unknown): string {
   const stdout = err.stdout?.toString().trim() ?? "";
   const stderr = err.stderr?.toString().trim() ?? "";
   return [stdout, stderr, err.message].filter(Boolean).join("\n") || String(error);
+}
+
+export function isHermesMissingSessionError(error: unknown): boolean {
+  const message = typeof error === "string" ? error : errorMessageWithOutput(error);
+  return /Session not found:/i.test(message)
+    || /Use a session ID from a previous CLI run/i.test(message);
 }
 
 export function sleep(ms: number): Promise<void> {

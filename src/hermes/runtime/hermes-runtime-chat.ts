@@ -7,8 +7,12 @@ import { spawn } from "child_process";
 import type { LocalCommandContext } from "../../core/command-types.js";
 import {
   buildMobileAssistantDeltaPayload,
-  buildMobileAssistantStreamingPayload,
 } from "../../core/relay/mobile-chat-run-bridge.js";
+import {
+  buildMessagePartDeltaEvent,
+  buildToolInvocationUpdatedEvent,
+} from "../../core/relay/timeline-event-builder.js";
+import type { ToolState } from "../../core/relay/timeline-event-log.js";
 import {
   forgetHermesSession,
   getMappedHermesSessionId,
@@ -21,9 +25,10 @@ import {
   CLAWCONNECT_MOBILE_BRIDGE_HINT,
   HERMES_AGENT_LOG_FILE,
   HERMES_INBOX_DIR,
-  HERMES_TYPING_MARKER,
   SUBPROCESS_ENV,
   resolveHermesBin,
+  isHermesCommandDeniedTimeoutLine,
+  isHermesMissingSessionError,
   runHermes,
   runHermesPython,
   sanitizeHermesChatOutput,
@@ -36,6 +41,7 @@ import { compactStringArray, sanitizeFileName } from "./hermes-runtime-values.js
 
 const HERMES_ASSISTANT_DELTA_FLUSH_MS = 120;
 const HERMES_ASSISTANT_DELTA_MAX_BYTES = 4096;
+const HERMES_COMMAND_DENIED_TIMEOUT_MESSAGE = "Timeout – denying command";
 const HERMES_SLASH_COMMAND_SCRIPT = String.raw`
 import contextlib
 import io
@@ -128,18 +134,23 @@ export async function runHermesChat(
     throw new Error("message_required");
   }
 
-  const args = ["chat", "--query", message, "--quiet", "--source", "pocketclaw"];
-  const resume = typeof record.hermesSessionId === "string" && record.hermesSessionId.trim().length > 0
+  const explicitResume = typeof record.hermesSessionId === "string" && record.hermesSessionId.trim().length > 0
     ? record.hermesSessionId.trim()
-    : await getMappedHermesSessionId(sessionKey);
-  if (resume) {
-    args.push("--resume", resume);
-  }
+    : undefined;
+  const mappedResume = explicitResume ? undefined : await getMappedHermesSessionId(sessionKey);
+  let resume = explicitResume ?? mappedResume;
   const beforeSessions = await listHermesSessions();
-
-  const rawOutput = context.publishEvent
-    ? await runHermesChatStreaming(args, sessionKey, context)
-    : runHermes(args, CHAT_TIMEOUT_MS);
+  let rawOutput: string;
+  try {
+    rawOutput = await runHermesChatOnce({ message, sessionKey, resume, context });
+  } catch (error) {
+    if (!mappedResume || !isHermesMissingSessionError(error)) {
+      throw error;
+    }
+    await forgetHermesSession(sessionKey, mappedResume);
+    resume = undefined;
+    rawOutput = await runHermesChatOnce({ message, sessionKey, context });
+  }
   const output = sanitizeHermesChatOutput(rawOutput).trim();
   const sessions = await listHermesSessions();
   const mappedSession = selectHermesSessionForCompletedChat(sessions, {
@@ -159,6 +170,21 @@ export async function runHermesChat(
     artifactPaths: extractDeliverablePaths(output, { userMessage: rawMessage }),
     usage,
   };
+}
+
+async function runHermesChatOnce(params: {
+  message: string;
+  sessionKey: string;
+  resume?: string;
+  context: LocalCommandContext;
+}): Promise<string> {
+  const args = ["chat", "--query", params.message, "--quiet", "--source", "pocketclaw"];
+  if (params.resume) {
+    args.push("--resume", params.resume);
+  }
+  return params.context.publishEvent
+    ? await runHermesChatStreaming(args, params.sessionKey, params.context)
+    : runHermes(args, CHAT_TIMEOUT_MS);
 }
 
 export function isHermesSlashCommandMessage(message: string): boolean {
@@ -316,9 +342,20 @@ async function runHermesChatStreaming(
   let pendingAssistantDelta = "";
   let assistantDeltaFlushTimer: NodeJS.Timeout | undefined;
   let inSecurityReview = false;
-  let hasPublishedAssistantText = false;
+  let commandDeniedTimeout = false;
+  let commandDeniedTimeoutKillTimer: NodeJS.Timeout | undefined;
   const toolCallIdsByName = new Map<string, string>();
   let toolCallCounter = 0;
+
+  const requestCommandDeniedTimeoutFailure = (): void => {
+    if (commandDeniedTimeout) {
+      return;
+    }
+    commandDeniedTimeout = true;
+    child.kill("SIGTERM");
+    commandDeniedTimeoutKillTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+    commandDeniedTimeoutKillTimer.unref?.();
+  };
 
   const publishToolLogEvent = (event: HermesToolLogEvent): void => {
     let toolCallId = toolCallIdsByName.get(event.toolName);
@@ -349,6 +386,24 @@ async function runHermesChatStreaming(
           text: event.text,
           is_error: event.isError === true,
         },
+        timelineEvents: [
+          buildToolInvocationUpdatedEvent({
+            gatewayId: context.gatewayId ?? "clawconnect",
+            sessionKey,
+            turnId: runId,
+            runId,
+            toolInvocationId: toolCallId,
+            toolState: hermesToolState(event),
+            seq: seq,
+            turnSeq: seq,
+            content: [{
+              type: event.phase === "completed" || event.phase === "failed" ? "tool_result" : "tool_call",
+              toolName: event.toolName,
+              text: event.text,
+              isError: event.isError === true,
+            }],
+          }),
+        ],
       },
     });
   };
@@ -356,6 +411,10 @@ async function runHermesChatStreaming(
 
   const filterChatLine = (line: string): string | null => {
     const clean = stripAnsi(line).trim();
+    if (isHermesCommandDeniedTimeoutLine(clean)) {
+      requestCommandDeniedTimeoutFailure();
+      return null;
+    }
     if (/DANGEROUS COMMAND:\s*Security scan/i.test(clean)) {
       inSecurityReview = true;
       return null;
@@ -415,7 +474,6 @@ async function runHermesChatStreaming(
   };
 
   const publishAssistantDelta = (text: string): void => {
-    hasPublishedAssistantText = true;
     output += text;
     pendingAssistantDelta += text;
     if (Buffer.byteLength(pendingAssistantDelta, "utf8") >= HERMES_ASSISTANT_DELTA_MAX_BYTES) {
@@ -479,18 +537,8 @@ async function runHermesChatStreaming(
   };
 
   const publishTypingMarker = (): void => {
-    if (hasPublishedAssistantText) {
-      return;
-    }
-    context.publishEvent?.({
-      type: "event",
-      event: "chat",
-      payload: buildMobileAssistantStreamingPayload({
-        run: { runId, sessionKey },
-        seq: seq += 1,
-        text: HERMES_TYPING_MARKER,
-      }),
-    });
+    // The local mobile client already owns the pending placeholder. Do not
+    // forward protocol-only typing markers as empty assistant chat events.
   };
 
   child.stdout?.on("data", (chunk) => publishText(chunk.toString()));
@@ -499,6 +547,8 @@ async function runHermesChatStreaming(
   publishTypingMarker();
 
   return await new Promise<string>((resolveOutput, rejectOutput) => {
+    const abortSignal = context.abortSignal;
+    let abortRequested = abortSignal?.aborted === true;
     const typingTimer = setInterval(publishTypingMarker, 5000);
     typingTimer.unref?.();
     const timeout = setTimeout(() => {
@@ -509,20 +559,53 @@ async function runHermesChatStreaming(
       rejectOutput(new Error("hermes_chat_timeout"));
     }, CHAT_TIMEOUT_MS);
     timeout.unref?.();
-    child.once("error", (error) => {
-      clearInterval(typingTimer);
-      clearTimeout(timeout);
+  const abortChat = (): void => {
+      abortRequested = true;
+      stdoutLineBuffer = "";
+      pendingAssistantDelta = "";
       clearAssistantDeltaFlushTimer();
-      toolLogWatcher.stop();
+      child.kill("SIGTERM");
+    };
+    const cleanup = (): void => {
+      abortSignal?.removeEventListener("abort", abortChat);
+    };
+    if (abortRequested) {
+      abortChat();
+    } else {
+      abortSignal?.addEventListener("abort", abortChat, { once: true });
+    }
+    child.once("error", (error) => {
+        clearInterval(typingTimer);
+        clearTimeout(timeout);
+        if (commandDeniedTimeoutKillTimer) {
+          clearTimeout(commandDeniedTimeoutKillTimer);
+          commandDeniedTimeoutKillTimer = undefined;
+        }
+        clearAssistantDeltaFlushTimer();
+        toolLogWatcher.stop();
+        cleanup();
       rejectOutput(error);
     });
     child.once("close", (code, signal) => {
       void (async () => {
         clearInterval(typingTimer);
         clearTimeout(timeout);
+        if (commandDeniedTimeoutKillTimer) {
+          clearTimeout(commandDeniedTimeoutKillTimer);
+          commandDeniedTimeoutKillTimer = undefined;
+        }
         toolLogWatcher.stop();
+        cleanup();
+        if (abortRequested) {
+          rejectOutput(new Error("hermes_chat_aborted"));
+          return;
+        }
         flushStdoutLineBuffer();
         flushAssistantDelta();
+        if (commandDeniedTimeout) {
+          rejectOutput(new Error(HERMES_COMMAND_DENIED_TIMEOUT_MESSAGE));
+          return;
+        }
         if (code && code !== 0) {
           const reason = stderr.trim() || output.trim() || `hermes chat exited with code ${code}`;
           rejectOutput(new Error(signal ? `${reason} (${signal})` : reason));
@@ -541,12 +624,38 @@ export function buildHermesAssistantDeltaPayload(params: {
   timestampMs: number;
   delta: string;
 }) {
-  return buildMobileAssistantDeltaPayload({
+  const payload = buildMobileAssistantDeltaPayload({
     run: { runId: params.runId, sessionKey: params.sessionKey },
     seq: params.seq,
     timestampMs: params.timestampMs,
     delta: params.delta,
   });
+  return {
+    ...payload,
+    timelineEvents: [
+      buildMessagePartDeltaEvent({
+        gatewayId: "clawconnect",
+        sessionKey: params.sessionKey,
+        turnId: params.runId,
+        runId: params.runId,
+        role: "assistant",
+        seq: params.seq,
+        turnSeq: params.seq,
+        now: () => new Date(params.timestampMs),
+        content: [{ type: "text", text: params.delta }],
+      }),
+    ],
+  };
+}
+
+function hermesToolState(event: HermesToolLogEvent): ToolState {
+  if (event.phase === "completed") {
+    return "success";
+  }
+  if (event.phase === "failed") {
+    return "failed";
+  }
+  return "streaming_output";
 }
 
 function createHermesToolLogWatcher(onEvent: (event: HermesToolLogEvent) => void): {

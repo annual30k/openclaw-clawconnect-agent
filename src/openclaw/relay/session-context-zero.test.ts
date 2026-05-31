@@ -4,6 +4,8 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readOpenClawTranscriptChatHistory } from "./chat-history.js";
+import { DEFAULT_GATEWAY_SESSION_DEFAULTS } from "./session-context.js";
 
 test("readContextUsageSnapshot preserves a zero-token current session", () => {
   const tempHome = mkdtempSync(join(tmpdir(), "clawconnect-home-"));
@@ -103,5 +105,70 @@ test("readContextUsageSnapshot preserves a zero-token current session", () => {
     assert.equal(snapshot.promptTokens, 0);
   } finally {
     rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
+test("transcript history resolves unqualified iOS session keys from agent-qualified store entries", async () => {
+  const openclawHome = mkdtempSync(join(tmpdir(), "openclaw-home-"));
+  const previousOpenClawHome = process.env.CLAWCONNECT_OPENCLAW_HOME;
+  try {
+    process.env.CLAWCONNECT_OPENCLAW_HOME = openclawHome;
+    const sessionsDir = join(openclawHome, "agents", "main", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+
+    const iosSessionKey = "ios-e2e-openclaw-123";
+    const agentSessionKey = `agent:main:${iosSessionKey}`;
+    const sessionId = "session-123";
+    const sessionFile = join(sessionsDir, `${sessionId}.jsonl`);
+    writeFileSync(
+      join(sessionsDir, "sessions.json"),
+      JSON.stringify({
+        [agentSessionKey]: {
+          sessionId,
+          sessionFile,
+        },
+      }),
+    );
+    writeFileSync(
+      sessionFile,
+      [
+        JSON.stringify({
+          type: "message",
+          id: "user-1",
+          timestamp: "2026-05-31T05:49:47.378Z",
+          message: {
+            role: "user",
+            content: "[Sun 2026-05-31 13:49 GMT+8] ping",
+            timestamp: 1780206587373,
+          },
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "assistant-1",
+          timestamp: "2026-05-31T05:49:47.380Z",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "pong" }],
+            timestamp: 1780206587373,
+          },
+        }),
+        "",
+      ].join("\n"),
+    );
+
+    const history = await readOpenClawTranscriptChatHistory(
+      { sessionKey: iosSessionKey, limit: 10 },
+      DEFAULT_GATEWAY_SESSION_DEFAULTS,
+    );
+
+    assert.equal(history?.sessionId, sessionId);
+    assert.equal(history?.messages?.at(-1)?.role, "assistant");
+  } finally {
+    if (previousOpenClawHome === undefined) {
+      delete process.env.CLAWCONNECT_OPENCLAW_HOME;
+    } else {
+      process.env.CLAWCONNECT_OPENCLAW_HOME = previousOpenClawHome;
+    }
+    rmSync(openclawHome, { recursive: true, force: true });
   }
 });

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -16,12 +16,21 @@ import {
   selectHermesSessionForCompletedChat,
   stripHermesSecurityReviewNotices,
   stripHermesSessionResumeNotices,
+  runHermesChat,
+  runHermesChatHistory,
+  handleHermesCommand,
 } from "./hermes-runtime.js";
+import { runHermesSessionExport } from "./runtime/hermes-runtime-sessions.js";
 import {
   hermesModelListResultFromPayload,
   modelItemsFromHermesModelOptionsPayload,
 } from "./runtime/hermes-runtime-models.js";
-import { mergeLiveHermesSessionsWithStoredAliases, parseHermesSessionsList } from "./hermes-session-store.js";
+import {
+  listStoredHermesSessions,
+  mergeLiveHermesSessionsWithStoredAliases,
+  parseHermesSessionsList,
+  rememberHermesSession,
+} from "./hermes-session-store.js";
 
 test("extractDeliverablePaths returns existing supported artifact paths", () => {
   const dir = mkdtempSync(join(tmpdir(), "hermes-artifacts-"));
@@ -111,6 +120,33 @@ test("Hermes assistant stream payload mirrors OpenClaw chat delta shape", () => 
     timestamp: 123456,
     content: [{ type: "text", text: "hello" }],
   });
+  assert.equal(payload.timelineEvents?.[0]?.eventType, "message.part.delta");
+  assert.equal(payload.timelineEvents?.[0]?.turnId, "run-1");
+  assert.equal(payload.timelineEvents?.[0]?.messageId, "assistant-run-1");
+  assert.deepEqual(payload.timelineEvents?.[0]?.content, [{ type: "text", text: "hello" }]);
+});
+
+test("Hermes assistant stream payload is canonicalized before publishing", () => {
+  const payload = buildHermesAssistantDeltaPayload({
+    runId: "run-1",
+    sessionKey: "main",
+    seq: 8,
+    timestampMs: 123456,
+    delta: [
+      "↻ Resumed session 20260525_114940_1cccb9",
+      "Error: 'NoneType' object is not iterable",
+      "session_id: 20260525_114940_1cccb9",
+      "visible reply",
+    ].join("\n"),
+  });
+
+  assert.equal(payload.delta, "visible reply");
+  assert.deepEqual(payload.message, {
+    role: "assistant",
+    timestamp: 123456,
+    content: [{ type: "text", text: "visible reply" }],
+  });
+  assert.deepEqual(payload.timelineEvents?.[0]?.content, [{ type: "text", text: "visible reply" }]);
 });
 
 test("stripHermesSessionResumeNotices removes Hermes resume banners", () => {
@@ -120,6 +156,17 @@ test("stripHermesSessionResumeNotices removes Hermes resume banners", () => {
   ].join("\n")).trim();
 
   assert.equal(output, "OK");
+});
+
+test("stripHermesSessionResumeNotices removes Hermes resume error metadata", () => {
+  const output = stripHermesSessionResumeNotices([
+    "hello",
+    "\r↻ Resumed session 20260525_114940_1cccb9 (10 user messages, 37 total messages) Error: 'NoneType' object is not iterable",
+    "",
+    "session_id: 20260525_114940_1cccb9",
+  ].join("\n")).trim();
+
+  assert.equal(output, "hello");
 });
 
 test("stripHermesSecurityReviewNotices removes denied command review blocks", () => {
@@ -150,6 +197,15 @@ test("stripHermesSecurityReviewNotices removes denied command review blocks", ()
     "| --- | --- |",
     "| 当前天气 | Partly Cloudy / 局部多云 |",
   ].join("\n"));
+});
+
+test("stripHermesSecurityReviewNotices removes timeout-denied command control lines", () => {
+  const output = stripHermesSecurityReviewNotices([
+    "⏱ Timeout – denying command",
+    "assistant answer",
+  ].join("\n")).trim();
+
+  assert.equal(output, "assistant answer");
 });
 
 test("parseHermesStatusSnapshot reads model and provider", () => {
@@ -521,3 +577,516 @@ test("mergeLiveHermesSessionsWithStoredAliases keeps one row per live Hermes ses
     "20260519_015943_72d864",
   ]);
 });
+
+test("Hermes session store quarantines corrupt JSON and recovers empty", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-session-store-corrupt-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  try {
+    const storePath = join(root, "sessions.json");
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    writeFileSync(storePath, '{"version":1,"sessions":{}}\ntrailing-garbage', "utf8");
+
+    assert.deepEqual(await listStoredHermesSessions(), []);
+    const quarantined = readdirSync(root).filter((name) => name.startsWith("sessions.json.corrupt-"));
+    assert.equal(quarantined.length, 1);
+    assert.equal(readFileSync(join(root, quarantined[0]!), "utf8").includes("trailing-garbage"), true);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Hermes session store serializes concurrent writes into valid JSON", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-session-store-concurrent-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  try {
+    const storePath = join(root, "sessions.json");
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+
+    await Promise.all(Array.from({ length: 16 }, async (_, index) => {
+      await rememberHermesSession(`session-${index}`, {
+        sessionKey: `session-${index}`,
+        hermesSessionId: `20260528_1800${String(index).padStart(2, "0")}_abcd${index}`,
+        displayName: `Session ${index}`,
+        kind: "hermes",
+      });
+    }));
+
+    const parsed = JSON.parse(readFileSync(storePath, "utf8")) as { sessions?: Record<string, unknown> };
+    assert.equal(Object.keys(parsed.sessions ?? {}).length, 16);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat forgets stale mapped sessions and retries without resume", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-stale-resume-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeFakeHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId: "missing",
+      displayName: "Missing",
+      kind: "hermes",
+    });
+
+    const result = await runHermesChat({ sessionKey: "main", message: "hello" });
+
+    assert.equal(result.output, "fresh reply");
+    const stored = await listStoredHermesSessions();
+    assert.equal(stored[0]?.hermesSessionId, "20260528_181500_abcd12");
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat treats timeout-denied command output as a terminal error", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-timeout-denied-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeTimeoutDeniedHermesBin(root);
+    const publishedEvents: unknown[] = [];
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+
+    await assert.rejects(
+      () => runHermesChat(
+        { sessionKey: "main", message: "hello" },
+        { requestId: "run-timeout", publishEvent: (event) => publishedEvents.push(event) },
+      ),
+      /Timeout – denying command/,
+    );
+
+    assert.equal(JSON.stringify(publishedEvents).includes("Timeout – denying command"), false);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat drops buffered assistant output when aborted", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-abort-partial-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeAbortPartialHermesBin(root);
+    const publishedEvents: unknown[] = [];
+    const controller = new AbortController();
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+
+    const chatPromise = runHermesChat(
+      { sessionKey: "main", message: "abort me" },
+      {
+        requestId: "run-abort",
+        abortSignal: controller.signal,
+        publishEvent: (event) => publishedEvents.push(event),
+      },
+    );
+    setTimeout(() => controller.abort(), 20);
+
+    await assert.rejects(() => chatPromise, /hermes_chat_aborted/);
+    const serializedEvents = JSON.stringify(publishedEvents);
+    assert.equal(serializedEvents.includes("partial"), false);
+    assert.equal(serializedEvents.includes("\"state\":\"delta\""), false);
+    assert.equal(serializedEvents.includes("[[clawlink:typing]]"), false);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat strips Hermes resume metadata from streaming events and final output", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-resume-metadata-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeResumeMetadataHermesBin(root);
+    const publishedEvents: unknown[] = [];
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+
+    const result = await runHermesChat(
+      { sessionKey: "main", message: "hello" },
+      { requestId: "run-resume", publishEvent: (event) => publishedEvents.push(event) },
+    );
+
+    assert.equal(result.output, "visible reply");
+    const serializedEvents = JSON.stringify(publishedEvents);
+    assert.equal(serializedEvents.includes("Resumed session"), false);
+    assert.equal(serializedEvents.includes("NoneType"), false);
+    assert.equal(serializedEvents.includes("session_id:"), false);
+    assert.equal(serializedEvents.includes("visible reply"), true);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesSessionExport clears stale mapped sessions and retries without session id", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-export-stale-session-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeFakeHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId: "missing",
+      displayName: "Missing",
+      kind: "hermes",
+    });
+
+    const result = await runHermesSessionExport({ sessionKey: "main", output: "-" });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.payload, { output: "{\"model\":\"gpt-5.5\",\"input_tokens\":1,\"model_config\":{\"max_input_tokens\":10}}\n" });
+    assert.deepEqual(await listStoredHermesSessions(), []);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChatHistory returns OpenClaw-shaped canonical history", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeHistoryHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId: "20260529_100000_history",
+      displayName: "History",
+      kind: "hermes",
+    });
+
+    const result = await runHermesChatHistory({ sessionKey: "main", limit: 10 });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.payload, {
+      sessionKey: "main",
+      sessionId: "20260529_100000_history",
+      messages: [
+        {
+          id: "m1",
+          role: "user",
+          content: [{ type: "text", text: "hello" }],
+          createdAt: "2026-05-29T02:00:00.000Z",
+          seq: 1,
+        },
+        {
+          id: "m2",
+          role: "assistant",
+          content: [
+            { type: "text", text: "visible reply" },
+            { type: "file", fileId: "file-history-1", fileName: "report.pdf", mimeType: "application/pdf" },
+          ],
+          createdAt: "2026-05-29T02:00:01.000Z",
+          seq: 2,
+        },
+      ],
+      items: [
+        {
+          id: "m1",
+          role: "user",
+          content: [{ type: "text", text: "hello" }],
+          createdAt: "2026-05-29T02:00:00.000Z",
+          seq: 1,
+        },
+        {
+          id: "m2",
+          role: "assistant",
+          content: [
+            { type: "text", text: "visible reply" },
+            { type: "file", fileId: "file-history-1", fileName: "report.pdf", mimeType: "application/pdf" },
+          ],
+          createdAt: "2026-05-29T02:00:01.000Z",
+          seq: 2,
+        },
+      ],
+      hasMore: false,
+      newestCursor: "seq:2",
+      timelineSnapshot: {
+        protocolVersion: 2,
+        eventType: "history.snapshot.page",
+        gatewayId: "clawconnect",
+        sessionKey: "main",
+        source: "history",
+        cursor: null,
+        hasMore: false,
+        nextCursor: null,
+        newestCursor: "seq:2",
+        messages: [
+          {
+            turnId: "history-main-1-user",
+            messageId: "user-history-main-1-user",
+            role: "user",
+            messageState: "completed",
+            createdAt: "2026-05-29T02:00:00.000Z",
+            content: [{ type: "text", text: "hello" }],
+            partId: "part-text-1",
+            runId: "history-main-1-user",
+          },
+          {
+            turnId: "history-main-2-assistant",
+            messageId: "assistant-history-main-2-assistant",
+            role: "assistant",
+            messageState: "completed",
+            createdAt: "2026-05-29T02:00:01.000Z",
+            content: [
+              { type: "text", text: "visible reply" },
+              { type: "file", fileId: "file-history-1", fileName: "report.pdf", mimeType: "application/pdf" },
+            ],
+            partId: "part-text-1",
+            runId: "history-main-2-assistant",
+          },
+        ],
+        attachments: [],
+      },
+    });
+    assert.equal(JSON.stringify(result.payload).includes("Resumed session"), false);
+    assert.equal(JSON.stringify(result.payload).includes("NoneType"), false);
+    assert.equal(JSON.stringify(result.payload).includes("session_id:"), false);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Hermes command router handles chat.history canonically", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-router-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeHistoryHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+
+    const result = await handleHermesCommand("chat.history", { sessionKey: "hermes:20260529_100000_history", limit: 1 });
+
+    assert.equal(result?.ok, true);
+    assert.deepEqual((result as { payload?: Record<string, unknown> }).payload?.messages, [
+      {
+        id: "m2",
+        role: "assistant",
+        content: [
+          { type: "text", text: "visible reply" },
+          { type: "file", fileId: "file-history-1", fileName: "report.pdf", mimeType: "application/pdf" },
+        ],
+        createdAt: "2026-05-29T02:00:01.000Z",
+        seq: 2,
+      },
+    ]);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function restoreEnv(name: string, previousValue: string | undefined): void {
+  if (previousValue === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = previousValue;
+  }
+}
+
+function writeFakeHermesBin(root: string): string {
+  const binPath = join(root, "hermes");
+  writeFileSync(binPath, [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"list\" ]; then",
+    "  echo 'Title                            Preview          Last Active   ID'",
+    "  echo 'Fresh reply                      fresh reply      just now      20260528_181500_abcd12'",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"export\" ]; then",
+    "  previous=''",
+    "  for arg in \"$@\"; do",
+    "    if [ \"$previous\" = \"--session-id\" ] && [ \"$arg\" = \"missing\" ]; then",
+    "      echo 'Session not found: missing' >&2",
+    "      echo 'Use a session ID from a previous CLI run (hermes sessions list).' >&2",
+    "      exit 1",
+    "    fi",
+    "    previous=\"$arg\"",
+    "  done",
+    "  echo '{\"model\":\"gpt-5.5\",\"input_tokens\":1,\"model_config\":{\"max_input_tokens\":10}}'",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"status\" ]; then",
+    "  echo '  Model:        gpt-5.5'",
+    "  echo '  Provider:     OpenAI Codex'",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"chat\" ]; then",
+    "  previous=''",
+    "  for arg in \"$@\"; do",
+    "    if [ \"$previous\" = \"--resume\" ] && [ \"$arg\" = \"missing\" ]; then",
+    "      echo 'Session not found: missing' >&2",
+    "      echo 'Use a session ID from a previous CLI run (hermes sessions list).' >&2",
+    "      exit 1",
+    "    fi",
+    "    previous=\"$arg\"",
+    "  done",
+    "  echo 'fresh reply'",
+    "  exit 0",
+    "fi",
+    "echo \"unexpected args: $@\" >&2",
+    "exit 2",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}
+
+function writeTimeoutDeniedHermesBin(root: string): string {
+  const binPath = join(root, "hermes-timeout-denied");
+  writeFileSync(binPath, [
+    "#!/usr/bin/env node",
+    "const args = process.argv.slice(2);",
+    "if (args[0] === 'sessions' && args[1] === 'list') {",
+    "  console.log('Title                            Preview          Last Active   ID');",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'chat') {",
+    "  console.log('⏱ Timeout – denying command');",
+    "  process.on('SIGTERM', () => process.exit(143));",
+    "  setInterval(() => {}, 1000);",
+    "  return;",
+    "}",
+    "if (args[0] === 'status') { process.exit(0); }",
+    "console.error(`unexpected args: ${args.join(' ')}`);",
+    "process.exit(2);",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}
+
+function writeAbortPartialHermesBin(root: string): string {
+  const binPath = join(root, "hermes-abort-partial");
+  writeFileSync(binPath, [
+    "#!/usr/bin/env node",
+    "const args = process.argv.slice(2);",
+    "if (args[0] === 'sessions' && args[1] === 'list') {",
+    "  console.log('Title                            Preview          Last Active   ID');",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'chat') {",
+    "  process.stdout.write('partial ');",
+    "  process.on('SIGTERM', () => process.exit(143));",
+    "  setInterval(() => {}, 1000);",
+    "  return;",
+    "}",
+    "if (args[0] === 'status') { process.exit(0); }",
+    "console.error(`unexpected args: ${args.join(' ')}`);",
+    "process.exit(2);",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}
+
+function writeResumeMetadataHermesBin(root: string): string {
+  const binPath = join(root, "hermes-resume-metadata");
+  writeFileSync(binPath, [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"list\" ]; then",
+    "  echo 'Title                            Preview          Last Active   ID'",
+    "  echo 'Visible reply                    visible reply    just now      20260528_181501_abcd12'",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"chat\" ]; then",
+    "  echo '↻ Resumed session 20260525_114940_1cccb9'",
+    "  printf \"%s\\n\" \"Error: 'NoneType' object is not iterable\"",
+    "  echo 'session_id: 20260525_114940_1cccb9'",
+    "  echo 'visible reply'",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"status\" ]; then",
+    "  echo '  Model:        gpt-5.5'",
+    "  echo '  Provider:     OpenAI Codex'",
+    "  exit 0",
+    "fi",
+    "echo \"unexpected args: $@\" >&2",
+    "exit 2",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}
+
+function writeHistoryHermesBin(root: string): string {
+  const binPath = join(root, "hermes-history");
+  const payload = JSON.stringify({
+    sessionId: "20260529_100000_history",
+    messages: [
+      {
+        id: "m1",
+        role: "user",
+        content: "hello",
+        createdAt: "2026-05-29T02:00:00.000Z",
+      },
+      {
+        id: "m2",
+        role: "assistant",
+        content: [
+          { type: "text", text: "↻ Resumed session 20260525_114940_1cccb9" },
+          { type: "text", text: "Error: 'NoneType' object is not iterable" },
+          { type: "text", text: "session_id: 20260525_114940_1cccb9" },
+          { type: "text", text: "visible reply" },
+          { type: "file", fileId: "file-history-1", fileName: "report.pdf", mimeType: "application/pdf" },
+        ],
+        createdAt: "2026-05-29T02:00:01.000Z",
+      },
+    ],
+  });
+  writeFileSync(binPath, [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"export\" ]; then",
+    `  printf '%s\\n' '${payload.replace(/'/g, "'\\''")}'`,
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"list\" ]; then",
+    "  echo 'Title                            Preview          Last Active   ID'",
+    "  echo 'History                          visible reply    just now      20260529_100000_history'",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"status\" ]; then exit 0; fi",
+    "echo \"unexpected args: $@\" >&2",
+    "exit 2",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}

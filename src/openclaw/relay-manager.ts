@@ -73,7 +73,7 @@ type ToServer =
 const CHAT_HISTORY_FETCH_TIMEOUT_MS = 3000;
 const CHAT_HISTORY_FALLBACK_INITIAL_DELAY_MS = 1200;
 const CHAT_HISTORY_FALLBACK_RETRY_DELAY_MS = 1800;
-const CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS = 8;
+const CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS = 120;
 const CHAT_HISTORY_FINAL_RETRY_DELAY_MS = 750;
 
 /** Messages the relay server sends to the relay client. */
@@ -233,6 +233,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               const basePayload = buildMobileAssistantFinalPayload({
                 run: { runId, sessionKey: context.sessionKey },
                 text: outcome.text,
+                includeTimelineEvents: true,
               });
               await publishAndSendGatewayEvent("chat", buildFinalPayloadFromHistoryOutcome(basePayload, outcome), true);
               return;
@@ -242,6 +243,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               buildMobileAssistantErrorPayload({
                 run: { runId, sessionKey: context.sessionKey },
                 errorMessage: outcome.errorMessage,
+                includeTimelineEvents: true,
               }),
               true,
             );
@@ -330,10 +332,25 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       if (hasHistoryCursor(params)) {
         return buildEmptyHistoryPage(params);
       }
+      if (!shouldUseLegacyOpenClawHistoryFallback(params)) {
+        return buildEmptyHistoryPage(params);
+      }
       if (!gatewayClient) {
         throw new Error("gateway not connected");
       }
       return gatewayClient.request<HistoryResponse>("chat.history", buildLegacyOpenClawHistoryParams(params));
+    }
+
+    function shouldUseLegacyOpenClawHistoryFallback(params: unknown): boolean {
+      const record = params && typeof params === "object" && !Array.isArray(params)
+        ? (params as Record<string, unknown>)
+        : {};
+      const rawSessionKey =
+        typeof record.sessionKey === "string" && record.sessionKey.trim().length > 0
+          ? record.sessionKey.trim()
+          : sessionDefaults.mainSessionKey;
+      const normalized = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
+      return typeof normalized === "string" && normalized === sessionDefaults.mainSessionKey;
     }
 
     function buildLegacyOpenClawHistoryParams(params: unknown): Record<string, unknown> {
@@ -481,6 +498,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             const resolvedSessionKey = sessionKey ?? runContext?.sessionKey;
             const currentText = extractChatText(normalizedPayload);
             const role = extractChatRole(normalizedPayload);
+            let realtimePayload = normalizedPayload;
 
             if (runId) {
               if (role === "assistant" && (state === "delta" || state === "final" || state === "error" || state === "failed" || state === "fail")) {
@@ -488,7 +506,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               }
               if (state === "delta" || state === "streaming" || state === "in_progress") {
                 const previousText = chatBuffers.get(runId) ?? "";
-                chatBuffers.set(runId, appendUniqueSuffix(previousText, currentText));
+                const bufferedText = appendUniqueSuffix(previousText, currentText);
+                chatBuffers.set(runId, bufferedText);
+                if (role === "assistant" && bufferedText.trim()) {
+                  realtimePayload = withMessageText(normalizedPayload, bufferedText);
+                }
               } else if (state === "error" || state === "failed" || state === "fail" || state === "aborted") {
                 chatBuffers.delete(runId);
               }
@@ -559,7 +581,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               chatRunContexts.delete(runId);
               scheduleContextUsageRefresh(p?.sessionKey, 450);
             }
-            void publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice);
+            void publishAndSendGatewayEvent(event, realtimePayload, shouldPublishOffice);
             return;
           }
           void publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice);
@@ -710,6 +732,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             payload: buildMobileAssistantErrorPayload({
               run: voiceInputRun,
               errorMessage: setupMessage,
+              includeTimelineEvents: true,
             }),
           });
           if (requestId) {

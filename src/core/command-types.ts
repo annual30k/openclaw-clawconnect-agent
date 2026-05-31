@@ -12,4 +12,5 @@ export type LocalCommandContext = {
   requestId?: string;
   gatewayId?: string;
   publishEvent?: LocalCommandEventPublisher;
+  abortSignal?: AbortSignal;
 };

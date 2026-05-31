@@ -4,6 +4,7 @@ import {
   appendUniqueSuffix,
   extractChatRole,
   extractChatText,
+  normalizeChatState,
   normalizeChatEventPayload,
   withMessageText,
 } from "../../core/relay/chat-payload.js";
@@ -27,6 +28,8 @@ test("chat payload helpers normalize event shape and preserve streamed text", ()
   assert.equal(extractChatText(normalized), "hello");
   assert.equal(extractChatRole(normalized), "assistant");
   assert.equal(appendUniqueSuffix("hello", "llo world"), "hello world");
+  assert.equal(normalizeChatState({ state: "completed" }), "final");
+  assert.equal((normalizeChatEventPayload({ state: "completed" }) as Record<string, unknown>).state, "final");
 
   const withText = withMessageText({ ts: 123, message: { role: "assistant" } }, "done") as Record<string, unknown>;
   assert.deepEqual(withText.message, {
@@ -97,6 +100,113 @@ test("history helper resolves media-only assistant outcomes after the matching u
   });
 });
 
+test("history helper ignores empty assistant text blocks while waiting for a real reply", () => {
+  const context = {
+    sessionKey: "agent:main:main",
+    requestedAtMs: 1_000,
+    promptText: "ping",
+  };
+  const history: HistoryResponse = {
+    messages: [
+      { role: "user", timestamp: 1_100, content: [{ type: "text", text: "ping" }] },
+      { role: "assistant", timestamp: 1_200, content: [{ type: "text", text: "" }] },
+    ],
+  };
+
+  assert.equal(extractHistoryOutcome(history, context), null);
+});
+
+test("history helper skips empty assistant placeholders and resolves later text", () => {
+  const context = {
+    sessionKey: "agent:main:main",
+    requestedAtMs: 1_000,
+    promptText: "ping",
+  };
+  const history: HistoryResponse = {
+    messages: [
+      { role: "user", timestamp: 1_100, content: [{ type: "text", text: "ping" }] },
+      { role: "assistant", timestamp: 1_200, content: [{ type: "text", text: "" }] },
+      { role: "assistant", timestamp: 1_300, content: [{ type: "text", text: "pong" }] },
+    ],
+  };
+
+  assert.deepEqual(extractHistoryOutcome(history, context), {
+    kind: "final",
+    text: "pong",
+    message: history.messages?.[2],
+  });
+});
+
+test("history helper waits through tool-only assistant blocks until user-visible final content", () => {
+  const context = {
+    sessionKey: "agent:main:main",
+    requestedAtMs: 1_000,
+    promptText: "read the file",
+  };
+  const history: HistoryResponse = {
+    messages: [
+      { role: "user", timestamp: 1_100, content: [{ type: "text", text: "read the file" }] },
+      {
+        role: "assistant",
+        timestamp: 1_150,
+        content: [
+          {
+            type: "tool_call",
+            name: "read_file",
+            toolCallId: "tool-1",
+            arguments: { path: "report.pdf" },
+          },
+        ],
+      },
+      {
+        role: "assistant",
+        timestamp: 1_200,
+        content: [
+          {
+            type: "tool_result",
+            toolCallId: "tool-1",
+            result: { ok: true },
+          },
+        ],
+      },
+      { role: "assistant", timestamp: 1_300, content: [{ type: "text", text: "report.pdf is ready" }] },
+    ],
+  };
+
+  assert.deepEqual(extractHistoryOutcome(history, context), {
+    kind: "final",
+    text: "report.pdf is ready",
+    message: history.messages?.[3],
+  });
+});
+
+test("history helper does not treat tool-only assistant blocks as final content", () => {
+  const context = {
+    sessionKey: "agent:main:main",
+    requestedAtMs: 1_000,
+    promptText: "read the file",
+  };
+  const history: HistoryResponse = {
+    messages: [
+      { role: "user", timestamp: 1_100, content: [{ type: "text", text: "read the file" }] },
+      {
+        role: "assistant",
+        timestamp: 1_150,
+        content: [
+          {
+            type: "tool_use",
+            name: "read_file",
+            toolUseId: "tool-1",
+            args: { path: "report.pdf" },
+          },
+        ],
+      },
+    ],
+  };
+
+  assert.equal(extractHistoryOutcome(history, context), null);
+});
+
 test("history helper matches OpenClaw string user content", () => {
   const context = {
     sessionKey: "session_1",
@@ -113,6 +223,30 @@ test("history helper matches OpenClaw string user content", () => {
   assert.deepEqual(extractHistoryOutcome(history, context), {
     kind: "final",
     text: "我可以帮你处理文件。",
+    message: history.messages?.[1],
+  });
+});
+
+test("history helper matches OpenClaw timestamp-prefixed user content", () => {
+  const context = {
+    sessionKey: "session_1",
+    requestedAtMs: 1_000,
+    promptText: "OPENCLAW_E2E_1 reply exactly OPENCLAW_OK_1",
+  };
+  const history: HistoryResponse = {
+    messages: [
+      {
+        role: "user",
+        timestamp: 1_100,
+        content: "[Sun 2026-05-31 13:42 GMT+8] OPENCLAW_E2E_1 reply exactly OPENCLAW_OK_1",
+      },
+      { role: "assistant", timestamp: 1_200, content: [{ type: "text", text: "OPENCLAW_OK_1" }] },
+    ],
+  };
+
+  assert.deepEqual(extractHistoryOutcome(history, context), {
+    kind: "final",
+    text: "OPENCLAW_OK_1",
     message: history.messages?.[1],
   });
 });

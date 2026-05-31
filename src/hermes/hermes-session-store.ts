@@ -1,5 +1,5 @@
 import { existsSync } from "fs";
-import { mkdir, readFile, writeFile } from "fs/promises";
+import { copyFile, mkdir, readFile, rename, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { dirname, join } from "path";
 
@@ -27,10 +27,13 @@ interface StoreShape {
   sessions: Record<string, StoredHermesSession>;
 }
 
-const STORE_PATH = process.env.CLAWCONNECT_HERMES_SESSION_STORE
-  ?? join(homedir(), ".clawconnect", "hermes", "sessions.json");
-
 const HERMES_ID_PATTERN = /\b\d{8}_\d{6}_[A-Za-z0-9]+\b/;
+let storeMutationChain: Promise<void> = Promise.resolve();
+
+function storePath(): string {
+  return process.env.CLAWCONNECT_HERMES_SESSION_STORE
+    ?? join(homedir(), ".clawconnect", "hermes", "sessions.json");
+}
 
 export async function getMappedHermesSessionId(sessionKey: string): Promise<string | undefined> {
   if (sessionKey.startsWith("hermes:")) {
@@ -41,35 +44,30 @@ export async function getMappedHermesSessionId(sessionKey: string): Promise<stri
 }
 
 export async function rememberHermesSession(sessionKey: string, item: HermesSessionItem): Promise<void> {
-  const store = await readStore();
-  const now = new Date().toISOString();
-  store.sessions[sessionKey] = {
-    sessionKey,
-    hermesSessionId: item.hermesSessionId,
-    displayName: item.displayName ?? item.derivedTitle ?? item.hermesSessionId,
-    preview: item.label,
-    lastActivityAt: item.lastActivityAt ?? now,
-    updatedAt: now,
-  };
-  await writeStore(store);
+  await mutateStore((store) => {
+    const now = new Date().toISOString();
+    store.sessions[sessionKey] = {
+      sessionKey,
+      hermesSessionId: item.hermesSessionId,
+      displayName: item.displayName ?? item.derivedTitle ?? item.hermesSessionId,
+      preview: item.label,
+      lastActivityAt: item.lastActivityAt ?? now,
+      updatedAt: now,
+    };
+  });
 }
 
 export async function forgetHermesSession(sessionKeyOrId: string, hermesSessionId?: string): Promise<void> {
-  const store = await readStore();
-  const normalizedSessionKey = sessionKeyOrId.trim();
-  const normalizedHermesId = hermesSessionId?.trim() || normalizedSessionKey;
-  let changed = false;
+  await mutateStore((store) => {
+    const normalizedSessionKey = sessionKeyOrId.trim();
+    const normalizedHermesId = hermesSessionId?.trim() || normalizedSessionKey;
 
-  for (const [key, item] of Object.entries(store.sessions)) {
-    if (key === normalizedSessionKey || item.sessionKey === normalizedSessionKey || item.hermesSessionId === normalizedHermesId) {
-      delete store.sessions[key];
-      changed = true;
+    for (const [key, item] of Object.entries(store.sessions)) {
+      if (key === normalizedSessionKey || item.sessionKey === normalizedSessionKey || item.hermesSessionId === normalizedHermesId) {
+        delete store.sessions[key];
+      }
     }
-  }
-
-  if (changed) {
-    await writeStore(store);
-  }
+  });
 }
 
 export async function listStoredHermesSessions(): Promise<HermesSessionItem[]> {
@@ -152,24 +150,48 @@ function sortHermesSessions(sessions: HermesSessionItem[]): HermesSessionItem[] 
 }
 
 async function readStore(): Promise<StoreShape> {
-  if (!existsSync(STORE_PATH)) {
+  const path = storePath();
+  if (!existsSync(path)) {
     return { version: 1, sessions: {} };
   }
   try {
-    const raw = await readFile(STORE_PATH, "utf8");
+    const raw = await readFile(path, "utf8");
     const parsed = JSON.parse(raw) as Partial<StoreShape>;
     return {
       version: 1,
       sessions: parsed.sessions && typeof parsed.sessions === "object" ? parsed.sessions : {},
     };
   } catch {
+    await quarantineCorruptStore(path);
     return { version: 1, sessions: {} };
   }
 }
 
 async function writeStore(store: StoreShape): Promise<void> {
-  await mkdir(dirname(STORE_PATH), { recursive: true });
-  await writeFile(STORE_PATH, JSON.stringify(store, null, 2), "utf8");
+  const path = storePath();
+  await mkdir(dirname(path), { recursive: true });
+  const tmpPath = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  await writeFile(tmpPath, JSON.stringify(store, null, 2), "utf8");
+  await rename(tmpPath, path);
+}
+
+async function mutateStore(mutator: (store: StoreShape) => void): Promise<void> {
+  const run = storeMutationChain.then(async () => {
+    const store = await readStore();
+    mutator(store);
+    await writeStore(store);
+  });
+  storeMutationChain = run.catch(() => undefined);
+  await run;
+}
+
+async function quarantineCorruptStore(path: string): Promise<void> {
+  try {
+    const quarantinePath = `${path}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    await copyFile(path, quarantinePath);
+  } catch {
+    // Best effort only; the caller still recovers with an empty in-memory store.
+  }
 }
 
 function parseRelativeLastActive(value: string | undefined, now: Date): string | undefined {

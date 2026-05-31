@@ -4,7 +4,7 @@ import { forgetHermesSession, getMappedHermesSessionId } from "../hermes-session
 import { listHermesSessions } from "./hermes-runtime-usage.js";
 import { runHermesOutput } from "./hermes-runtime-command-utils.js";
 import { stringParam, toRecord } from "./hermes-runtime-values.js";
-import { errorMessageWithOutput } from "./hermes-runtime-process.js";
+import { errorMessageWithOutput, isHermesMissingSessionError } from "./hermes-runtime-process.js";
 
 export async function runHermesSessionsList(): Promise<LocalResult> {
   try {
@@ -29,7 +29,7 @@ export async function runHermesSessionDelete(params: unknown): Promise<LocalResu
   const record = toRecord(params);
   const sessionKey = stringParam(record, "sessionKey", "key", "session");
   const sessionId = stringParam(record, "sessionId", "hermesSessionId", "id")
-    ?? await resolveHermesSessionIdFromParams(record);
+    ?? (await resolveHermesSessionIdFromParams(record)).sessionId;
   if (!sessionId) {
     return { ok: false, error: "session_id_required" };
   }
@@ -51,25 +51,48 @@ export async function runHermesSessionDelete(params: unknown): Promise<LocalResu
 
 export async function runHermesSessionExport(params: unknown): Promise<LocalResult> {
   const record = toRecord(params);
-  const sessionId = stringParam(record, "sessionId", "hermesSessionId", "id")
-    ?? await resolveHermesSessionIdFromParams(record);
+  const resolved = await resolveHermesSessionIdFromParams(record);
+  const sessionId = resolved.sessionId;
   const output = stringParam(record, "output", "outputPath");
   const args = ["sessions", "export", output ?? "-"];
   if (sessionId) args.push("--session-id", sessionId);
-  return runHermesOutput(args, 10 * 60_000);
+  const result = runHermesOutput(args, 10 * 60_000);
+  if (
+    !result.ok
+    && resolved.fromMappedSessionKey
+    && resolved.sessionKey
+    && sessionId
+    && isHermesMissingSessionError(result.error)
+  ) {
+    await forgetHermesSession(resolved.sessionKey, sessionId);
+    return runHermesOutput(["sessions", "export", output ?? "-"], 10 * 60_000);
+  }
+  return result;
 }
 
-async function resolveHermesSessionIdFromParams(record: Record<string, unknown>): Promise<string | undefined> {
+async function resolveHermesSessionIdFromParams(record: Record<string, unknown>): Promise<{
+  sessionId?: string;
+  sessionKey?: string;
+  fromMappedSessionKey: boolean;
+}> {
+  const explicitSessionId = stringParam(record, "sessionId", "hermesSessionId", "id");
+  if (explicitSessionId) {
+    return { sessionId: explicitSessionId, fromMappedSessionKey: false };
+  }
   const sessionKey = stringParam(record, "sessionKey", "key", "session");
   if (!sessionKey) {
-    return undefined;
+    return { fromMappedSessionKey: false };
   }
   if (sessionKey.toLowerCase().startsWith("hermes:")) {
     const hermesId = sessionKey.slice("hermes:".length).trim();
-    return hermesId || undefined;
+    return { sessionId: hermesId || undefined, sessionKey, fromMappedSessionKey: false };
   }
   if (/^[0-9]{8}_[0-9]{6}_[A-Za-z0-9_-]+$/.test(sessionKey)) {
-    return sessionKey;
+    return { sessionId: sessionKey, sessionKey, fromMappedSessionKey: false };
   }
-  return await getMappedHermesSessionId(sessionKey);
+  return {
+    sessionId: await getMappedHermesSessionId(sessionKey),
+    sessionKey,
+    fromMappedSessionKey: true,
+  };
 }

@@ -403,7 +403,39 @@ function extractHistoryMessageText(message: HistoryMessage | undefined): string 
 
 function hasHistoryMessageContent(message: HistoryMessage | undefined): boolean {
   const content = Array.isArray(message?.content) ? message.content : [];
-  return content.some((block) => block && typeof block === "object" && Object.keys(block).length > 0);
+  return content.some((block) => {
+    if (!block || typeof block !== "object") {
+      return false;
+    }
+
+    const type = typeof block.type === "string" ? block.type.trim().toLowerCase() : "";
+    if (type === "text" || type === "markdown" || type === "output_text" || type === "input_text") {
+      return typeof block.text === "string" && block.text.trim().length > 0;
+    }
+    if (isToolOnlyHistoryBlockType(type)) {
+      return false;
+    }
+
+    return Object.entries(block).some(([key, value]) => {
+      if (key === "type") {
+        return false;
+      }
+      if (typeof value === "string") {
+        return value.trim().length > 0;
+      }
+      return value !== undefined && value !== null;
+    });
+  });
+}
+
+function isToolOnlyHistoryBlockType(type: string): boolean {
+  return type === "tool_call"
+    || type === "tool_use"
+    || type === "tool_result"
+    || type === "function_call"
+    || type === "function_result"
+    || type === "computer_call"
+    || type === "computer_call_output";
 }
 
 function findHistoryUserIndex(messages: HistoryMessage[], context: ChatRunContext): number {
@@ -420,10 +452,14 @@ function findHistoryUserIndex(messages: HistoryMessage[], context: ChatRunContex
       continue;
     }
     const text = extractHistoryMessageText(message);
-    if (!normalizedPrompt || text === normalizedPrompt) {
+    if (!normalizedPrompt || historyUserTextMatches(text, normalizedPrompt)) {
       return index;
     }
   }
 
   return -1;
+}
+
+function historyUserTextMatches(text: string, normalizedPrompt: string): boolean {
+  return text === normalizedPrompt || text.endsWith(normalizedPrompt);
 }

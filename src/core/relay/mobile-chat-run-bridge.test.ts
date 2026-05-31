@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildCanonicalMobileAssistantDeltaPayload,
+  buildCanonicalMobileAssistantErrorPayload,
+  buildCanonicalMobileAssistantFinalPayload,
+  buildCanonicalMobileAssistantStreamingPayload,
   buildMobileAssistantDeltaPayload,
   buildMobileAssistantErrorPayload,
   buildMobileAssistantFinalPayload,
   buildMobileAssistantStreamingPayload,
+  buildMobileAssistantAbortedPayload,
+  canonicalizeMobileAssistantText,
+  isCanonicalMobileChatControlError,
   resolveMobileChatRun,
 } from "./mobile-chat-run-bridge.js";
 
@@ -102,4 +109,167 @@ test("mobile chat run bridge builds gateway-neutral assistant events", () => {
       },
     },
   );
+});
+
+test("canonical mobile assistant text drops protocol-only typing markers", () => {
+  assert.deepEqual(canonicalizeMobileAssistantText("[[clawlink:typing]]"), {
+    text: "",
+    shouldPublish: false,
+  });
+  assert.deepEqual(canonicalizeMobileAssistantText("[[clawlink:typing]]\n[[clawlink:typing]]"), {
+    text: "",
+    shouldPublish: false,
+  });
+});
+
+test("canonical mobile assistant text strips Hermes resume metadata", () => {
+  assert.deepEqual(
+    canonicalizeMobileAssistantText([
+      "↻ Resumed session 20260525_114940_1cccb9",
+      "Error: 'NoneType' object is not iterable",
+      "session_id: 20260525_114940_1cccb9",
+      "",
+      "visible reply",
+    ].join("\n")),
+    {
+      text: "visible reply",
+      shouldPublish: true,
+    },
+  );
+});
+
+test("canonical mobile assistant text classifies timeout-denied control output", () => {
+  assert.equal(isCanonicalMobileChatControlError("Timeout – denying command"), true);
+  assert.deepEqual(canonicalizeMobileAssistantText("Timeout – denying command"), {
+    text: "",
+    shouldPublish: false,
+    controlError: "Timeout – denying command",
+  });
+});
+
+test("canonical mobile assistant builders sanitize outgoing text", () => {
+  const run = { runId: "run-1", sessionKey: "main" };
+
+  assert.deepEqual(
+    buildCanonicalMobileAssistantStreamingPayload({
+      run,
+      seq: 1,
+      text: "[[clawlink:typing]]",
+    }),
+    {
+      runId: "run-1",
+      sessionKey: "main",
+      state: "streaming",
+      role: "assistant",
+      seq: 1,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+      },
+    },
+  );
+
+  assert.deepEqual(
+    buildCanonicalMobileAssistantDeltaPayload({
+      run,
+      seq: 2,
+      timestampMs: 123,
+      delta: "↻ Resumed session 20260525_114940_1cccb9\nhello",
+    }),
+    {
+      runId: "run-1",
+      sessionKey: "main",
+      state: "delta",
+      role: "assistant",
+      seq: 2,
+      ts: 123,
+      delta: "hello",
+      message: {
+        role: "assistant",
+        timestamp: 123,
+        content: [{ type: "text", text: "hello" }],
+      },
+    },
+  );
+
+  assert.deepEqual(
+    buildCanonicalMobileAssistantDeltaPayload({
+      run,
+      seq: 3,
+      timestampMs: 124,
+      delta: "hello ",
+    }),
+    {
+      runId: "run-1",
+      sessionKey: "main",
+      state: "delta",
+      role: "assistant",
+      seq: 3,
+      ts: 124,
+      delta: "hello ",
+      message: {
+        role: "assistant",
+        timestamp: 124,
+        content: [{ type: "text", text: "hello " }],
+      },
+    },
+  );
+
+  assert.deepEqual(
+    buildCanonicalMobileAssistantFinalPayload({ run, text: "[[clawlink:typing]]" }),
+    {
+      runId: "run-1",
+      sessionKey: "main",
+      state: "final",
+      role: "assistant",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+      },
+    },
+  );
+
+  assert.deepEqual(
+    buildCanonicalMobileAssistantErrorPayload({ run, errorMessage: "Timeout – denying command" }),
+    {
+      runId: "run-1",
+      sessionKey: "main",
+      state: "error",
+      role: "assistant",
+      errorMessage: "Timeout – denying command",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Timeout – denying command" }],
+      },
+    },
+  );
+});
+
+test("mobile assistant builders can include canonical timeline events during migration", () => {
+  const run = { runId: "client-run-1", sessionKey: "main" };
+
+  const finalPayload = buildMobileAssistantFinalPayload({
+    run,
+    text: "done",
+    includeTimelineEvents: true,
+  });
+  assert.equal(finalPayload.timelineEvents?.[0]?.eventType, "message.completed");
+  assert.equal(finalPayload.timelineEvents?.[1]?.eventType, "run.completed");
+  assert.equal(finalPayload.timelineEvents?.[0]?.turnId, "client-run-1");
+
+  const errorPayload = buildMobileAssistantErrorPayload({
+    run,
+    errorMessage: "failed",
+    includeTimelineEvents: true,
+  });
+  assert.equal(errorPayload.timelineEvents?.[0]?.eventType, "run.failed");
+  assert.deepEqual(errorPayload.timelineEvents?.[0]?.error, { userMessage: "failed" });
+
+  const abortedPayload = buildMobileAssistantAbortedPayload({
+    run,
+    includeTimelineEvents: true,
+  });
+  assert.equal(abortedPayload.state, "aborted");
+  assert.equal(abortedPayload.timelineEvents?.[0]?.eventType, "run.aborted");
+  assert.equal(abortedPayload.timelineEvents?.[0]?.runState, "aborted");
 });

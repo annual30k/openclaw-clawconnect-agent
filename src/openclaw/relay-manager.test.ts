@@ -87,6 +87,94 @@ test("relay manager forwards OpenClaw agent tool events to relay", async () => {
   }
 });
 
+test("relay manager publishes OpenClaw chat deltas as accumulated assistant text", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let gatewaySocket: WebSocket | undefined;
+
+  relayServer.on("connection", (socket) => {
+    socket.on("message", (raw) => {
+      relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
+    });
+  });
+
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({
+      type: "event",
+      event: "connect.challenge",
+      payload: { nonce: "nonce-1" },
+    }));
+    socket.on("message", (raw) => {
+      const msg = JSON.parse(raw.toString()) as {
+        type?: string;
+        id?: string;
+        method?: string;
+      };
+      if (msg.type !== "req" || !msg.id) {
+        return;
+      }
+      socket.send(JSON.stringify({ type: "res", id: msg.id, ok: true, payload: {} }));
+      if (msg.method === "connect") {
+        socket.send(JSON.stringify({
+          type: "event",
+          event: "chat",
+          payload: {
+            runId: "run-1",
+            sessionKey: "main",
+            state: "delta",
+            role: "assistant",
+            seq: 1,
+            delta: "hello ",
+          },
+        }));
+        socket.send(JSON.stringify({
+          type: "event",
+          event: "chat",
+          payload: {
+            runId: "run-1",
+            sessionKey: "main",
+            state: "delta",
+            role: "assistant",
+            seq: 2,
+            delta: "world",
+          },
+        }));
+      }
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-test",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+
+  try {
+    await waitFor(() => relayMessages.some((message) => {
+      if (message.type !== "event" || message.event !== "chat" || !isRecord(message.payload)) {
+        return false;
+      }
+      return extractPayloadText(message.payload) === "hello world";
+    }), 4_000);
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+  }
+});
+
 test("relay manager answers chat.history cursor pages from OpenClaw transcripts without forwarding to gateway", async () => {
   const openclawHome = await createOpenClawHomeFixture(12);
   const previousOpenClawHome = process.env.CLAWCONNECT_OPENCLAW_HOME;
@@ -285,6 +373,13 @@ test("relay manager sanitizes legacy OpenClaw chat.history fallback params", asy
     await openclawHome.cleanup();
   }
 });
+
+function extractPayloadText(payload: Record<string, unknown>): string {
+  const message = isRecord(payload.message) ? payload.message : undefined;
+  const content = Array.isArray(message?.content) ? message.content : [];
+  const textBlock = content.find((block): block is Record<string, unknown> => isRecord(block) && block.type === "text");
+  return typeof textBlock?.text === "string" ? textBlock.text : "";
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);

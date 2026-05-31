@@ -17,6 +17,7 @@ import {
 import { runClawConnectProfileRestart, runHermesLifecycle } from "./hermes-runtime-lifecycle.js";
 import { runHermesModelList, runHermesModelSelect } from "./hermes-runtime-models.js";
 import { runHermesLogs } from "./hermes-runtime-command-utils.js";
+import { runHermesChatHistory } from "./hermes-runtime-history.js";
 import {
   runHermesDashboardStart,
   runHermesMcpAdd,
@@ -43,6 +44,8 @@ export function handleHermesCommand(
   context: LocalCommandContext = {},
 ): LocalResult | Promise<LocalResult> | null {
   switch (method) {
+    case "chat.history":
+      return runHermesChatHistory(params);
     case "hermes.status":
       return runHermesOutput(["status"]);
     case "hermes.logs":

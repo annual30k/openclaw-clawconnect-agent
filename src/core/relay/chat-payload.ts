@@ -12,6 +12,14 @@ const ASSISTANT_CHAT_STATES = new Set([
   "aborted",
 ]);
 
+function canonicalChatState(rawState: string): string {
+  const state = rawState.trim().toLowerCase();
+  if (state === "done" || state === "completed" || state === "complete") {
+    return "final";
+  }
+  return state;
+}
+
 export function normalizeChatEventPayload(rawPayload: unknown): unknown {
   if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
     return rawPayload;
@@ -21,7 +29,9 @@ export function normalizeChatEventPayload(rawPayload: unknown): unknown {
   const phaseRaw = typeof payload.phase === "string" ? payload.phase.trim().toLowerCase() : "";
   const hasState = stateRaw.length > 0;
 
-  if (!hasState && phaseRaw) {
+  if (hasState) {
+    payload.state = canonicalChatState(stateRaw);
+  } else if (phaseRaw) {
     if (phaseRaw.includes("delta") || phaseRaw.includes("stream")) {
       payload.state = "delta";
     } else if (phaseRaw.includes("final") || phaseRaw.includes("complete") || phaseRaw.includes("done")) {
@@ -108,7 +118,7 @@ export function normalizeChatState(rawPayload: unknown): string {
       : typeof payload.phase === "string" ? payload.phase
         : typeof data?.phase === "string" ? data.phase
           : "";
-  return rawState.trim().toLowerCase();
+  return canonicalChatState(rawState);
 }
 
 export function extractChatRole(rawPayload: unknown): string {

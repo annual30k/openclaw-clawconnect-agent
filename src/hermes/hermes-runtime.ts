@@ -19,6 +19,7 @@ export {
   runHermesChat,
   selectHermesSessionForCompletedChat,
 } from "./runtime/hermes-runtime-chat.js";
+export { runHermesChatHistory } from "./runtime/hermes-runtime-history.js";
 export {
   collectHermesUsageSnapshot,
   listHermesSessions,

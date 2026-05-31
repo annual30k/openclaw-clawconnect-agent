@@ -11,11 +11,18 @@ import {
 import { buildOfficeEventPayload } from "../core/relay/office-payload.js";
 import type { RelaySlashCommandDescriptor } from "../core/relay/slash-command-types.js";
 import {
+  buildMobileAssistantAbortedPayload,
   buildMobileAssistantErrorPayload,
   buildMobileAssistantFinalPayload,
+  type MobileChatRun,
   resolveMobileChatRun,
 } from "../core/relay/mobile-chat-run-bridge.js";
 import { voiceInputSetupMessage } from "../core/relay/voice-input.js";
+import {
+  buildAttachmentStateChangedEvent,
+  deriveAttachmentId,
+  derivePartId,
+} from "../core/relay/timeline-event-builder.js";
 import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
 import { runHermesPython } from "./runtime/hermes-runtime-process.js";
 import { prepareHermesVoiceInputCommand, resolveHermesVoiceInputSessionKey } from "./hermes-voice-input.js";
@@ -33,6 +40,11 @@ type ToServer =
   | { type: "gateway_disconnected"; reason: string }
   | { type: "event"; event: string; payload: unknown }
   | { type: "res"; id: string; ok: boolean; payload?: unknown; error?: { message?: string } };
+
+export type ActiveHermesChatRun = {
+  controller: AbortController;
+  run: MobileChatRun;
+};
 
 interface FromServer {
   type: "cmd" | "hello" | "heartbeat" | "event";
@@ -361,10 +373,69 @@ function readHermesSlashCommandSearchParams(params: unknown): {
   };
 }
 
+function readStringParam(params: unknown, key: string): string | undefined {
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return undefined;
+  }
+  const value = (params as Record<string, unknown>)[key];
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+export function rememberActiveHermesChatRun(
+  activeChatRuns: Map<string, ActiveHermesChatRun>,
+  run: MobileChatRun,
+  params: unknown,
+  requestId: string | undefined,
+  controller: AbortController,
+): void {
+  const entry = { controller, run };
+  for (const key of [run.runId, requestId, readStringParam(params, "idempotencyKey")]) {
+    if (key) {
+      activeChatRuns.set(key, entry);
+    }
+  }
+}
+
+function forgetActiveHermesChatRun(
+  activeChatRuns: Map<string, ActiveHermesChatRun>,
+  run: MobileChatRun,
+): void {
+  for (const [key, entry] of activeChatRuns) {
+    if (entry.run.runId === run.runId && entry.run.sessionKey === run.sessionKey) {
+      activeChatRuns.delete(key);
+    }
+  }
+}
+
+export function resolveHermesAbortRun(
+  params: unknown,
+  activeChatRuns: Map<string, ActiveHermesChatRun>,
+): ActiveHermesChatRun | undefined {
+  const runId = readStringParam(params, "runId")
+    ?? readStringParam(params, "run_id")
+    ?? readStringParam(params, "idempotencyKey");
+  if (runId) {
+    return activeChatRuns.get(runId);
+  }
+  const sessionKey = readStringParam(params, "sessionKey") ?? readStringParam(params, "session_key");
+  if (sessionKey) {
+    return [...activeChatRuns.values()].find((entry) => entry.run.sessionKey === sessionKey);
+  }
+  return undefined;
+}
+
+export function resolveHermesChatPreferredRunId(params: unknown, voiceInputRun?: MobileChatRun): string | undefined {
+  return voiceInputRun?.runId
+    ?? readStringParam(params, "runId")
+    ?? readStringParam(params, "run_id")
+    ?? readStringParam(params, "idempotencyKey");
+}
+
 export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Promise<boolean> {
   const wsUrl = buildRelayUrl(opts.relayServerUrl, opts.gatewayId, opts.relaySecret);
   const recentMobileFiles = new Map<string, Array<Record<string, unknown>>>();
   const sentArtifacts = new Map<string, number>();
+  const activeChatRuns = new Map<string, ActiveHermesChatRun>();
 
   return new Promise<boolean>((resolve) => {
     let relayWs: WebSocket;
@@ -441,6 +512,31 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         requestId = msg.id;
         methodForLog = msg.method;
 
+        if (msg.method === "chat.abort") {
+          const abortRun = resolveHermesAbortRun(msg.params, activeChatRuns);
+          abortRun?.controller.abort();
+          if (requestId) {
+            send({ type: "res", id: requestId, ok: true, payload: abortRun?.run });
+          }
+          if (abortRun) {
+            send({
+              type: "event",
+              event: "chat",
+              payload: {
+                runId: abortRun.run.runId,
+                sessionKey: abortRun.run.sessionKey,
+                state: "aborted",
+                role: "assistant",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "" }],
+                },
+              },
+            });
+          }
+          return;
+        }
+
         if (msg.method === "slash_commands.search") {
           if (requestId) {
             send({
@@ -480,13 +576,15 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
 
         const requestedSessionKey = resolveHermesRelaySessionKey(msg.params);
         const run = resolveMobileChatRun({
-          preferredRunId: voiceInputRun?.runId,
+          preferredRunId: resolveHermesChatPreferredRunId(msg.params, voiceInputRun),
           requestId,
           sessionKey: requestedSessionKey,
           fallbackPrefix: "hermes",
         });
         const runId = run.runId;
         const sessionKey = run.sessionKey;
+        const abortController = new AbortController();
+        rememberActiveHermesChatRun(activeChatRuns, run, msg.params, requestId, abortController);
         if (requestId) {
           acknowledgedChatRun = { runId, sessionKey };
           send({ type: "res", id: requestId, ok: true, payload: acknowledgedChatRun });
@@ -495,11 +593,13 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         const chat = await runHermesChat(paramsWithFiles, {
           requestId: runId,
           gatewayId: opts.gatewayId,
+          abortSignal: abortController.signal,
           publishEvent: (event) => {
             send(event);
             publishHermesOfficeSnapshot(send, event.event, event.payload);
           },
         });
+        forgetActiveHermesChatRun(activeChatRuns, run);
         const finalChatPayload = buildMobileAssistantFinalPayload({
           run: { runId, sessionKey: chat.sessionKey },
           text: chat.output,
@@ -507,6 +607,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           provider: chat.usage?.provider,
           contextUsage: chat.usage?.contextUsage,
           contextLimit: chat.usage?.contextLimit,
+          includeTimelineEvents: true,
         });
         send({
           type: "event",
@@ -521,7 +622,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           if (artifactKey && sentArtifacts.has(artifactKey)) {
             continue;
           }
-          await uploadFileToRelay(buildHermesArtifactUploadRequest({
+          const upload = await uploadFileToRelay(buildHermesArtifactUploadRequest({
             artifactPath,
             relayServerUrl: opts.relayServerUrl,
             relaySecret: opts.relaySecret,
@@ -529,6 +630,51 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
             sessionKey: chat.sessionKey,
             runId,
           }));
+          const attachmentId = deriveAttachmentId({
+            sessionKey: chat.sessionKey,
+            name: upload.fileName,
+            mimeType: upload.mimeType,
+            size: upload.sizeBytes,
+            contentHash: upload.sha256,
+          });
+          send({
+            type: "event",
+            event: "chat",
+            payload: {
+              runId,
+              sessionKey: chat.sessionKey,
+              state: "attachment",
+              role: "assistant",
+              timelineEvents: [
+                buildAttachmentStateChangedEvent({
+                  gatewayId: opts.gatewayId,
+                  sessionKey: chat.sessionKey,
+                  turnId: runId,
+                  runId,
+                  messageId: `assistant-${runId}`,
+                  partId: derivePartId({
+                    type: upload.mimeType.startsWith("image/")
+                      ? "image"
+                      : upload.mimeType.startsWith("audio/")
+                        ? "voice"
+                        : "file",
+                    index: 0,
+                  }),
+                  attachment: {
+                    attachmentId,
+                    state: "available",
+                    fileId: upload.fileId,
+                    name: upload.fileName,
+                    mimeType: upload.mimeType,
+                    sizeBytes: upload.sizeBytes,
+                    url: upload.downloadUrl,
+                    expiresAt: upload.expiresAt,
+                    sha256: upload.sha256,
+                  },
+                }),
+              ],
+            },
+          });
           if (artifactKey) {
             sentArtifacts.set(artifactKey, Date.now());
           }
@@ -539,6 +685,25 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (message === "hermes_chat_aborted") {
+          if (acknowledgedChatRun) {
+            const abortedPayload = buildMobileAssistantAbortedPayload({
+              run: acknowledgedChatRun,
+              includeTimelineEvents: true,
+            });
+            send({
+              type: "event",
+              event: "chat",
+              payload: abortedPayload,
+            });
+            publishHermesOfficeSnapshot(send, "chat", abortedPayload);
+            forgetActiveHermesChatRun(activeChatRuns, acknowledgedChatRun);
+          }
+          return;
+        }
+        if (acknowledgedChatRun) {
+          forgetActiveHermesChatRun(activeChatRuns, acknowledgedChatRun);
+        }
         console.error(`[hermes-relay] cmd failed method=${methodForLog || "(unknown)"} id=${requestId ?? "(no-id)"}: ${message}`);
         const setupMessage = voiceInputSetupMessage(error);
         const chatRun = setupMessage ? (acknowledgedChatRun ?? voiceInputRun) : acknowledgedChatRun;
@@ -546,6 +711,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           const errorPayload = buildMobileAssistantErrorPayload({
             run: chatRun,
             errorMessage: setupMessage ?? message,
+            includeTimelineEvents: true,
           });
           send({
             type: "event",
@@ -565,6 +731,8 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
     relayWs.on("close", (code, reason) => {
       console.log(`Hermes relay connection closed: ${code} ${reason.toString()}`);
       opts.onDisconnected?.();
+      activeChatRuns.forEach((entry) => entry.controller.abort());
+      activeChatRuns.clear();
       resolve(shouldRetryRelayClose(code, opts.signal));
     });
 
