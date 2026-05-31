@@ -39,7 +39,7 @@ export async function prepareVoiceSendParams(
     throw new Error("voice_audio_required");
   }
 
-  const languageHint = stringValue(record.languageHint);
+  const languageHint = stringValue(record.languageHint) ?? stringValue(record.language);
   const stagingRoot = options.stagingDir ?? await mkdtemp(join(tmpdir(), "clawconnect-voice-input-"));
   await mkdir(stagingRoot, { recursive: true });
   const audioPath = join(stagingRoot, resolveVoiceAudioFileName(audio));
@@ -63,6 +63,7 @@ export async function prepareVoiceSendParams(
   };
   delete next.audio;
   delete next.languageHint;
+  delete next.language;
   delete next.attachments;
   return next;
 }

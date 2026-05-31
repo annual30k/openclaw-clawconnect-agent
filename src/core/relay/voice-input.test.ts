@@ -69,6 +69,36 @@ test("prepareVoiceSendParams combines typed context with host transcript", async
   }
 });
 
+test("prepareVoiceSendParams accepts language alias without leaking it to chat.send", async () => {
+  const stagingDir = await mkdtemp(join(tmpdir(), "clawconnect-voice-input-test-"));
+  try {
+    const params = await prepareVoiceSendParams(
+      {
+        sessionKey: "main",
+        language: "zh-CN",
+        audio: {
+          fileName: "voice.wav",
+          mimeType: "audio/wav",
+          content: Buffer.from("wav-body", "utf8").toString("base64"),
+        },
+      },
+      {
+        stagingDir,
+        transcribeAudioImpl: async (opts) => {
+          assert.equal(opts.languageHint, "zh-CN");
+          return "测试语音发送";
+        },
+      },
+    ) as Record<string, unknown>;
+
+    assert.equal(params.message, "测试语音发送");
+    assert.equal(params.language, undefined);
+    assert.equal(params.languageHint, undefined);
+  } finally {
+    await rm(stagingDir, { recursive: true, force: true });
+  }
+});
+
 test("prepareVoiceSendParams rejects non-audio voice payloads", async () => {
   await assert.rejects(
     () => prepareVoiceSendParams({
