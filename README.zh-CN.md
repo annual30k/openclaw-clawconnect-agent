@@ -85,6 +85,14 @@ clawconnect pair \
 
 每条命令执行后，使用移动端扫码，或在移动端输入终端打印的配对码。配对 payload 会带上 `gatewayType`，Relay 会校验手机端请求的类型和主机注册的类型是否一致；类型不一致会拒绝绑定，避免 OpenClaw 手机网关绑定到 Hermes Agent 主机，或反过来绑定错误。
 
+配对完成后，安装已配对的后台服务：
+
+```bash
+clawconnect install
+```
+
+不带 `--profile` 时，`clawconnect install` 会安装当前能找到的所有已配对 profile。只想指定一个 profile 时，可以用 `clawconnect install-openclaw`、`clawconnect install-hermes`，或 `clawconnect install --profile <name>`。
+
 查看两个实例：
 
 ```bash

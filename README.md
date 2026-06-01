@@ -78,6 +78,14 @@ clawconnect pair \
 
 After each command, scan the QR code in the mobile app or enter the printed access code. The pairing payload includes `gatewayType`, and the relay rejects mismatched pairing attempts so an OpenClaw mobile gateway cannot bind to a Hermes Agent host, or the reverse.
 
+Install paired background service(s) once after pairing:
+
+```bash
+clawconnect install
+```
+
+Without `--profile`, `clawconnect install` installs every paired profile it finds. To target one profile explicitly, use `clawconnect install-openclaw`, `clawconnect install-hermes`, or `clawconnect install --profile <name>`.
+
 Check both instances:
 
 ```bash

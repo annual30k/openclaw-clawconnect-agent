@@ -10,7 +10,7 @@ import { installCommand, uninstallCommand, stopCommand, restartCommand, resetCom
 import { statusCommand } from "./commands/status.js";
 import { setTokenCommand } from "./commands/set-token.js";
 import { updateCommand } from "./commands/update.js";
-import { setActiveProfile } from "./config/profile.js";
+import { listProfileNames, setActiveProfile } from "./config/profile.js";
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
 ensureUserEnvFile();
@@ -29,6 +29,20 @@ async function runPairCommand(opts) {
 function runWithProfile(profile, action) {
     setActiveProfile(profile);
     action();
+}
+function runInstallCommand(opts) {
+    if (opts.profile) {
+        runWithProfile(opts.profile, installCommand);
+        return;
+    }
+    const profiles = listProfileNames();
+    if (profiles.length === 0) {
+        runWithProfile(undefined, installCommand);
+        return;
+    }
+    for (const profile of profiles) {
+        runWithProfile(profile === "default" ? undefined : profile, installCommand);
+    }
 }
 program
     .name("clawconnect")
@@ -169,8 +183,19 @@ program
     .description("Register as a background service (launchd on macOS, systemd --user on Linux, Startup on Windows)")
     .option(...profileOption)
     .action((opts) => {
-    setActiveProfile(opts.profile);
-    installCommand();
+    runInstallCommand(opts);
+});
+program
+    .command("install-openclaw")
+    .description("Shortcut: install the OpenClaw profile background service")
+    .action(() => {
+    runWithProfile("openclaw", installCommand);
+});
+program
+    .command("install-hermes")
+    .description("Shortcut: install the Hermes Agent profile background service")
+    .action(() => {
+    runWithProfile("hermes", installCommand);
 });
 program
     .command("restart")
