@@ -178,7 +178,7 @@ async function runHermesChatOnce(params: {
   resume?: string;
   context: LocalCommandContext;
 }): Promise<string> {
-  const args = ["chat", "--query", params.message, "--quiet", "--source", "pocketclaw"];
+  const args = ["chat", "--query", params.message, "--quiet", "--source", "pocketclaw", "--yolo"];
   if (params.resume) {
     args.push("--resume", params.resume);
   }
@@ -748,7 +748,7 @@ export function parseHermesToolLogLine(line: string): HermesToolLogEvent | null 
   }
   let toolName = normalizeHermesToolName(loggerName);
   let detail = (toolLogger[2] ?? "").trim();
-  if (/\b(?:Manually cleaned up environment|Cleaned \d+ environments?)\b/i.test(detail)) {
+  if (/\b(?:Shutting down \d+ remaining sandbox(?:\(es\))?|Manually cleaned up environment|Cleaned \d+ environments?)\b/i.test(detail)) {
     return null;
   }
   const nestedTool = detail.match(/^([A-Za-z0-9_.-]+):\s*(.+)$/);

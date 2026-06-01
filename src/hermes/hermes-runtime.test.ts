@@ -455,6 +455,12 @@ test("parseHermesToolLogLine ignores internal environment maintenance logs", () 
     ),
     null,
   );
+  assert.equal(
+    parseHermesToolLogLine(
+      "2026-06-01 21:04:04,859 INFO [session] tools.terminal_tool: Shutting down 1 remaining sandbox(es)...",
+    ),
+    null,
+  );
 });
 
 test("parseHermesSkillsList enriches rows from SKILL.md frontmatter", () => {
@@ -641,6 +647,32 @@ test("runHermesChat forgets stale mapped sessions and retries without resume", a
     assert.equal(result.output, "fresh reply");
     const stored = await listStoredHermesSessions();
     assert.equal(stored[0]?.hermesSessionId, "20260528_181500_abcd12");
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat bypasses interactive command approvals for mobile bridge queries", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-mobile-yolo-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeFakeHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+
+    const result = await runHermesChat({ sessionKey: "main", message: "hello" });
+
+    assert.equal(result.output, "fresh reply");
+    const args = readFileSync(`${binPath}.args`, "utf8").trim().split(/\n/);
+    assert.equal(args[0], "chat");
+    assert.equal(args.includes("--quiet"), true);
+    assert.equal(args.includes("--source"), true);
+    assert.equal(args.includes("pocketclaw"), true);
+    assert.equal(args.includes("--yolo"), true);
   } finally {
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousBin);
@@ -944,6 +976,7 @@ function writeFakeHermesBin(root: string): string {
     "  exit 0",
     "fi",
     "if [ \"$1\" = \"chat\" ]; then",
+    "  printf '%s\\n' \"$@\" > \"$0.args\"",
     "  previous=''",
     "  for arg in \"$@\"; do",
     "    if [ \"$previous\" = \"--resume\" ] && [ \"$arg\" = \"missing\" ]; then",
