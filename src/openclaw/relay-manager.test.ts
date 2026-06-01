@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -359,6 +359,179 @@ test("relay manager sanitizes legacy OpenClaw chat.history fallback params", asy
     assert.deepEqual(gatewayHistoryRequests, [{ sessionKey: "agent:main:main", limit: 7 }]);
     const response = relayMessages.find((message) => message.type === "res" && message.id === "history-legacy");
     assert.equal(response?.ok, true);
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+    if (previousOpenClawHome === undefined) {
+      delete process.env.CLAWCONNECT_OPENCLAW_HOME;
+    } else {
+      process.env.CLAWCONNECT_OPENCLAW_HOME = previousOpenClawHome;
+    }
+    await openclawHome.cleanup();
+  }
+});
+
+test("relay manager removes duplicate OpenClaw prompt mirrors before serving transcript history", async () => {
+  const openclawHome = await createEmptyOpenClawHomeFixture();
+  const previousOpenClawHome = process.env.CLAWCONNECT_OPENCLAW_HOME;
+  process.env.CLAWCONNECT_OPENCLAW_HOME = openclawHome.home;
+
+  const sessionsDir = join(openclawHome.home, "agents", "main", "sessions");
+  const transcriptPath = join(sessionsDir, "session-1.jsonl");
+  await writeFile(
+    join(sessionsDir, "sessions.json"),
+    `${JSON.stringify({
+      "agent:main:main": {
+        sessionId: "session-1",
+        sessionFile: "session-1.jsonl",
+      },
+    })}\n`,
+    "utf8",
+  );
+  await writeFile(transcriptPath, "", "utf8");
+
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let relaySocket: WebSocket | undefined;
+  let gatewaySocket: WebSocket | undefined;
+
+  relayServer.on("connection", (socket) => {
+    relaySocket = socket;
+    socket.on("message", (raw) => {
+      relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
+    });
+  });
+
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({
+      type: "event",
+      event: "connect.challenge",
+      payload: { nonce: "nonce-1" },
+    }));
+    socket.on("message", (raw) => {
+      void (async () => {
+        const msg = JSON.parse(raw.toString()) as {
+          type?: string;
+          id?: string;
+          method?: string;
+          params?: Record<string, unknown>;
+        };
+        if (msg.type !== "req" || !msg.id) {
+          return;
+        }
+        if (msg.method === "chat.send") {
+          await writeFile(
+            transcriptPath,
+            [
+              JSON.stringify({
+                type: "message",
+                id: "original-user",
+                parentId: "previous-assistant",
+                message: {
+                  role: "user",
+                  content: msg.params?.message,
+                  idempotencyKey: `${String(msg.params?.idempotencyKey)}:user`,
+                },
+              }),
+              JSON.stringify({
+                type: "message",
+                id: "prompt-mirror",
+                parentId: "original-user",
+                message: {
+                  role: "user",
+                  content: `[Mon 2026-06-01 09:43 GMT+8] ${String(msg.params?.message)}`,
+                  senderId: "openclaw-macos",
+                  senderName: "ClawConnect Agent",
+                  __openclaw: { mirrorIdentity: "thread-1:prompt" },
+                  idempotencyKey: "codex-app-server:thread-1:prompt",
+                },
+              }),
+              JSON.stringify({
+                type: "message",
+                id: "assistant-1",
+                parentId: "prompt-mirror",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "天气表格" }],
+                },
+              }),
+            ].join("\n") + "\n",
+            "utf8",
+          );
+        }
+        socket.send(JSON.stringify({
+          type: "res",
+          id: msg.id,
+          ok: true,
+          payload: msg.method === "chat.send"
+            ? { runId: "gateway-run-1" }
+            : msg.method === "config.get"
+              ? sessionDefaultsPayload()
+              : {},
+        }));
+      })().catch((error) => {
+        socket.send(JSON.stringify({
+          type: "res",
+          id: "unknown",
+          ok: false,
+          error: { message: String(error) },
+        }));
+      });
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-test",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+
+  try {
+    await waitFor(() => Boolean(relaySocket) && relayMessages.some((message) => message.type === "gateway_connected"), 4_000);
+    relaySocket?.send(JSON.stringify({
+      type: "cmd",
+      id: "send-1",
+      method: "chat.send",
+      params: {
+        sessionKey: "agent:main:main",
+        message: "后天福州的天气怎么样返回表格",
+        idempotencyKey: "mobile-run-1",
+      },
+    }));
+
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "send-1"), 4_000);
+    relaySocket?.send(JSON.stringify({
+      type: "cmd",
+      id: "history-1",
+      method: "chat.history",
+      params: {
+        sessionKey: "agent:main:main",
+        limit: 10,
+      },
+    }));
+
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "history-1"), 4_000);
+    const response = relayMessages.find((message) => message.type === "res" && message.id === "history-1");
+    assert.equal(response?.ok, true);
+    const payload = response?.payload as { messages?: Array<Record<string, unknown>> };
+    assert.deepEqual(payload.messages?.map((message) => message.id), ["original-user", "assistant-1"]);
+
+    const rewrittenTranscript = await readFile(transcriptPath, "utf8");
+    assert.equal(rewrittenTranscript.includes("prompt-mirror"), false);
+    assert.match(rewrittenTranscript, /"id":"assistant-1","parentId":"original-user"/);
   } finally {
     abort.abort();
     gatewaySocket?.close(1000, "test done");

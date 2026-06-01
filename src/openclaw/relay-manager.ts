@@ -36,6 +36,10 @@ import {
   type HistoryResponse,
 } from "./relay/chat-history.js";
 import {
+  dedupeOpenClawChatSendUserMirrorTranscript,
+  type ChatSendUserMirrorDedupeRequest,
+} from "./relay/transcript-dedupe.js";
+import {
   buildMobileAssistantErrorPayload,
   buildMobileAssistantFinalPayload,
 } from "../core/relay/mobile-chat-run-bridge.js";
@@ -75,6 +79,7 @@ const CHAT_HISTORY_FALLBACK_INITIAL_DELAY_MS = 1200;
 const CHAT_HISTORY_FALLBACK_RETRY_DELAY_MS = 1800;
 const CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS = 120;
 const CHAT_HISTORY_FINAL_RETRY_DELAY_MS = 750;
+const CHAT_SEND_MIRROR_DEDUPE_RETRY_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 20000, 30000];
 
 /** Messages the relay server sends to the relay client. */
 interface FromServer {
@@ -134,6 +139,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     const chatBuffers = new Map<string, string>();
     const chatFallbacks = new Map<string, ReturnType<typeof setTimeout>>();
     const chatRunContexts = new Map<string, ChatRunContext>();
+    const chatSendDedupeRequests = new Map<string, ChatSendUserMirrorDedupeRequest>();
+    const chatSendDedupeRunKeys = new Map<string, string>();
+    const chatSendDedupeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    const chatSendDedupeAttempts = new Map<string, number>();
+    const chatSendDedupeRunning = new Map<string, Promise<boolean>>();
     const outgoingMediaUploadCache = new Map<string, FileUploadResult>();
     const contextUsageRefreshes = new Map<string, ReturnType<typeof setTimeout>>();
     const contextUsageFingerprints = new Map<string, string>();
@@ -145,6 +155,152 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         chatFallbacks.delete(runId);
       }
     };
+
+    const clearChatSendDedupe = (clientRunId: string): void => {
+      const timer = chatSendDedupeTimers.get(clientRunId);
+      if (timer) {
+        clearTimeout(timer);
+        chatSendDedupeTimers.delete(clientRunId);
+      }
+      chatSendDedupeRequests.delete(clientRunId);
+      chatSendDedupeAttempts.delete(clientRunId);
+      for (const [runId, mappedClientRunId] of chatSendDedupeRunKeys.entries()) {
+        if (mappedClientRunId === clientRunId) {
+          chatSendDedupeRunKeys.delete(runId);
+        }
+      }
+    };
+
+    const registerChatSendDedupe = (request: ChatSendUserMirrorDedupeRequest, runId?: string): void => {
+      chatSendDedupeRequests.set(request.clientRunId, request);
+      if (runId) {
+        chatSendDedupeRunKeys.set(runId, request.clientRunId);
+      }
+      scheduleChatSendDedupe(request.clientRunId);
+    };
+
+    function scheduleChatSendDedupe(clientRunId: string, delayOverrideMs?: number): void {
+      if (!chatSendDedupeRequests.has(clientRunId)) {
+        return;
+      }
+      const existing = chatSendDedupeTimers.get(clientRunId);
+      if (existing) {
+        clearTimeout(existing);
+      }
+      const attempt = chatSendDedupeAttempts.get(clientRunId) ?? 0;
+      const delayMs = delayOverrideMs ?? CHAT_SEND_MIRROR_DEDUPE_RETRY_DELAYS_MS[Math.min(
+        attempt,
+        CHAT_SEND_MIRROR_DEDUPE_RETRY_DELAYS_MS.length - 1,
+      )];
+      const timer = setTimeout(() => {
+        chatSendDedupeTimers.delete(clientRunId);
+        void runChatSendDedupeAttempt(clientRunId).then((changed) => {
+          if (changed || !chatSendDedupeRequests.has(clientRunId)) {
+            return;
+          }
+          const nextAttempt = attempt + 1;
+          if (nextAttempt >= CHAT_SEND_MIRROR_DEDUPE_RETRY_DELAYS_MS.length) {
+            clearChatSendDedupe(clientRunId);
+            return;
+          }
+          chatSendDedupeAttempts.set(clientRunId, nextAttempt);
+          scheduleChatSendDedupe(clientRunId);
+        });
+      }, delayMs);
+      timer.unref?.();
+      chatSendDedupeTimers.set(clientRunId, timer);
+    }
+
+    function scheduleChatSendDedupeForRun(runId: string, delayMs = 100): void {
+      const clientRunId = chatSendDedupeRunKeys.get(runId);
+      if (!clientRunId) {
+        return;
+      }
+      scheduleChatSendDedupe(clientRunId, delayMs);
+    }
+
+    async function runChatSendDedupeAttempt(clientRunId: string): Promise<boolean> {
+      const running = chatSendDedupeRunning.get(clientRunId);
+      if (running) {
+        return running;
+      }
+
+      const promise = (async () => {
+        const request = chatSendDedupeRequests.get(clientRunId);
+        if (!request) {
+          return false;
+        }
+        try {
+          const result = await dedupeOpenClawChatSendUserMirrorTranscript(request, sessionDefaults, { maxRetries: 2 });
+          if (result.changed) {
+            console.log(`[relay] removed ${result.removedCount} duplicate OpenClaw prompt mirror(s) from ${result.transcriptPath ?? "transcript"}`);
+            clearChatSendDedupe(clientRunId);
+            return true;
+          }
+        } catch (error) {
+          console.warn(`[relay] chat.send transcript dedupe failed runId=${clientRunId}: ${String(error)}`);
+        }
+        return false;
+      })().finally(() => {
+        chatSendDedupeRunning.delete(clientRunId);
+      });
+
+      chatSendDedupeRunning.set(clientRunId, promise);
+      return promise;
+    }
+
+    async function dedupePendingChatSendMirrorsForSession(rawParams: unknown): Promise<void> {
+      const sessionKey = resolveRawParamsSessionKey(rawParams);
+      const pending = Array.from(chatSendDedupeRequests.entries()).filter(([, request]) => {
+        const requestSessionKey = canonicalizeSessionKey(request.sessionKey ?? sessionDefaults.mainSessionKey, sessionDefaults);
+        return requestSessionKey === sessionKey;
+      });
+      for (const [clientRunId] of pending) {
+        await runChatSendDedupeAttempt(clientRunId);
+      }
+    }
+
+    function buildChatSendDedupeRequest(paramsRecord: Record<string, unknown> | undefined): ChatSendUserMirrorDedupeRequest | undefined {
+      if (!paramsRecord) {
+        return undefined;
+      }
+      const message = typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
+        ? paramsRecord.message.trim()
+        : "";
+      const idempotencyKey = typeof paramsRecord.idempotencyKey === "string" && paramsRecord.idempotencyKey.trim().length > 0
+        ? paramsRecord.idempotencyKey.trim()
+        : "";
+      if (!message || !idempotencyKey) {
+        return undefined;
+      }
+      const clientRunId = idempotencyKey.endsWith(":user")
+        ? idempotencyKey.slice(0, -":user".length)
+        : idempotencyKey;
+      if (!clientRunId) {
+        return undefined;
+      }
+      return {
+        clientRunId,
+        message,
+        sessionKey: resolveRawParamsSessionKey(paramsRecord),
+        senderId: "openclaw-macos",
+        senderName: "ClawConnect Agent",
+      };
+    }
+
+    function resolveRawParamsSessionKey(rawParams: unknown): string {
+      const record = rawParams && typeof rawParams === "object" && !Array.isArray(rawParams)
+        ? (rawParams as Record<string, unknown>)
+        : {};
+      const rawSessionKey =
+        typeof record.sessionKey === "string" && record.sessionKey.trim().length > 0
+          ? record.sessionKey.trim()
+          : sessionDefaults.mainSessionKey;
+      const normalized = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
+      return typeof normalized === "string" && normalized.trim().length > 0
+        ? normalized.trim()
+        : sessionDefaults.mainSessionKey;
+    }
 
     const publishContextUsageSnapshot = async (sessionKey: string, force = false): Promise<void> => {
       const normalizedSessionKey = canonicalizeSessionKey(sessionKey, sessionDefaults);
@@ -321,6 +477,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
     async function requestChatHistoryFromClawConnect(params: unknown): Promise<HistoryResponse> {
       try {
+        await dedupePendingChatSendMirrorsForSession(params);
         const transcriptHistory = await readOpenClawTranscriptChatHistory(params, sessionDefaults);
         if (transcriptHistory) {
           return transcriptHistory;
@@ -501,6 +658,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             let realtimePayload = normalizedPayload;
 
             if (runId) {
+              if (state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted") {
+                scheduleChatSendDedupeForRun(runId, 100);
+              }
               if (role === "assistant" && (state === "delta" || state === "final" || state === "error" || state === "failed" || state === "fail")) {
                 clearChatFallback(runId);
               }
@@ -668,6 +828,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         params && typeof params === "object" && !Array.isArray(params)
           ? (params as Record<string, unknown>)
           : undefined;
+      const chatSendDedupeRequest = msg.method === "chat.send"
+        ? buildChatSendDedupeRequest(paramsRecord)
+        : undefined;
 
       if (!gatewayClient && msg.method !== "chat.history") {
         throw new Error("gateway not connected");
@@ -705,6 +868,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 promptText,
               };
               scheduleChatHistoryFallback(runId, runContext);
+            }
+            if (msg.method === "chat.send" && chatSendDedupeRequest) {
+              registerChatSendDedupe(chatSendDedupeRequest, runId);
             }
             // Let a model switch settle before publishing context usage again.
             // Forced refreshes can replay a stale model snapshot and overwrite the new selection.
@@ -753,6 +919,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         clearTimeout(timer);
       }
       chatFallbacks.clear();
+      for (const timer of chatSendDedupeTimers.values()) {
+        clearTimeout(timer);
+      }
+      chatSendDedupeTimers.clear();
+      chatSendDedupeRequests.clear();
+      chatSendDedupeRunKeys.clear();
+      chatSendDedupeAttempts.clear();
       for (const timer of contextUsageRefreshes.values()) {
         clearTimeout(timer);
       }
