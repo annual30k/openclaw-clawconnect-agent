@@ -3,6 +3,24 @@ import { existsSync } from "fs";
 import { homedir } from "os";
 import { extname, join, resolve } from "path";
 
+const DELIVERABLE_EXTENSIONS = [
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg",
+  ".mp4", ".mov", ".avi", ".mkv", ".webm",
+  ".mp3", ".wav", ".ogg", ".m4a", ".flac",
+  ".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".md",
+  ".xlsx", ".xls", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
+  ".pptx", ".ppt", ".odp", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".7z",
+  ".html", ".htm",
+];
+
+const deliverableExtensionPattern = DELIVERABLE_EXTENSIONS
+  .map((extension) => extension.slice(1).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+  .sort((a, b) => b.length - a.length)
+  .join("|");
+
+const deliverablePathRegexSource = String.raw`(?:~|\/)[^\n"'` + "`" + String.raw`<>|]*?\.(?:${deliverableExtensionPattern})(?=$|[\s).,"'` + "`" + String.raw`，。；;:：!?？])`;
+const deliverablePathRegex = new RegExp(String.raw`(?:^|[\s("'` + "`" + String.raw`:：])(${deliverablePathRegexSource})`, "gi");
+
 export function extractDeliverablePaths(
   text: string,
   options: { userMessage?: string } = {},
@@ -11,18 +29,9 @@ export function extractDeliverablePaths(
     return [];
   }
 
-  const allowed = new Set([
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg",
-    ".mp4", ".mov", ".avi", ".mkv", ".webm",
-    ".mp3", ".wav", ".ogg", ".m4a", ".flac",
-    ".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".md",
-    ".xlsx", ".xls", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
-    ".pptx", ".ppt", ".odp", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".7z",
-    ".html", ".htm",
-  ]);
+  const allowed = new Set(DELIVERABLE_EXTENSIONS);
   const paths = new Set<string>();
-  const pattern = /(?:^|[\s("'`:：])((?:~|\/)[^\s"'`<>|]+?\.[A-Za-z0-9]{1,8})(?=$|[\s).,"'`])/g;
-  for (const match of text.matchAll(pattern)) {
+  for (const match of text.matchAll(deliverablePathRegex)) {
     const rawPath = match[1];
     const absolutePath = rawPath.startsWith("~/") ? join(homedir(), rawPath.slice(2)) : rawPath;
     if (allowed.has(extname(absolutePath).toLowerCase()) && existsSync(resolve(absolutePath))) {
@@ -53,6 +62,13 @@ function hasDeliverableSendIntent(message: string): boolean {
   const sendVerbs = [
     "发", "发送", "传", "上传", "转发", "分享", "发给", "传给", "send", "upload", "attach", "share", "deliver",
   ].join("|");
+
+  const pathIntentPattern = new RegExp(
+    `(?:(${sendVerbs}).{0,80}${deliverablePathRegexSource}|${deliverablePathRegexSource}.{0,80}(${sendVerbs}))`,
+  );
+  if (pathIntentPattern.test(text)) {
+    return true;
+  }
 
   if (new RegExp(`(你.{0,6}(能|可以|会)|能不能|可不可以|能否|是否|会不会|支持).{0,30}(${sendVerbs}).{0,30}(${deliverableWords}).{0,8}(吗|么|嘛|\\?|？)?`).test(text)) {
     return false;

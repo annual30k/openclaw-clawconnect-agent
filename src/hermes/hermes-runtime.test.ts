@@ -52,8 +52,10 @@ test("extractDeliverablePaths requires the latest user to ask for sending files"
   const dir = mkdtempSync(join(tmpdir(), "hermes-artifacts-intent-"));
   try {
     const imagePath = join(dir, "微信图片_20260427092438_279_84.jpg");
+    const spacedImagePath = join(dir, "ChatGPT Image 2026年4月24日 02_12_21.png");
     const docPath = join(dir, "vue_component_progressive_introduction.docx");
     writeFileSync(imagePath, "jpg");
+    writeFileSync(spacedImagePath, "png");
     writeFileSync(docPath, "docx");
 
     const answerWithOldPaths = [
@@ -88,6 +90,18 @@ test("extractDeliverablePaths requires the latest user to ask for sending files"
     );
     assert.deepEqual(
       extractDeliverablePaths(`图片路径：${imagePath}`, { userMessage: "发送这张图到手机" }),
+      [imagePath],
+    );
+    assert.deepEqual(
+      extractDeliverablePaths(`图片路径：${spacedImagePath}`, { userMessage: "把这张图片发给我" }),
+      [spacedImagePath],
+    );
+    assert.deepEqual(
+      extractDeliverablePaths(`图片路径：${imagePath}`, { userMessage: "发过来了吗" }),
+      [imagePath],
+    );
+    assert.deepEqual(
+      extractDeliverablePaths(`Path: ${imagePath}`, { userMessage: `send ${imagePath} to my phone` }),
       [imagePath],
     );
     assert.deepEqual(

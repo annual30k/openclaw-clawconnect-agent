@@ -391,7 +391,12 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 text: outcome.text,
                 includeTimelineEvents: true,
               });
-              await publishAndSendGatewayEvent("chat", buildFinalPayloadFromHistoryOutcome(basePayload, outcome), true);
+              await publishAndSendGatewayEvent(
+                "chat",
+                buildFinalPayloadFromHistoryOutcome(basePayload, outcome),
+                true,
+                context.promptText,
+              );
               return;
             }
             await publishAndSendGatewayEvent(
@@ -446,7 +451,12 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       send({ type: "event", event: "office", payload: officePayload });
     }
 
-    async function publishAndSendGatewayEvent(eventName: string, payload: unknown, publishOffice: boolean): Promise<void> {
+    async function publishAndSendGatewayEvent(
+      eventName: string,
+      payload: unknown,
+      publishOffice: boolean,
+      userMessage?: string,
+    ): Promise<void> {
       const outgoingPayload = eventName === "chat"
         ? await relayOutgoingMediaInPayload(payload, {
             relayServerUrl: opts.relayServerUrl,
@@ -454,6 +464,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             gatewayId: opts.gatewayId,
             senderDisplayName: "OpenClaw",
             cache: outgoingMediaUploadCache,
+            userMessage,
           })
         : payload;
       if (publishOffice) {
@@ -688,7 +699,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                   chatRunContexts.delete(runId);
                 }
                 const outgoingPayload = withMessageText(normalizedPayload, resolvedText);
-                void publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice);
+                void publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
                 return;
               }
 
@@ -708,7 +719,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                   }
                   if (outcome?.kind === "final") {
                     const outgoingPayload = buildFinalPayloadFromHistoryOutcome(normalizedPayload, outcome);
-                    await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice);
+                    await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
                     return;
                   }
                   if (outcome?.kind === "error") {

@@ -84,6 +84,75 @@ test("relayOutgoingMediaInHistoryResponse rewrites outgoing media inside chat hi
   }
 });
 
+test("relayOutgoingMediaInPayload uploads assistant local artifact paths when user asked to send them", async () => {
+  const root = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-artifact-"));
+  const imagePath = join(root, "ChatGPT Image 2026 04 24.jpg");
+  await writeFile(imagePath, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+  const server = await createFileUploadRelayServer("file_local_artifact");
+  try {
+    const payload = {
+      runId: "run-1",
+      sessionKey: "agent:main:session_1",
+      state: "final",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: `Here is the image:\n${imagePath}` },
+        ],
+      },
+    };
+
+    const result = await relayOutgoingMediaInPayload(payload, {
+      relayServerUrl: server.baseUrl,
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      cache: new Map(),
+      userMessage: `send ${imagePath} to my phone`,
+    }) as typeof payload;
+
+    assert.equal(result.message.content.length, 2);
+    const image = result.message.content[1] as Record<string, unknown>;
+    assert.equal(image.type, "image");
+    assert.equal(image.fileId, "file_local_artifact");
+    assert.equal(image.downloadUrl, "/api/mobile/files/file_local_artifact");
+    assert.equal(image.downloadPath, "/api/mobile/files/file_local_artifact");
+    assert.equal(image.sourceRunId, "run-1");
+  } finally {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("relayOutgoingMediaInPayload leaves local paths alone without send intent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-artifact-no-intent-"));
+  const imagePath = join(root, "photo.jpg");
+  await writeFile(imagePath, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+  try {
+    const payload = {
+      runId: "run-1",
+      sessionKey: "agent:main:session_1",
+      state: "final",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: `The image path is ${imagePath}` },
+        ],
+      },
+    };
+
+    const result = await relayOutgoingMediaInPayload(payload, {
+      relayServerUrl: "http://127.0.0.1:1",
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      userMessage: "where is the image",
+    });
+
+    assert.equal(result, payload);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function createOutgoingMediaFixture() {
   const root = await mkdtemp(join(tmpdir(), "clawconnect-outgoing-media-"));
   const recordsDir = join(root, "records");

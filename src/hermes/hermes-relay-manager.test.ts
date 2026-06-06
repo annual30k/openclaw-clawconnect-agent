@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  buildHermesArtifactContentBlock,
   buildHermesArtifactUploadRequest,
   buildHermesRelayHelloMessage,
   collectHermesSlashCommandCatalog,
@@ -11,6 +12,50 @@ import {
   searchHermesSlashCommandCatalog,
   shouldPublishHermesOfficeSnapshot,
 } from "./hermes-relay-manager.js";
+
+test("Hermes image artifact upload is represented as a mobile content block", () => {
+  const block = buildHermesArtifactContentBlock({
+    filePath: "/tmp/reply.png",
+    absolutePath: "/tmp/reply.png",
+    gatewayId: "gw-1",
+    sessionKey: "main",
+    fileId: "file-image-1",
+    uploadId: "upload-1",
+    fileName: "reply.png",
+    mimeType: "image/png",
+    sizeBytes: 1234,
+    imageWidth: 640,
+    imageHeight: 360,
+    sha256: "sha",
+    chunkSize: 1024,
+    totalChunks: 2,
+    sourceRunId: "run-1",
+    expiresAt: "2026-06-06T00:00:00.000Z",
+    downloadPath: "/api/mobile/files/file-image-1",
+    downloadUrl: "http://127.0.0.1:8080/api/mobile/files/file-image-1",
+    status: "available",
+    createdAt: "2026-06-06T00:00:00.000Z",
+    updatedAt: "2026-06-06T00:00:00.000Z",
+  }, "att-1");
+
+  assert.deepEqual(block, {
+    type: "image",
+    attachmentId: "att-1",
+    fileId: "file-image-1",
+    fileName: "reply.png",
+    mimeType: "image/png",
+    sizeBytes: 1234,
+    imageWidth: 640,
+    imageHeight: 360,
+    downloadUrl: "/api/mobile/files/file-image-1",
+    downloadPath: "/api/mobile/files/file-image-1",
+    expiresAt: "2026-06-06T00:00:00.000Z",
+    sourceRunId: "run-1",
+    gatewayId: "gw-1",
+    sessionKey: "main",
+    status: "available",
+  });
+});
 
 test("Hermes artifact uploads are linked to the assistant source run", () => {
   const request = buildHermesArtifactUploadRequest({

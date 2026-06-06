@@ -93,6 +93,39 @@ test("mobile chat run bridge builds gateway-neutral assistant events", () => {
   );
 
   assert.deepEqual(
+    buildMobileAssistantFinalPayload({
+      run,
+      text: "done",
+      contentBlocks: [{
+        type: "image",
+        fileId: "file-image-1",
+        fileName: "reply.png",
+        mimeType: "image/png",
+        downloadPath: "/api/mobile/files/file-image-1",
+      }],
+    }),
+    {
+      runId: "mobile-run-1",
+      sessionKey: "main",
+      state: "final",
+      role: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "done" },
+          {
+            type: "image",
+            fileId: "file-image-1",
+            fileName: "reply.png",
+            mimeType: "image/png",
+            downloadPath: "/api/mobile/files/file-image-1",
+          },
+        ],
+      },
+    },
+  );
+
+  assert.deepEqual(
     buildMobileAssistantErrorPayload({
       run,
       errorMessage: "failed",

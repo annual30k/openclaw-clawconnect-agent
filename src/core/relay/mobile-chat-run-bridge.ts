@@ -174,15 +174,20 @@ export function buildMobileAssistantStreamingPayload(params: {
 export function buildCanonicalMobileAssistantFinalPayload(params: {
   run: MobileChatRun;
   text: string;
+  contentBlocks?: TimelineContentBlock[];
   includeTimelineEvents?: boolean;
 } & MobileAssistantUsage) {
+  const content = [
+    { type: "text", text: params.text },
+    ...(params.contentBlocks ?? []),
+  ];
   const timelineEvent = buildMessageCompletedEvent({
     gatewayId: "clawconnect",
     sessionKey: params.run.sessionKey,
     turnId: params.run.runId,
     runId: params.run.runId,
     role: "assistant",
-    content: [{ type: "text", text: params.text }],
+    content,
   });
   const text = timelineTextContent(timelineEvent);
   return {
@@ -196,7 +201,10 @@ export function buildCanonicalMobileAssistantFinalPayload(params: {
     ...(params.contextLimit !== undefined ? { contextLimit: params.contextLimit } : {}),
     message: {
       role: "assistant",
-      content: [{ type: "text", text }],
+      content: [
+        { type: "text", text },
+        ...(params.contentBlocks ?? []),
+      ],
     },
     ...(params.includeTimelineEvents
       ? {
@@ -218,6 +226,7 @@ export function buildCanonicalMobileAssistantFinalPayload(params: {
 export function buildMobileAssistantFinalPayload(params: {
   run: MobileChatRun;
   text: string;
+  contentBlocks?: TimelineContentBlock[];
   includeTimelineEvents?: boolean;
 } & MobileAssistantUsage) {
   return buildCanonicalMobileAssistantFinalPayload(params);
