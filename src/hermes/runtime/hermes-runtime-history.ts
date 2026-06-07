@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { LocalResult } from "../../core/command-types.js";
 import { canonicalizeMobileAssistantText } from "../../core/relay/mobile-chat-run-bridge.js";
 import { buildHistorySnapshotPage } from "../../core/relay/timeline-event-builder.js";
@@ -18,6 +19,18 @@ const DEFAULT_HISTORY_LIMIT = 100;
 const MAX_HISTORY_LIMIT = 200;
 const CURSOR_PREFIX = "seq:";
 
+type HermesHistoryCacheEntry = {
+  parsed: unknown;
+  sessionId?: string;
+  messages: HermesHistoryMessage[];
+};
+
+const hermesHistoryCache = new Map<string, HermesHistoryCacheEntry>();
+
+export function clearHermesHistoryCache(): void {
+  hermesHistoryCache.clear();
+}
+
 export async function runHermesChatHistory(params: unknown): Promise<LocalResult> {
   const record = toRecord(params);
   const sessionKey = stringParam(record, "sessionKey", "session_key", "key", "session") ?? "main";
@@ -26,8 +39,15 @@ export async function runHermesChatHistory(params: unknown): Promise<LocalResult
     return exportResult;
   }
 
-  const parsed = parseHermesHistoryExportOutput(toRecord(exportResult.payload).output);
-  const messages = normalizeHermesHistoryMessages(parsed);
+  const exportOutput = toRecord(exportResult.payload).output;
+  const exportHash = hashHermesHistoryExportOutput(exportOutput);
+  const history = readHermesHistoryExportFromCache({
+    sessionIdentity: stringParam(record, "sessionId", "session_id", "hermesSessionId", "id") ?? sessionKey,
+    exportHash,
+    exportOutput,
+  });
+  const parsed = history.parsed;
+  const messages = history.messages;
   const page = paginateHermesHistory(messages, {
     limit: normalizeHistoryLimit(record.limit),
     cursorSeq: parseHistoryCursorSeq(record.cursor),
@@ -62,12 +82,48 @@ export async function runHermesChatHistory(params: unknown): Promise<LocalResult
           createdAt: message.createdAt ?? timestampToIso(message.timestamp) ?? new Date(0).toISOString(),
           partId: "part-text-1",
           content: message.content,
+          seq: message.seq,
+          turnSeq: message.seq,
         };
       }),
       attachments: [],
     }),
   };
   return { ok: true, payload };
+}
+
+function readHermesHistoryExportFromCache(params: {
+  sessionIdentity: string;
+  exportHash: string;
+  exportOutput: unknown;
+}): HermesHistoryCacheEntry {
+  const primaryKey = hermesHistoryCacheKey(params.sessionIdentity, params.exportHash);
+  const cached = hermesHistoryCache.get(primaryKey);
+  if (cached) {
+    return cached;
+  }
+
+  const parsed = parseHermesHistoryExportOutput(params.exportOutput);
+  const sessionId = stringParam(toRecord(parsed), "sessionId", "session_id", "id");
+  const entry: HermesHistoryCacheEntry = {
+    parsed,
+    ...(sessionId ? { sessionId } : {}),
+    messages: normalizeHermesHistoryMessages(parsed),
+  };
+  hermesHistoryCache.set(primaryKey, entry);
+  if (sessionId && sessionId !== params.sessionIdentity) {
+    hermesHistoryCache.set(hermesHistoryCacheKey(sessionId, params.exportHash), entry);
+  }
+  return entry;
+}
+
+function hermesHistoryCacheKey(sessionIdentity: string, exportHash: string): string {
+  return `${sessionIdentity}\u0000${exportHash}`;
+}
+
+function hashHermesHistoryExportOutput(value: unknown): string {
+  const source = typeof value === "string" ? value : JSON.stringify(value);
+  return createHash("sha256").update(source ?? "").digest("hex");
 }
 
 function parseHermesHistoryExportOutput(value: unknown): unknown {

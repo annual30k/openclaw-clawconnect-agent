@@ -117,6 +117,8 @@ test("parses canonical history snapshot pages", () => {
         messageState: "completed",
         createdAt: "2026-05-29T03:00:00.000Z",
         content: [{ type: "text", text: "done" }],
+        seq: 12,
+        turnSeq: 2,
       },
     ],
     attachments: [],
@@ -125,5 +127,7 @@ test("parses canonical history snapshot pages", () => {
 
   assert.equal(page.eventType, "history.snapshot.page");
   assert.equal(page.messages[0]?.messageId, "assistant-turn_123");
+  assert.equal(page.messages[0]?.seq, 12);
+  assert.equal(page.messages[0]?.turnSeq, 2);
   assert.deepEqual(page.extensions, { unknownSnapshotField: "preserved" });
 });

@@ -82,6 +82,8 @@ export type TimelineHistoryMessage = {
   content: TimelineContentBlock[];
   partId?: string;
   runId?: string;
+  seq?: number;
+  turnSeq?: number;
 };
 
 export type CanonicalTimelineHistorySnapshotPage = {
@@ -318,6 +320,8 @@ function parseHistoryMessage(input: unknown): TimelineHistoryMessage {
     content: parseContentBlocks(input.content),
     ...(typeof input.partId === "string" ? { partId: input.partId } : {}),
     ...(typeof input.runId === "string" ? { runId: input.runId } : {}),
+    ...(typeof input.seq === "number" && Number.isFinite(input.seq) ? { seq: input.seq } : {}),
+    ...(typeof input.turnSeq === "number" && Number.isFinite(input.turnSeq) ? { turnSeq: input.turnSeq } : {}),
   };
 }
 

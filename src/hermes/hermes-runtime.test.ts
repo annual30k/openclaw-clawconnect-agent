@@ -894,6 +894,8 @@ test("runHermesChatHistory returns OpenClaw-shaped canonical history", async () 
             content: [{ type: "text", text: "hello" }],
             partId: "part-text-1",
             runId: "history-main-1-user",
+            seq: 1,
+            turnSeq: 1,
           },
           {
             turnId: "history-main-2-assistant",
@@ -907,6 +909,8 @@ test("runHermesChatHistory returns OpenClaw-shaped canonical history", async () 
             ],
             partId: "part-text-1",
             runId: "history-main-2-assistant",
+            seq: 2,
+            turnSeq: 2,
           },
         ],
         attachments: [],
@@ -954,12 +958,165 @@ test("Hermes command router handles chat.history canonically", async () => {
   }
 });
 
+test("runHermesChatHistory reuses normalized history for the same session export hash", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-cache-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writePagedHistoryHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId: "20260529_100000_history",
+      displayName: "History",
+      kind: "hermes",
+    });
+
+    const newest = await runHermesChatHistory({ sessionKey: "main", limit: 2 });
+    const older = await runHermesChatHistory({
+      sessionKey: "main",
+      limit: 2,
+      cursor: (newest.payload as { nextCursor?: string }).nextCursor,
+      direction: "older",
+    });
+
+    assert.equal(newest.ok, true);
+    assert.equal(older.ok, true);
+    assert.deepEqual((newest.payload as { messages?: Array<{ seq: number }> }).messages?.map((message) => message.seq), [3, 4]);
+    assert.deepEqual((older.payload as { messages?: Array<{ seq: number }> }).messages?.map((message) => message.seq), [1, 2]);
+    const newestThirdMessage = (newest.payload as { messages?: unknown[] }).messages?.[0];
+    const newerFromOlderPage = await runHermesChatHistory({
+      sessionKey: "main",
+      limit: 1,
+      cursor: (older.payload as { newestCursor?: string }).newestCursor,
+      direction: "newer",
+    });
+    assert.equal(newerFromOlderPage.ok, true);
+    assert.equal((newerFromOlderPage.payload as { messages?: unknown[] }).messages?.[0], newestThirdMessage);
+
+    const explicitSessionIdPage = await runHermesChatHistory({
+      sessionKey: "main",
+      sessionId: "20260529_100000_history",
+      limit: 1,
+      cursor: "seq:2",
+      direction: "newer",
+    });
+    assert.equal(explicitSessionIdPage.ok, true);
+    assert.equal((explicitSessionIdPage.payload as { messages?: unknown[] }).messages?.[0], newestThirdMessage);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChatHistory invalidates normalized history when the export hash changes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-cache-invalidate-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const payloadPath = join(root, "history-payload.json");
+    const binPath = writeMutableHistoryHermesBin(root, payloadPath);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId: "20260529_100000_history",
+      displayName: "History",
+      kind: "hermes",
+    });
+    writeFileSync(payloadPath, JSON.stringify({
+      sessionId: "20260529_100000_history",
+      messages: [{ id: "m1", role: "assistant", content: "first", createdAt: "2026-05-29T02:00:01.000Z" }],
+    }));
+
+    const first = await runHermesChatHistory({ sessionKey: "main", limit: 1 });
+    writeFileSync(payloadPath, JSON.stringify({
+      sessionId: "20260529_100000_history",
+      messages: [{ id: "m1", role: "assistant", content: "second", createdAt: "2026-05-29T02:00:01.000Z" }],
+    }));
+    const second = await runHermesChatHistory({ sessionKey: "main", limit: 1 });
+
+    const firstMessage = (first.payload as { messages?: Array<{ content: unknown }> }).messages?.[0];
+    const secondMessage = (second.payload as { messages?: Array<{ content: unknown }> }).messages?.[0];
+    assert.deepEqual(firstMessage?.content, [{ type: "text", text: "first" }]);
+    assert.deepEqual(secondMessage?.content, [{ type: "text", text: "second" }]);
+    assert.notEqual(secondMessage, firstMessage);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function restoreEnv(name: string, previousValue: string | undefined): void {
   if (previousValue === undefined) {
     delete process.env[name];
   } else {
     process.env[name] = previousValue;
   }
+}
+
+function writeMutableHistoryHermesBin(root: string, payloadPath: string): string {
+  const binPath = join(root, "hermes-history-mutable");
+  writeFileSync(binPath, [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"export\" ]; then",
+    `  cat '${payloadPath.replace(/'/g, "'\\''")}'`,
+    "  printf '\\n'",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"list\" ]; then",
+    "  echo 'Title                            Preview          Last Active   ID'",
+    "  echo 'History                          visible reply    just now      20260529_100000_history'",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"status\" ]; then exit 0; fi",
+    "echo \"unexpected args: $@\" >&2",
+    "exit 2",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}
+
+function writePagedHistoryHermesBin(root: string): string {
+  const binPath = join(root, "hermes-history-paged");
+  const payload = JSON.stringify({
+    sessionId: "20260529_100000_history",
+    messages: Array.from({ length: 4 }, (_, index) => {
+      const seq = index + 1;
+      return {
+        id: `m${seq}`,
+        role: seq % 2 === 0 ? "assistant" : "user",
+        content: `message ${seq}`,
+        createdAt: new Date(Date.UTC(2026, 4, 29, 2, 0, seq)).toISOString(),
+      };
+    }),
+  });
+  writeFileSync(binPath, [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"export\" ]; then",
+    `  printf '%s\\n' '${payload.replace(/'/g, "'\\''")}'`,
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"list\" ]; then",
+    "  echo 'Title                            Preview          Last Active   ID'",
+    "  echo 'History                          visible reply    just now      20260529_100000_history'",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"status\" ]; then exit 0; fi",
+    "echo \"unexpected args: $@\" >&2",
+    "exit 2",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
 }
 
 function writeFakeHermesBin(root: string): string {

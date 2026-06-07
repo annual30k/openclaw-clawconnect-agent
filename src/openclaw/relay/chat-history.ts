@@ -1,4 +1,11 @@
 import { readFile, stat } from "fs/promises";
+import { buildHistorySnapshotPage } from "../../core/relay/timeline-event-builder.js";
+import type {
+  CanonicalTimelineHistorySnapshotPage,
+  TimelineContentBlock,
+  TimelineMessageState,
+  TimelineRole,
+} from "../../core/relay/timeline-event-log.js";
 import {
   resolveOpenClawSessionTranscript,
   type GatewaySessionDefaults,
@@ -28,6 +35,7 @@ export type HistoryResponse = {
   hasMore?: boolean;
   nextCursor?: string;
   newestCursor?: string;
+  timelineSnapshot?: CanonicalTimelineHistorySnapshotPage;
 };
 
 export type ChatHistoryOutcome =
@@ -108,6 +116,32 @@ export async function readChatHistoryFromTranscriptFile(
     hasMore: page.hasMore,
     ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
     ...(page.newestCursor ? { newestCursor: page.newestCursor } : {}),
+    timelineSnapshot: buildHistorySnapshotPage({
+      gatewayId: "clawconnect",
+      sessionKey: request.sessionKey,
+      cursor: normalizeCursor(request.cursor) ?? null,
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor ?? null,
+      newestCursor: page.newestCursor ?? null,
+      messages: page.messages.map((message, index) => {
+        const seq = messageSeq(message) ?? index + 1;
+        const role = normalizeTimelineRole(message.role);
+        const turnId = historyString(message, "turnId", "turn_id") ?? `history-${request.sessionKey}-${seq}-${role}`;
+        return {
+          turnId,
+          runId: historyString(message, "runId", "run_id") ?? turnId,
+          messageId: historyString(message, "messageId", "message_id", "id") ?? `${role}-${turnId}`,
+          role,
+          messageState: normalizeTimelineMessageState(message),
+          createdAt: normalizeTimelineCreatedAt(message),
+          partId: historyString(message, "partId", "part_id") ?? "part-text-1",
+          content: normalizeTimelineContentBlocks(message.content),
+          seq,
+          turnSeq: historyNumber(message, "turnSeq", "turn_seq") ?? seq,
+        };
+      }),
+      attachments: [],
+    }),
   };
 }
 
@@ -313,6 +347,72 @@ function normalizeHistoryTimestamp(value: unknown): number | undefined {
 function normalizeHistoryCreatedAt(value: unknown): string | undefined {
   const timestamp = normalizeHistoryTimestamp(value);
   return timestamp === undefined ? undefined : new Date(timestamp).toISOString();
+}
+
+function normalizeTimelineRole(value: unknown): TimelineRole {
+  const role = typeof value === "string" ? value.trim().toLowerCase().replace("_", "") : "";
+  switch (role) {
+    case "user":
+    case "assistant":
+    case "system":
+      return role;
+    case "tool":
+    case "toolresult":
+      return "tool";
+    default:
+      return "assistant";
+  }
+}
+
+function normalizeTimelineMessageState(message: HistoryMessage): TimelineMessageState {
+  return typeof message.errorMessage === "string" && message.errorMessage.trim().length > 0
+    ? "failed"
+    : "completed";
+}
+
+function normalizeTimelineCreatedAt(message: HistoryMessage): string {
+  if (typeof message.createdAt === "string" && message.createdAt.trim().length > 0) {
+    return message.createdAt.trim();
+  }
+  const timestamp = normalizeHistoryTimestamp(message.timestamp);
+  return timestamp === undefined ? new Date(0).toISOString() : new Date(timestamp).toISOString();
+}
+
+function normalizeTimelineContentBlocks(value: HistoryMessage["content"]): TimelineContentBlock[] {
+  if (typeof value === "string") {
+    const text = value.trim();
+    return text ? [{ type: "text", text }] : [];
+  }
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((block): TimelineContentBlock[] => {
+    if (!isRecord(block)) {
+      return [];
+    }
+    const type = typeof block.type === "string" && block.type.trim().length > 0 ? block.type.trim() : "text";
+    return [{ ...block, type }];
+  });
+}
+
+function historyString(record: Record<string, unknown>, ...fields: string[]): string | undefined {
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function historyNumber(record: Record<string, unknown>, ...fields: string[]): number | undefined {
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return Math.round(value);
+    }
+  }
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

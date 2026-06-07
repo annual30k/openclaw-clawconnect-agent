@@ -123,6 +123,87 @@ test("transcript history provider preserves OpenClaw tool content blocks", async
   }
 });
 
+test("transcript history provider returns a canonical timeline snapshot page", async () => {
+  const fixture = await createTranscriptFixture(2, [
+    {
+      type: "message",
+      id: "prompt-1",
+      timestamp: "2026-05-28T01:00:00.000Z",
+      message: {
+        role: "user",
+        content: "send the desktop image",
+      },
+    },
+    {
+      type: "message",
+      id: "file-1",
+      timestamp: "2026-05-28T01:00:01.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "sent:" },
+          { type: "file", fileId: "file-history-1", fileName: "desktop.png", mimeType: "image/png" },
+        ],
+      },
+    },
+  ]);
+  try {
+    const page = await readChatHistoryFromTranscriptFile({
+      sessionKey: "agent:main:main",
+      sessionId: "session-1",
+      transcriptPath: fixture.path,
+      limit: 20,
+    });
+    const snapshot = (page as HistoryResponse & {
+      timelineSnapshot?: {
+        protocolVersion: number;
+        eventType: string;
+        sessionKey: string;
+        cursor: string | null;
+        hasMore: boolean;
+        newestCursor: string | null;
+        messages: Array<Record<string, unknown>>;
+        attachments: unknown[];
+      };
+    }).timelineSnapshot;
+
+    assert.equal(snapshot?.protocolVersion, 2);
+    assert.equal(snapshot?.eventType, "history.snapshot.page");
+    assert.equal(snapshot?.sessionKey, "agent:main:main");
+    assert.equal(snapshot?.cursor, null);
+    assert.equal(snapshot?.hasMore, false);
+    assert.equal(snapshot?.newestCursor, "seq:2");
+    assert.deepEqual(snapshot?.messages.map((message) => ({
+      messageId: message.messageId,
+      role: message.role,
+      content: message.content,
+      seq: message.seq,
+      turnSeq: message.turnSeq,
+    })), [
+      {
+        messageId: "prompt-1",
+        role: "user",
+        content: [{ type: "text", text: "send the desktop image" }],
+        seq: 1,
+        turnSeq: 1,
+      },
+      {
+        messageId: "file-1",
+        role: "assistant",
+        content: [
+          { type: "text", text: "sent:" },
+          { type: "file", fileId: "file-history-1", fileName: "desktop.png", mimeType: "image/png" },
+        ],
+        seq: 2,
+        turnSeq: 2,
+      },
+    ]);
+    assert.deepEqual(snapshot?.attachments, []);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("transcript history provider recovers invalid and future cursors to newest older page", async () => {
   const fixture = await createTranscriptFixture(12);
   try {
