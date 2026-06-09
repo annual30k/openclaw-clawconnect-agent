@@ -82,8 +82,11 @@ export type TimelineHistoryMessage = {
   content: TimelineContentBlock[];
   partId?: string;
   runId?: string;
+  clientMessageId?: string;
+  idempotencyKey?: string;
   seq?: number;
   turnSeq?: number;
+  attachmentIds?: string[];
 };
 
 export type CanonicalTimelineHistorySnapshotPage = {
@@ -320,8 +323,13 @@ function parseHistoryMessage(input: unknown): TimelineHistoryMessage {
     content: parseContentBlocks(input.content),
     ...(typeof input.partId === "string" ? { partId: input.partId } : {}),
     ...(typeof input.runId === "string" ? { runId: input.runId } : {}),
+    ...(typeof input.clientMessageId === "string" ? { clientMessageId: input.clientMessageId } : {}),
+    ...(typeof input.idempotencyKey === "string" ? { idempotencyKey: input.idempotencyKey } : {}),
     ...(typeof input.seq === "number" && Number.isFinite(input.seq) ? { seq: input.seq } : {}),
     ...(typeof input.turnSeq === "number" && Number.isFinite(input.turnSeq) ? { turnSeq: input.turnSeq } : {}),
+    ...(Array.isArray(input.attachmentIds)
+      ? { attachmentIds: input.attachmentIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0) }
+      : {}),
   };
 }
 

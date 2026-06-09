@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile, stat } from "fs/promises";
 import { buildHistorySnapshotPage } from "../../core/relay/timeline-event-builder.js";
 import type {
@@ -19,6 +20,8 @@ export type HistoryMessage = {
   timestamp?: number;
   createdAt?: string;
   seq?: number;
+  clientMessageId?: string;
+  idempotencyKey?: string;
   stopReason?: string;
   errorMessage?: string;
 };
@@ -126,18 +129,28 @@ export async function readChatHistoryFromTranscriptFile(
       messages: page.messages.map((message, index) => {
         const seq = messageSeq(message) ?? index + 1;
         const role = normalizeTimelineRole(message.role);
-        const turnId = historyString(message, "turnId", "turn_id") ?? `history-${request.sessionKey}-${seq}-${role}`;
+        const clientMessageId = historyString(message, "clientMessageId", "client_message_id");
+        const idempotencyKey = historyString(message, "idempotencyKey", "idempotency_key");
+        const turnId =
+          historyString(message, "turnId", "turn_id")
+          ?? idempotencyKey
+          ?? clientMessageId
+          ?? `history-${request.sessionKey}-${seq}-${role}`;
+        const content = normalizeTimelineContentBlocks(message.content);
         return {
           turnId,
           runId: historyString(message, "runId", "run_id") ?? turnId,
           messageId: historyString(message, "messageId", "message_id", "id") ?? `${role}-${turnId}`,
           role,
           messageState: normalizeTimelineMessageState(message),
-          createdAt: normalizeTimelineCreatedAt(message),
+          createdAt: normalizeTimelineCreatedAt(message) ?? fallbackTimelineCreatedAt(page.messages, index),
           partId: historyString(message, "partId", "part_id") ?? "part-text-1",
-          content: normalizeTimelineContentBlocks(message.content),
+          content,
           seq,
           turnSeq: historyNumber(message, "turnSeq", "turn_seq") ?? seq,
+          ...(clientMessageId ? { clientMessageId } : {}),
+          ...(idempotencyKey ? { idempotencyKey } : {}),
+          ...(extractAttachmentIds(content).length > 0 ? { attachmentIds: extractAttachmentIds(content) } : {}),
         };
       }),
       attachments: [],
@@ -370,12 +383,36 @@ function normalizeTimelineMessageState(message: HistoryMessage): TimelineMessage
     : "completed";
 }
 
-function normalizeTimelineCreatedAt(message: HistoryMessage): string {
+function normalizeTimelineCreatedAt(message: HistoryMessage): string | undefined {
   if (typeof message.createdAt === "string" && message.createdAt.trim().length > 0) {
     return message.createdAt.trim();
   }
   const timestamp = normalizeHistoryTimestamp(message.timestamp);
-  return timestamp === undefined ? new Date(0).toISOString() : new Date(timestamp).toISOString();
+  return timestamp === undefined ? undefined : new Date(timestamp).toISOString();
+}
+
+function fallbackTimelineCreatedAt(messages: HistoryMessage[], index: number): string {
+  for (let previous = index - 1; previous >= 0; previous -= 1) {
+    const createdAt = normalizeTimelineCreatedAt(messages[previous]);
+    if (!createdAt) {
+      continue;
+    }
+    const ms = Date.parse(createdAt);
+    if (Number.isFinite(ms)) {
+      return new Date(ms + (index - previous)).toISOString();
+    }
+  }
+  for (let next = index + 1; next < messages.length; next += 1) {
+    const createdAt = normalizeTimelineCreatedAt(messages[next]);
+    if (!createdAt) {
+      continue;
+    }
+    const ms = Date.parse(createdAt);
+    if (Number.isFinite(ms)) {
+      return new Date(Math.max(0, ms - (next - index))).toISOString();
+    }
+  }
+  return new Date().toISOString();
 }
 
 function normalizeTimelineContentBlocks(value: HistoryMessage["content"]): TimelineContentBlock[] {
@@ -391,8 +428,64 @@ function normalizeTimelineContentBlocks(value: HistoryMessage["content"]): Timel
       return [];
     }
     const type = typeof block.type === "string" && block.type.trim().length > 0 ? block.type.trim() : "text";
-    return [{ ...block, type }];
+    return [normalizeTimelineContentBlock({ ...block, type })];
   });
+}
+
+function normalizeTimelineContentBlock(block: TimelineContentBlock): TimelineContentBlock {
+  const type = String(block.type).trim().toLowerCase();
+  if (!["image", "file", "audio", "voice", "video"].includes(type)) {
+    return { ...block, type };
+  }
+
+  const fileId = historyString(block, "fileId", "file_id");
+  const attachmentId =
+    historyString(block, "attachmentId", "attachment_id")
+    ?? fileId
+    ?? stableAttachmentId(block);
+  return compactBlock({
+    ...block,
+    type: type === "voice" ? "audio" : type,
+    ...(attachmentId ? { attachmentId } : {}),
+    ...(fileId ? { fileId } : {}),
+    ...(historyString(block, "fileName", "file_name", "name", "filename") ? {
+      fileName: historyString(block, "fileName", "file_name", "name", "filename"),
+    } : {}),
+    ...(historyString(block, "mimeType", "mime_type", "contentType", "content_type") ? {
+      mimeType: historyString(block, "mimeType", "mime_type", "contentType", "content_type"),
+    } : {}),
+    ...(historyNumber(block, "byteSize", "byte_size", "sizeBytes", "size_bytes") ? {
+      byteSize: historyNumber(block, "byteSize", "byte_size", "sizeBytes", "size_bytes"),
+    } : {}),
+    ...(historyNumber(block, "width", "imageWidth", "image_width") ? {
+      width: historyNumber(block, "width", "imageWidth", "image_width"),
+    } : {}),
+    ...(historyNumber(block, "height", "imageHeight", "image_height") ? {
+      height: historyNumber(block, "height", "imageHeight", "image_height"),
+    } : {}),
+    transferState: historyString(block, "transferState", "transfer_state", "status") ?? "available",
+  });
+}
+
+function extractAttachmentIds(blocks: TimelineContentBlock[]): string[] {
+  return blocks
+    .map((block) => historyString(block, "attachmentId", "attachment_id", "fileId", "file_id"))
+    .filter((value): value is string => Boolean(value))
+    .filter((value, index, values) => values.indexOf(value) === index);
+}
+
+function stableAttachmentId(block: Record<string, unknown>): string | undefined {
+  const source = [
+    historyString(block, "fileName", "file_name", "name", "filename"),
+    historyString(block, "mimeType", "mime_type", "contentType", "content_type"),
+    historyString(block, "downloadUrl", "download_url", "downloadPath", "download_path", "url"),
+    historyNumber(block, "byteSize", "byte_size", "sizeBytes", "size_bytes"),
+  ].filter((value) => value !== undefined).join("\u0000");
+  return source ? `att_${createHash("sha256").update(source).digest("hex").slice(0, 16)}` : undefined;
+}
+
+function compactBlock(block: TimelineContentBlock): TimelineContentBlock {
+  return Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined)) as TimelineContentBlock;
 }
 
 function historyString(record: Record<string, unknown>, ...fields: string[]): string | undefined {

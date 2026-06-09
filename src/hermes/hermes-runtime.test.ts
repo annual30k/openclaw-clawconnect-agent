@@ -847,7 +847,14 @@ test("runHermesChatHistory returns OpenClaw-shaped canonical history", async () 
           role: "assistant",
           content: [
             { type: "text", text: "visible reply" },
-            { type: "file", fileId: "file-history-1", fileName: "report.pdf", mimeType: "application/pdf" },
+            {
+              type: "file",
+              attachmentId: "file-history-1",
+              fileId: "file-history-1",
+              fileName: "report.pdf",
+              mimeType: "application/pdf",
+              transferState: "available",
+            },
           ],
           createdAt: "2026-05-29T02:00:01.000Z",
           seq: 2,
@@ -866,7 +873,14 @@ test("runHermesChatHistory returns OpenClaw-shaped canonical history", async () 
           role: "assistant",
           content: [
             { type: "text", text: "visible reply" },
-            { type: "file", fileId: "file-history-1", fileName: "report.pdf", mimeType: "application/pdf" },
+            {
+              type: "file",
+              attachmentId: "file-history-1",
+              fileId: "file-history-1",
+              fileName: "report.pdf",
+              mimeType: "application/pdf",
+              transferState: "available",
+            },
           ],
           createdAt: "2026-05-29T02:00:01.000Z",
           seq: 2,
@@ -887,7 +901,7 @@ test("runHermesChatHistory returns OpenClaw-shaped canonical history", async () 
         messages: [
           {
             turnId: "history-main-1-user",
-            messageId: "user-history-main-1-user",
+            messageId: "m1",
             role: "user",
             messageState: "completed",
             createdAt: "2026-05-29T02:00:00.000Z",
@@ -899,14 +913,22 @@ test("runHermesChatHistory returns OpenClaw-shaped canonical history", async () 
           },
           {
             turnId: "history-main-2-assistant",
-            messageId: "assistant-history-main-2-assistant",
+            messageId: "m2",
             role: "assistant",
             messageState: "completed",
             createdAt: "2026-05-29T02:00:01.000Z",
             content: [
               { type: "text", text: "visible reply" },
-              { type: "file", fileId: "file-history-1", fileName: "report.pdf", mimeType: "application/pdf" },
+              {
+                type: "file",
+                attachmentId: "file-history-1",
+                fileId: "file-history-1",
+                fileName: "report.pdf",
+                mimeType: "application/pdf",
+                transferState: "available",
+              },
             ],
+            attachmentIds: ["file-history-1"],
             partId: "part-text-1",
             runId: "history-main-2-assistant",
             seq: 2,
@@ -919,6 +941,44 @@ test("runHermesChatHistory returns OpenClaw-shaped canonical history", async () 
     assert.equal(JSON.stringify(result.payload).includes("Resumed session"), false);
     assert.equal(JSON.stringify(result.payload).includes("NoneType"), false);
     assert.equal(JSON.stringify(result.payload).includes("session_id:"), false);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChatHistory does not emit epoch timestamps when export omits message times", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-untimed-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeUntimedHistoryHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId: "20260529_100000_history",
+      displayName: "History",
+      kind: "hermes",
+    });
+
+    const result = await runHermesChatHistory({ sessionKey: "main", limit: 10 });
+
+    assert.equal(result.ok, true);
+    const payload = result.payload as {
+      messages: Array<{ createdAt: string }>;
+      timelineSnapshot: { messages: Array<{ createdAt: string }> };
+    };
+    assert.deepEqual(payload.messages.map((message) => message.createdAt), [
+      "2026-05-29T02:00:00.000Z",
+      "2026-05-29T02:00:00.001Z",
+    ]);
+    assert.deepEqual(payload.timelineSnapshot.messages.map((message) => message.createdAt), [
+      "2026-05-29T02:00:00.000Z",
+      "2026-05-29T02:00:00.001Z",
+    ]);
   } finally {
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousBin);
@@ -945,7 +1005,14 @@ test("Hermes command router handles chat.history canonically", async () => {
         role: "assistant",
         content: [
           { type: "text", text: "visible reply" },
-          { type: "file", fileId: "file-history-1", fileName: "report.pdf", mimeType: "application/pdf" },
+          {
+            type: "file",
+            attachmentId: "file-history-1",
+            fileId: "file-history-1",
+            fileName: "report.pdf",
+            mimeType: "application/pdf",
+            transferState: "available",
+          },
         ],
         createdAt: "2026-05-29T02:00:01.000Z",
         seq: 2,
@@ -1283,6 +1350,39 @@ function writeHistoryHermesBin(root: string): string {
     "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"list\" ]; then",
     "  echo 'Title                            Preview          Last Active   ID'",
     "  echo 'History                          visible reply    just now      20260529_100000_history'",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"status\" ]; then exit 0; fi",
+    "echo \"unexpected args: $@\" >&2",
+    "exit 2",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}
+
+function writeUntimedHistoryHermesBin(root: string): string {
+  const binPath = join(root, "hermes-history-untimed");
+  const payload = JSON.stringify({
+    sessionId: "20260529_100000_history",
+    messages: [
+      {
+        id: "m1",
+        role: "user",
+        content: "hello",
+      },
+      {
+        id: "m2",
+        role: "assistant",
+        content: "visible reply",
+      },
+    ],
+  });
+  writeFileSync(binPath, [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"export\" ]; then",
+    `  printf '%s\\n' '${payload.replace(/'/g, "'\\''")}'`,
     "  exit 0",
     "fi",
     "if [ \"$1\" = \"status\" ]; then exit 0; fi",

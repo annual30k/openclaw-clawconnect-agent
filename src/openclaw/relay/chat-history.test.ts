@@ -142,7 +142,14 @@ test("transcript history provider returns a canonical timeline snapshot page", a
         role: "assistant",
         content: [
           { type: "text", text: "sent:" },
-          { type: "file", fileId: "file-history-1", fileName: "desktop.png", mimeType: "image/png" },
+          {
+            type: "file",
+            attachmentId: "file-history-1",
+            fileId: "file-history-1",
+            fileName: "desktop.png",
+            mimeType: "image/png",
+            transferState: "available",
+          },
         ],
       },
     },
@@ -192,13 +199,60 @@ test("transcript history provider returns a canonical timeline snapshot page", a
         role: "assistant",
         content: [
           { type: "text", text: "sent:" },
-          { type: "file", fileId: "file-history-1", fileName: "desktop.png", mimeType: "image/png" },
+          {
+            type: "file",
+            attachmentId: "file-history-1",
+            fileId: "file-history-1",
+            fileName: "desktop.png",
+            mimeType: "image/png",
+            transferState: "available",
+          },
         ],
         seq: 2,
         turnSeq: 2,
       },
     ]);
     assert.deepEqual(snapshot?.attachments, []);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("transcript history provider does not emit epoch timestamps when message time is missing", async () => {
+  const fixture = await createTranscriptFixture(2, [
+    {
+      type: "message",
+      id: "prompt-untimed",
+      message: {
+        role: "user",
+        content: "untimed prompt",
+      },
+    },
+    {
+      type: "message",
+      id: "assistant-timed",
+      timestamp: "2026-05-28T01:00:01.000Z",
+      message: {
+        role: "assistant",
+        content: "timed answer",
+      },
+    },
+  ]);
+  try {
+    const page = await readChatHistoryFromTranscriptFile({
+      sessionKey: "agent:main:main",
+      sessionId: "session-1",
+      transcriptPath: fixture.path,
+      limit: 20,
+    });
+    const snapshot = (page as HistoryResponse & {
+      timelineSnapshot?: { messages: Array<Record<string, unknown>> };
+    }).timelineSnapshot;
+
+    assert.deepEqual(snapshot?.messages.map((message) => message.createdAt), [
+      "2026-05-28T01:00:00.999Z",
+      "2026-05-28T01:00:01.000Z",
+    ]);
   } finally {
     await fixture.cleanup();
   }

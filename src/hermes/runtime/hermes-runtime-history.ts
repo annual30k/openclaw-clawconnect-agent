@@ -12,6 +12,11 @@ type HermesHistoryMessage = {
   content: TimelineContentBlock[];
   createdAt?: string;
   timestamp?: number | string;
+  turnId?: string;
+  runId?: string;
+  partId?: string;
+  clientMessageId?: string;
+  idempotencyKey?: string;
   seq: number;
 };
 
@@ -72,18 +77,22 @@ export async function runHermesChatHistory(params: unknown): Promise<LocalResult
       nextCursor: page.nextCursor ?? null,
       newestCursor: page.newestCursor ?? null,
       messages: page.messages.map((message) => {
-        const turnId = `history-${sessionKey}-${message.seq}-${message.role}`;
+        const turnId = message.turnId ?? message.idempotencyKey ?? message.clientMessageId ?? `history-${sessionKey}-${message.seq}-${message.role}`;
+        const attachmentIds = extractAttachmentIds(message.content);
         return {
           turnId,
-          runId: turnId,
-          messageId: `${message.role}-${turnId}`,
+          runId: message.runId ?? turnId,
+          messageId: message.id,
           role: message.role as "user" | "assistant" | "tool" | "system",
           messageState: "completed" as const,
-          createdAt: message.createdAt ?? timestampToIso(message.timestamp) ?? new Date(0).toISOString(),
-          partId: "part-text-1",
+          createdAt: message.createdAt ?? timestampToIso(message.timestamp) ?? new Date().toISOString(),
+          partId: message.partId ?? "part-text-1",
           content: message.content,
           seq: message.seq,
           turnSeq: message.seq,
+          ...(message.clientMessageId ? { clientMessageId: message.clientMessageId } : {}),
+          ...(message.idempotencyKey ? { idempotencyKey: message.idempotencyKey } : {}),
+          ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
         };
       }),
       attachments: [],
@@ -158,7 +167,8 @@ function normalizeHermesHistoryMessages(parsed: unknown): HermesHistoryMessage[]
         : Array.isArray(parsed) ? parsed
           : [];
 
-  return rawMessages.flatMap((entry, index): HermesHistoryMessage[] => {
+  const sessionId = stringParam(record, "sessionId", "session_id", "id");
+  const messages = rawMessages.flatMap((entry, index): HermesHistoryMessage[] => {
     const source = toRecord(entry);
     if (Object.keys(source).length === 0) {
       return [];
@@ -175,11 +185,21 @@ function normalizeHermesHistoryMessages(parsed: unknown): HermesHistoryMessage[]
       id: stringParam(source, "id", "messageId", "message_id") ?? `history-${seq}`,
       role,
       content,
+      ...(stringParam(source, "turnId", "turn_id") ? { turnId: stringParam(source, "turnId", "turn_id") } : {}),
+      ...(stringParam(source, "runId", "run_id") ? { runId: stringParam(source, "runId", "run_id") } : {}),
+      ...(stringParam(source, "partId", "part_id") ? { partId: stringParam(source, "partId", "part_id") } : {}),
+      ...(stringParam(source, "clientMessageId", "client_message_id") ? {
+        clientMessageId: stringParam(source, "clientMessageId", "client_message_id"),
+      } : {}),
+      ...(stringParam(source, "idempotencyKey", "idempotency_key") ? {
+        idempotencyKey: stringParam(source, "idempotencyKey", "idempotency_key"),
+      } : {}),
       ...(readTimestamp(source) ? { timestamp: readTimestamp(source) } : {}),
       ...(readCreatedAt(source) ? { createdAt: readCreatedAt(source) } : {}),
       seq,
     }];
   });
+  return withHermesHistoryFallbackTimestamps(messages, sessionId);
 }
 
 function normalizeHistoryRole(value: unknown): string {
@@ -247,10 +267,75 @@ function normalizeHistoryContentBlocks(
     if (!type || type === "text" || type === "output_text" || type === "input_text") {
       continue;
     }
-    blocks.push({ ...blockRecord, type });
+    blocks.push(normalizeAttachmentContentBlock({ ...blockRecord, type }));
   }
 
   return blocks;
+}
+
+function normalizeAttachmentContentBlock(block: TimelineContentBlock): TimelineContentBlock {
+  const type = String(block.type).trim().toLowerCase();
+  if (!["image", "file", "audio", "voice", "video"].includes(type)) {
+    return { ...block, type };
+  }
+  const fileId = stringParam(block, "fileId", "file_id");
+  const attachmentId =
+    stringParam(block, "attachmentId", "attachment_id")
+    ?? fileId
+    ?? stableAttachmentId(block);
+  return compactBlock({
+    ...block,
+    type: type === "voice" ? "audio" : type,
+    ...(attachmentId ? { attachmentId } : {}),
+    ...(fileId ? { fileId } : {}),
+    ...(stringParam(block, "fileName", "file_name", "name", "filename") ? {
+      fileName: stringParam(block, "fileName", "file_name", "name", "filename"),
+    } : {}),
+    ...(stringParam(block, "mimeType", "mime_type", "contentType", "content_type") ? {
+      mimeType: stringParam(block, "mimeType", "mime_type", "contentType", "content_type"),
+    } : {}),
+    ...(numberParam(block, "byteSize", "byte_size", "sizeBytes", "size_bytes") ? {
+      byteSize: numberParam(block, "byteSize", "byte_size", "sizeBytes", "size_bytes"),
+    } : {}),
+    ...(numberParam(block, "width", "imageWidth", "image_width") ? {
+      width: numberParam(block, "width", "imageWidth", "image_width"),
+    } : {}),
+    ...(numberParam(block, "height", "imageHeight", "image_height") ? {
+      height: numberParam(block, "height", "imageHeight", "image_height"),
+    } : {}),
+    transferState: stringParam(block, "transferState", "transfer_state", "status") ?? "available",
+  });
+}
+
+function extractAttachmentIds(blocks: TimelineContentBlock[]): string[] {
+  return blocks
+    .map((block) => stringParam(block, "attachmentId", "attachment_id", "fileId", "file_id"))
+    .filter((value): value is string => Boolean(value))
+    .filter((value, index, values) => values.indexOf(value) === index);
+}
+
+function stableAttachmentId(block: Record<string, unknown>): string | undefined {
+  const source = [
+    stringParam(block, "fileName", "file_name", "name", "filename"),
+    stringParam(block, "mimeType", "mime_type", "contentType", "content_type"),
+    stringParam(block, "downloadUrl", "download_url", "downloadPath", "download_path", "url"),
+    numberParam(block, "byteSize", "byte_size", "sizeBytes", "size_bytes"),
+  ].filter((value) => value !== undefined).join("\u0000");
+  return source ? `att_${createHash("sha256").update(source).digest("hex").slice(0, 16)}` : undefined;
+}
+
+function numberParam(record: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return Math.round(value);
+    }
+  }
+  return undefined;
+}
+
+function compactBlock(block: TimelineContentBlock): TimelineContentBlock {
+  return Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined)) as TimelineContentBlock;
 }
 
 function normalizeHistoryText(role: string, text: string): string {
@@ -274,6 +359,67 @@ function readTimestamp(record: Record<string, unknown>): number | string | undef
 
 function readCreatedAt(record: Record<string, unknown>): string | undefined {
   return stringParam(record, "createdAt", "created_at");
+}
+
+function withHermesHistoryFallbackTimestamps(
+  messages: HermesHistoryMessage[],
+  sessionId: string | undefined,
+): HermesHistoryMessage[] {
+  const firstKnown = firstKnownHistoryTimestampMs(messages);
+  let lastResolvedMs = hermesSessionStartMs(sessionId)
+    ?? (firstKnown ? firstKnown.ms - firstKnown.index : undefined)
+    ?? Date.now();
+  lastResolvedMs -= 1;
+  return messages.map((message) => {
+    const knownMs = historyMessageTimestampMs(message);
+    if (knownMs !== undefined) {
+      lastResolvedMs = Math.max(lastResolvedMs + 1, knownMs);
+      return message;
+    }
+    lastResolvedMs += 1;
+    return {
+      ...message,
+      createdAt: new Date(lastResolvedMs).toISOString(),
+    };
+  });
+}
+
+function firstKnownHistoryTimestampMs(messages: HermesHistoryMessage[]): { index: number; ms: number } | undefined {
+  for (const [index, message] of messages.entries()) {
+    const ms = historyMessageTimestampMs(message);
+    if (ms !== undefined) {
+      return { index, ms };
+    }
+  }
+  return undefined;
+}
+
+function historyMessageTimestampMs(message: HermesHistoryMessage): number | undefined {
+  const createdAtMs = Date.parse(message.createdAt ?? "");
+  if (Number.isFinite(createdAtMs)) {
+    return createdAtMs;
+  }
+  const timestamp = timestampToIso(message.timestamp);
+  const timestampMs = Date.parse(timestamp ?? "");
+  return Number.isFinite(timestampMs) ? timestampMs : undefined;
+}
+
+function hermesSessionStartMs(sessionId: string | undefined): number | undefined {
+  const match = /^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/.exec(sessionId ?? "");
+  if (!match) {
+    return undefined;
+  }
+  const [, year, month, day, hour, minute, second] = match;
+  const date = new Date(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second),
+  );
+  const ms = date.getTime();
+  return Number.isFinite(ms) ? ms : undefined;
 }
 
 function timestampToIso(value: number | string | undefined): string | undefined {

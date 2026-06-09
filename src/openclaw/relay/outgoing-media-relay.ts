@@ -126,10 +126,14 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaRelayO
     return {
       ...source,
       type: typeof source.type === "string" && source.type.trim() ? source.type : "image",
+      attachmentId,
       fileId: upload.fileId,
       fileName: record.alt || upload.fileName,
       mimeType: record.original?.contentType || upload.mimeType,
+      byteSize: record.original?.sizeBytes || upload.sizeBytes,
       sizeBytes: record.original?.sizeBytes || upload.sizeBytes,
+      width: record.original?.width || upload.imageWidth,
+      height: record.original?.height || upload.imageHeight,
       imageWidth: record.original?.width || upload.imageWidth,
       imageHeight: record.original?.height || upload.imageHeight,
       downloadUrl: upload.downloadPath,
@@ -137,6 +141,7 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaRelayO
       expiresAt: upload.expiresAt,
       gatewayId: upload.gatewayId,
       sessionKey: upload.sessionKey,
+      transferState: "available",
     };
   } catch (error) {
     console.warn(`[relay] failed to publish outgoing media attachment ${attachmentId}: ${String(error)}`);
@@ -226,16 +231,20 @@ function uploadToContentBlock(upload: FileUploadResult): Record<string, unknown>
   const type = upload.mimeType.startsWith("image/")
     ? "image"
     : upload.mimeType.startsWith("audio/")
-      ? "voice"
+      ? "audio"
       : "file";
   return compact({
     type,
+    attachmentId: upload.fileId,
     fileId: upload.fileId,
     fileName: upload.fileName,
     name: upload.fileName,
     mimeType: upload.mimeType,
+    byteSize: upload.sizeBytes,
     sizeBytes: upload.sizeBytes,
     durationMs: upload.durationMs,
+    width: upload.imageWidth,
+    height: upload.imageHeight,
     imageWidth: upload.imageWidth,
     imageHeight: upload.imageHeight,
     downloadUrl: upload.downloadPath,
@@ -245,6 +254,7 @@ function uploadToContentBlock(upload: FileUploadResult): Record<string, unknown>
     gatewayId: upload.gatewayId,
     sessionKey: upload.sessionKey,
     status: "available",
+    transferState: "available",
   });
 }
 
