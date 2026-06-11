@@ -40,9 +40,12 @@ import {
   type ChatSendUserMirrorDedupeRequest,
 } from "./relay/transcript-dedupe.js";
 import {
+  buildMobileAssistantDeltaPayload,
   buildMobileAssistantErrorPayload,
   buildMobileAssistantFinalPayload,
+  type MobileAssistantUsage,
 } from "../core/relay/mobile-chat-run-bridge.js";
+import type { TimelineContentBlock } from "../core/relay/timeline-event-log.js";
 import { buildOfficeEventPayload } from "../core/relay/office-payload.js";
 import { prepareChatSendParams } from "./relay/chat-send-attachments.js";
 import { relayOutgoingMediaInHistoryResponse, relayOutgoingMediaInPayload } from "./relay/outgoing-media-relay.js";
@@ -619,6 +622,143 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       );
     }
 
+    function mergeCanonicalChatPayload(basePayload: unknown, canonicalPayload: unknown): unknown {
+      const base = asRecord(basePayload);
+      const canonical = asRecord(canonicalPayload);
+      if (!base) {
+        return canonicalPayload;
+      }
+      if (!canonical) {
+        return basePayload;
+      }
+      const baseMessage = asRecord(base.message);
+      const canonicalMessage = asRecord(canonical.message);
+      const merged = {
+        ...base,
+        ...canonical,
+      };
+      return baseMessage || canonicalMessage
+        ? {
+            ...merged,
+            message: {
+              ...(baseMessage ?? {}),
+              ...(canonicalMessage ?? {}),
+            },
+          }
+        : merged;
+    }
+
+    function resolveChatPayloadSeq(payload: unknown): number {
+      return normalizeFiniteNumber(deepField(payload, ["seq", "sequence", "index"]))
+        ?? resolveChatPayloadTimestamp(payload);
+    }
+
+    function resolveChatPayloadTimestamp(payload: unknown): number {
+      const value = normalizeFiniteNumber(deepField(payload, ["ts", "timestamp", "createdAt", "created_at", "time"]));
+      if (value !== undefined) {
+        return value > 10_000_000_000 ? Math.round(value) : Math.round(value * 1000);
+      }
+      return Date.now();
+    }
+
+    function extractChatErrorMessage(payload: unknown): string {
+      const direct = firstNonEmptyString(deepField(payload, ["errorMessage", "error_message", "message", "text"]));
+      if (direct) {
+        return direct;
+      }
+      const error = asRecord(asRecord(payload)?.error);
+      const nested = firstNonEmptyString(error?.message, error?.userMessage, error?.detail);
+      return nested ?? "Request failed";
+    }
+
+    function mobileAssistantUsageFromPayload(payload: unknown): MobileAssistantUsage {
+      const record = asRecord(payload);
+      const usage = asRecord(record?.usage);
+      return stripUndefined({
+        currentModel: firstNonEmptyString(record?.currentModel, record?.model, usage?.currentModel, usage?.model),
+        provider: firstNonEmptyString(record?.provider, usage?.provider),
+        contextUsage: normalizeNonNegativeInteger(record?.contextUsage)
+          ?? normalizeNonNegativeInteger(record?.promptTokens)
+          ?? normalizeNonNegativeInteger(record?.inputTokens)
+          ?? normalizeNonNegativeInteger(usage?.contextUsage)
+          ?? normalizeNonNegativeInteger(usage?.promptTokens)
+          ?? normalizeNonNegativeInteger(usage?.inputTokens),
+        contextLimit: normalizeNonNegativeInteger(record?.contextLimit)
+          ?? normalizeNonNegativeInteger(record?.maxInputTokens)
+          ?? normalizeNonNegativeInteger(usage?.contextLimit)
+          ?? normalizeNonNegativeInteger(usage?.maxInputTokens),
+      });
+    }
+
+    function nonTextContentBlocks(payload: unknown): TimelineContentBlock[] {
+      const payloadRecord = asRecord(payload);
+      const message = asRecord(payloadRecord?.message);
+      const topLevelContent = payloadRecord?.content;
+      const content = Array.isArray(message?.content)
+        ? message.content
+        : Array.isArray(topLevelContent)
+          ? topLevelContent
+          : [];
+      return content.filter((block): block is TimelineContentBlock => {
+        const record = asRecord(block);
+        return Boolean(record?.type) && record?.type !== "text";
+      });
+    }
+
+    function nonTextContentBlocksFromHistory(message: HistoryMessage): TimelineContentBlock[] {
+      return Array.isArray(message.content)
+        ? message.content.filter((block): block is TimelineContentBlock => {
+            const record = asRecord(block);
+            return Boolean(record?.type) && record?.type !== "text";
+          })
+        : [];
+    }
+
+    function deepField(payload: unknown, keys: string[]): unknown {
+      const record = asRecord(payload);
+      const message = asRecord(record?.message);
+      const data = asRecord(record?.data);
+      for (const key of keys) {
+        if (record && record[key] !== undefined) return record[key];
+        if (message && message[key] !== undefined) return message[key];
+        if (data && data[key] !== undefined) return data[key];
+      }
+      return undefined;
+    }
+
+    function firstNonEmptyString(...values: unknown[]): string | undefined {
+      for (const value of values) {
+        if (typeof value === "string" && value.trim().length > 0) {
+          return value.trim();
+        }
+      }
+      return undefined;
+    }
+
+    function normalizeFiniteNumber(value: unknown): number | undefined {
+      const number = typeof value === "number" && Number.isFinite(value)
+        ? value
+        : typeof value === "string" && value.trim().length > 0
+          ? Number(value.trim())
+          : Number.NaN;
+      return Number.isFinite(number) ? number : undefined;
+    }
+
+    function normalizeNonNegativeInteger(value: unknown): number | undefined {
+      const number = normalizeFiniteNumber(value);
+      return number !== undefined && number >= 0 ? Math.round(number) : undefined;
+    }
+
+    function stripUndefined<T extends Record<string, unknown>>(value: T): T {
+      return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
+    }
+
+    function asRecord(value: unknown): Record<string, unknown> | undefined {
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : undefined;
+    }
+
     relayWs.on("open", () => {
       console.log(`Connected to relay server (gatewayId=${opts.gatewayId})`);
       opts.onConnected?.();
@@ -680,10 +820,31 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 const bufferedText = appendUniqueSuffix(previousText, currentText);
                 chatBuffers.set(runId, bufferedText);
                 if (role === "assistant" && bufferedText.trim()) {
-                  realtimePayload = withMessageText(normalizedPayload, bufferedText);
+                  realtimePayload = resolvedSessionKey
+                    ? mergeCanonicalChatPayload(
+                        normalizedPayload,
+                        buildMobileAssistantDeltaPayload({
+                          run: { runId, sessionKey: resolvedSessionKey },
+                          seq: resolveChatPayloadSeq(normalizedPayload),
+                          timestampMs: resolveChatPayloadTimestamp(normalizedPayload),
+                          delta: bufferedText,
+                          includeTimelineEvents: true,
+                        }),
+                      )
+                    : withMessageText(normalizedPayload, bufferedText);
                 }
               } else if (state === "error" || state === "failed" || state === "fail" || state === "aborted") {
                 chatBuffers.delete(runId);
+                if (role === "assistant" && resolvedSessionKey) {
+                  realtimePayload = mergeCanonicalChatPayload(
+                    normalizedPayload,
+                    buildMobileAssistantErrorPayload({
+                      run: { runId, sessionKey: resolvedSessionKey },
+                      errorMessage: extractChatErrorMessage(normalizedPayload),
+                      includeTimelineEvents: true,
+                    }),
+                  );
+                }
               }
             }
 
@@ -698,7 +859,18 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 if (runId) {
                   chatRunContexts.delete(runId);
                 }
-                const outgoingPayload = withMessageText(normalizedPayload, resolvedText);
+                const outgoingPayload = runId
+                  ? mergeCanonicalChatPayload(
+                      normalizedPayload,
+                      buildMobileAssistantFinalPayload({
+                        run: { runId, sessionKey: resolvedSessionKey },
+                        text: resolvedText,
+                        contentBlocks: nonTextContentBlocks(normalizedPayload),
+                        includeTimelineEvents: true,
+                        ...mobileAssistantUsageFromPayload(normalizedPayload),
+                      }),
+                    )
+                  : withMessageText(normalizedPayload, resolvedText);
                 void publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
                 return;
               }
@@ -718,16 +890,34 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     chatRunContexts.delete(runId);
                   }
                   if (outcome?.kind === "final") {
-                    const outgoingPayload = buildFinalPayloadFromHistoryOutcome(normalizedPayload, outcome);
+                    const basePayload = runId
+                      ? buildMobileAssistantFinalPayload({
+                          run: { runId, sessionKey: resolvedSessionKey },
+                          text: outcome.text,
+                          contentBlocks: nonTextContentBlocksFromHistory(outcome.message),
+                          includeTimelineEvents: true,
+                          ...mobileAssistantUsageFromPayload(normalizedPayload),
+                        })
+                      : normalizedPayload;
+                    const outgoingPayload = buildFinalPayloadFromHistoryOutcome(basePayload, outcome);
                     await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
                     return;
                   }
                   if (outcome?.kind === "error") {
-                    const outgoingPayload = {
-                      ...(normalizedPayload as Record<string, unknown>),
-                      state: "error",
-                      errorMessage: outcome.errorMessage,
-                    };
+                    const outgoingPayload = runId
+                      ? mergeCanonicalChatPayload(
+                          normalizedPayload,
+                          buildMobileAssistantErrorPayload({
+                            run: { runId, sessionKey: resolvedSessionKey },
+                            errorMessage: outcome.errorMessage,
+                            includeTimelineEvents: true,
+                          }),
+                        )
+                      : {
+                          ...(normalizedPayload as Record<string, unknown>),
+                          state: "error",
+                          errorMessage: outcome.errorMessage,
+                        };
                     await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice);
                     return;
                   }

@@ -96,6 +96,7 @@ export function buildCanonicalMobileAssistantDeltaPayload(params: {
   seq: number;
   timestampMs: number;
   delta: string;
+  includeTimelineEvents?: boolean;
 }) {
   const timelineEvent = buildMessagePartDeltaEvent({
     gatewayId: "clawconnect",
@@ -122,6 +123,7 @@ export function buildCanonicalMobileAssistantDeltaPayload(params: {
       timestamp: params.timestampMs,
       content: [{ type: "text", text }],
     },
+    ...(params.includeTimelineEvents ? { timelineEvents: [timelineEvent] } : {}),
   };
 }
 
@@ -130,6 +132,7 @@ export function buildMobileAssistantDeltaPayload(params: {
   seq: number;
   timestampMs: number;
   delta: string;
+  includeTimelineEvents?: boolean;
 }) {
   return buildCanonicalMobileAssistantDeltaPayload(params);
 }
@@ -138,6 +141,7 @@ export function buildCanonicalMobileAssistantStreamingPayload(params: {
   run: MobileChatRun;
   seq?: number;
   text: string;
+  includeTimelineEvents?: boolean;
 }) {
   const timelineEvent = buildMessagePartDeltaEvent({
     gatewayId: "clawconnect",
@@ -160,6 +164,7 @@ export function buildCanonicalMobileAssistantStreamingPayload(params: {
       role: "assistant",
       content: [{ type: "text", text }],
     },
+    ...(params.includeTimelineEvents ? { timelineEvents: [timelineEvent] } : {}),
   };
 }
 
@@ -167,6 +172,7 @@ export function buildMobileAssistantStreamingPayload(params: {
   run: MobileChatRun;
   seq?: number;
   text: string;
+  includeTimelineEvents?: boolean;
 }) {
   return buildCanonicalMobileAssistantStreamingPayload(params);
 }

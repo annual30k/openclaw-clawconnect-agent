@@ -9,7 +9,6 @@ import {
   buildMobileAssistantDeltaPayload,
 } from "../../core/relay/mobile-chat-run-bridge.js";
 import {
-  buildMessagePartDeltaEvent,
   buildToolInvocationUpdatedEvent,
 } from "../../core/relay/timeline-event-builder.js";
 import type { ToolState } from "../../core/relay/timeline-event-log.js";
@@ -624,28 +623,13 @@ export function buildHermesAssistantDeltaPayload(params: {
   timestampMs: number;
   delta: string;
 }) {
-  const payload = buildMobileAssistantDeltaPayload({
+  return buildMobileAssistantDeltaPayload({
     run: { runId: params.runId, sessionKey: params.sessionKey },
     seq: params.seq,
     timestampMs: params.timestampMs,
     delta: params.delta,
+    includeTimelineEvents: true,
   });
-  return {
-    ...payload,
-    timelineEvents: [
-      buildMessagePartDeltaEvent({
-        gatewayId: "clawconnect",
-        sessionKey: params.sessionKey,
-        turnId: params.runId,
-        runId: params.runId,
-        role: "assistant",
-        seq: params.seq,
-        turnSeq: params.seq,
-        now: () => new Date(params.timestampMs),
-        content: [{ type: "text", text: params.delta }],
-      }),
-    ],
-  };
 }
 
 function hermesToolState(event: HermesToolLogEvent): ToolState {

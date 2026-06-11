@@ -281,6 +281,30 @@ test("canonical mobile assistant builders sanitize outgoing text", () => {
 test("mobile assistant builders can include canonical timeline events during migration", () => {
   const run = { runId: "client-run-1", sessionKey: "main" };
 
+  const deltaPayload = buildMobileAssistantDeltaPayload({
+    run,
+    seq: 7,
+    timestampMs: 123456,
+    delta: "streaming",
+    includeTimelineEvents: true,
+  } as Parameters<typeof buildMobileAssistantDeltaPayload>[0] & { includeTimelineEvents: true });
+  assert.equal(deltaPayload.timelineEvents?.[0]?.eventType, "message.part.delta");
+  assert.equal(deltaPayload.timelineEvents?.[0]?.turnId, "client-run-1");
+  assert.equal(deltaPayload.timelineEvents?.[0]?.runId, "client-run-1");
+  assert.equal(deltaPayload.timelineEvents?.[0]?.messageId, "assistant-client-run-1");
+  assert.equal(deltaPayload.timelineEvents?.[0]?.seq, 7);
+  assert.deepEqual(deltaPayload.timelineEvents?.[0]?.content, [{ type: "text", text: "streaming" }]);
+
+  const streamingPayload = buildMobileAssistantStreamingPayload({
+    run,
+    seq: 8,
+    text: "partial",
+    includeTimelineEvents: true,
+  } as Parameters<typeof buildMobileAssistantStreamingPayload>[0] & { includeTimelineEvents: true });
+  assert.equal(streamingPayload.timelineEvents?.[0]?.eventType, "message.part.delta");
+  assert.equal(streamingPayload.timelineEvents?.[0]?.seq, 8);
+  assert.deepEqual(streamingPayload.timelineEvents?.[0]?.content, [{ type: "text", text: "partial" }]);
+
   const finalPayload = buildMobileAssistantFinalPayload({
     run,
     text: "done",

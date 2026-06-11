@@ -142,6 +142,18 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
             delta: "world",
           },
         }));
+        socket.send(JSON.stringify({
+          type: "event",
+          event: "chat",
+          payload: {
+            runId: "run-1",
+            sessionKey: "main",
+            state: "final",
+            role: "assistant",
+            seq: 3,
+            text: "hello world",
+          },
+        }));
       }
     });
   });
@@ -165,6 +177,28 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
         return false;
       }
       return extractPayloadText(message.payload) === "hello world";
+    }), 4_000);
+    const accumulatedPayload = relayMessages
+      .filter((message) => message.type === "event" && message.event === "chat" && isRecord(message.payload))
+      .map((message) => message.payload as Record<string, unknown>)
+      .find((payload) => payload.state === "delta" && extractPayloadText(payload) === "hello world");
+    assert.ok(accumulatedPayload);
+    const deltaEvents = timelineEvents(accumulatedPayload);
+    assert.equal(deltaEvents[0]?.eventType, "message.part.delta");
+    assert.equal(deltaEvents[0]?.runId, "run-1");
+    assert.equal(deltaEvents[0]?.turnId, "run-1");
+    assert.equal(deltaEvents[0]?.messageId, "assistant-run-1");
+    assert.equal(deltaEvents[0]?.seq, 2);
+    assert.deepEqual(deltaEvents[0]?.content, [{ type: "text", text: "hello world" }]);
+
+    await waitFor(() => relayMessages.some((message) => {
+      if (message.type !== "event" || message.event !== "chat" || !isRecord(message.payload)) {
+        return false;
+      }
+      const events = timelineEvents(message.payload);
+      return message.payload.state === "final" &&
+        events.some((event) => event.eventType === "message.completed") &&
+        events.some((event) => event.eventType === "run.completed");
     }), 4_000);
   } finally {
     abort.abort();
@@ -552,6 +586,12 @@ function extractPayloadText(payload: Record<string, unknown>): string {
   const content = Array.isArray(message?.content) ? message.content : [];
   const textBlock = content.find((block): block is Record<string, unknown> => isRecord(block) && block.type === "text");
   return typeof textBlock?.text === "string" ? textBlock.text : "";
+}
+
+function timelineEvents(payload: Record<string, unknown>): Array<Record<string, unknown>> {
+  return Array.isArray(payload.timelineEvents)
+    ? payload.timelineEvents.filter((event): event is Record<string, unknown> => isRecord(event))
+    : [];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
