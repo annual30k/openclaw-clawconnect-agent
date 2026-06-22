@@ -19,6 +19,7 @@ import {
   type HermesSessionItem,
 } from "../hermes-session-store.js";
 import { extractDeliverablePaths } from "./hermes-runtime-artifacts.js";
+import { runHermesSessionExport } from "./hermes-runtime-sessions.js";
 import {
   CHAT_TIMEOUT_MS,
   CLAWCONNECT_MOBILE_BRIDGE_HINT,
@@ -36,11 +37,14 @@ import {
 } from "./hermes-runtime-process.js";
 import type { HermesChatResult, HermesToolLogEvent, HermesUsageSnapshot } from "./hermes-runtime-types.js";
 import { collectHermesUsageSnapshot, listHermesSessions, readHermesStatusSnapshot } from "./hermes-runtime-usage.js";
-import { compactStringArray, sanitizeFileName } from "./hermes-runtime-values.js";
+import { compactStringArray, sanitizeFileName, toRecord } from "./hermes-runtime-values.js";
 
 const HERMES_ASSISTANT_DELTA_FLUSH_MS = 120;
 const HERMES_ASSISTANT_DELTA_MAX_BYTES = 4096;
+const HERMES_HISTORY_COMPLETION_GRACE_MS = 2_000;
+const HERMES_HISTORY_COMPLETION_POLL_MS = 1_000;
 const HERMES_COMMAND_DENIED_TIMEOUT_MESSAGE = "Timeout – denying command";
+const hermesChatQueues = new Map<string, Promise<void>>();
 const HERMES_SLASH_COMMAND_SCRIPT = String.raw`
 import contextlib
 import io
@@ -126,47 +130,105 @@ export async function runHermesChat(
     ? record.sessionKey.trim()
     : "main";
   if (isHermesSlashCommandMessage(rawMessage)) {
-    return await runHermesSlashCommand({ message: rawMessage, sessionKey, hermesSessionId: record.hermesSessionId });
+    return await runSerializedHermesChat(sessionKey, () => (
+      runHermesSlashCommand({ message: rawMessage, sessionKey, hermesSessionId: record.hermesSessionId })
+    ));
   }
   const message = await prepareHermesMessage(rawMessage, record.attachments, sessionKey);
   if (!message.trim()) {
     throw new Error("message_required");
   }
 
-  const explicitResume = typeof record.hermesSessionId === "string" && record.hermesSessionId.trim().length > 0
-    ? record.hermesSessionId.trim()
+  return await runSerializedHermesChat(sessionKey, async () => {
+    return await runHermesChatPrepared({
+      rawMessage,
+      message,
+      sessionKey,
+      hermesSessionId: record.hermesSessionId,
+      context,
+    });
+  });
+}
+
+async function runSerializedHermesChat<T>(
+  sessionKey: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const queueKey = sessionKey.trim() || "main";
+  const previous = hermesChatQueues.get(queueKey) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(operation);
+  const stored = current.then(() => undefined, () => undefined);
+  hermesChatQueues.set(queueKey, stored);
+  try {
+    return await current;
+  } finally {
+    if (hermesChatQueues.get(queueKey) === stored) {
+      hermesChatQueues.delete(queueKey);
+    }
+  }
+}
+
+async function runHermesChatPrepared(params: {
+  rawMessage: string;
+  message: string;
+  sessionKey: string;
+  hermesSessionId: unknown;
+  context: LocalCommandContext;
+}): Promise<HermesChatResult> {
+  const explicitResume = typeof params.hermesSessionId === "string" && params.hermesSessionId.trim().length > 0
+    ? params.hermesSessionId.trim()
     : undefined;
-  const mappedResume = explicitResume ? undefined : await getMappedHermesSessionId(sessionKey);
+  const mappedResume = explicitResume ? undefined : await getMappedHermesSessionId(params.sessionKey);
   let resume = explicitResume ?? mappedResume;
   const beforeSessions = await listHermesSessions();
   let rawOutput: string;
   try {
-    rawOutput = await runHermesChatOnce({ message, sessionKey, resume, context });
+    rawOutput = await runHermesChatOnce({
+      message: params.message,
+      sessionKey: params.sessionKey,
+      resume,
+      context: params.context,
+      historyCompletion: () => detectHermesHistoryCompletion({
+        beforeSessions,
+        resume,
+        sessionKey: params.sessionKey,
+        userMessage: params.rawMessage,
+      }),
+    });
   } catch (error) {
     if (!mappedResume || !isHermesMissingSessionError(error)) {
       throw error;
     }
-    await forgetHermesSession(sessionKey, mappedResume);
+    await forgetHermesSession(params.sessionKey, mappedResume);
     resume = undefined;
-    rawOutput = await runHermesChatOnce({ message, sessionKey, context });
+    rawOutput = await runHermesChatOnce({
+      message: params.message,
+      sessionKey: params.sessionKey,
+      context: params.context,
+      historyCompletion: () => detectHermesHistoryCompletion({
+        beforeSessions,
+        sessionKey: params.sessionKey,
+        userMessage: params.rawMessage,
+      }),
+    });
   }
   const output = sanitizeHermesChatOutput(rawOutput).trim();
   const sessions = await listHermesSessions();
   const mappedSession = selectHermesSessionForCompletedChat(sessions, {
     beforeSessions,
     resume,
-    userMessage: rawMessage,
+    userMessage: params.rawMessage,
   });
   if (mappedSession) {
-    await rememberHermesSession(sessionKey, mappedSession);
+    await rememberHermesSession(params.sessionKey, mappedSession);
   }
   const usage = mappedSession?.hermesSessionId
     ? await collectHermesUsageSnapshot(mappedSession.hermesSessionId)
     : readHermesStatusSnapshot();
   return {
     output,
-    sessionKey,
-    artifactPaths: extractDeliverablePaths(output, { userMessage: rawMessage }),
+    sessionKey: params.sessionKey,
+    artifactPaths: extractDeliverablePaths(output, { userMessage: params.rawMessage }),
     usage,
   };
 }
@@ -176,14 +238,147 @@ async function runHermesChatOnce(params: {
   sessionKey: string;
   resume?: string;
   context: LocalCommandContext;
+  historyCompletion?: () => Promise<string | undefined>;
 }): Promise<string> {
   const args = ["chat", "--query", params.message, "--quiet", "--source", "pocketclaw", "--yolo"];
   if (params.resume) {
     args.push("--resume", params.resume);
   }
   return params.context.publishEvent
-    ? await runHermesChatStreaming(args, params.sessionKey, params.context)
+    ? await runHermesChatStreaming(args, params.sessionKey, params.context, params.historyCompletion)
     : runHermes(args, CHAT_TIMEOUT_MS);
+}
+
+async function detectHermesHistoryCompletion(params: {
+  beforeSessions: HermesSessionItem[];
+  resume?: string;
+  sessionKey: string;
+  userMessage: string;
+}): Promise<string | undefined> {
+  const sessions = await listHermesSessions();
+  const mappedSession = selectHermesSessionForCompletedChat(sessions, {
+    beforeSessions: params.beforeSessions,
+    resume: params.resume,
+    userMessage: params.userMessage,
+  });
+  if (!mappedSession?.hermesSessionId) {
+    return undefined;
+  }
+
+  const exportResult = await runHermesSessionExport({
+    sessionKey: params.sessionKey,
+    hermesSessionId: mappedSession.hermesSessionId,
+    output: "-",
+  });
+  if (!exportResult.ok) {
+    return undefined;
+  }
+
+  return latestAssistantReplyFromHermesExport(exportResult.payload, params.userMessage);
+}
+
+function latestAssistantReplyFromHermesExport(payload: unknown, userMessage: string): string | undefined {
+  const output = toRecord(payload).output;
+  const parsed = parseHermesChatExportOutput(output);
+  const record = toRecord(parsed);
+  const rawMessages = Array.isArray(record.messages)
+    ? record.messages
+    : Array.isArray(record.items)
+      ? record.items
+      : Array.isArray(parsed)
+        ? parsed
+        : [];
+  if (rawMessages.length === 0) {
+    return undefined;
+  }
+
+  const normalizedUser = normalizeSessionSelectionText(userMessage);
+  if (!normalizedUser) {
+    return undefined;
+  }
+  let latestUserIndex = -1;
+  let latestUserMatchesCurrentRequest = false;
+  for (let index = rawMessages.length - 1; index >= 0; index -= 1) {
+    const message = toRecord(rawMessages[index]);
+    if (normalizeHistoryRoleValue(message.role) !== "user") {
+      continue;
+    }
+    const text = normalizeSessionSelectionText(extractHermesHistoryText(message));
+    latestUserIndex = index;
+    latestUserMatchesCurrentRequest = text.length > 0
+      && (text.includes(normalizedUser) || normalizedUser.includes(text));
+    break;
+  }
+  if (latestUserIndex < 0 || !latestUserMatchesCurrentRequest) {
+    return undefined;
+  }
+
+  for (let index = rawMessages.length - 1; index >= latestUserIndex + 1; index -= 1) {
+    const message = toRecord(rawMessages[index]);
+    if (normalizeHistoryRoleValue(message.role) !== "assistant") {
+      continue;
+    }
+    const text = sanitizeHermesChatOutput(extractHermesHistoryText(message)).trim();
+    if (text) {
+      return text;
+    }
+  }
+  return undefined;
+}
+
+function parseHermesChatExportOutput(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return {};
+  }
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    const firstObjectBrace = trimmed.indexOf("{");
+    const lastObjectBrace = trimmed.lastIndexOf("}");
+    if (firstObjectBrace >= 0 && lastObjectBrace > firstObjectBrace) {
+      try {
+        return JSON.parse(trimmed.slice(firstObjectBrace, lastObjectBrace + 1)) as unknown;
+      } catch {
+        return {};
+      }
+    }
+    return {};
+  }
+}
+
+function normalizeHistoryRoleValue(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase().replace("_", "") : "";
+}
+
+function extractHermesHistoryText(record: Record<string, unknown>): string {
+  const content = record.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .flatMap((block) => {
+        const blockRecord = toRecord(block);
+        const type = typeof blockRecord.type === "string" ? blockRecord.type.trim().toLowerCase() : "";
+        if (type && type !== "text" && type !== "output_text" && type !== "input_text") {
+          return [];
+        }
+        return typeof blockRecord.text === "string" ? [blockRecord.text] : [];
+      })
+      .filter((text) => text.trim().length > 0)
+      .join("\n\n");
+  }
+  for (const key of ["text", "message", "output"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return "";
 }
 
 export function isHermesSlashCommandMessage(message: string): boolean {
@@ -327,6 +522,7 @@ async function runHermesChatStreaming(
   args: string[],
   sessionKey: string,
   context: LocalCommandContext,
+  historyCompletion?: () => Promise<string | undefined>,
 ): Promise<string> {
   const child = spawn(resolveHermesBin(), args, {
     env: SUBPROCESS_ENV,
@@ -548,70 +744,131 @@ async function runHermesChatStreaming(
   return await new Promise<string>((resolveOutput, rejectOutput) => {
     const abortSignal = context.abortSignal;
     let abortRequested = abortSignal?.aborted === true;
+    let settled = false;
+    let historyCompletionTimer: NodeJS.Timeout | undefined;
+    let historyCompletionInFlight = false;
     const typingTimer = setInterval(publishTypingMarker, 5000);
     typingTimer.unref?.();
-    const timeout = setTimeout(() => {
+    const cleanup = (): void => {
       clearInterval(typingTimer);
+      if (historyCompletionTimer) {
+        clearInterval(historyCompletionTimer);
+        historyCompletionTimer = undefined;
+      }
+      abortSignal?.removeEventListener("abort", abortChat);
+    };
+    const finishResolve = (value: string): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      clearTimeout(timeout);
       clearAssistantDeltaFlushTimer();
       toolLogWatcher.stop();
+      resolveOutput(value);
+    };
+    const finishReject = (error: Error): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      clearTimeout(timeout);
+      clearAssistantDeltaFlushTimer();
+      toolLogWatcher.stop();
+      rejectOutput(error);
+    };
+    const timeout = setTimeout(() => {
       child.kill("SIGTERM");
-      rejectOutput(new Error("hermes_chat_timeout"));
+      if (output.trim()) {
+        finishResolve(output);
+      } else {
+        finishReject(new Error("hermes_chat_timeout"));
+      }
     }, CHAT_TIMEOUT_MS);
     timeout.unref?.();
-  const abortChat = (): void => {
+    const abortChat = (): void => {
       abortRequested = true;
       stdoutLineBuffer = "";
       pendingAssistantDelta = "";
       clearAssistantDeltaFlushTimer();
       child.kill("SIGTERM");
     };
-    const cleanup = (): void => {
-      abortSignal?.removeEventListener("abort", abortChat);
+    const checkHistoryCompletion = (): void => {
+      if (!historyCompletion || settled || abortRequested || historyCompletionInFlight) {
+        return;
+      }
+      historyCompletionInFlight = true;
+      historyCompletion()
+        .then((detectedOutput) => {
+          if (!detectedOutput || settled || abortRequested) {
+            return;
+          }
+          output = detectedOutput;
+          pendingAssistantDelta = "";
+          stdoutLineBuffer = "";
+          child.kill("SIGTERM");
+          setTimeout(() => {
+            if (child.exitCode === null && child.signalCode === null) {
+              child.kill("SIGKILL");
+            }
+          }, 1000).unref?.();
+          finishResolve(detectedOutput);
+        })
+        .catch(() => {
+          // History completion is a best-effort escape hatch for Hermes processes
+          // that keep running after the assistant turn is already persisted.
+        })
+        .finally(() => {
+          historyCompletionInFlight = false;
+        });
     };
     if (abortRequested) {
       abortChat();
     } else {
       abortSignal?.addEventListener("abort", abortChat, { once: true });
     }
+    if (historyCompletion) {
+      historyCompletionTimer = setInterval(checkHistoryCompletion, HERMES_HISTORY_COMPLETION_POLL_MS);
+      setTimeout(checkHistoryCompletion, HERMES_HISTORY_COMPLETION_GRACE_MS);
+    }
     child.once("error", (error) => {
-        clearInterval(typingTimer);
-        clearTimeout(timeout);
+      if (settled) {
+        return;
+      }
         if (commandDeniedTimeoutKillTimer) {
           clearTimeout(commandDeniedTimeoutKillTimer);
           commandDeniedTimeoutKillTimer = undefined;
         }
-        clearAssistantDeltaFlushTimer();
-        toolLogWatcher.stop();
-        cleanup();
-      rejectOutput(error);
+      finishReject(error);
     });
     child.once("close", (code, signal) => {
       void (async () => {
-        clearInterval(typingTimer);
-        clearTimeout(timeout);
+        if (settled) {
+          return;
+        }
         if (commandDeniedTimeoutKillTimer) {
           clearTimeout(commandDeniedTimeoutKillTimer);
           commandDeniedTimeoutKillTimer = undefined;
         }
-        toolLogWatcher.stop();
-        cleanup();
         if (abortRequested) {
-          rejectOutput(new Error("hermes_chat_aborted"));
+          finishReject(new Error("hermes_chat_aborted"));
           return;
         }
         flushStdoutLineBuffer();
         flushAssistantDelta();
         if (commandDeniedTimeout) {
-          rejectOutput(new Error(HERMES_COMMAND_DENIED_TIMEOUT_MESSAGE));
+          finishReject(new Error(HERMES_COMMAND_DENIED_TIMEOUT_MESSAGE));
           return;
         }
         if (code && code !== 0) {
           const reason = stderr.trim() || output.trim() || `hermes chat exited with code ${code}`;
-          rejectOutput(new Error(signal ? `${reason} (${signal})` : reason));
+          finishReject(new Error(signal ? `${reason} (${signal})` : reason));
           return;
         }
-        resolveOutput(output);
-      })().catch(rejectOutput);
+        finishResolve(output);
+      })().catch((error) => finishReject(error instanceof Error ? error : new Error(String(error))));
     });
   });
 }

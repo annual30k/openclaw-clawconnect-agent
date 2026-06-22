@@ -126,6 +126,7 @@ export async function readChatHistoryFromTranscriptFile(
       hasMore: page.hasMore,
       nextCursor: page.nextCursor ?? null,
       newestCursor: page.newestCursor ?? null,
+      orderPolicy: "transcript",
       messages: page.messages.map((message, index) => {
         const seq = messageSeq(message) ?? index + 1;
         const role = normalizeTimelineRole(message.role);

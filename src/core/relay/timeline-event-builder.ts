@@ -298,6 +298,7 @@ export function buildHistorySnapshotPage(params: {
   newestCursor?: string | null;
   messages?: TimelineHistoryMessage[];
   attachments?: TimelineAttachmentInput[];
+  orderPolicy?: "display" | "transcript";
 }): CanonicalTimelineHistorySnapshotPage {
   return parseCanonicalTimelineHistorySnapshotPage({
     protocolVersion: 2,
@@ -311,5 +312,6 @@ export function buildHistorySnapshotPage(params: {
     newestCursor: params.newestCursor ?? null,
     messages: params.messages ?? [],
     attachments: params.attachments ?? [],
+    ...(params.orderPolicy ? { orderPolicy: params.orderPolicy } : {}),
   });
 }

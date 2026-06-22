@@ -76,6 +76,7 @@ export async function runHermesChatHistory(params: unknown): Promise<LocalResult
       hasMore: page.hasMore,
       nextCursor: page.nextCursor ?? null,
       newestCursor: page.newestCursor ?? null,
+      orderPolicy: "transcript",
       messages: page.messages.map((message) => {
         const turnId = message.turnId ?? message.idempotencyKey ?? message.clientMessageId ?? `history-${sessionKey}-${message.seq}-${message.role}`;
         const attachmentIds = extractAttachmentIds(message.content);

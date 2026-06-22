@@ -755,6 +755,102 @@ test("runHermesChat drops buffered assistant output when aborted", async () => {
   }
 });
 
+test("runHermesChat resolves from exported history when Hermes keeps running after answer", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-completion-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeHistoryCompletingHermesBin(root);
+    const publishedEvents: unknown[] = [];
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+
+    const result = await runHermesChat(
+      { sessionKey: "main", message: "Hi" },
+      { requestId: "run-history-complete", publishEvent: (event) => publishedEvents.push(event) },
+    );
+
+    assert.equal(result.output, "你好！有什么我能帮你的吗？");
+    assert.equal(JSON.stringify(publishedEvents).includes("你好！有什么我能帮你的吗？"), false);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat ignores exported history until it contains the current user turn", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-current-turn-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeStaleHistoryHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+
+    const result = await runHermesChat(
+      { sessionKey: "main", message: "Ping" },
+      { requestId: "run-history-current-turn", publishEvent: () => undefined },
+    );
+
+    assert.equal(result.output, "Pong! 🏓");
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat does not complete from an older repeated user prompt in exported history", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-repeated-user-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeRepeatedUserStaleHistoryHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+
+    const result = await runHermesChat(
+      { sessionKey: "main", message: "Hi" },
+      { requestId: "run-history-repeated-user", publishEvent: () => undefined },
+    );
+
+    assert.equal(result.output, "fresh hi reply");
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat serializes concurrent requests for the same Hermes session", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-serialized-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeConcurrentDetectingHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+
+    const [first, second] = await Promise.all([
+      runHermesChat({ sessionKey: "main", message: "Ping" }),
+      runHermesChat({ sessionKey: "main", message: "Hi" }),
+    ]);
+
+    assert.equal(first.output, "reply:Ping");
+    assert.equal(second.output, "reply:Hi");
+    assert.equal(existsSync(join(root, "concurrent")), false);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runHermesChat strips Hermes resume metadata from streaming events and final output", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-resume-metadata-"));
   const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
@@ -898,6 +994,9 @@ test("runHermesChatHistory returns OpenClaw-shaped canonical history", async () 
         hasMore: false,
         nextCursor: null,
         newestCursor: "seq:2",
+        extensions: {
+          orderPolicy: "transcript",
+        },
         messages: [
           {
             turnId: "history-main-1-user",
@@ -1274,6 +1373,199 @@ function writeAbortPartialHermesBin(root: string): string {
     "  process.stdout.write('partial ');",
     "  process.on('SIGTERM', () => process.exit(143));",
     "  setInterval(() => {}, 1000);",
+    "  return;",
+    "}",
+    "if (args[0] === 'status') { process.exit(0); }",
+    "console.error(`unexpected args: ${args.join(' ')}`);",
+    "process.exit(2);",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}
+
+function writeHistoryCompletingHermesBin(root: string): string {
+  const binPath = join(root, "hermes-history-completion");
+  const readyPath = join(root, "history-ready");
+  const payload = JSON.stringify({
+    sessionId: "20260622_100613_8947a8",
+    messages: [
+      {
+        id: "user-hi",
+        role: "user",
+        content: "Hi",
+        createdAt: "2026-06-22T02:06:26.000Z",
+      },
+      {
+        id: "assistant-hi",
+        role: "assistant",
+        content: "你好！有什么我能帮你的吗？",
+        createdAt: "2026-06-22T02:06:33.000Z",
+      },
+    ],
+  });
+  writeFileSync(binPath, [
+    "#!/usr/bin/env node",
+    "const fs = require('fs');",
+    "const args = process.argv.slice(2);",
+    `const readyPath = ${JSON.stringify(readyPath)};`,
+    `const payload = ${JSON.stringify(payload)};`,
+    "if (args[0] === 'sessions' && args[1] === 'list') {",
+    "  console.log('Title                            Preview          Last Active   ID');",
+    "  if (fs.existsSync(readyPath)) console.log('Greeting                         你好！           just now      20260622_100613_8947a8');",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'sessions' && args[1] === 'export') {",
+    "  if (fs.existsSync(readyPath)) { console.log(payload); process.exit(0); }",
+    "  console.log(JSON.stringify({ sessionId: '20260622_100613_8947a8', messages: [] }));",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'chat') {",
+    "  setTimeout(() => fs.writeFileSync(readyPath, '1'), 100);",
+    "  process.on('SIGTERM', () => process.exit(0));",
+    "  setInterval(() => {}, 1000);",
+    "  return;",
+    "}",
+    "if (args[0] === 'status') { process.exit(0); }",
+    "console.error(`unexpected args: ${args.join(' ')}`);",
+    "process.exit(2);",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}
+
+function writeStaleHistoryHermesBin(root: string): string {
+  const binPath = join(root, "hermes-stale-history");
+  const payload = JSON.stringify({
+    sessionId: "20260622_100613_8947a8",
+    messages: [
+      {
+        id: "user-hi",
+        role: "user",
+        content: "Hi",
+        createdAt: "2026-06-22T02:06:26.000Z",
+      },
+      {
+        id: "assistant-hi",
+        role: "assistant",
+        content: "你好！👋 我在这里，随时准备帮你解决问题。有什么需要我协助的吗？",
+        createdAt: "2026-06-22T02:06:33.000Z",
+      },
+    ],
+  });
+  writeFileSync(binPath, [
+    "#!/usr/bin/env node",
+    "const args = process.argv.slice(2);",
+    `const payload = ${JSON.stringify(payload)};`,
+    "if (args[0] === 'sessions' && args[1] === 'list') {",
+    "  console.log('Title                            Preview          Last Active   ID');",
+    "  console.log('Greeting                         你好！           just now      20260622_100613_8947a8');",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'sessions' && args[1] === 'export') {",
+    "  console.log(payload);",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'chat') {",
+    "  setTimeout(() => { console.log('Pong! 🏓'); process.exit(0); }, 2500);",
+    "  return;",
+    "}",
+    "if (args[0] === 'status') { process.exit(0); }",
+    "console.error(`unexpected args: ${args.join(' ')}`);",
+    "process.exit(2);",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}
+
+function writeRepeatedUserStaleHistoryHermesBin(root: string): string {
+  const binPath = join(root, "hermes-repeated-user-stale-history");
+  const payload = JSON.stringify({
+    sessionId: "20260622_100613_8947a8",
+    messages: [
+      {
+        id: "user-old-hi",
+        role: "user",
+        content: "Hi",
+        createdAt: "2026-06-22T02:06:26.000Z",
+      },
+      {
+        id: "assistant-old-hi",
+        role: "assistant",
+        content: "old hi reply",
+        createdAt: "2026-06-22T02:06:33.000Z",
+      },
+      {
+        id: "user-visible",
+        role: "user",
+        content: "iOS final visible",
+        createdAt: "2026-06-22T06:18:04.000Z",
+      },
+      {
+        id: "assistant-visible",
+        role: "assistant",
+        content: "stale visible reply",
+        createdAt: "2026-06-22T06:18:12.000Z",
+      },
+    ],
+  });
+  writeFileSync(binPath, [
+    "#!/usr/bin/env node",
+    "const args = process.argv.slice(2);",
+    `const payload = ${JSON.stringify(payload)};`,
+    "if (args[0] === 'sessions' && args[1] === 'list') {",
+    "  console.log('Title                            Preview          Last Active   ID');",
+    "  console.log('Greeting                         stale           just now      20260622_100613_8947a8');",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'sessions' && args[1] === 'export') {",
+    "  console.log(payload);",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'chat') {",
+    "  setTimeout(() => { console.log('fresh hi reply'); process.exit(0); }, 2500);",
+    "  return;",
+    "}",
+    "if (args[0] === 'status') { process.exit(0); }",
+    "console.error(`unexpected args: ${args.join(' ')}`);",
+    "process.exit(2);",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}
+
+function writeConcurrentDetectingHermesBin(root: string): string {
+  const binPath = join(root, "hermes-concurrent-detect");
+  const activePath = join(root, "active");
+  const concurrentPath = join(root, "concurrent");
+  writeFileSync(binPath, [
+    "#!/usr/bin/env node",
+    "const fs = require('fs');",
+    "const args = process.argv.slice(2);",
+    `const activePath = ${JSON.stringify(activePath)};`,
+    `const concurrentPath = ${JSON.stringify(concurrentPath)};`,
+    "if (args[0] === 'sessions' && args[1] === 'list') {",
+    "  console.log('Title                            Preview          Last Active   ID');",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'chat') {",
+    "  const queryIndex = args.indexOf('--query');",
+    "  const rawQuery = queryIndex >= 0 ? args[queryIndex + 1] : '';",
+    "  const query = rawQuery.split('\\n\\n[ClawConnect mobile bridge]')[0];",
+    "  if (fs.existsSync(activePath)) fs.writeFileSync(concurrentPath, '1');",
+    "  fs.writeFileSync(activePath, query);",
+    "  setTimeout(() => {",
+    "    try { fs.unlinkSync(activePath); } catch {}",
+    "    console.log(`reply:${query}`);",
+    "    process.exit(0);",
+    "  }, 200);",
     "  return;",
     "}",
     "if (args[0] === 'status') { process.exit(0); }",
