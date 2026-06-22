@@ -139,15 +139,17 @@ program
   .argument("<path>", "Path to the local file")
   .option("-g, --gateway <id>", "Override gateway ID from local config")
   .option("-s, --session <key>", "Target chat session key (defaults to the latest active session)")
+  .option("--source-run-id <id>", "Message/run ID this file belongs to")
   .option(...profileOption)
   .option("--json", "Print the upload result as JSON", false)
-  .action(async (filePath: string, opts: { gateway?: string; session?: string; profile?: string; json?: boolean }) => {
+  .action(async (filePath: string, opts: { gateway?: string; session?: string; sourceRunId?: string; profile?: string; json?: boolean }) => {
     try {
       setActiveProfile(opts.profile);
       await sendFileCommand({
         filePath,
         gateway: opts.gateway,
         session: opts.session,
+        sourceRunId: opts.sourceRunId,
         json: opts.json,
       });
     } catch (err) {

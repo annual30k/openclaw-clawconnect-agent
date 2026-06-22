@@ -15,6 +15,7 @@ test("relayOutgoingMediaInPayload uploads OpenClaw outgoing media and rewrites t
   try {
     const payload = {
       message: {
+        runId: "assistant-run-outgoing",
         role: "assistant",
         content: [
           { type: "text", text: "sent image" },
@@ -40,6 +41,7 @@ test("relayOutgoingMediaInPayload uploads OpenClaw outgoing media and rewrites t
     assert.equal(image.fileId, "file_outgoing_payload");
     assert.equal(image.downloadUrl, "/api/mobile/files/file_outgoing_payload");
     assert.equal(image.fileName, "photo.jpg");
+    assert.equal(image.sourceRunId, "assistant-run-outgoing");
     assert.equal(image.gatewayId, "gw_test");
     assert.equal(image.sessionKey, "agent:main:session_1");
   } finally {
@@ -180,10 +182,12 @@ async function createOutgoingMediaFixture() {
 
 async function createFileUploadRelayServer(fileId: string) {
   const receivedChunks: Buffer[] = [];
+  let initSourceRunId: unknown;
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? "";
     if (req.method === "POST" && url === "/api/host/gateways/gw_test/files/init") {
-      await readRequestBody(req);
+      const initBody = JSON.parse((await readRequestBody(req)).toString("utf8")) as Record<string, unknown>;
+      initSourceRunId = initBody.sourceRunId;
       writeJson(res, {
         fileId,
         uploadId: "upload_test",
@@ -222,6 +226,7 @@ async function createFileUploadRelayServer(fileId: string) {
           downloadPath: `/api/mobile/files/${fileId}`,
           chunkSize: 1024,
           totalChunks: 1,
+          sourceRunId: typeof initSourceRunId === "string" ? initSourceRunId : undefined,
         },
       });
       return;

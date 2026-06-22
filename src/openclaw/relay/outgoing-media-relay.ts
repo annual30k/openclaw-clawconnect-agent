@@ -16,6 +16,10 @@ export type OutgoingMediaRelayOptions = {
   userMessage?: string;
 };
 
+type OutgoingMediaOptionsWithSourceRun = OutgoingMediaRelayOptions & {
+  sourceRunId?: string;
+};
+
 type OutgoingMediaRecord = {
   attachmentId?: string;
   sessionKey?: string;
@@ -47,8 +51,9 @@ export async function relayOutgoingMediaInPayload(
   }
 
   let changed = false;
+  const sourceRunId = payloadSourceRunId(payload as Record<string, unknown>);
   const nextContent = await Promise.all(content.map(async (block) => {
-    const nextBlock = await relayOutgoingMediaBlock(block, opts);
+    const nextBlock = await relayOutgoingMediaBlock(block, { ...opts, sourceRunId });
     changed ||= nextBlock !== block;
     return nextBlock;
   }));
@@ -91,7 +96,7 @@ export async function relayOutgoingMediaInHistoryResponse(
     : response;
 }
 
-async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaRelayOptions): Promise<unknown> {
+async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOptionsWithSourceRun): Promise<unknown> {
   if (!block || typeof block !== "object" || Array.isArray(block)) {
     return block;
   }
@@ -119,6 +124,7 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaRelayO
         sessionKey,
         filePath,
         senderDisplayName: opts.senderDisplayName,
+        sourceRunId: opts.sourceRunId,
       });
       opts.cache?.set(cacheKey, upload);
     }
@@ -139,6 +145,7 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaRelayO
       downloadUrl: upload.downloadPath,
       downloadPath: upload.downloadPath,
       expiresAt: upload.expiresAt,
+      sourceRunId: upload.sourceRunId,
       gatewayId: upload.gatewayId,
       sessionKey: upload.sessionKey,
       transferState: "available",
@@ -155,6 +162,21 @@ function outgoingAttachmentId(url: string | undefined): string | undefined {
   }
   const match = OUTGOING_MEDIA_RE.exec(url);
   return match?.[1]?.trim() || undefined;
+}
+
+function payloadSourceRunId(payload: Record<string, unknown>): string | undefined {
+  const message = payload.message;
+  const messageRecord = message && typeof message === "object" && !Array.isArray(message)
+    ? message as Record<string, unknown>
+    : undefined;
+  return firstString(
+    payload.runId,
+    payload.turnId,
+    payload.messageId,
+    messageRecord?.runId,
+    messageRecord?.turnId,
+    messageRecord?.messageId,
+  );
 }
 
 async function readOutgoingMediaRecord(attachmentId: string, recordsDir?: string): Promise<OutgoingMediaRecord> {
