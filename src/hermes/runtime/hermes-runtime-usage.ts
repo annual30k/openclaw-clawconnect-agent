@@ -206,35 +206,84 @@ function readHermesContextLimitFromModelsDevCache(model: string, provider?: stri
   try {
     const raw = readFileSync(HERMES_MODELS_DEV_CACHE_FILE, "utf8");
     const cache = JSON.parse(raw) as unknown;
-    if (!cache || typeof cache !== "object" || Array.isArray(cache)) {
-      return undefined;
-    }
-    const providerId = hermesModelsDevProviderId(provider);
-    if (!providerId) {
-      return undefined;
-    }
-    const providerRecord = toRecord((cache as Record<string, unknown>)[providerId]);
-    const models = toRecord(providerRecord.models);
-    const normalizedModel = normalizeModelId(model);
-    for (const [candidate, entry] of Object.entries(models)) {
-      if (normalizeModelId(candidate) !== normalizedModel) {
-        continue;
-      }
-      const limit = toRecord(toRecord(entry).limit);
-      const parsed = firstPositiveInteger(
-        limit.context,
-        limit.input,
-        toRecord(entry).context_window,
-        toRecord(entry).contextWindow,
-      );
-      if (parsed !== undefined) {
-        return parsed;
-      }
-    }
+    return readHermesContextLimitFromModelsDevCacheRecord(model, provider, cache);
   } catch {
     return undefined;
   }
+}
+
+export function readHermesContextLimitFromModelsDevCacheRecord(
+  model: string,
+  provider: string | undefined,
+  cache: unknown,
+): number | undefined {
+  const cacheRecord = toRecord(cache);
+  const normalizedModel = normalizeModelId(model);
+  if (!normalizedModel) {
+    return undefined;
+  }
+
+  for (const providerKey of hermesModelsDevProviderKeys(provider, cacheRecord)) {
+    const parsed = readHermesContextLimitFromProviderRecord(cacheRecord[providerKey], normalizedModel);
+    if (parsed !== undefined) {
+      return parsed;
+    }
+  }
+
+  const globalMatches = new Set<number>();
+  for (const providerRecord of Object.values(cacheRecord)) {
+    const parsed = readHermesContextLimitFromProviderRecord(providerRecord, normalizedModel);
+    if (parsed !== undefined) {
+      globalMatches.add(parsed);
+    }
+  }
+  return globalMatches.size === 1 ? [...globalMatches][0] : undefined;
+}
+
+function hermesModelsDevProviderKeys(provider: string | undefined, cacheRecord: Record<string, unknown>): string[] {
+  const keys: string[] = [];
+  const add = (key: string | undefined) => {
+    const normalized = key?.trim();
+    if (normalized && Object.prototype.hasOwnProperty.call(cacheRecord, normalized) && !keys.includes(normalized)) {
+      keys.push(normalized);
+    }
+  };
+
+  add(hermesModelsDevProviderId(provider));
+  add(provider?.trim().toLowerCase());
+
+  const normalizedProvider = normalizeProviderId(provider);
+  if (normalizedProvider) {
+    for (const key of Object.keys(cacheRecord)) {
+      const normalizedKey = normalizeProviderId(key);
+      if (normalizedKey === normalizedProvider || normalizedKey.includes(normalizedProvider) || normalizedProvider.includes(normalizedKey)) {
+        add(key);
+      }
+    }
+  }
+  return keys;
+}
+
+function readHermesContextLimitFromProviderRecord(providerRecord: unknown, normalizedModel: string): number | undefined {
+  const models = toRecord(toRecord(providerRecord).models);
+  for (const [candidate, entry] of Object.entries(models)) {
+    if (normalizeModelId(candidate) !== normalizedModel) {
+      continue;
+    }
+    return readHermesContextLimitFromModelRecord(entry);
+  }
   return undefined;
+}
+
+function readHermesContextLimitFromModelRecord(entry: unknown): number | undefined {
+  const record = toRecord(entry);
+  const limit = toRecord(record.limit);
+  return firstPositiveInteger(
+    limit.context,
+    limit.input,
+    record.context_window,
+    record.contextWindow,
+  );
 }
 
 export function hermesModelsDevProviderId(provider?: string): string | undefined {

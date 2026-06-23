@@ -31,6 +31,9 @@ import {
   parseHermesSessionsList,
   rememberHermesSession,
 } from "./hermes-session-store.js";
+import {
+  readHermesContextLimitFromModelsDevCacheRecord,
+} from "./runtime/hermes-runtime-usage.js";
 
 test("extractDeliverablePaths returns existing supported artifact paths", () => {
   const dir = mkdtempSync(join(tmpdir(), "hermes-artifacts-"));
@@ -257,6 +260,71 @@ test("parseHermesSessionUsageSnapshot reads compact context window values", () =
   assert.equal(snapshot.currentModel, "mimo-v2.5-pro");
   assert.equal(snapshot.contextUsage, 671800);
   assert.equal(snapshot.contextLimit, 1000000);
+});
+
+test("Hermes context limit falls back to model id across provider cache entries", () => {
+  const cache = {
+    "future-provider": {
+      models: {
+        "vendor/new-model-pro": {
+          limit: { context: 456000 },
+        },
+      },
+    },
+  };
+
+  assert.equal(
+    readHermesContextLimitFromModelsDevCacheRecord("new-model-pro", "Future Display Name", cache),
+    456000,
+  );
+});
+
+test("Hermes context limit matches provider display names to provider cache keys", () => {
+  const cache = {
+    xiaomi: {
+      models: {
+        "mimo-v2.5-pro": {
+          limit: { context: 1048576 },
+        },
+      },
+    },
+    "other-provider": {
+      models: {
+        "mimo-v2.5-pro": {
+          limit: { context: 272000 },
+        },
+      },
+    },
+  };
+
+  assert.equal(
+    readHermesContextLimitFromModelsDevCacheRecord("mimo-v2.5-pro", "Xiaomi MiMo", cache),
+    1048576,
+  );
+});
+
+test("Hermes context limit stays unknown when global model matches conflict", () => {
+  const cache = {
+    "provider-a": {
+      models: {
+        "shared-model": {
+          limit: { context: 128000 },
+        },
+      },
+    },
+    "provider-b": {
+      models: {
+        "shared-model": {
+          limit: { context: 256000 },
+        },
+      },
+    },
+  };
+
+  assert.equal(
+    readHermesContextLimitFromModelsDevCacheRecord("shared-model", "Unknown Provider", cache),
+    undefined,
+  );
 });
 
 test("buildHermesRuntimeContextHint includes current model and provider", () => {
