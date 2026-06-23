@@ -1,6 +1,6 @@
 {
   "name": "clawconnect-agent",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "ClawConnect host agent for OpenClaw remote access",
   "license": "MIT",
   "type": "module",
