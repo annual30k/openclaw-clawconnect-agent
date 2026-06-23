@@ -534,6 +534,7 @@ async function runHermesChatStreaming(
   let stderr = "";
   let seq = 0;
   let stdoutLineBuffer = "";
+  let stdoutLineFlushTimer: NodeJS.Timeout | undefined;
   let pendingAssistantDelta = "";
   let assistantDeltaFlushTimer: NodeJS.Timeout | undefined;
   let inSecurityReview = false;
@@ -631,6 +632,14 @@ async function runHermesChatStreaming(
     assistantDeltaFlushTimer = undefined;
   };
 
+  const clearStdoutLineFlushTimer = (): void => {
+    if (!stdoutLineFlushTimer) {
+      return;
+    }
+    clearTimeout(stdoutLineFlushTimer);
+    stdoutLineFlushTimer = undefined;
+  };
+
   const flushAssistantDelta = (): void => {
     clearAssistantDeltaFlushTimer();
     if (!pendingAssistantDelta) {
@@ -681,6 +690,31 @@ async function runHermesChatStreaming(
     }
   };
 
+  const flushStdoutLineBuffer = (): void => {
+    clearStdoutLineFlushTimer();
+    if (!stdoutLineBuffer) {
+      return;
+    }
+    const clean = stripHermesSessionResumeNotices(filterChatLine(stdoutLineBuffer) ?? "");
+    stdoutLineBuffer = "";
+    if (!clean.trim()) {
+      return;
+    }
+    publishAssistantDelta(clean);
+  };
+
+  const scheduleStdoutLineFlush = (): void => {
+    if (!stdoutLineBuffer.trim()) {
+      clearStdoutLineFlushTimer();
+      return;
+    }
+    if (stdoutLineFlushTimer) {
+      return;
+    }
+    stdoutLineFlushTimer = setTimeout(flushStdoutLineBuffer, HERMES_ASSISTANT_DELTA_FLUSH_MS);
+    stdoutLineFlushTimer.unref?.();
+  };
+
   const publishText = (text: string): void => {
     stdoutLineBuffer += text;
     const lines = stdoutLineBuffer.split(/\r?\n/);
@@ -692,22 +726,12 @@ async function runHermesChatStreaming(
         .join("\n"),
     );
     if (!clean.trim()) {
+      scheduleStdoutLineFlush();
       return;
     }
     const chunk = `${clean}\n`;
     publishAssistantDelta(chunk);
-  };
-
-  const flushStdoutLineBuffer = (): void => {
-    if (!stdoutLineBuffer) {
-      return;
-    }
-    const clean = stripHermesSessionResumeNotices(filterChatLine(stdoutLineBuffer) ?? "");
-    stdoutLineBuffer = "";
-    if (!clean.trim()) {
-      return;
-    }
-    publishAssistantDelta(clean);
+    scheduleStdoutLineFlush();
   };
 
   const publishStderr = (text: string): void => {
@@ -764,6 +788,7 @@ async function runHermesChatStreaming(
       settled = true;
       cleanup();
       clearTimeout(timeout);
+      clearStdoutLineFlushTimer();
       clearAssistantDeltaFlushTimer();
       toolLogWatcher.stop();
       resolveOutput(value);
@@ -775,6 +800,7 @@ async function runHermesChatStreaming(
       settled = true;
       cleanup();
       clearTimeout(timeout);
+      clearStdoutLineFlushTimer();
       clearAssistantDeltaFlushTimer();
       toolLogWatcher.stop();
       rejectOutput(error);
@@ -792,6 +818,7 @@ async function runHermesChatStreaming(
       abortRequested = true;
       stdoutLineBuffer = "";
       pendingAssistantDelta = "";
+      clearStdoutLineFlushTimer();
       clearAssistantDeltaFlushTimer();
       child.kill("SIGTERM");
     };
@@ -808,6 +835,7 @@ async function runHermesChatStreaming(
           output = detectedOutput;
           pendingAssistantDelta = "";
           stdoutLineBuffer = "";
+          clearStdoutLineFlushTimer();
           child.kill("SIGTERM");
           setTimeout(() => {
             if (child.exitCode === null && child.signalCode === null) {

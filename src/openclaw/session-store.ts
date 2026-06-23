@@ -1,6 +1,6 @@
 import { readdir, readFile } from "fs/promises";
 import { homedir } from "os";
-import { join } from "path";
+import { basename, isAbsolute, join, resolve } from "path";
 
 export async function inferLatestOpenClawSessionKey(sessionStoreRoot = join(homedir(), ".openclaw")): Promise<string | undefined> {
   const agentsDir = join(sessionStoreRoot, "agents");
@@ -53,6 +53,151 @@ export async function inferLatestOpenClawSessionKey(sessionStoreRoot = join(home
   }
 
   return latestSessionKey;
+}
+
+export async function inferLatestOpenClawSendFileSourceRunId(input: {
+  sessionKey: string;
+  filePath?: string;
+  sessionStoreRoot?: string;
+}): Promise<string | undefined> {
+  const logPath = await resolveOpenClawSessionLogPath(input.sessionKey, input.sessionStoreRoot);
+  if (!logPath) {
+    return undefined;
+  }
+
+  let rawTranscript: string;
+  try {
+    rawTranscript = await readFile(logPath, "utf8");
+  } catch {
+    return undefined;
+  }
+
+  const expectedPath = input.filePath ? resolve(input.filePath) : undefined;
+  const expectedBasename = expectedPath ? basename(expectedPath) : undefined;
+  const lines = rawTranscript.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const parsed = parseJsonRecord(lines[index]);
+    if (!parsed || parsed.type !== "message") {
+      continue;
+    }
+    const message = asRecord(parsed.message);
+    if (!message || message.role !== "assistant") {
+      continue;
+    }
+    if (!messageContainsSendFileToolCall(message, expectedPath, expectedBasename)) {
+      continue;
+    }
+
+    return firstString(message.runId, message.turnId, parsed.id);
+  }
+
+  return undefined;
+}
+
+async function resolveOpenClawSessionLogPath(
+  sessionKey: string,
+  sessionStoreRoot = join(homedir(), ".openclaw"),
+): Promise<string | undefined> {
+  const trimmedSessionKey = sessionKey.trim();
+  if (!trimmedSessionKey) {
+    return undefined;
+  }
+  const agentId = resolveAgentId(trimmedSessionKey);
+  const sessionsDir = join(sessionStoreRoot, "agents", agentId, "sessions");
+  let rawStore: string;
+  try {
+    rawStore = await readFile(join(sessionsDir, "sessions.json"), "utf8");
+  } catch {
+    return undefined;
+  }
+
+  const parsedStore = parseJsonRecord(rawStore);
+  if (!parsedStore) {
+    return undefined;
+  }
+  const entry =
+    asRecord(parsedStore[trimmedSessionKey])
+    ?? (trimmedSessionKey.startsWith("agent:")
+      ? undefined
+      : asRecord(parsedStore[`agent:${agentId}:${trimmedSessionKey}`]));
+  if (!entry) {
+    return undefined;
+  }
+
+  const candidate = firstString(entry.sessionFile, entry.transcriptPath);
+  if (candidate) {
+    return isAbsolute(candidate) ? candidate : resolve(sessionsDir, candidate);
+  }
+  const sessionId = firstString(entry.sessionId, entry.id);
+  return sessionId ? join(sessionsDir, sessionId.endsWith(".jsonl") ? sessionId : `${sessionId}.jsonl`) : undefined;
+}
+
+function resolveAgentId(sessionKey: string): string {
+  const match = /^agent:([^:]+):/.exec(sessionKey);
+  return match?.[1]?.trim() || "main";
+}
+
+function messageContainsSendFileToolCall(
+  message: Record<string, unknown>,
+  expectedPath: string | undefined,
+  expectedBasename: string | undefined,
+): boolean {
+  const content = Array.isArray(message.content) ? message.content : [];
+  return content.some((block) => {
+    const record = asRecord(block);
+    if (!record) {
+      return false;
+    }
+    const name = firstString(record.name, record.toolName, record.tool_name);
+    const type = firstString(record.type)?.toLowerCase();
+    if (name && name !== "exec") {
+      return false;
+    }
+    if (type && !["toolcall", "tool_call", "tool-use", "tooluse"].includes(type)) {
+      return false;
+    }
+    const command = toolCallCommand(record);
+    if (!command || !/\bclawconnect\s+send-file\b/.test(command)) {
+      return false;
+    }
+    if (!expectedPath && !expectedBasename) {
+      return true;
+    }
+    return Boolean(
+      (expectedPath && command.includes(expectedPath))
+        || (expectedBasename && command.includes(expectedBasename)),
+    );
+  });
+}
+
+function toolCallCommand(record: Record<string, unknown>): string | undefined {
+  const args = asRecord(record.arguments);
+  const direct = firstString(record.command, args?.command);
+  if (direct) {
+    return direct;
+  }
+  const partialArgs = firstString(record.partialArgs, record.partial_args);
+  const parsedPartialArgs = partialArgs ? parseJsonRecord(partialArgs) : undefined;
+  return firstString(parsedPartialArgs?.command);
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return asRecord(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
 }
 
 function extractSessionUpdatedAt(value: unknown): number | undefined {

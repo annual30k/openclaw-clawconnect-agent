@@ -4,7 +4,10 @@ import {
   formatFileSize,
   normalizeSessionKey,
 } from "../core/relay/file-upload-utils.js";
-import { inferLatestOpenClawSessionKey } from "../openclaw/session-store.js";
+import {
+  inferLatestOpenClawSendFileSourceRunId,
+  inferLatestOpenClawSessionKey,
+} from "../openclaw/session-store.js";
 
 export interface SendFileCommandOptions {
   filePath: string;
@@ -22,6 +25,7 @@ export interface SendFileCommandDependencies {
   stdout?: Pick<NodeJS.WritableStream, "write">;
   stderr?: Pick<NodeJS.WritableStream, "write">;
   sessionStoreRoot?: string;
+  env?: NodeJS.ProcessEnv;
 }
 
 export type SendFileResult = FileUploadResult;
@@ -50,6 +54,9 @@ export async function sendFileCommand(
   }
 
   const sessionKey = await resolveTargetSessionKey(opts.session, config, deps.sessionStoreRoot);
+  const sourceRunId =
+    resolveSourceRunId(opts.sourceRunId, deps.env ?? process.env)
+    ?? await resolveOpenClawTranscriptSourceRunId(opts, config, sessionKey, deps.sessionStoreRoot);
   writeLog(stderr, `[send-file] preparing ${opts.filePath} for gateway ${gatewayId} session ${sessionKey}`);
 
   const result = await uploadFileToRelay(
@@ -62,7 +69,7 @@ export async function sendFileCommand(
       senderDisplayName: config.displayName,
       durationMs: opts.durationMs,
       transcript: opts.transcript,
-      sourceRunId: opts.sourceRunId,
+      sourceRunId,
     },
     {
       fetchImpl: deps.fetchImpl,
@@ -82,6 +89,54 @@ export async function sendFileCommand(
   }
 
   return result;
+}
+
+async function resolveOpenClawTranscriptSourceRunId(
+  opts: SendFileCommandOptions,
+  config: ClawConnectConfig,
+  sessionKey: string,
+  sessionStoreRoot?: string,
+): Promise<string | undefined> {
+  if (config.gatewayType && config.gatewayType !== "openclaw") {
+    return undefined;
+  }
+  // OpenClaw exec tools do not always inject the relay run id into subprocess
+  // env. Use the target transcript's current send-file tool call as a stable
+  // source id, so returned files attach to the assistant turn instead of time.
+  return inferLatestOpenClawSendFileSourceRunId({
+    sessionKey,
+    filePath: opts.filePath,
+    sessionStoreRoot,
+  });
+}
+
+function resolveSourceRunId(explicit: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
+  const explicitValue = normalizeSourceRunId(explicit);
+  if (explicitValue) return explicitValue;
+
+  for (const key of [
+    "CLAWCONNECT_SOURCE_RUN_ID",
+    "OPENCLAW_RUN_ID",
+    "OPENCLAW_TRACE_RUN_ID",
+    "OPENCLAW_REQUEST_ID",
+    "CODEX_RUN_ID",
+  ]) {
+    const value = normalizeSourceRunId(env[key]);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function normalizeSourceRunId(value: string | undefined): string | undefined {
+  let trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  for (const suffix of [":user", ":assistant", ":tool", ":system"]) {
+    if (trimmed.endsWith(suffix)) {
+      trimmed = trimmed.slice(0, -suffix.length);
+      break;
+    }
+  }
+  return trimmed || undefined;
 }
 
 async function resolveTargetSessionKey(

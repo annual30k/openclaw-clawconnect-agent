@@ -755,6 +755,36 @@ test("runHermesChat drops buffered assistant output when aborted", async () => {
   }
 });
 
+test("runHermesChat publishes assistant output before a newline arrives", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-partial-stream-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeSlowPartialHermesBin(root);
+    const publishedEvents: unknown[] = [];
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+
+    const chatPromise = runHermesChat(
+      { sessionKey: "main", message: "stream slowly" },
+      {
+        requestId: "run-partial-stream",
+        publishEvent: (event) => publishedEvents.push(event),
+      },
+    );
+
+    await waitForHermesDelta(publishedEvents, "partial", 600);
+    const result = await chatPromise;
+
+    assert.match(result.output, /partial reply/);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runHermesChat resolves from exported history when Hermes keeps running after answer", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-completion-"));
   const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
@@ -1383,6 +1413,43 @@ function writeAbortPartialHermesBin(root: string): string {
   chmodSync(binPath, 0o755);
   assert.equal(existsSync(binPath), true);
   return binPath;
+}
+
+function writeSlowPartialHermesBin(root: string): string {
+  const binPath = join(root, "hermes-slow-partial");
+  writeFileSync(binPath, [
+    "#!/usr/bin/env node",
+    "const args = process.argv.slice(2);",
+    "if (args[0] === 'sessions' && args[1] === 'list') {",
+    "  console.log('Title                            Preview          Last Active   ID');",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'chat') {",
+    "  process.stdout.write('partial ');",
+    "  setTimeout(() => {",
+    "    console.log('reply');",
+    "  }, 1200);",
+    "  return;",
+    "}",
+    "if (args[0] === 'status') { process.exit(0); }",
+    "console.error(`unexpected args: ${args.join(' ')}`);",
+    "process.exit(2);",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return binPath;
+}
+
+async function waitForHermesDelta(events: unknown[], expectedText: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (JSON.stringify(events).includes(`"state":"delta"`) && JSON.stringify(events).includes(expectedText)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`Timed out waiting for Hermes delta containing ${expectedText}`);
 }
 
 function writeHistoryCompletingHermesBin(root: string): string {
