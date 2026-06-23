@@ -12,6 +12,7 @@ import {
 } from "./hermes-runtime-usage.js";
 import {
   compactStringArray,
+  firstPositiveInteger,
   stringValue,
   toRecord,
 } from "./hermes-runtime-values.js";
@@ -118,24 +119,28 @@ export function modelItemsFromHermesModelOptionsPayload(
       continue;
     }
     const providerName = stringValue(provider.name) ?? providerId;
-    const models = Array.isArray(provider.models)
-      ? provider.models.filter((model): model is string => typeof model === "string" && model.trim().length > 0)
-      : [];
+    const models = Array.isArray(provider.models) ? provider.models : [];
     const providerIsSelected = provider.is_current === true || normalizedProviderMatches(providerId, selectedProvider);
 
-    for (const modelId of models) {
+    for (const modelEntry of models) {
+      const model = hermesModelEntry(modelEntry);
+      if (!model) {
+        continue;
+      }
+      const { modelId, alias, name, contextWindow, tags } = model;
       const selected = providerIsSelected && normalizeModelId(modelId) === normalizeModelId(selectedModel);
       items.push({
         providerId,
         provider: providerName,
         modelId,
-        alias: modelId,
-        name: modelId,
-        contextWindow: "--",
+        alias,
+        name,
+        contextWindow,
         tags: compactStringArray([
           modelId,
           stringValue(provider.source),
           provider.is_user_defined === true ? "user-config" : undefined,
+          ...tags,
         ]),
         isSelected: selected,
         isDefault: selected,
@@ -144,6 +149,71 @@ export function modelItemsFromHermesModelOptionsPayload(
   }
 
   return items;
+}
+
+function hermesModelEntry(entry: unknown): {
+  modelId: string;
+  alias: string;
+  name: string;
+  contextWindow: string;
+  tags: string[];
+} | undefined {
+  if (typeof entry === "string") {
+    const modelId = entry.trim();
+    if (!modelId) {
+      return undefined;
+    }
+    return {
+      modelId,
+      alias: modelId,
+      name: modelId,
+      contextWindow: "--",
+      tags: [],
+    };
+  }
+
+  const record = toRecord(entry);
+  const modelId = stringValue(record.id)
+    ?? stringValue(record.modelId)
+    ?? stringValue(record.model_id)
+    ?? stringValue(record.model)
+    ?? stringValue(record.name)
+    ?? stringValue(record.alias);
+  if (!modelId) {
+    return undefined;
+  }
+  const alias = stringValue(record.alias) ?? stringValue(record.modelAlias) ?? modelId;
+  const name = stringValue(record.name) ?? alias;
+  const tags = Array.isArray(record.tags)
+    ? record.tags.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    : [];
+
+  return {
+    modelId,
+    alias,
+    name,
+    contextWindow: hermesModelContextWindow(record) ?? "--",
+    tags,
+  };
+}
+
+function hermesModelContextWindow(record: Record<string, unknown>): string | undefined {
+  const limit = toRecord(record.limit);
+  const parsed = firstPositiveInteger(
+    record.contextWindow,
+    record.context_window,
+    record.contextLength,
+    record.context_length,
+    record.contextTokens,
+    record.context_tokens,
+    record.maxInputTokens,
+    record.max_input_tokens,
+    record.maxContextTokens,
+    record.max_context_tokens,
+    limit.context,
+    limit.input,
+  );
+  return parsed !== undefined ? String(parsed) : undefined;
 }
 
 function dedupeModelItems(items: HermesModelListItem[]): HermesModelListItem[] {

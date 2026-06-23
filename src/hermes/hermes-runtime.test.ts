@@ -247,6 +247,18 @@ test("parseHermesSessionUsageSnapshot reads session token usage", () => {
   assert.equal(snapshot.contextLimit, 128000);
 });
 
+test("parseHermesSessionUsageSnapshot reads compact context window values", () => {
+  const snapshot = parseHermesSessionUsageSnapshot(JSON.stringify({
+    model: "mimo-v2.5-pro",
+    input_tokens: 671800,
+    model_config: { contextWindow: "1m" },
+  }));
+
+  assert.equal(snapshot.currentModel, "mimo-v2.5-pro");
+  assert.equal(snapshot.contextUsage, 671800);
+  assert.equal(snapshot.contextLimit, 1000000);
+});
+
 test("buildHermesRuntimeContextHint includes current model and provider", () => {
   const hint = buildHermesRuntimeContextHint({
     currentModel: "gpt-5.4",
@@ -369,6 +381,30 @@ test("model options use Hermes provider payload without Codex fallback", () => {
   assert.deepEqual(items.map((item) => item.modelId), ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"]);
   assert.equal(items[0]?.isSelected, true);
   assert.equal(items.some((item) => item.providerId === "openai-codex"), false);
+});
+
+test("model options expose Hermes model context windows", () => {
+  const items = modelItemsFromHermesModelOptionsPayload({
+    provider: "minimax-oauth",
+    model: "mimo-v2.5-pro",
+    providers: [
+      {
+        slug: "minimax-oauth",
+        name: "Xiaomi MiMo",
+        is_current: true,
+        source: "hermes",
+        models: [
+          { id: "mimo-v2.5-pro", name: "mimo-v2.5-pro", limit: { context: 1000000 } },
+          { id: "MiniMax-M2.7", context_window: "272k" },
+        ],
+      },
+    ],
+  });
+
+  assert.deepEqual(items.map((item) => item.modelId), ["mimo-v2.5-pro", "MiniMax-M2.7"]);
+  assert.equal(items[0]?.contextWindow, "1000000");
+  assert.equal(items[1]?.contextWindow, "272000");
+  assert.equal(items[0]?.isSelected, true);
 });
 
 test("Codex provider models come from Hermes payload rather than fixed fallback list", () => {

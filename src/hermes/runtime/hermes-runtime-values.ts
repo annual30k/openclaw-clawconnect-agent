@@ -42,11 +42,34 @@ export function compactStringArray(values: Array<string | undefined>): string[] 
 }
 
 export function nonNegativeInteger(value: unknown): number | undefined {
-  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? tokenCountValue(value) : NaN;
   if (!Number.isFinite(parsed) || parsed < 0) {
     return undefined;
   }
   return Math.floor(parsed);
+}
+
+function tokenCountValue(value: string): number {
+  const normalized = value.trim().replace(/,/g, "").toLowerCase();
+  if (!normalized) {
+    return NaN;
+  }
+  const match = normalized.match(/^(\d+(?:\.\d+)?)\s*([km])?$/);
+  if (!match) {
+    return Number(normalized);
+  }
+  const parsed = Number(match[1]);
+  if (!Number.isFinite(parsed)) {
+    return NaN;
+  }
+  const suffix = match[2];
+  if (suffix === "k") {
+    return parsed * 1_000;
+  }
+  if (suffix === "m") {
+    return parsed * 1_000_000;
+  }
+  return parsed;
 }
 
 export function firstNonNegativeInteger(...values: unknown[]): number | undefined {
