@@ -86,6 +86,89 @@ test("relayOutgoingMediaInHistoryResponse rewrites outgoing media inside chat hi
   }
 });
 
+test("relayOutgoingMediaInHistoryResponse strips OpenClaw MEDIA control markers without local artifact uploads", async () => {
+  const root = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-media-marker-history-"));
+  const imagePath = join(root, "codex-shot.png");
+  await writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  const server = await createFileUploadRelayServer("file_should_not_upload");
+  try {
+    const history = {
+      sessionKey: "agent:main:session_1",
+      messages: [
+        {
+          id: "assistant-message-1",
+          role: "assistant",
+          content: [
+            { type: "text", text: `桌面截图已发送到你手机上了\nMEDIA:${imagePath}` },
+          ],
+        },
+      ],
+      timelineSnapshot: {
+        messages: [
+          {
+            messageId: "assistant-message-1",
+            role: "assistant",
+            content: [
+              { type: "text", text: `桌面截图已发送到你手机上了\nMEDIA:${imagePath}` },
+            ],
+          },
+        ],
+      },
+    };
+
+    const result = await relayOutgoingMediaInHistoryResponse(history, {
+      relayServerUrl: server.baseUrl,
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      cache: new Map(),
+    }) as typeof history;
+
+    assert.equal((result.messages[0].content[0] as Record<string, unknown>).text, "桌面截图已发送到你手机上了");
+    assert.equal(result.messages[0].content.length, 1);
+    assert.equal((result.timelineSnapshot.messages[0].content[0] as Record<string, unknown>).text, "桌面截图已发送到你手机上了");
+    assert.equal(result.timelineSnapshot.messages[0].content.length, 1);
+    assert.equal(server.initRequestCount(), 0);
+  } finally {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("relayOutgoingMediaInPayload does not treat OpenClaw MEDIA markers as sendable local paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-media-marker-payload-"));
+  const imagePath = join(root, "codex-shot.png");
+  await writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  const server = await createFileUploadRelayServer("file_should_not_upload");
+  try {
+    const payload = {
+      runId: "assistant-run-1",
+      sessionKey: "agent:main:session_1",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: `截图已经发过去了\nMEDIA:${imagePath}` },
+        ],
+      },
+    };
+
+    const result = await relayOutgoingMediaInPayload(payload, {
+      relayServerUrl: server.baseUrl,
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      cache: new Map(),
+      userMessage: "把截图发过来",
+    }) as typeof payload;
+
+    assert.deepEqual(result.message.content, [
+      { type: "text", text: "截图已经发过去了" },
+    ]);
+    assert.equal(server.initRequestCount(), 0);
+  } finally {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("relayOutgoingMediaInPayload uploads assistant local artifact paths when user asked to send them", async () => {
   const root = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-artifact-"));
   const imagePath = join(root, "ChatGPT Image 2026 04 24.jpg");
@@ -183,9 +266,11 @@ async function createOutgoingMediaFixture() {
 async function createFileUploadRelayServer(fileId: string) {
   const receivedChunks: Buffer[] = [];
   let initSourceRunId: unknown;
+  let initRequestCount = 0;
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? "";
     if (req.method === "POST" && url === "/api/host/gateways/gw_test/files/init") {
+      initRequestCount += 1;
       const initBody = JSON.parse((await readRequestBody(req)).toString("utf8")) as Record<string, unknown>;
       initSourceRunId = initBody.sourceRunId;
       writeJson(res, {
@@ -239,6 +324,7 @@ async function createFileUploadRelayServer(fileId: string) {
   assert(address && typeof address === "object");
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
+    initRequestCount: () => initRequestCount,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }

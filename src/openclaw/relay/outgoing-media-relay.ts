@@ -5,6 +5,7 @@ import { extname, join, resolve } from "path";
 import { uploadFileToRelay, type FileUploadRequest, type FileUploadResult } from "../../core/relay/file-upload.js";
 
 const OUTGOING_MEDIA_RE = /\/api\/chat\/media\/outgoing\/[^/]+\/([^/]+)\/full(?:$|[?#])/;
+const OPENCLAW_MEDIA_CONTROL_PREFIX_RE = /^MEDIA:\s*(?:file:\/\/|~\/|\/)/i;
 
 export type OutgoingMediaRelayOptions = {
   relayServerUrl: string;
@@ -46,18 +47,32 @@ export async function relayOutgoingMediaInPayload(
     return payload;
   }
   const content = (message as Record<string, unknown>).content;
+  if (typeof content === "string") {
+    const sanitizedText = stripOpenClawMediaControlLines(content);
+    return sanitizedText === content
+      ? payload
+      : {
+          ...(payload as Record<string, unknown>),
+          message: {
+            ...(message as Record<string, unknown>),
+            content: sanitizedText,
+          },
+        };
+  }
   if (!Array.isArray(content)) {
     return payload;
   }
 
   let changed = false;
   const sourceRunId = payloadSourceRunId(payload as Record<string, unknown>);
-  const nextContent = await Promise.all(content.map(async (block) => {
+  const relayedContent = await Promise.all(content.map(async (block) => {
     const nextBlock = await relayOutgoingMediaBlock(block, { ...opts, sourceRunId });
     changed ||= nextBlock !== block;
     return nextBlock;
   }));
-  const localArtifactBlocks = await relayLocalArtifactPathsInContent(nextContent, payload as Record<string, unknown>, opts);
+  const sanitizedContent = sanitizeOpenClawMediaControlBlocks(relayedContent);
+  changed ||= sanitizedContent.changed;
+  const localArtifactBlocks = await relayLocalArtifactPathsInContent(sanitizedContent.content, payload as Record<string, unknown>, opts);
 
   if (!changed && localArtifactBlocks.length === 0) {
     return payload;
@@ -66,7 +81,7 @@ export async function relayOutgoingMediaInPayload(
     ...(payload as Record<string, unknown>),
     message: {
       ...(message as Record<string, unknown>),
-      content: [...nextContent, ...localArtifactBlocks],
+      content: [...sanitizedContent.content, ...localArtifactBlocks],
     },
   };
 }
@@ -83,17 +98,48 @@ export async function relayOutgoingMediaInHistoryResponse(
     return response;
   }
 
+  const responseRecord = response as Record<string, unknown>;
+  const responseSessionKey = firstString(responseRecord.sessionKey, responseRecord.sessionId);
+  const messageResult = await relayOutgoingMediaInMessageList(messages, responseSessionKey, opts);
+  const snapshot = responseRecord.timelineSnapshot;
+  const snapshotMessages = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
+    ? (snapshot as Record<string, unknown>).messages
+    : undefined;
+  const snapshotResult = Array.isArray(snapshotMessages)
+    ? await relayOutgoingMediaInMessageList(snapshotMessages, responseSessionKey, opts)
+    : undefined;
+  const changed = messageResult.changed || Boolean(snapshotResult?.changed);
+
+  return changed
+    ? {
+        ...responseRecord,
+        messages: messageResult.messages,
+        ...(snapshotResult
+          ? {
+              timelineSnapshot: {
+                ...(snapshot as Record<string, unknown>),
+                messages: snapshotResult.messages,
+              },
+            }
+          : {}),
+      }
+    : response;
+}
+
+async function relayOutgoingMediaInMessageList(
+  messages: unknown[],
+  sessionKey: string | undefined,
+  opts: OutgoingMediaRelayOptions,
+): Promise<{ messages: unknown[]; changed: boolean }> {
   let changed = false;
   const nextMessages = await Promise.all(messages.map(async (message) => {
-    const wrapper = await relayOutgoingMediaInPayload({ message }, opts) as Record<string, unknown>;
+    const wrapperInput = sessionKey ? { sessionKey, message } : { message };
+    const wrapper = await relayOutgoingMediaInPayload(wrapperInput, opts) as Record<string, unknown>;
     const nextMessage = wrapper.message ?? message;
     changed ||= nextMessage !== message;
     return nextMessage;
   }));
-
-  return changed
-    ? { ...(response as Record<string, unknown>), messages: nextMessages }
-    : response;
+  return { messages: nextMessages, changed };
 }
 
 async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOptionsWithSourceRun): Promise<unknown> {
@@ -170,12 +216,18 @@ function payloadSourceRunId(payload: Record<string, unknown>): string | undefine
     ? message as Record<string, unknown>
     : undefined;
   return firstString(
+    payload.sourceRunId,
+    payload.source_run_id,
     payload.runId,
     payload.turnId,
     payload.messageId,
+    payload.id,
+    messageRecord?.sourceRunId,
+    messageRecord?.source_run_id,
     messageRecord?.runId,
     messageRecord?.turnId,
     messageRecord?.messageId,
+    messageRecord?.id,
   );
 }
 
@@ -194,6 +246,9 @@ async function relayLocalArtifactPathsInContent(
   payload: Record<string, unknown>,
   opts: OutgoingMediaRelayOptions,
 ): Promise<Record<string, unknown>[]> {
+  if (opts.userMessage === undefined) {
+    return [];
+  }
   if (content.some(isUploadedMediaBlock)) {
     return [];
   }
@@ -213,7 +268,7 @@ async function relayLocalArtifactPathsInContent(
   }
 
   const sessionKey = firstString(payload.sessionKey, (payload.message as Record<string, unknown> | undefined)?.sessionKey) ?? "main";
-  const runId = firstString(payload.runId, (payload.message as Record<string, unknown> | undefined)?.runId);
+  const runId = payloadSourceRunId(payload);
   const blocks: Record<string, unknown>[] = [];
   for (const filePath of paths) {
     try {
@@ -278,6 +333,51 @@ function uploadToContentBlock(upload: FileUploadResult): Record<string, unknown>
     status: "available",
     transferState: "available",
   });
+}
+
+function sanitizeOpenClawMediaControlBlocks(content: unknown[]): { content: unknown[]; changed: boolean } {
+  let changed = false;
+  const nextContent: unknown[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object" || Array.isArray(block)) {
+      nextContent.push(block);
+      continue;
+    }
+    const record = block as Record<string, unknown>;
+    if (record.type !== "text" || typeof record.text !== "string") {
+      nextContent.push(block);
+      continue;
+    }
+    const text = record.text;
+    const sanitizedText = stripOpenClawMediaControlLines(text);
+    if (sanitizedText === text) {
+      nextContent.push(block);
+      continue;
+    }
+    changed = true;
+    // OpenClaw 的 MEDIA:/... 是内部桥接标记，不能显示成聊天文本，也不能从历史回放再次触发本地路径上传。
+    if (!sanitizedText.trim()) {
+      continue;
+    }
+    nextContent.push({ ...record, text: sanitizedText });
+  }
+  return { content: nextContent, changed };
+}
+
+function stripOpenClawMediaControlLines(text: string): string {
+  if (!text.includes("MEDIA:")) {
+    return text;
+  }
+  const normalized = text
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+  const stripped = normalized
+    .split("\n")
+    .filter((line) => !OPENCLAW_MEDIA_CONTROL_PREFIX_RE.test(line.trim()))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return stripped;
 }
 
 function compact(record: Record<string, unknown>): Record<string, unknown> {
