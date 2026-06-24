@@ -30,85 +30,53 @@ import {
   extractHistoryOutcome,
   readOpenClawTranscriptChatHistory,
   withTimeout,
-  type ChatHistoryOutcome,
   type ChatRunContext,
-  type HistoryMessage,
   type HistoryResponse,
 } from "./relay/chat-history.js";
 import {
-  dedupeOpenClawChatSendUserMirrorTranscript,
-  type ChatSendUserMirrorDedupeRequest,
-} from "./relay/transcript-dedupe.js";
+  OpenClawChatSendDedupeCoordinator,
+} from "./relay/chat-send-dedupe-coordinator.js";
 import {
   buildMobileAssistantDeltaPayload,
   buildMobileAssistantErrorPayload,
   buildMobileAssistantFinalPayload,
-  type MobileAssistantUsage,
 } from "../core/relay/mobile-chat-run-bridge.js";
-import type { TimelineContentBlock } from "../core/relay/timeline-event-log.js";
-import { buildOfficeEventPayload } from "../core/relay/office-payload.js";
 import { prepareChatSendParams } from "./relay/chat-send-attachments.js";
 import { relayOutgoingMediaInHistoryResponse, relayOutgoingMediaInPayload } from "./relay/outgoing-media-relay.js";
 import { prepareOpenClawVoiceInputCommand } from "./relay/openclaw-voice-input.js";
 import { voiceInputSetupMessage } from "../core/relay/voice-input.js";
 import type { FileUploadResult } from "../core/relay/file-upload.js";
 import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
-import type { RelaySlashCommandDescriptor } from "../core/relay/slash-command-types.js";
-import { OPENCLAW_SLASH_COMMAND_CATALOG } from "./relay/slash-command-catalog.js";
-
-// ---------------------------------------------------------------------------
-// Messages: relay client ↔ relay server
-// ---------------------------------------------------------------------------
-
-/** Messages the relay client sends to the relay server. */
-export type RelayHelloMessage = {
-  type: "hello";
-  platform: string;
-  agentVersion: string;
-  capabilities?: string[];
-  slashCommands?: readonly RelaySlashCommandDescriptor[];
-};
-
-type ToServer =
-  | RelayHelloMessage
-  | { type: "heartbeat" }
-  | { type: "gateway_connected" }
-  | { type: "gateway_disconnected"; reason: string }
-  | { type: "event"; event: string; payload: unknown }
-  | { type: "res"; id: string; ok: boolean; payload?: unknown; error?: { message?: string } };
-
-const CHAT_HISTORY_FETCH_TIMEOUT_MS = 3000;
-const CHAT_HISTORY_FALLBACK_INITIAL_DELAY_MS = 1200;
-const CHAT_HISTORY_FALLBACK_RETRY_DELAY_MS = 1800;
-const CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS = 120;
-const CHAT_HISTORY_FINAL_RETRY_DELAY_MS = 750;
-const CHAT_SEND_MIRROR_DEDUPE_RETRY_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 20000, 30000];
-
-/** Messages the relay server sends to the relay client. */
-interface FromServer {
-  type: "cmd" | "hello" | "heartbeat";
-  id?: string;
-  method: string;
-  params: unknown;
-}
-
-// ---------------------------------------------------------------------------
-// Options
-// ---------------------------------------------------------------------------
-
-export interface RelayManagerOptions {
-  relayServerUrl: string;
-  gatewayId: string;
-  relaySecret: string;
-  gatewayUrl: string | (() => string);
-  gatewayToken?: string;
-  gatewayPassword?: string;
-  onConnected?: () => void;
-  onDisconnected?: () => void;
-  /** Optional abort signal.  When aborted the relay WebSocket is closed
-   *  cleanly (code 1001) and the retry loop stops. */
-  signal?: AbortSignal;
-}
+import { buildRelayHelloMessage } from "./relay/relay-manager-hello.js";
+import {
+  CHAT_HISTORY_FALLBACK_INITIAL_DELAY_MS,
+  CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS,
+  CHAT_HISTORY_FALLBACK_RETRY_DELAY_MS,
+  CHAT_HISTORY_FETCH_TIMEOUT_MS,
+  CHAT_HISTORY_FINAL_RETRY_DELAY_MS,
+} from "./relay/relay-manager-history-timing.js";
+import { publishOfficeSnapshot } from "./relay/relay-manager-office-events.js";
+import type {
+  OpenClawRelayFromServer,
+  OpenClawRelayToServer,
+  RelayManagerOptions,
+} from "./relay/relay-manager-protocol.js";
+export { buildRelayHelloMessage } from "./relay/relay-manager-hello.js";
+export type { RelayHelloMessage, RelayManagerOptions } from "./relay/relay-manager-protocol.js";
+import {
+  buildEmptyHistoryPage,
+  buildFinalPayloadFromHistoryOutcome,
+  buildLegacyOpenClawHistoryParams,
+  extractChatErrorMessage,
+  hasHistoryCursor,
+  mergeCanonicalChatPayload,
+  mobileAssistantUsageFromPayload,
+  nonTextContentBlocks,
+  nonTextContentBlocksFromHistory,
+  resolveChatPayloadSeq,
+  resolveChatPayloadTimestamp,
+  shouldUseLegacyOpenClawHistoryFallback,
+} from "./relay/relay-manager-payload-helpers.js";
 
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -142,11 +110,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     const chatBuffers = new Map<string, string>();
     const chatFallbacks = new Map<string, ReturnType<typeof setTimeout>>();
     const chatRunContexts = new Map<string, ChatRunContext>();
-    const chatSendDedupeRequests = new Map<string, ChatSendUserMirrorDedupeRequest>();
-    const chatSendDedupeRunKeys = new Map<string, string>();
-    const chatSendDedupeTimers = new Map<string, ReturnType<typeof setTimeout>>();
-    const chatSendDedupeAttempts = new Map<string, number>();
-    const chatSendDedupeRunning = new Map<string, Promise<boolean>>();
+    const chatSendDedupe = new OpenClawChatSendDedupeCoordinator(() => sessionDefaults);
     const outgoingMediaUploadCache = new Map<string, FileUploadResult>();
     const contextUsageRefreshes = new Map<string, ReturnType<typeof setTimeout>>();
     const contextUsageFingerprints = new Map<string, string>();
@@ -158,152 +122,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         chatFallbacks.delete(runId);
       }
     };
-
-    const clearChatSendDedupe = (clientRunId: string): void => {
-      const timer = chatSendDedupeTimers.get(clientRunId);
-      if (timer) {
-        clearTimeout(timer);
-        chatSendDedupeTimers.delete(clientRunId);
-      }
-      chatSendDedupeRequests.delete(clientRunId);
-      chatSendDedupeAttempts.delete(clientRunId);
-      for (const [runId, mappedClientRunId] of chatSendDedupeRunKeys.entries()) {
-        if (mappedClientRunId === clientRunId) {
-          chatSendDedupeRunKeys.delete(runId);
-        }
-      }
-    };
-
-    const registerChatSendDedupe = (request: ChatSendUserMirrorDedupeRequest, runId?: string): void => {
-      chatSendDedupeRequests.set(request.clientRunId, request);
-      if (runId) {
-        chatSendDedupeRunKeys.set(runId, request.clientRunId);
-      }
-      scheduleChatSendDedupe(request.clientRunId);
-    };
-
-    function scheduleChatSendDedupe(clientRunId: string, delayOverrideMs?: number): void {
-      if (!chatSendDedupeRequests.has(clientRunId)) {
-        return;
-      }
-      const existing = chatSendDedupeTimers.get(clientRunId);
-      if (existing) {
-        clearTimeout(existing);
-      }
-      const attempt = chatSendDedupeAttempts.get(clientRunId) ?? 0;
-      const delayMs = delayOverrideMs ?? CHAT_SEND_MIRROR_DEDUPE_RETRY_DELAYS_MS[Math.min(
-        attempt,
-        CHAT_SEND_MIRROR_DEDUPE_RETRY_DELAYS_MS.length - 1,
-      )];
-      const timer = setTimeout(() => {
-        chatSendDedupeTimers.delete(clientRunId);
-        void runChatSendDedupeAttempt(clientRunId).then((changed) => {
-          if (changed || !chatSendDedupeRequests.has(clientRunId)) {
-            return;
-          }
-          const nextAttempt = attempt + 1;
-          if (nextAttempt >= CHAT_SEND_MIRROR_DEDUPE_RETRY_DELAYS_MS.length) {
-            clearChatSendDedupe(clientRunId);
-            return;
-          }
-          chatSendDedupeAttempts.set(clientRunId, nextAttempt);
-          scheduleChatSendDedupe(clientRunId);
-        });
-      }, delayMs);
-      timer.unref?.();
-      chatSendDedupeTimers.set(clientRunId, timer);
-    }
-
-    function scheduleChatSendDedupeForRun(runId: string, delayMs = 100): void {
-      const clientRunId = chatSendDedupeRunKeys.get(runId);
-      if (!clientRunId) {
-        return;
-      }
-      scheduleChatSendDedupe(clientRunId, delayMs);
-    }
-
-    async function runChatSendDedupeAttempt(clientRunId: string): Promise<boolean> {
-      const running = chatSendDedupeRunning.get(clientRunId);
-      if (running) {
-        return running;
-      }
-
-      const promise = (async () => {
-        const request = chatSendDedupeRequests.get(clientRunId);
-        if (!request) {
-          return false;
-        }
-        try {
-          const result = await dedupeOpenClawChatSendUserMirrorTranscript(request, sessionDefaults, { maxRetries: 2 });
-          if (result.changed) {
-            console.log(`[relay] removed ${result.removedCount} duplicate OpenClaw prompt mirror(s) from ${result.transcriptPath ?? "transcript"}`);
-            clearChatSendDedupe(clientRunId);
-            return true;
-          }
-        } catch (error) {
-          console.warn(`[relay] chat.send transcript dedupe failed runId=${clientRunId}: ${String(error)}`);
-        }
-        return false;
-      })().finally(() => {
-        chatSendDedupeRunning.delete(clientRunId);
-      });
-
-      chatSendDedupeRunning.set(clientRunId, promise);
-      return promise;
-    }
-
-    async function dedupePendingChatSendMirrorsForSession(rawParams: unknown): Promise<void> {
-      const sessionKey = resolveRawParamsSessionKey(rawParams);
-      const pending = Array.from(chatSendDedupeRequests.entries()).filter(([, request]) => {
-        const requestSessionKey = canonicalizeSessionKey(request.sessionKey ?? sessionDefaults.mainSessionKey, sessionDefaults);
-        return requestSessionKey === sessionKey;
-      });
-      for (const [clientRunId] of pending) {
-        await runChatSendDedupeAttempt(clientRunId);
-      }
-    }
-
-    function buildChatSendDedupeRequest(paramsRecord: Record<string, unknown> | undefined): ChatSendUserMirrorDedupeRequest | undefined {
-      if (!paramsRecord) {
-        return undefined;
-      }
-      const message = typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
-        ? paramsRecord.message.trim()
-        : "";
-      const idempotencyKey = typeof paramsRecord.idempotencyKey === "string" && paramsRecord.idempotencyKey.trim().length > 0
-        ? paramsRecord.idempotencyKey.trim()
-        : "";
-      if (!message || !idempotencyKey) {
-        return undefined;
-      }
-      const clientRunId = idempotencyKey.endsWith(":user")
-        ? idempotencyKey.slice(0, -":user".length)
-        : idempotencyKey;
-      if (!clientRunId) {
-        return undefined;
-      }
-      return {
-        clientRunId,
-        message,
-        sessionKey: resolveRawParamsSessionKey(paramsRecord),
-        senderId: "openclaw-macos",
-        senderName: "ClawConnect Agent",
-      };
-    }
-
-    function resolveRawParamsSessionKey(rawParams: unknown): string {
-      const record = rawParams && typeof rawParams === "object" && !Array.isArray(rawParams)
-        ? (rawParams as Record<string, unknown>)
-        : {};
-      const rawSessionKey =
-        typeof record.sessionKey === "string" && record.sessionKey.trim().length > 0
-          ? record.sessionKey.trim()
-          : sessionDefaults.mainSessionKey;
-      const normalized = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
-      return typeof normalized === "string" && normalized.trim().length > 0
-        ? normalized.trim()
-        : sessionDefaults.mainSessionKey;
-    }
 
     const publishContextUsageSnapshot = async (sessionKey: string, force = false): Promise<void> => {
       const normalizedSessionKey = canonicalizeSessionKey(sessionKey, sessionDefaults);
@@ -442,16 +260,8 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       }
     };
 
-    function send(msg: ToServer): void {
+    function send(msg: OpenClawRelayToServer): void {
       sendRelayJson(relayWs, msg);
-    }
-
-    function publishOfficeSnapshot(eventName: string, payload: unknown): void {
-      const officePayload = buildOfficeEventPayload(eventName, payload, () => new Date().toISOString());
-      if (!officePayload) {
-        return;
-      }
-      send({ type: "event", event: "office", payload: officePayload });
     }
 
     async function publishAndSendGatewayEvent(
@@ -471,7 +281,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           })
         : payload;
       if (publishOffice) {
-        publishOfficeSnapshot(eventName, outgoingPayload);
+        publishOfficeSnapshot(send, eventName, outgoingPayload);
       }
       send({ type: "event", event: eventName, payload: outgoingPayload });
     }
@@ -491,7 +301,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
     async function requestChatHistoryFromClawConnect(params: unknown): Promise<HistoryResponse> {
       try {
-        await dedupePendingChatSendMirrorsForSession(params);
+        await chatSendDedupe.dedupePendingForSession(params);
         const transcriptHistory = await readOpenClawTranscriptChatHistory(params, sessionDefaults);
         if (transcriptHistory) {
           return transcriptHistory;
@@ -501,262 +311,15 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       }
 
       if (hasHistoryCursor(params)) {
-        return buildEmptyHistoryPage(params);
+        return buildEmptyHistoryPage(params, sessionDefaults);
       }
-      if (!shouldUseLegacyOpenClawHistoryFallback(params)) {
-        return buildEmptyHistoryPage(params);
+      if (!shouldUseLegacyOpenClawHistoryFallback(params, sessionDefaults)) {
+        return buildEmptyHistoryPage(params, sessionDefaults);
       }
       if (!gatewayClient) {
         throw new Error("gateway not connected");
       }
-      return gatewayClient.request<HistoryResponse>("chat.history", buildLegacyOpenClawHistoryParams(params));
-    }
-
-    function shouldUseLegacyOpenClawHistoryFallback(params: unknown): boolean {
-      const record = params && typeof params === "object" && !Array.isArray(params)
-        ? (params as Record<string, unknown>)
-        : {};
-      const rawSessionKey =
-        typeof record.sessionKey === "string" && record.sessionKey.trim().length > 0
-          ? record.sessionKey.trim()
-          : sessionDefaults.mainSessionKey;
-      const normalized = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
-      return typeof normalized === "string" && normalized === sessionDefaults.mainSessionKey;
-    }
-
-    function buildLegacyOpenClawHistoryParams(params: unknown): Record<string, unknown> {
-      const record = params && typeof params === "object" && !Array.isArray(params)
-        ? (params as Record<string, unknown>)
-        : {};
-      const rawSessionKey =
-        typeof record.sessionKey === "string" && record.sessionKey.trim().length > 0
-          ? record.sessionKey.trim()
-          : sessionDefaults.mainSessionKey;
-      const sessionKey = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
-      const legacyParams: Record<string, unknown> = {
-        sessionKey: typeof sessionKey === "string" && sessionKey.trim().length > 0
-          ? sessionKey.trim()
-          : sessionDefaults.mainSessionKey,
-      };
-      const limit = normalizePositiveInteger(record.limit);
-      if (limit !== undefined) {
-        legacyParams.limit = limit;
-      }
-      const maxChars = normalizePositiveInteger(record.maxChars);
-      if (maxChars !== undefined) {
-        legacyParams.maxChars = maxChars;
-      }
-      return legacyParams;
-    }
-
-    function buildEmptyHistoryPage(params: unknown): HistoryResponse {
-      const record = params && typeof params === "object" && !Array.isArray(params)
-        ? (params as Record<string, unknown>)
-        : {};
-      const rawSessionKey =
-        typeof record.sessionKey === "string" && record.sessionKey.trim().length > 0
-          ? record.sessionKey.trim()
-          : sessionDefaults.mainSessionKey;
-      const sessionKey = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
-      return {
-        sessionKey: typeof sessionKey === "string" && sessionKey.trim().length > 0
-          ? sessionKey.trim()
-          : sessionDefaults.mainSessionKey,
-        messages: [],
-        hasMore: false,
-      };
-    }
-
-    function hasHistoryCursor(params: unknown): boolean {
-      if (!params || typeof params !== "object" || Array.isArray(params)) {
-        return false;
-      }
-      const cursor = (params as Record<string, unknown>).cursor;
-      return typeof cursor === "string" && cursor.trim().length > 0;
-    }
-
-    function normalizePositiveInteger(value: unknown): number | undefined {
-      const parsed =
-        typeof value === "number" && Number.isFinite(value)
-          ? Math.round(value)
-          : typeof value === "string" && value.trim().length > 0
-            ? Number.parseInt(value.trim(), 10)
-            : Number.NaN;
-      return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
-    }
-
-    function buildFinalPayloadFromHistoryOutcome(
-      basePayload: unknown,
-      outcome: Extract<ChatHistoryOutcome, { kind: "final" }>,
-    ): unknown {
-      const payload = outcome.text.trim()
-        ? withMessageText(basePayload, outcome.text)
-        : basePayload && typeof basePayload === "object" && !Array.isArray(basePayload)
-          ? { ...(basePayload as Record<string, unknown>) }
-          : {};
-      const historyMessage = outcome.message;
-      const content = Array.isArray(historyMessage.content) ? historyMessage.content : [];
-      if (content.length === 0) {
-        return payload;
-      }
-      const payloadRecord = payload && typeof payload === "object" && !Array.isArray(payload)
-        ? (payload as Record<string, unknown>)
-        : {};
-      const existingMessage = payloadRecord.message && typeof payloadRecord.message === "object" && !Array.isArray(payloadRecord.message)
-        ? (payloadRecord.message as Record<string, unknown>)
-        : {};
-      return {
-        ...payloadRecord,
-        message: {
-          ...existingMessage,
-          ...stripUndefinedHistoryMessageFields(historyMessage),
-          role: "assistant",
-          content,
-        },
-      };
-    }
-
-    function stripUndefinedHistoryMessageFields(message: HistoryMessage): Record<string, unknown> {
-      return Object.fromEntries(
-        Object.entries(message).filter(([, value]) => value !== undefined),
-      );
-    }
-
-    function mergeCanonicalChatPayload(basePayload: unknown, canonicalPayload: unknown): unknown {
-      const base = asRecord(basePayload);
-      const canonical = asRecord(canonicalPayload);
-      if (!base) {
-        return canonicalPayload;
-      }
-      if (!canonical) {
-        return basePayload;
-      }
-      const baseMessage = asRecord(base.message);
-      const canonicalMessage = asRecord(canonical.message);
-      const merged = {
-        ...base,
-        ...canonical,
-      };
-      return baseMessage || canonicalMessage
-        ? {
-            ...merged,
-            message: {
-              ...(baseMessage ?? {}),
-              ...(canonicalMessage ?? {}),
-            },
-          }
-        : merged;
-    }
-
-    function resolveChatPayloadSeq(payload: unknown): number {
-      return normalizeFiniteNumber(deepField(payload, ["seq", "sequence", "index"]))
-        ?? resolveChatPayloadTimestamp(payload);
-    }
-
-    function resolveChatPayloadTimestamp(payload: unknown): number {
-      const value = normalizeFiniteNumber(deepField(payload, ["ts", "timestamp", "createdAt", "created_at", "time"]));
-      if (value !== undefined) {
-        return value > 10_000_000_000 ? Math.round(value) : Math.round(value * 1000);
-      }
-      return Date.now();
-    }
-
-    function extractChatErrorMessage(payload: unknown): string {
-      const direct = firstNonEmptyString(deepField(payload, ["errorMessage", "error_message", "message", "text"]));
-      if (direct) {
-        return direct;
-      }
-      const error = asRecord(asRecord(payload)?.error);
-      const nested = firstNonEmptyString(error?.message, error?.userMessage, error?.detail);
-      return nested ?? "Request failed";
-    }
-
-    function mobileAssistantUsageFromPayload(payload: unknown): MobileAssistantUsage {
-      const record = asRecord(payload);
-      const usage = asRecord(record?.usage);
-      return stripUndefined({
-        currentModel: firstNonEmptyString(record?.currentModel, record?.model, usage?.currentModel, usage?.model),
-        provider: firstNonEmptyString(record?.provider, usage?.provider),
-        contextUsage: normalizeNonNegativeInteger(record?.contextUsage)
-          ?? normalizeNonNegativeInteger(record?.promptTokens)
-          ?? normalizeNonNegativeInteger(record?.inputTokens)
-          ?? normalizeNonNegativeInteger(usage?.contextUsage)
-          ?? normalizeNonNegativeInteger(usage?.promptTokens)
-          ?? normalizeNonNegativeInteger(usage?.inputTokens),
-        contextLimit: normalizeNonNegativeInteger(record?.contextLimit)
-          ?? normalizeNonNegativeInteger(record?.maxInputTokens)
-          ?? normalizeNonNegativeInteger(usage?.contextLimit)
-          ?? normalizeNonNegativeInteger(usage?.maxInputTokens),
-      });
-    }
-
-    function nonTextContentBlocks(payload: unknown): TimelineContentBlock[] {
-      const payloadRecord = asRecord(payload);
-      const message = asRecord(payloadRecord?.message);
-      const topLevelContent = payloadRecord?.content;
-      const content = Array.isArray(message?.content)
-        ? message.content
-        : Array.isArray(topLevelContent)
-          ? topLevelContent
-          : [];
-      return content.filter((block): block is TimelineContentBlock => {
-        const record = asRecord(block);
-        return Boolean(record?.type) && record?.type !== "text";
-      });
-    }
-
-    function nonTextContentBlocksFromHistory(message: HistoryMessage): TimelineContentBlock[] {
-      return Array.isArray(message.content)
-        ? message.content.filter((block): block is TimelineContentBlock => {
-            const record = asRecord(block);
-            return Boolean(record?.type) && record?.type !== "text";
-          })
-        : [];
-    }
-
-    function deepField(payload: unknown, keys: string[]): unknown {
-      const record = asRecord(payload);
-      const message = asRecord(record?.message);
-      const data = asRecord(record?.data);
-      for (const key of keys) {
-        if (record && record[key] !== undefined) return record[key];
-        if (message && message[key] !== undefined) return message[key];
-        if (data && data[key] !== undefined) return data[key];
-      }
-      return undefined;
-    }
-
-    function firstNonEmptyString(...values: unknown[]): string | undefined {
-      for (const value of values) {
-        if (typeof value === "string" && value.trim().length > 0) {
-          return value.trim();
-        }
-      }
-      return undefined;
-    }
-
-    function normalizeFiniteNumber(value: unknown): number | undefined {
-      const number = typeof value === "number" && Number.isFinite(value)
-        ? value
-        : typeof value === "string" && value.trim().length > 0
-          ? Number(value.trim())
-          : Number.NaN;
-      return Number.isFinite(number) ? number : undefined;
-    }
-
-    function normalizeNonNegativeInteger(value: unknown): number | undefined {
-      const number = normalizeFiniteNumber(value);
-      return number !== undefined && number >= 0 ? Math.round(number) : undefined;
-    }
-
-    function stripUndefined<T extends Record<string, unknown>>(value: T): T {
-      return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
-    }
-
-    function asRecord(value: unknown): Record<string, unknown> | undefined {
-      return value && typeof value === "object" && !Array.isArray(value)
-        ? (value as Record<string, unknown>)
-        : undefined;
+      return gatewayClient.request<HistoryResponse>("chat.history", buildLegacyOpenClawHistoryParams(params, sessionDefaults));
     }
 
     relayWs.on("open", () => {
@@ -780,7 +343,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         onConnected: () => {
           console.log("Gateway connected.");
           send({ type: "gateway_connected" });
-          publishOfficeSnapshot("gateway_connected", {
+          publishOfficeSnapshot(send, "gateway_connected", {
             sessionKey: sessionDefaults.mainSessionKey,
           });
           void refreshSessionDefaults();
@@ -789,7 +352,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         onDisconnected: (reason) => {
           console.log(`Gateway disconnected: ${reason}`);
           send({ type: "gateway_disconnected", reason });
-          publishOfficeSnapshot("gateway_disconnected", {
+          publishOfficeSnapshot(send, "gateway_disconnected", {
             reason,
           });
         },
@@ -810,7 +373,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
             if (runId) {
               if (state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted") {
-                scheduleChatSendDedupeForRun(runId, 100);
+                chatSendDedupe.scheduleForRun(runId, 100);
               }
               if (role === "assistant" && (state === "delta" || state === "final" || state === "error" || state === "failed" || state === "fail")) {
                 clearChatFallback(runId);
@@ -957,7 +520,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       let methodForLog: string | undefined;
       let voiceInputRun: { runId: string; sessionKey: string } | undefined;
       try {
-      const msg = parseRelayFrame<FromServer>(raw);
+      const msg = parseRelayFrame<OpenClawRelayFromServer>(raw);
       if (!msg) {
         return;
       }
@@ -1030,7 +593,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           ? (params as Record<string, unknown>)
           : undefined;
       const chatSendDedupeRequest = msg.method === "chat.send"
-        ? buildChatSendDedupeRequest(paramsRecord)
+        ? chatSendDedupe.buildRequest(paramsRecord)
         : undefined;
 
       if (!gatewayClient && msg.method !== "chat.history") {
@@ -1071,7 +634,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               scheduleChatHistoryFallback(runId, runContext);
             }
             if (msg.method === "chat.send" && chatSendDedupeRequest) {
-              registerChatSendDedupe(chatSendDedupeRequest, runId);
+              chatSendDedupe.register(chatSendDedupeRequest, runId);
             }
             // Let a model switch settle before publishing context usage again.
             // Forced refreshes can replay a stale model snapshot and overwrite the new selection.
@@ -1120,13 +683,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         clearTimeout(timer);
       }
       chatFallbacks.clear();
-      for (const timer of chatSendDedupeTimers.values()) {
-        clearTimeout(timer);
-      }
-      chatSendDedupeTimers.clear();
-      chatSendDedupeRequests.clear();
-      chatSendDedupeRunKeys.clear();
-      chatSendDedupeAttempts.clear();
+      chatSendDedupe.clearAll();
       for (const timer of contextUsageRefreshes.values()) {
         clearTimeout(timer);
       }
@@ -1139,18 +696,4 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       // close event will follow
     });
   });
-}
-
-export function buildRelayHelloMessage(opts: {
-  platform: string;
-  agentVersion: string;
-  capabilities?: string[];
-}): RelayHelloMessage {
-  return {
-    type: "hello",
-    platform: opts.platform,
-    agentVersion: opts.agentVersion,
-    capabilities: opts.capabilities,
-    slashCommands: OPENCLAW_SLASH_COMMAND_CATALOG,
-  };
 }

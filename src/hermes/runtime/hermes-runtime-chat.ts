@@ -1,6 +1,5 @@
 
 import { randomUUID } from "crypto";
-import { readFileSync, statSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { spawn } from "child_process";
@@ -11,33 +10,45 @@ import {
 import {
   buildToolInvocationUpdatedEvent,
 } from "../../core/relay/timeline-event-builder.js";
-import type { ToolState } from "../../core/relay/timeline-event-log.js";
 import {
   forgetHermesSession,
   getMappedHermesSessionId,
   rememberHermesSession,
-  type HermesSessionItem,
 } from "../hermes-session-store.js";
 import { extractDeliverablePaths } from "./hermes-runtime-artifacts.js";
-import { runHermesSessionExport } from "./hermes-runtime-sessions.js";
 import {
   CHAT_TIMEOUT_MS,
   CLAWCONNECT_MOBILE_BRIDGE_HINT,
-  HERMES_AGENT_LOG_FILE,
   HERMES_INBOX_DIR,
   SUBPROCESS_ENV,
   resolveHermesBin,
   isHermesCommandDeniedTimeoutLine,
   isHermesMissingSessionError,
   runHermes,
-  runHermesPython,
   sanitizeHermesChatOutput,
   stripAnsi,
   stripHermesSessionResumeNotices,
 } from "./hermes-runtime-process.js";
 import type { HermesChatResult, HermesToolLogEvent, HermesUsageSnapshot } from "./hermes-runtime-types.js";
 import { collectHermesUsageSnapshot, listHermesSessions, readHermesStatusSnapshot } from "./hermes-runtime-usage.js";
-import { compactStringArray, sanitizeFileName, toRecord } from "./hermes-runtime-values.js";
+import { compactStringArray, sanitizeFileName } from "./hermes-runtime-values.js";
+import {
+  detectHermesHistoryCompletion,
+  selectHermesSessionForCompletedChat,
+} from "./hermes-runtime-history-completion.js";
+import {
+  createHermesToolLogWatcher,
+  hermesToolState,
+  parseHermesToolLogLine,
+} from "./hermes-runtime-tool-log-watcher.js";
+import {
+  isHermesSlashCommandMessage,
+  runHermesSlashCommand,
+} from "./hermes-runtime-slash-command.js";
+
+export { selectHermesSessionForCompletedChat } from "./hermes-runtime-history-completion.js";
+export { parseHermesToolLogLine } from "./hermes-runtime-tool-log-watcher.js";
+export { isHermesSlashCommandMessage } from "./hermes-runtime-slash-command.js";
 
 const HERMES_ASSISTANT_DELTA_FLUSH_MS = 120;
 const HERMES_ASSISTANT_DELTA_MAX_BYTES = 4096;
@@ -45,78 +56,6 @@ const HERMES_HISTORY_COMPLETION_GRACE_MS = 2_000;
 const HERMES_HISTORY_COMPLETION_POLL_MS = 1_000;
 const HERMES_COMMAND_DENIED_TIMEOUT_MESSAGE = "Timeout – denying command";
 const hermesChatQueues = new Map<string, Promise<void>>();
-const HERMES_SLASH_COMMAND_SCRIPT = String.raw`
-import contextlib
-import io
-import json
-import os
-import sys
-
-from rich.console import Console
-
-import cli as cli_mod
-from cli import HermesCLI
-
-command = os.environ.get("CLAWCONNECT_HERMES_SLASH_COMMAND", "").strip()
-resume = os.environ.get("CLAWCONNECT_HERMES_SLASH_RESUME", "").strip() or None
-if command and not command.startswith("/"):
-    command = "/" + command
-
-with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-    cli = HermesCLI(model=None, compact=True, resume=resume, verbose=False)
-
-buf = io.StringIO()
-cli.console = Console(file=buf, force_terminal=True, width=120)
-
-def approve_once(prompt=""):
-    if prompt:
-        print(prompt, end="")
-    return "1"
-
-def approve_once_modal(*args, **kwargs):
-    return "once"
-
-try:
-    cli._prompt_text_input = approve_once
-    cli._prompt_text_input_modal = approve_once_modal
-except Exception:
-    pass
-
-old_cprint = getattr(cli_mod, "_cprint", None)
-if old_cprint is not None:
-    cli_mod._cprint = lambda text: print(text)
-
-try:
-    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-        keep_going = cli.process_command(command)
-    pending_inputs = []
-    pending_queue = getattr(cli, "_pending_input", None)
-    if pending_queue is not None:
-        while True:
-            try:
-                pending_inputs.append(pending_queue.get_nowait())
-            except Exception:
-                break
-    payload = {
-        "ok": True,
-        "output": buf.getvalue().rstrip(),
-        "sessionId": getattr(cli, "session_id", None),
-        "keepGoing": bool(keep_going),
-        "pendingInputs": pending_inputs,
-    }
-except Exception as exc:
-    payload = {
-        "ok": False,
-        "output": buf.getvalue().rstrip(),
-        "error": str(exc),
-        "sessionId": getattr(cli, "session_id", None),
-    }
-finally:
-    if old_cprint is not None:
-        cli_mod._cprint = old_cprint
-
-sys.stdout.write(json.dumps(payload, ensure_ascii=False))
-`;
 
 export async function runHermesChat(
   params: unknown,
@@ -131,7 +70,16 @@ export async function runHermesChat(
     : "main";
   if (isHermesSlashCommandMessage(rawMessage)) {
     return await runSerializedHermesChat(sessionKey, () => (
-      runHermesSlashCommand({ message: rawMessage, sessionKey, hermesSessionId: record.hermesSessionId })
+      runHermesSlashCommand({
+        message: rawMessage,
+        sessionKey,
+        hermesSessionId: record.hermesSessionId,
+        runQueuedChat: (queuedMessage, hermesSessionId) => runHermesChat({
+          message: queuedMessage,
+          sessionKey,
+          ...(hermesSessionId ? { hermesSessionId } : {}),
+        }),
+      })
     ));
   }
   const message = await prepareHermesMessage(rawMessage, record.attachments, sessionKey);
@@ -247,275 +195,6 @@ async function runHermesChatOnce(params: {
   return params.context.publishEvent
     ? await runHermesChatStreaming(args, params.sessionKey, params.context, params.historyCompletion)
     : runHermes(args, CHAT_TIMEOUT_MS);
-}
-
-async function detectHermesHistoryCompletion(params: {
-  beforeSessions: HermesSessionItem[];
-  resume?: string;
-  sessionKey: string;
-  userMessage: string;
-}): Promise<string | undefined> {
-  const sessions = await listHermesSessions();
-  const mappedSession = selectHermesSessionForCompletedChat(sessions, {
-    beforeSessions: params.beforeSessions,
-    resume: params.resume,
-    userMessage: params.userMessage,
-  });
-  if (!mappedSession?.hermesSessionId) {
-    return undefined;
-  }
-
-  const exportResult = await runHermesSessionExport({
-    sessionKey: params.sessionKey,
-    hermesSessionId: mappedSession.hermesSessionId,
-    output: "-",
-  });
-  if (!exportResult.ok) {
-    return undefined;
-  }
-
-  return latestAssistantReplyFromHermesExport(exportResult.payload, params.userMessage);
-}
-
-function latestAssistantReplyFromHermesExport(payload: unknown, userMessage: string): string | undefined {
-  const output = toRecord(payload).output;
-  const parsed = parseHermesChatExportOutput(output);
-  const record = toRecord(parsed);
-  const rawMessages = Array.isArray(record.messages)
-    ? record.messages
-    : Array.isArray(record.items)
-      ? record.items
-      : Array.isArray(parsed)
-        ? parsed
-        : [];
-  if (rawMessages.length === 0) {
-    return undefined;
-  }
-
-  const normalizedUser = normalizeSessionSelectionText(userMessage);
-  if (!normalizedUser) {
-    return undefined;
-  }
-  let latestUserIndex = -1;
-  let latestUserMatchesCurrentRequest = false;
-  for (let index = rawMessages.length - 1; index >= 0; index -= 1) {
-    const message = toRecord(rawMessages[index]);
-    if (normalizeHistoryRoleValue(message.role) !== "user") {
-      continue;
-    }
-    const text = normalizeSessionSelectionText(extractHermesHistoryText(message));
-    latestUserIndex = index;
-    latestUserMatchesCurrentRequest = text.length > 0
-      && (text.includes(normalizedUser) || normalizedUser.includes(text));
-    break;
-  }
-  if (latestUserIndex < 0 || !latestUserMatchesCurrentRequest) {
-    return undefined;
-  }
-
-  for (let index = rawMessages.length - 1; index >= latestUserIndex + 1; index -= 1) {
-    const message = toRecord(rawMessages[index]);
-    if (normalizeHistoryRoleValue(message.role) !== "assistant") {
-      continue;
-    }
-    const text = sanitizeHermesChatOutput(extractHermesHistoryText(message)).trim();
-    if (text) {
-      return text;
-    }
-  }
-  return undefined;
-}
-
-function parseHermesChatExportOutput(value: unknown): unknown {
-  if (typeof value !== "string") {
-    return value;
-  }
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return {};
-  }
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    const firstObjectBrace = trimmed.indexOf("{");
-    const lastObjectBrace = trimmed.lastIndexOf("}");
-    if (firstObjectBrace >= 0 && lastObjectBrace > firstObjectBrace) {
-      try {
-        return JSON.parse(trimmed.slice(firstObjectBrace, lastObjectBrace + 1)) as unknown;
-      } catch {
-        return {};
-      }
-    }
-    return {};
-  }
-}
-
-function normalizeHistoryRoleValue(value: unknown): string {
-  return typeof value === "string" ? value.trim().toLowerCase().replace("_", "") : "";
-}
-
-function extractHermesHistoryText(record: Record<string, unknown>): string {
-  const content = record.content;
-  if (typeof content === "string") {
-    return content;
-  }
-  if (Array.isArray(content)) {
-    return content
-      .flatMap((block) => {
-        const blockRecord = toRecord(block);
-        const type = typeof blockRecord.type === "string" ? blockRecord.type.trim().toLowerCase() : "";
-        if (type && type !== "text" && type !== "output_text" && type !== "input_text") {
-          return [];
-        }
-        return typeof blockRecord.text === "string" ? [blockRecord.text] : [];
-      })
-      .filter((text) => text.trim().length > 0)
-      .join("\n\n");
-  }
-  for (const key of ["text", "message", "output"]) {
-    const value = record[key];
-    if (typeof value === "string" && value.trim()) {
-      return value;
-    }
-  }
-  return "";
-}
-
-export function isHermesSlashCommandMessage(message: string): boolean {
-  return /^\/[A-Za-z0-9][\w-]*(?:\s|$)/.test(message.trim());
-}
-
-export function selectHermesSessionForCompletedChat(
-  sessions: HermesSessionItem[],
-  options: {
-    beforeSessions?: HermesSessionItem[];
-    resume?: string;
-    userMessage?: string;
-  } = {},
-): HermesSessionItem | undefined {
-  const resume = options.resume?.trim();
-  if (resume) {
-    return sessions.find((session) => session.hermesSessionId === resume);
-  }
-
-  const beforeIds = new Set((options.beforeSessions ?? []).map((session) => session.hermesSessionId));
-  const newSessions = sessions.filter((session) => !beforeIds.has(session.hermesSessionId));
-  if (newSessions.length === 0) {
-    return sessions[0];
-  }
-
-  const normalizedUserMessage = normalizeSessionSelectionText(options.userMessage);
-  if (normalizedUserMessage) {
-    const matched = newSessions.find((session) => {
-      const haystack = normalizeSessionSelectionText([
-        session.displayName,
-        session.derivedTitle,
-        session.label,
-      ].filter(Boolean).join(" "));
-      return haystack.length > 0
-        && (haystack.includes(normalizedUserMessage) || normalizedUserMessage.includes(haystack));
-    });
-    if (matched) {
-      return matched;
-    }
-  }
-
-  return newSessions[0];
-}
-
-function normalizeSessionSelectionText(value: string | undefined): string {
-  return value
-    ?.replace(/\[Hermes runtime context][\s\S]*$/i, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 80)
-    .toLowerCase() ?? "";
-}
-
-export async function runHermesSlashCommand(params: {
-  message: string;
-  sessionKey: string;
-  hermesSessionId?: unknown;
-}): Promise<HermesChatResult> {
-  const command = params.message.trim();
-  const resume = typeof params.hermesSessionId === "string" && params.hermesSessionId.trim().length > 0
-    ? params.hermesSessionId.trim()
-    : await getMappedHermesSessionId(params.sessionKey);
-
-  const raw = runHermesPython(HERMES_SLASH_COMMAND_SCRIPT, {
-    CLAWCONNECT_HERMES_SLASH_COMMAND: command,
-    CLAWCONNECT_HERMES_SLASH_RESUME: resume ?? "",
-  });
-
-  const payload = parseHermesSlashCommandPayload(raw);
-  const output = sanitizeHermesChatOutput(payload.output ?? "").trim();
-  if (!payload.ok) {
-    const message = [output, payload.error].filter(Boolean).join("\n").trim() || "hermes_slash_command_failed";
-    throw new Error(message);
-  }
-
-  const sessionId = typeof payload.sessionId === "string" && payload.sessionId.trim().length > 0
-    ? payload.sessionId.trim()
-    : undefined;
-  if (sessionId) {
-    await rememberHermesSession(params.sessionKey, {
-      sessionKey: params.sessionKey,
-      hermesSessionId: sessionId,
-      displayName: sessionId,
-      label: command,
-      lastActivityAt: new Date().toISOString(),
-      kind: "hermes",
-    });
-  }
-  if (/^\/(?:new|reset)\b/i.test(command) && resume && sessionId && sessionId !== resume) {
-    await forgetHermesSession(resume, resume);
-  }
-
-  if (payload.pendingInputs && payload.pendingInputs.length > 0) {
-    const queuedMessage = payload.pendingInputs.join("\n\n").trim();
-    if (queuedMessage) {
-      const queued = await runHermesChat({
-        message: queuedMessage,
-        sessionKey: params.sessionKey,
-        ...(sessionId ? { hermesSessionId: sessionId } : {}),
-      });
-      return {
-        ...queued,
-        output: [output, queued.output].filter((part) => part && part !== "(no output)").join("\n\n") || queued.output,
-      };
-    }
-  }
-
-  const usage = await collectHermesUsageSnapshot(sessionId);
-  return {
-    output: output || "(no output)",
-    sessionKey: params.sessionKey,
-    artifactPaths: [],
-    usage,
-  };
-}
-
-function parseHermesSlashCommandPayload(raw: string): {
-  ok: boolean;
-  output?: string;
-  error?: string;
-  sessionId?: string;
-  pendingInputs?: string[];
-} {
-  const parsed = JSON.parse(raw) as unknown;
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("invalid_hermes_slash_command_payload");
-  }
-  const record = parsed as Record<string, unknown>;
-  return {
-    ok: record.ok === true,
-    output: typeof record.output === "string" ? record.output : undefined,
-    error: typeof record.error === "string" ? record.error : undefined,
-    sessionId: typeof record.sessionId === "string" ? record.sessionId : undefined,
-    pendingInputs: Array.isArray(record.pendingInputs)
-      ? record.pendingInputs.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-      : undefined,
-  };
 }
 
 async function runHermesChatStreaming(
@@ -915,133 +594,6 @@ export function buildHermesAssistantDeltaPayload(params: {
     delta: params.delta,
     includeTimelineEvents: true,
   });
-}
-
-function hermesToolState(event: HermesToolLogEvent): ToolState {
-  if (event.phase === "completed") {
-    return "success";
-  }
-  if (event.phase === "failed") {
-    return "failed";
-  }
-  return "streaming_output";
-}
-
-function createHermesToolLogWatcher(onEvent: (event: HermesToolLogEvent) => void): {
-  start: () => void;
-  stop: () => void;
-} {
-  let offset = 0;
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    offset = statSync(HERMES_AGENT_LOG_FILE).size;
-  } catch {
-    offset = 0;
-  }
-
-  const poll = (): void => {
-    let content = "";
-    try {
-      const bytes = readFileSync(HERMES_AGENT_LOG_FILE);
-      if (bytes.length < offset) {
-        offset = 0;
-      }
-      if (bytes.length === offset) {
-        return;
-      }
-      content = bytes.subarray(offset).toString("utf8");
-      offset = bytes.length;
-    } catch {
-      return;
-    }
-    for (const line of content.split(/\r?\n/)) {
-      const event = parseHermesToolLogLine(line);
-      if (event) {
-        onEvent(event);
-      }
-    }
-  };
-
-  return {
-    start: () => {
-      if (timer) {
-        return;
-      }
-      timer = setInterval(poll, 250);
-      timer.unref?.();
-    },
-    stop: () => {
-      poll();
-      if (timer) {
-        clearInterval(timer);
-        timer = undefined;
-      }
-    },
-  };
-}
-
-export function parseHermesToolLogLine(line: string): HermesToolLogEvent | null {
-  const clean = stripAnsi(line).trim();
-  if (!clean) {
-    return null;
-  }
-
-  const executor = clean.match(/\bagent\.tool_executor:\s*tool\s+([A-Za-z0-9_.-]+)\s+(.+)$/i);
-  if (executor) {
-    const toolName = normalizeHermesToolName(executor[1] ?? "tool");
-    const detail = (executor[2] ?? "").trim();
-    if (/\b(?:running|started|executing|start)\b/i.test(detail)) {
-      return {
-        toolName,
-        phase: "streaming",
-        text: `${toolName} ${detail}`.trim(),
-        isError: false,
-      };
-    }
-    const failed = /\b(?:failed|error|errored|denied|aborted)\b/i.test(detail);
-    return {
-      toolName,
-      phase: failed ? "failed" : "completed",
-      text: `${toolName} ${detail}`.trim(),
-      isError: failed,
-    };
-  }
-
-  const toolLogger = clean.match(/\btools\.([A-Za-z0-9_.-]+):\s*(.+)$/i);
-  if (!toolLogger) {
-    return null;
-  }
-  const loggerName = toolLogger[1] ?? "tool";
-  if (!/(?:_tool|_tools)$/i.test(loggerName)) {
-    return null;
-  }
-  let toolName = normalizeHermesToolName(loggerName);
-  let detail = (toolLogger[2] ?? "").trim();
-  if (/\b(?:Shutting down \d+ remaining sandbox(?:\(es\))?|Manually cleaned up environment|Cleaned \d+ environments?)\b/i.test(detail)) {
-    return null;
-  }
-  const nestedTool = detail.match(/^([A-Za-z0-9_.-]+):\s*(.+)$/);
-  if (nestedTool) {
-    toolName = normalizeHermesToolName(nestedTool[1] ?? toolName);
-    detail = (nestedTool[2] ?? "").trim();
-  }
-  if (!detail) {
-    return null;
-  }
-  return {
-    toolName,
-    phase: "streaming",
-    text: `${toolName}: ${detail}`,
-  };
-}
-
-function normalizeHermesToolName(rawName: string): string {
-  const normalized = rawName
-    .trim()
-    .replace(/[^A-Za-z0-9_.-]+/g, "_")
-    .replace(/_tools$/i, "")
-    .replace(/_tool$/i, "");
-  return normalized || "tool";
 }
 
 async function prepareHermesMessage(message: string, attachments: unknown, sessionKey: string): Promise<string> {

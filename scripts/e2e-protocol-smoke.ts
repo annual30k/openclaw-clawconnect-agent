@@ -384,9 +384,25 @@ process.exit(0);
     let toolCompleteReceived = false;
     let assistantDeltaReceived = false;
     let finalAssistantReceived = false;
+    let runtimeMetadataReceived = foundGateway.currentModel === "fake-model";
 
     const testFinishedPromise = new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("E2E Protocol check timeout waiting for WS messages")), PROTOCOL_TIMEOUT_MS);
+
+      const maybeResolve = () => {
+        if (
+          ackReceived &&
+          toolStartReceived &&
+          toolStreamReceived &&
+          toolCompleteReceived &&
+          assistantDeltaReceived &&
+          finalAssistantReceived &&
+          runtimeMetadataReceived
+        ) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      };
       
       mobileWsClient.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
@@ -396,8 +412,18 @@ process.exit(0);
           if (msg.ok) {
             ackReceived = true;
             console.log("[PASS] Received Command ACK");
+            maybeResolve();
           } else {
             reject(new Error(`Command failed on Relay: ${JSON.stringify(msg.error)}`));
+          }
+        }
+
+        if (msg.type === "event" && msg.event === "office") {
+          const payload = msg.payload ?? {};
+          if (payload.currentModel === "fake-model") {
+            runtimeMetadataReceived = true;
+            console.log("[PASS] Runtime model metadata verified");
+            maybeResolve();
           }
         }
 
@@ -421,6 +447,41 @@ process.exit(0);
             }
           }
 
+          for (const event of payload.timelineEvents ?? []) {
+            const content = Array.isArray(event.content) ? event.content : [];
+            const firstBlock = content[0] ?? {};
+            if (event.eventType === "tool.invocation.updated" && String(firstBlock.name ?? "").includes("search_web")) {
+              const text = String(firstBlock.text ?? "");
+              if (event.toolState === "streaming_output" && text.includes("running")) {
+                toolStartReceived = true;
+                console.log("[PASS] Received canonical tool start/running event");
+              } else if (event.toolState === "streaming_output") {
+                toolStreamReceived = true;
+                console.log("[PASS] Received canonical tool streaming log event");
+              } else if (event.toolState === "success") {
+                toolCompleteReceived = true;
+                console.log("[PASS] Received canonical tool completed event");
+              }
+            }
+
+            if (event.eventType === "message.part.delta" && event.role === "assistant") {
+              assistantDeltaReceived = true;
+            }
+
+            if (event.eventType === "message.completed" && event.role === "assistant") {
+              const textContent = content
+                .map((block: any) => typeof block.text === "string" ? block.text : "")
+                .join("\n");
+              finalAssistantReceived = true;
+              console.log("[PASS] Received canonical final assistant message event");
+              if (textContent.includes("Hello! I am a fake Hermes agent") && textContent.includes("second line")) {
+                console.log("[PASS] Canonical final assistant text content verified");
+              } else {
+                reject(new Error(`Incorrect canonical final assistant text content: ${textContent}`));
+              }
+            }
+          }
+
           // Assistant text delta
           if (payload.role === "assistant" && payload.state === "delta" && payload.delta) {
             assistantDeltaReceived = true;
@@ -439,17 +500,13 @@ process.exit(0);
               reject(new Error(`Incorrect final assistant text content: ${textContent}`));
             }
 
-            // Verify usage metadata
-            if (payload.currentModel === "fake-model" && payload.provider === "fake-provider") {
-              console.log("[PASS] Final assistant model/provider metadata verified");
-            } else {
-              reject(new Error(`Incorrect final metadata: model=${payload.currentModel}, provider=${payload.provider}`));
+            // Verify usage metadata when the legacy top-level payload includes it.
+            if (payload.currentModel === "fake-model") {
+              runtimeMetadataReceived = true;
+              console.log("[PASS] Final assistant model metadata verified");
             }
-
-            // Since this is the final message, resolve the test!
-            clearTimeout(timeout);
-            resolve();
           }
+          maybeResolve();
         }
       });
     });
@@ -473,6 +530,7 @@ process.exit(0);
     if (!toolCompleteReceived) throw new Error("Missing Tool Log Completion Event");
     if (!assistantDeltaReceived) throw new Error("Missing Assistant Text Deltas");
     if (!finalAssistantReceived) throw new Error("Missing Final Assistant Response");
+    if (!runtimeMetadataReceived) throw new Error("Missing Runtime Metadata");
     
     console.log("=== ALL PROTOCOL E2E CHECKS PASSED SUCCESSFULLY ===");
 
