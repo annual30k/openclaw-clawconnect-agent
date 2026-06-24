@@ -2,6 +2,8 @@ import { readdirSync, statSync, copyFileSync, existsSync, readFileSync, openSync
 import { join } from "path";
 import { homedir } from "os";
 import { createBackup, deleteBackup, listBackups, restoreBackup, updateBackup } from "../backups/backup-manager.js";
+import { readConfig } from "../../config/config.js";
+import { getActiveProfile, profileErrorLogPath, profileLogPath } from "../../config/profile.js";
 import type { LocalCommandContext, LocalResult } from "../../core/command-types.js";
 import {
   errorMessage,
@@ -305,25 +307,46 @@ function readLogs(params: unknown = undefined): LocalResult {
     const limit = typeof p.limit === "number" ? p.limit : 500;
 
     const candidates: string[] = [];
+    const profileCandidates: string[] = [];
+    const addExistingProfileLog = (path: string): void => {
+      if (existsSync(path)) profileCandidates.push(path);
+    };
 
-    // Primary: ~/.clawconnect/ — where the service (Linux systemd/nohup,
-    // macOS launchd, Windows schtasks) redirects stdout/stderr.
-    if (existsSync(CLAWCONNECT_DIR)) {
-      for (const f of readdirSync(CLAWCONNECT_DIR)) {
-        if (f.endsWith(".log")) candidates.push(join(CLAWCONNECT_DIR, f));
+    const activeProfile = getActiveProfile();
+    let currentGatewayId: string | undefined;
+    if (activeProfile) {
+      addExistingProfileLog(profileLogPath(activeProfile));
+      addExistingProfileLog(profileErrorLogPath(activeProfile));
+      try {
+        currentGatewayId = readConfig(activeProfile).gatewayId;
+      } catch {
+        // The log viewer can still show profile logs while config is being repaired.
       }
     }
 
-    // Fallback: ~/.openclaw/logs/ or ~/.openclaw/*.log — for openclaw
-    // tool logs or legacy installations.
-    const logsDir = join(OPENCLAW_DIR, "logs");
-    if (existsSync(logsDir)) {
-      for (const f of readdirSync(logsDir)) {
-        if (f.endsWith(".log")) candidates.push(join(logsDir, f));
+    // 当前网关通常运行在隔离 profile 内；有 profile 日志时不要被默认 profile 的陈旧错误日志抢占。
+    if (profileCandidates.length > 0) {
+      candidates.push(...profileCandidates);
+    } else {
+      // Primary: ~/.clawconnect/ — where the service (Linux systemd/nohup,
+      // macOS launchd, Windows schtasks) redirects stdout/stderr.
+      if (existsSync(CLAWCONNECT_DIR)) {
+        for (const f of readdirSync(CLAWCONNECT_DIR)) {
+          if (f.endsWith(".log")) candidates.push(join(CLAWCONNECT_DIR, f));
+        }
       }
-    } else if (existsSync(OPENCLAW_DIR)) {
-      for (const f of readdirSync(OPENCLAW_DIR)) {
-        if (f.endsWith(".log")) candidates.push(join(OPENCLAW_DIR, f));
+
+      // Fallback: ~/.openclaw/logs/ or ~/.openclaw/*.log — for openclaw
+      // tool logs or legacy installations.
+      const logsDir = join(OPENCLAW_DIR, "logs");
+      if (existsSync(logsDir)) {
+        for (const f of readdirSync(logsDir)) {
+          if (f.endsWith(".log")) candidates.push(join(logsDir, f));
+        }
+      } else if (existsSync(OPENCLAW_DIR)) {
+        for (const f of readdirSync(OPENCLAW_DIR)) {
+          if (f.endsWith(".log")) candidates.push(join(OPENCLAW_DIR, f));
+        }
       }
     }
 
@@ -394,9 +417,32 @@ function readLogs(params: unknown = undefined): LocalResult {
       allLines.pop();
     }
 
-    const totalLines = allLines.length;
+    let scopedLines = allLines;
+    if (activeProfile && currentGatewayId) {
+      let gatewayLineIndex = -1;
+      for (let i = allLines.length - 1; i >= 0; i--) {
+        if (allLines[i].includes(currentGatewayId)) {
+          gatewayLineIndex = i;
+          break;
+        }
+      }
+
+      if (gatewayLineIndex >= 0) {
+        let runStartIndex = gatewayLineIndex;
+        for (let i = gatewayLineIndex; i >= 0; i--) {
+          if (allLines[i].includes("Starting ClawConnect host agent")) {
+            runStartIndex = i;
+            break;
+          }
+        }
+        // 当前 profile 日志可能包含旧配对的历史段；移动端只展示当前网关最近启动后的日志。
+        scopedLines = allLines.slice(runStartIndex);
+      }
+    }
+
+    const totalLines = scopedLines.length;
     const startIndex = Math.max(0, totalLines - limit);
-    const lines = allLines.slice(startIndex).map(stripAnsi);
+    const lines = scopedLines.slice(startIndex).map(stripAnsi);
     const returnedLines = lines.length;
     const truncated = startIndex > 0;
 

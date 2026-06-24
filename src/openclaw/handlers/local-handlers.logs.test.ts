@@ -7,13 +7,20 @@ import { join } from "node:path";
 const tempHome = await mkdtemp(join(tmpdir(), "clawconnect-logs-"));
 const openclawDir = join(tempHome, ".openclaw");
 const logsDir = join(openclawDir, "logs");
+const clawconnectDir = join(tempHome, ".clawconnect");
+const defaultErrorLogPath = join(clawconnectDir, "clawconnect-error.log");
+const profileOpenClawDir = join(clawconnectDir, "profiles", "openclaw");
+const profileOpenClawConfigPath = join(profileOpenClawDir, "config.json");
+const profileOpenClawLogPath = join(profileOpenClawDir, "clawconnect.log");
 const latestLogPath = join(logsDir, "clawconnect.log");
 const olderLogPath = join(logsDir, "clawconnect-error.log");
 
 const originalHome = process.env.HOME;
+const originalProfile = process.env.CLAWCONNECT_PROFILE;
 process.env.HOME = tempHome;
 
 await mkdir(logsDir, { recursive: true });
+await mkdir(profileOpenClawDir, { recursive: true });
 
 const olderLogLines = Array.from({ length: 20 }, (_, index) => `old-${index + 1}`);
 const latestLogLines = Array.from({ length: 120 }, (_, index) => `new-${index + 1}`);
@@ -21,6 +28,14 @@ const latestLogLines = Array.from({ length: 120 }, (_, index) => `new-${index + 
 await writeFile(olderLogPath, `${olderLogLines.join("\n")}\n`);
 await new Promise((resolve) => setTimeout(resolve, 25));
 await writeFile(latestLogPath, `${latestLogLines.join("\n")}\n`);
+await writeFile(profileOpenClawConfigPath, JSON.stringify({
+  relayServerUrl: "http://127.0.0.1:8080",
+  gatewayId: "gw_current",
+  relaySecret: "secret",
+  displayName: "Mac OpenClaw",
+  gatewayType: "openclaw",
+}));
+await writeFile(profileOpenClawLogPath, "profile-openclaw\n");
 
 const { handleLocalCommand } = await import(`./local-handlers.js?logs-test=${encodeURIComponent(tempHome)}`);
 
@@ -29,6 +44,11 @@ test.after(async () => {
     delete process.env.HOME;
   } else {
     process.env.HOME = originalHome;
+  }
+  if (originalProfile === undefined) {
+    delete process.env.CLAWCONNECT_PROFILE;
+  } else {
+    process.env.CLAWCONNECT_PROFILE = originalProfile;
   }
   await rm(tempHome, { recursive: true, force: true });
 });
@@ -69,4 +89,42 @@ test("logs command strips ANSI codes", async () => {
   const payload = result?.payload as any;
   
   assert.equal(payload.lines[0], "SUCCESS");
+});
+
+test("logs command reads the active profile log before newer default logs", async () => {
+  await writeFile(defaultErrorLogPath, "default-error\n");
+  const now = Date.now();
+  await utimes(defaultErrorLogPath, new Date(now + 3000), new Date(now + 3000));
+  await utimes(profileOpenClawLogPath, new Date(now + 1000), new Date(now + 1000));
+
+  process.env.CLAWCONNECT_PROFILE = "openclaw";
+  const result = handleLocalCommand("clawpilot.logs");
+  const payload = result?.payload as any;
+
+  assert.equal(payload.logPath, profileOpenClawLogPath);
+  assert.deepEqual(payload.lines, ["profile-openclaw"]);
+  delete process.env.CLAWCONNECT_PROFILE;
+});
+
+test("logs command scopes active profile logs to the current gateway run", async () => {
+  await writeFile(profileOpenClawLogPath, [
+    "Starting ClawConnect host agent…",
+    "  Gateway ID:   gw_old",
+    "old-gateway-line",
+    "Starting ClawConnect host agent…",
+    "  Gateway ID:   gw_current",
+    "current-gateway-line",
+  ].join("\n"));
+
+  process.env.CLAWCONNECT_PROFILE = "openclaw";
+  const result = handleLocalCommand("clawpilot.logs");
+  const payload = result?.payload as any;
+
+  assert.equal(payload.logPath, profileOpenClawLogPath);
+  assert.deepEqual(payload.lines, [
+    "Starting ClawConnect host agent…",
+    "  Gateway ID:   gw_current",
+    "current-gateway-line",
+  ]);
+  delete process.env.CLAWCONNECT_PROFILE;
 });
