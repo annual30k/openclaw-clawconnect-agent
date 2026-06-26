@@ -17,8 +17,9 @@ export const HERMES_TYPING_MARKER = "[[clawlink:typing]]";
 export const CLAWCONNECT_MOBILE_BRIDGE_HINT = [
   "[ClawConnect mobile bridge]",
   "You are connected to a mobile chat client through ClawConnect.",
-  "Only when the latest user request explicitly asks you to send, upload, attach, or share a local image or file, include its absolute local file path in your final answer.",
-  "ClawConnect uploads supported file paths only for those explicit send requests.",
+  "When the latest user request explicitly asks you to send, upload, attach, or share a local host image or file, use your Hermes file-transfer skill if it is installed.",
+  "The host-side delivery command is: clawconnect send-file --profile hermes --json <absolute-local-path>.",
+  "Do not rely on final-answer local file paths as mobile attachments; after a successful send-file call, summarize what was sent.",
   "If the user is asking about capabilities, skills, file listings, or past work, do not repeat old file paths as sendable attachments.",
   "Do not say you cannot send attachments merely because you are running in a CLI environment.",
 ].join(" ");
@@ -67,9 +68,13 @@ export function resolveHermesBin(): string {
   return "hermes";
 }
 
-export function runHermes(args: string[], timeoutMs = DEFAULT_TIMEOUT_MS): string {
+export function runHermes(
+  args: string[],
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  env: NodeJS.ProcessEnv = SUBPROCESS_ENV,
+): string {
   return execFileSync(resolveHermesBin(), args, {
-    env: SUBPROCESS_ENV,
+    env,
     stdio: "pipe",
     timeout: timeoutMs,
   }).toString();

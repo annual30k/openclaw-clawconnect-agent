@@ -6,7 +6,6 @@ import test from "node:test";
 import {
   buildHermesAssistantDeltaPayload,
   buildHermesRuntimeContextHint,
-  extractDeliverablePaths,
   isDuplicateHermesCronJob,
   isHermesSlashCommandMessage,
   parseHermesToolLogLine,
@@ -53,83 +52,80 @@ import {
   writeUntimedHistoryHermesBin,
 } from "./hermes-runtime-test-support.js";
 
-test("extractDeliverablePaths returns existing supported artifact paths", () => {
-  const dir = mkdtempSync(join(tmpdir(), "hermes-artifacts-"));
+test("runHermesChat leaves final-answer local paths as text without send-file skill delivery", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hermes-no-path-scan-"));
+  const previousHermesBin = process.env.HERMES_BIN;
   try {
-    const imagePath = join(dir, "chart.png");
-    const sourcePath = join(dir, "secret.ts");
+    const imagePath = join(dir, "reply.png");
+    const hermesBin = join(dir, "hermes");
     writeFileSync(imagePath, "png");
-    writeFileSync(sourcePath, "source");
+    writeFileSync(hermesBin, [
+      "#!/usr/bin/env node",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'sessions' && args[1] === 'list') {",
+      "  console.log('Title                            Preview          Last Active   ID');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'export') {",
+      "  console.log(JSON.stringify({ sessionId: 's1', messages: [] }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'status') { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      `  console.log(${JSON.stringify(`截图好了：${imagePath}`)});`,
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"));
+    chmodSync(hermesBin, 0o755);
+    process.env.HERMES_BIN = hermesBin;
 
-    const paths = extractDeliverablePaths(`Created ${imagePath} and ${sourcePath} plus /missing/report.pdf`);
+    const result = await runHermesChat({ message: "把这张图片发给我", sessionKey: "main" });
 
-    assert.deepEqual(paths, [imagePath]);
+    assert.equal(result.output, `截图好了：${imagePath}`);
+    assert.deepEqual(result.artifactPaths, []);
   } finally {
+    restoreEnv("HERMES_BIN", previousHermesBin);
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("extractDeliverablePaths requires the latest user to ask for sending files", () => {
-  const dir = mkdtempSync(join(tmpdir(), "hermes-artifacts-intent-"));
+test("runHermesChat exposes current run id to Hermes send-file skills", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hermes-send-file-env-"));
+  const previousHermesBin = process.env.HERMES_BIN;
   try {
-    const imagePath = join(dir, "微信图片_20260427092438_279_84.jpg");
-    const spacedImagePath = join(dir, "ChatGPT Image 2026年4月24日 02_12_21.png");
-    const docPath = join(dir, "vue_component_progressive_introduction.docx");
-    writeFileSync(imagePath, "jpg");
-    writeFileSync(spacedImagePath, "png");
-    writeFileSync(docPath, "docx");
+    const hermesBin = join(dir, "hermes");
+    writeFileSync(hermesBin, [
+      "#!/usr/bin/env node",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'sessions' && args[1] === 'list') {",
+      "  console.log('Title                            Preview          Last Active   ID');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'export') {",
+      "  console.log(JSON.stringify({ sessionId: 's1', messages: [] }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'status') { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      "  console.log(process.env.CLAWCONNECT_SOURCE_RUN_ID || 'missing-source-run');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"));
+    chmodSync(hermesBin, 0o755);
+    process.env.HERMES_BIN = hermesBin;
 
-    const answerWithOldPaths = [
-      "我现在有这些技能。",
-      `之前提到过 ${imagePath}`,
-      `也提到过 ${docPath}`,
-    ].join("\n");
+    const result = await runHermesChat(
+      { message: "用 file-transfer 发文件", sessionKey: "main" },
+      { requestId: "hermes-run-123", publishEvent: () => undefined },
+    );
 
-    assert.deepEqual(
-      extractDeliverablePaths(answerWithOldPaths, { userMessage: "你现在有什么技能" }),
-      [],
-    );
-    assert.deepEqual(
-      extractDeliverablePaths(answerWithOldPaths, { userMessage: "这些文件在哪里，只告诉我文件名和路径" }),
-      [],
-    );
-    assert.deepEqual(
-      extractDeliverablePaths(answerWithOldPaths, { userMessage: "不要发送文件，只给我文件名或者路径" }),
-      [],
-    );
-    assert.deepEqual(
-      extractDeliverablePaths(`图片路径：${imagePath}`, { userMessage: "把这张图片发给我" }),
-      [imagePath],
-    );
-    assert.deepEqual(
-      extractDeliverablePaths(`文件路径：${docPath}`, { userMessage: "只要把这个文件发给我" }),
-      [docPath],
-    );
-    assert.deepEqual(
-      extractDeliverablePaths(`图片路径：${imagePath}`, { userMessage: "发图片" }),
-      [imagePath],
-    );
-    assert.deepEqual(
-      extractDeliverablePaths(`图片路径：${imagePath}`, { userMessage: "发送这张图到手机" }),
-      [imagePath],
-    );
-    assert.deepEqual(
-      extractDeliverablePaths(`图片路径：${spacedImagePath}`, { userMessage: "把这张图片发给我" }),
-      [spacedImagePath],
-    );
-    assert.deepEqual(
-      extractDeliverablePaths(`图片路径：${imagePath}`, { userMessage: "发过来了吗" }),
-      [imagePath],
-    );
-    assert.deepEqual(
-      extractDeliverablePaths(`Path: ${imagePath}`, { userMessage: `send ${imagePath} to my phone` }),
-      [imagePath],
-    );
-    assert.deepEqual(
-      extractDeliverablePaths(`图片路径：${imagePath}`, { userMessage: "你能发图片吗" }),
-      [],
-    );
+    assert.equal(result.output, "hermes-run-123");
   } finally {
+    restoreEnv("HERMES_BIN", previousHermesBin);
     rmSync(dir, { recursive: true, force: true });
   }
 });

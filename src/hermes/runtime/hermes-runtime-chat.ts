@@ -15,7 +15,6 @@ import {
   getMappedHermesSessionId,
   rememberHermesSession,
 } from "../hermes-session-store.js";
-import { extractDeliverablePaths } from "./hermes-runtime-artifacts.js";
 import {
   CHAT_TIMEOUT_MS,
   CLAWCONNECT_MOBILE_BRIDGE_HINT,
@@ -176,7 +175,7 @@ async function runHermesChatPrepared(params: {
   return {
     output,
     sessionKey: params.sessionKey,
-    artifactPaths: extractDeliverablePaths(output, { userMessage: params.rawMessage }),
+    artifactPaths: [],
     usage,
   };
 }
@@ -192,23 +191,26 @@ async function runHermesChatOnce(params: {
   if (params.resume) {
     args.push("--resume", params.resume);
   }
+  const runId = params.context.requestId ?? `hermes-${Date.now()}`;
+  const env = hermesChatSubprocessEnv(runId);
   return params.context.publishEvent
-    ? await runHermesChatStreaming(args, params.sessionKey, params.context, params.historyCompletion)
-    : runHermes(args, CHAT_TIMEOUT_MS);
+    ? await runHermesChatStreaming(args, params.sessionKey, params.context, runId, env, params.historyCompletion)
+    : runHermes(args, CHAT_TIMEOUT_MS, env);
 }
 
 async function runHermesChatStreaming(
   args: string[],
   sessionKey: string,
   context: LocalCommandContext,
+  runId: string,
+  env: NodeJS.ProcessEnv,
   historyCompletion?: () => Promise<string | undefined>,
 ): Promise<string> {
   const child = spawn(resolveHermesBin(), args, {
-    env: SUBPROCESS_ENV,
+    env,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
-  const runId = context.requestId ?? `hermes-${Date.now()}`;
   let output = "";
   let stderr = "";
   let seq = 0;
@@ -594,6 +596,13 @@ export function buildHermesAssistantDeltaPayload(params: {
     delta: params.delta,
     includeTimelineEvents: true,
   });
+}
+
+function hermesChatSubprocessEnv(runId: string): NodeJS.ProcessEnv {
+  return {
+    ...SUBPROCESS_ENV,
+    CLAWCONNECT_SOURCE_RUN_ID: runId,
+  };
 }
 
 async function prepareHermesMessage(message: string, attachments: unknown, sessionKey: string): Promise<string> {

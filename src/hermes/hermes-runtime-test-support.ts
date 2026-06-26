@@ -6,7 +6,6 @@ import test from "node:test";
 import {
   buildHermesAssistantDeltaPayload,
   buildHermesRuntimeContextHint,
-  extractDeliverablePaths,
   isDuplicateHermesCronJob,
   isHermesSlashCommandMessage,
   parseHermesToolLogLine,

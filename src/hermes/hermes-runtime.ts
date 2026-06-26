@@ -29,4 +29,3 @@ export {
 } from "./runtime/hermes-runtime-usage.js";
 export { isDuplicateHermesCronJob } from "./runtime/hermes-runtime-cron.js";
 export { parseHermesSkillsList } from "./runtime/hermes-runtime-skills.js";
-export { extractDeliverablePaths } from "./runtime/hermes-runtime-artifacts.js";
