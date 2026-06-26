@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  buildHermesArtifactCompletedEvent,
   buildHermesArtifactContentBlock,
+  buildHermesArtifactTimelineEvents,
   buildHermesArtifactUploadRequest,
   buildHermesRelayHelloMessage,
   collectHermesSlashCommandCatalog,
@@ -13,30 +15,32 @@ import {
   shouldPublishHermesOfficeSnapshot,
 } from "./hermes-relay-manager.js";
 
+const imageUpload = {
+  filePath: "/tmp/reply.png",
+  absolutePath: "/tmp/reply.png",
+  gatewayId: "gw-1",
+  sessionKey: "main",
+  fileId: "file-image-1",
+  uploadId: "upload-1",
+  fileName: "reply.png",
+  mimeType: "image/png",
+  sizeBytes: 1234,
+  imageWidth: 640,
+  imageHeight: 360,
+  sha256: "sha",
+  chunkSize: 1024,
+  totalChunks: 2,
+  sourceRunId: "run-1",
+  expiresAt: "2026-06-06T00:00:00.000Z",
+  downloadPath: "/api/mobile/files/file-image-1",
+  downloadUrl: "http://127.0.0.1:8080/api/mobile/files/file-image-1",
+  status: "available",
+  createdAt: "2026-06-06T00:00:00.000Z",
+  updatedAt: "2026-06-06T00:00:00.000Z",
+};
+
 test("Hermes image artifact upload is represented as a mobile content block", () => {
-  const block = buildHermesArtifactContentBlock({
-    filePath: "/tmp/reply.png",
-    absolutePath: "/tmp/reply.png",
-    gatewayId: "gw-1",
-    sessionKey: "main",
-    fileId: "file-image-1",
-    uploadId: "upload-1",
-    fileName: "reply.png",
-    mimeType: "image/png",
-    sizeBytes: 1234,
-    imageWidth: 640,
-    imageHeight: 360,
-    sha256: "sha",
-    chunkSize: 1024,
-    totalChunks: 2,
-    sourceRunId: "run-1",
-    expiresAt: "2026-06-06T00:00:00.000Z",
-    downloadPath: "/api/mobile/files/file-image-1",
-    downloadUrl: "http://127.0.0.1:8080/api/mobile/files/file-image-1",
-    status: "available",
-    createdAt: "2026-06-06T00:00:00.000Z",
-    updatedAt: "2026-06-06T00:00:00.000Z",
-  }, "att-1");
+  const block = buildHermesArtifactContentBlock(imageUpload, "att-1");
 
   assert.deepEqual(block, {
     type: "image",
@@ -55,6 +59,49 @@ test("Hermes image artifact upload is represented as a mobile content block", ()
     sessionKey: "main",
     status: "available",
   });
+});
+
+test("Hermes artifact uploads use independent non-resolving attachment timeline messages", () => {
+  const block = buildHermesArtifactContentBlock(imageUpload, "att-1");
+  const event = buildHermesArtifactCompletedEvent({
+    gatewayId: "gw-1",
+    sessionKey: "main",
+    runId: "run-1",
+    upload: imageUpload,
+    attachmentId: "att-1",
+    contentBlock: block,
+    artifactIndex: 0,
+    now: () => new Date("2026-06-06T00:00:00.000Z"),
+    idFactory: (prefix) => `${prefix}_fixed`,
+  });
+
+  assert.equal(event.eventType, "message.completed");
+  assert.equal(event.messageId, "file-file-image-1");
+  assert.equal(event.partId, "part-image-1");
+  assert.equal(event.timelineItemKind, "attachment");
+  assert.equal(event.timelineResolvesWaiting, false);
+  assert.deepEqual(event.content, [block]);
+});
+
+test("Hermes artifact completed and state events use distinct sequence keys", () => {
+  const events = buildHermesArtifactTimelineEvents({
+    gatewayId: "gw-1",
+    sessionKey: "main",
+    runId: "run-1",
+    upload: imageUpload,
+    attachmentId: "att-1",
+    artifactIndex: 0,
+    now: () => new Date("2026-06-06T00:00:00.000Z"),
+    idFactory: (prefix) => `${prefix}_fixed_${prefix === "evt" ? "1" : "0"}`,
+  });
+
+  assert.equal(events.completed.messageId, "file-file-image-1");
+  assert.equal(events.attachment.messageId, "file-file-image-1");
+  assert.equal(events.completed.partId, "part-image-1");
+  assert.equal(events.attachment.partId, "part-image-1");
+  assert.equal(events.attachment.seq, events.completed.seq + 1);
+  assert.equal(events.attachment.timelineItemKind, "attachment");
+  assert.equal(events.attachment.timelineResolvesWaiting, false);
 });
 
 test("Hermes artifact uploads are linked to the assistant source run", () => {

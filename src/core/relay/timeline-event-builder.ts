@@ -5,6 +5,7 @@ import {
   type CanonicalTimelineEvent,
   type CanonicalTimelineHistorySnapshotPage,
   type TimelineContentBlock,
+  type TimelineItemKind,
   type TimelineHistoryMessage,
   type TimelineMessageState,
   type TimelineRole,
@@ -81,6 +82,8 @@ function buildEvent(
     error?: Record<string, unknown> | null;
     toolInvocationId?: string;
     toolState?: ToolState;
+    timelineItemKind?: TimelineItemKind;
+    timelineResolvesWaiting?: boolean;
   },
 ): CanonicalTimelineEvent {
   const role = params.role ?? "assistant";
@@ -107,6 +110,10 @@ function buildEvent(
     error: params.error ?? null,
     ...(params.toolInvocationId ? { toolInvocationId: params.toolInvocationId } : {}),
     ...(params.toolState ? { toolState: params.toolState } : {}),
+    ...(params.timelineItemKind ? { timelineItemKind: params.timelineItemKind } : {}),
+    ...(typeof params.timelineResolvesWaiting === "boolean"
+      ? { timelineResolvesWaiting: params.timelineResolvesWaiting }
+      : {}),
   });
 }
 
@@ -200,6 +207,8 @@ export function buildMessageCompletedEvent(params: TimelineTurnBase & {
   messageId?: string;
   partId?: string;
   content: TimelineContentBlock[];
+  timelineItemKind?: TimelineItemKind;
+  timelineResolvesWaiting?: boolean;
 }): CanonicalTimelineEvent {
   return buildEvent({
     ...params,
@@ -254,6 +263,8 @@ export function buildAttachmentStateChangedEvent(params: TimelineTurnBase & {
   messageId: string;
   partId: string;
   attachment: TimelineAttachmentInput;
+  timelineItemKind?: TimelineItemKind;
+  timelineResolvesWaiting?: boolean;
 }): CanonicalTimelineEvent {
   return buildEvent({
     ...params,

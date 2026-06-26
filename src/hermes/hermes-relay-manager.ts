@@ -20,6 +20,7 @@ import {
 import { voiceInputSetupMessage } from "../core/relay/voice-input.js";
 import {
   buildAttachmentStateChangedEvent,
+  buildMessageCompletedEvent,
   deriveAttachmentId,
   derivePartId,
 } from "../core/relay/timeline-event-builder.js";
@@ -276,8 +277,10 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           },
         });
         forgetActiveHermesChatRun(activeChatRuns, run);
-        const artifactContentBlocks: TimelineContentBlock[] = [];
-        const artifactAttachmentEvents: ReturnType<typeof buildAttachmentStateChangedEvent>[] = [];
+        const artifactTimelineEvents: Array<{
+          completed: ReturnType<typeof buildHermesArtifactCompletedEvent>;
+          attachment: ReturnType<typeof buildAttachmentStateChangedEvent>;
+        }> = [];
 
         for (const artifactPath of chat.artifactPaths) {
           const artifactKey = artifactDeliveryKey(chat.sessionKey, artifactPath);
@@ -302,31 +305,18 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
               contentHash: upload.sha256,
             });
             const block = buildHermesArtifactContentBlock(upload, attachmentId);
-            artifactContentBlocks.push(block);
-            artifactAttachmentEvents.push(
-              buildAttachmentStateChangedEvent({
+            const artifactIndex = artifactTimelineEvents.length;
+            artifactTimelineEvents.push({
+              ...buildHermesArtifactTimelineEvents({
                 gatewayId: opts.gatewayId,
                 sessionKey: chat.sessionKey,
-                turnId: runId,
                 runId,
-                messageId: `assistant-${runId}`,
-                partId: derivePartId({
-                  type: block.type,
-                  index: artifactContentBlocks.length - 1,
-                }),
-                attachment: {
-                  attachmentId,
-                  state: "available",
-                  fileId: upload.fileId,
-                  name: upload.fileName,
-                  mimeType: upload.mimeType,
-                  sizeBytes: upload.sizeBytes,
-                  url: upload.downloadUrl,
-                  expiresAt: upload.expiresAt,
-                  sha256: upload.sha256,
-                },
+                upload,
+                attachmentId,
+                contentBlock: block,
+                artifactIndex,
               }),
-            );
+            });
             if (artifactKey) {
               sentArtifacts.set(artifactKey, Date.now());
             }
@@ -335,10 +325,25 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           }
         }
 
+        for (const artifactEvents of artifactTimelineEvents) {
+          const attachmentPayload = {
+            runId,
+            sessionKey: chat.sessionKey,
+            state: "attachment",
+            role: "assistant",
+            timelineEvents: [artifactEvents.completed, artifactEvents.attachment],
+          };
+          send({
+            type: "event",
+            event: "chat",
+            payload: attachmentPayload,
+          });
+          publishHermesOfficeSnapshot(send, "chat", attachmentPayload);
+        }
+
         const finalChatPayload = buildMobileAssistantFinalPayload({
           run: { runId, sessionKey: chat.sessionKey },
           text: chat.output,
-          contentBlocks: artifactContentBlocks,
           currentModel: chat.usage?.currentModel,
           provider: chat.usage?.provider,
           contextUsage: chat.usage?.contextUsage,
@@ -351,22 +356,6 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           payload: finalChatPayload,
         });
         publishHermesOfficeSnapshot(send, "chat", finalChatPayload);
-
-        for (const attachmentEvent of artifactAttachmentEvents) {
-          const attachmentPayload = {
-            runId,
-            sessionKey: chat.sessionKey,
-            state: "attachment",
-            role: "assistant",
-            timelineEvents: [attachmentEvent],
-          };
-          send({
-            type: "event",
-            event: "chat",
-            payload: attachmentPayload,
-          });
-          publishHermesOfficeSnapshot(send, "chat", attachmentPayload);
-        }
 
         if (requestId && !acknowledgedChatRun) {
           send({ type: "res", id: requestId, ok: true, payload: { runId, sessionKey: chat.sessionKey } });
@@ -475,6 +464,89 @@ export function buildHermesArtifactContentBlock(
     sessionKey: upload.sessionKey,
     status: "available",
   });
+}
+
+export function buildHermesArtifactCompletedEvent(params: {
+  gatewayId: string;
+  sessionKey: string;
+  runId: string;
+  upload: FileUploadResult;
+  attachmentId?: string;
+  contentBlock?: TimelineContentBlock;
+  artifactIndex?: number;
+  now?: () => Date;
+  idFactory?: (prefix: string) => string;
+}) {
+  const contentBlock = params.contentBlock ?? buildHermesArtifactContentBlock(params.upload, params.attachmentId);
+  // Hermes 产物必须独立成附件消息，不能合进最终文字回答，否则客户端会把图片当作已完成 waiting 行的一部分吞掉。
+  return buildMessageCompletedEvent({
+    gatewayId: params.gatewayId,
+    sessionKey: params.sessionKey,
+    turnId: params.runId,
+    runId: params.runId,
+    role: "assistant",
+    messageId: hermesArtifactMessageId(params.upload.fileId),
+    partId: derivePartId({
+      type: contentBlock.type,
+      index: params.artifactIndex ?? 0,
+    }),
+    content: [contentBlock],
+    timelineItemKind: "attachment",
+    timelineResolvesWaiting: false,
+    now: params.now,
+    idFactory: params.idFactory,
+  });
+}
+
+export function buildHermesArtifactTimelineEvents(params: {
+  gatewayId: string;
+  sessionKey: string;
+  runId: string;
+  upload: FileUploadResult;
+  attachmentId: string;
+  contentBlock?: TimelineContentBlock;
+  artifactIndex?: number;
+  now?: () => Date;
+  idFactory?: (prefix: string) => string;
+}) {
+  const contentBlock = params.contentBlock ?? buildHermesArtifactContentBlock(params.upload, params.attachmentId);
+  const completed = buildHermesArtifactCompletedEvent({
+    ...params,
+    contentBlock,
+  });
+  const partId = completed.partId;
+  return {
+    completed,
+    attachment: buildAttachmentStateChangedEvent({
+      gatewayId: params.gatewayId,
+      sessionKey: params.sessionKey,
+      turnId: params.runId,
+      runId: params.runId,
+      role: "assistant",
+      messageId: completed.messageId,
+      partId,
+      seq: completed.seq + 1,
+      now: params.now,
+      idFactory: params.idFactory,
+      timelineItemKind: "attachment",
+      timelineResolvesWaiting: false,
+      attachment: {
+        attachmentId: params.attachmentId,
+        state: "available",
+        fileId: params.upload.fileId,
+        name: params.upload.fileName,
+        mimeType: params.upload.mimeType,
+        sizeBytes: params.upload.sizeBytes,
+        url: params.upload.downloadUrl,
+        expiresAt: params.upload.expiresAt,
+        sha256: params.upload.sha256,
+      },
+    }),
+  };
+}
+
+function hermesArtifactMessageId(fileId: string): string {
+  return `file-${fileId}`;
 }
 
 function compactTimelineContentBlock(

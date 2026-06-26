@@ -33,6 +33,14 @@ export type ToolState =
   | "failed"
   | "cancelled";
 
+export type TimelineItemKind =
+  | "message:user"
+  | "message:assistant"
+  | "tool"
+  | "attachment"
+  | "system"
+  | "waiting";
+
 export type TimelineContentBlock = Record<string, unknown> & {
   type: string;
 };
@@ -70,6 +78,8 @@ export type CanonicalTimelineEvent = {
   error: TimelineError | null;
   toolInvocationId?: string;
   toolState?: ToolState;
+  timelineItemKind?: TimelineItemKind;
+  timelineResolvesWaiting?: boolean;
   extensions?: Record<string, unknown>;
 };
 
@@ -156,6 +166,8 @@ const canonicalEventFields = new Set([
   "error",
   "toolInvocationId",
   "toolState",
+  "timelineItemKind",
+  "timelineResolvesWaiting",
 ]);
 
 const historyPageFields = new Set([
@@ -290,6 +302,8 @@ export function parseCanonicalTimelineEvent(input: unknown): CanonicalTimelineEv
     error: parseNullableRecord<TimelineError>(input.error, "error"),
     ...(typeof input.toolInvocationId === "string" ? { toolInvocationId: input.toolInvocationId } : {}),
     ...(typeof input.toolState === "string" ? { toolState: input.toolState as ToolState } : {}),
+    ...(typeof input.timelineItemKind === "string" ? { timelineItemKind: input.timelineItemKind as TimelineItemKind } : {}),
+    ...(typeof input.timelineResolvesWaiting === "boolean" ? { timelineResolvesWaiting: input.timelineResolvesWaiting } : {}),
     ...(collectExtensions(input, canonicalEventFields)
       ? { extensions: collectExtensions(input, canonicalEventFields) }
       : {}),
