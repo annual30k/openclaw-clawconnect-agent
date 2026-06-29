@@ -42,6 +42,7 @@ export async function sendFileCommand(
   const relayServerUrl = config.relayServerUrl?.trim();
   const relaySecret = config.relaySecret?.trim();
   const gatewayId = (opts.gateway?.trim() || config.gatewayId?.trim() || "").trim();
+  const env = deps.env ?? process.env;
 
   if (!relayServerUrl) {
     throw new Error("relay_server_url_required");
@@ -53,9 +54,9 @@ export async function sendFileCommand(
     throw new Error("gateway_id_required");
   }
 
-  const sessionKey = await resolveTargetSessionKey(opts.session, config, deps.sessionStoreRoot);
+  const sessionKey = await resolveTargetSessionKey(opts.session, config, deps.sessionStoreRoot, env);
   const sourceRunId =
-    resolveSourceRunId(opts.sourceRunId, deps.env ?? process.env)
+    resolveSourceRunId(opts.sourceRunId, env)
     ?? await resolveOpenClawTranscriptSourceRunId(opts, config, sessionKey, deps.sessionStoreRoot);
   writeLog(stderr, `[send-file] preparing ${opts.filePath} for gateway ${gatewayId} session ${sessionKey}`);
 
@@ -143,10 +144,16 @@ async function resolveTargetSessionKey(
   explicitSessionKey: string | undefined,
   config: ClawConnectConfig,
   sessionStoreRoot?: string,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<string> {
   const trimmedExplicit = explicitSessionKey?.trim() ?? "";
   if (trimmedExplicit) {
     return normalizeSessionKey(trimmedExplicit);
+  }
+
+  const envSessionKey = resolveSessionKeyFromEnv(env);
+  if (envSessionKey) {
+    return envSessionKey;
   }
 
   if (config.gatewayType === "openclaw" || !config.gatewayType) {
@@ -155,6 +162,22 @@ async function resolveTargetSessionKey(
   }
 
   return "main";
+}
+
+function resolveSessionKeyFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  for (const key of [
+    "CLAWCONNECT_SESSION_KEY",
+    "CLAWCONNECT_CHAT_SESSION_KEY",
+    "CLAWCONNECT_MOBILE_SESSION_KEY",
+    "OPENCLAW_SESSION_KEY",
+    "OPENCLAW_CHAT_SESSION_KEY",
+  ]) {
+    const value = env[key]?.trim();
+    if (value) {
+      return normalizeSessionKey(value);
+    }
+  }
+  return undefined;
 }
 
 function writeLog(stream: Pick<NodeJS.WritableStream, "write">, message: string): void {

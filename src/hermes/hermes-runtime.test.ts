@@ -91,7 +91,7 @@ test("runHermesChat leaves final-answer local paths as text without send-file sk
   }
 });
 
-test("runHermesChat exposes current run id to Hermes send-file skills", async () => {
+test("runHermesChat exposes current run and session ids to Hermes send-file skills", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hermes-send-file-env-"));
   const previousHermesBin = process.env.HERMES_BIN;
   try {
@@ -109,7 +109,11 @@ test("runHermesChat exposes current run id to Hermes send-file skills", async ()
       "}",
       "if (args[0] === 'status') { process.exit(0); }",
       "if (args[0] === 'chat') {",
-      "  console.log(process.env.CLAWCONNECT_SOURCE_RUN_ID || 'missing-source-run');",
+      "  console.log(JSON.stringify({",
+      "    sourceRunId: process.env.CLAWCONNECT_SOURCE_RUN_ID || 'missing-source-run',",
+      "    sessionKey: process.env.CLAWCONNECT_SESSION_KEY || 'missing-session',",
+      "    chatSessionKey: process.env.CLAWCONNECT_CHAT_SESSION_KEY || 'missing-chat-session',",
+      "  }));",
       "  process.exit(0);",
       "}",
       "process.exit(2);",
@@ -119,11 +123,124 @@ test("runHermesChat exposes current run id to Hermes send-file skills", async ()
     process.env.HERMES_BIN = hermesBin;
 
     const result = await runHermesChat(
-      { message: "用 file-transfer 发文件", sessionKey: "main" },
+      { message: "用 file-transfer 发文件", sessionKey: "ios-current-session" },
       { requestId: "hermes-run-123", publishEvent: () => undefined },
     );
 
-    assert.equal(result.output, "hermes-run-123");
+    assert.deepEqual(JSON.parse(result.output), {
+      sourceRunId: "hermes-run-123",
+      sessionKey: "ios-current-session",
+      chatSessionKey: "ios-current-session",
+    });
+  } finally {
+    restoreEnv("HERMES_BIN", previousHermesBin);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat passes stable mobile turn metadata and preloads file-transfer when installed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hermes-mobile-turn-metadata-"));
+  const previousHermesBin = process.env.HERMES_BIN;
+  try {
+    const hermesBin = join(dir, "hermes");
+    writeFileSync(hermesBin, [
+      "#!/usr/bin/env node",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'skills' && args[1] === 'list') {",
+      "  console.log('│ file-transfer │ productivity │ local │ local │ enabled │');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'list') {",
+      "  console.log('Title                            Preview          Last Active   ID');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'export') {",
+      "  console.log(JSON.stringify({ sessionId: 's1', messages: [] }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'status') { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      "  const query = args[args.indexOf('--query') + 1];",
+      "  console.log(JSON.stringify({ args, query }));",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"));
+    chmodSync(hermesBin, 0o755);
+    process.env.HERMES_BIN = hermesBin;
+
+    const result = await runHermesChat(
+      { message: "把桌面上的图片发到手机", sessionKey: "main" },
+      { requestId: "client-run-file-1", publishEvent: () => undefined },
+    );
+    const payload = JSON.parse(result.output) as { args: string[]; query: string };
+
+    assert.ok(payload.args.includes("--skills"));
+    assert.ok(payload.args.includes("file-transfer"));
+    assert.match(payload.query, /\[ClawConnect mobile turn\]/);
+    assert.match(payload.query, /sourceRunId: client-run-file-1/);
+    assert.match(payload.query, /sessionKey: main/);
+  } finally {
+    restoreEnv("HERMES_BIN", previousHermesBin);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChatHistory extracts stable mobile turn metadata from Hermes export", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hermes-history-turn-metadata-"));
+  const previousHermesBin = process.env.HERMES_BIN;
+  try {
+    const hermesBin = join(dir, "hermes");
+    const exported = {
+      sessionId: "s1",
+      messages: [
+        {
+          id: "history-user-1",
+          role: "user",
+          createdAt: "2026-06-26T09:00:00.000Z",
+          content: [
+            "帮把桌面上的图片发过来",
+            "",
+            "[ClawConnect mobile bridge] You are connected to a mobile chat client through ClawConnect.",
+            "",
+            "[ClawConnect mobile turn]",
+            "sourceRunId: client-run-file-1",
+            "sessionKey: main",
+          ].join("\n"),
+        },
+        {
+          id: "history-assistant-1",
+          role: "assistant",
+          createdAt: "2026-06-26T09:00:01.000Z",
+          content: "已经发到手机。",
+        },
+      ],
+    };
+    writeFileSync(hermesBin, [
+      "#!/usr/bin/env node",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'sessions' && args[1] === 'export') {",
+      `  console.log(${JSON.stringify(JSON.stringify(exported))});`,
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"));
+    chmodSync(hermesBin, 0o755);
+    process.env.HERMES_BIN = hermesBin;
+
+    const result = await runHermesChatHistory({ sessionKey: "main", limit: 10 });
+    assert.equal(result.ok, true);
+    const payload = result.payload as {
+      timelineSnapshot: { messages: Array<{ role: string; content: Array<{ text?: string }>; runId?: string; idempotencyKey?: string; clientMessageId?: string }> };
+    };
+    const user = payload.timelineSnapshot.messages.find((message) => message.role === "user");
+
+    assert.equal(user?.runId, "client-run-file-1");
+    assert.equal(user?.idempotencyKey, "client-run-file-1");
+    assert.equal(user?.clientMessageId, "client-run-file-1");
+    assert.equal(user?.content[0]?.text, "帮把桌面上的图片发过来");
   } finally {
     restoreEnv("HERMES_BIN", previousHermesBin);
     rmSync(dir, { recursive: true, force: true });

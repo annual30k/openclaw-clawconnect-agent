@@ -41,6 +41,9 @@ import {
   parseHermesToolLogLine,
 } from "./hermes-runtime-tool-log-watcher.js";
 import {
+  parseHermesSkillsList,
+} from "./hermes-runtime-skills.js";
+import {
   isHermesSlashCommandMessage,
   runHermesSlashCommand,
 } from "./hermes-runtime-slash-command.js";
@@ -54,6 +57,7 @@ const HERMES_ASSISTANT_DELTA_MAX_BYTES = 4096;
 const HERMES_HISTORY_COMPLETION_GRACE_MS = 2_000;
 const HERMES_HISTORY_COMPLETION_POLL_MS = 1_000;
 const HERMES_COMMAND_DENIED_TIMEOUT_MESSAGE = "Timeout – denying command";
+const HERMES_FILE_TRANSFER_SKILL = "file-transfer";
 const hermesChatQueues = new Map<string, Promise<void>>();
 
 export async function runHermesChat(
@@ -81,7 +85,10 @@ export async function runHermesChat(
       })
     ));
   }
-  const message = await prepareHermesMessage(rawMessage, record.attachments, sessionKey);
+  const sourceRunId = typeof context.requestId === "string" && context.requestId.trim().length > 0
+    ? context.requestId.trim()
+    : undefined;
+  const message = await prepareHermesMessage(rawMessage, record.attachments, sessionKey, sourceRunId);
   if (!message.trim()) {
     throw new Error("message_required");
   }
@@ -187,12 +194,21 @@ async function runHermesChatOnce(params: {
   context: LocalCommandContext;
   historyCompletion?: () => Promise<string | undefined>;
 }): Promise<string> {
-  const args = ["chat", "--query", params.message, "--quiet", "--source", "pocketclaw", "--yolo"];
+  const args = [
+    "chat",
+    "--query",
+    params.message,
+    "--quiet",
+    "--source",
+    "pocketclaw",
+    ...hermesPreloadedSkillArgs(),
+    "--yolo",
+  ];
   if (params.resume) {
     args.push("--resume", params.resume);
   }
   const runId = params.context.requestId ?? `hermes-${Date.now()}`;
-  const env = hermesChatSubprocessEnv(runId);
+  const env = hermesChatSubprocessEnv(runId, params.sessionKey);
   return params.context.publishEvent
     ? await runHermesChatStreaming(args, params.sessionKey, params.context, runId, env, params.historyCompletion)
     : runHermes(args, CHAT_TIMEOUT_MS, env);
@@ -598,14 +614,47 @@ export function buildHermesAssistantDeltaPayload(params: {
   });
 }
 
-function hermesChatSubprocessEnv(runId: string): NodeJS.ProcessEnv {
+function hermesChatSubprocessEnv(runId: string, sessionKey: string): NodeJS.ProcessEnv {
   return {
     ...SUBPROCESS_ENV,
     CLAWCONNECT_SOURCE_RUN_ID: runId,
+    CLAWCONNECT_SESSION_KEY: sessionKey,
+    CLAWCONNECT_CHAT_SESSION_KEY: sessionKey,
   };
 }
 
-async function prepareHermesMessage(message: string, attachments: unknown, sessionKey: string): Promise<string> {
+function hermesPreloadedSkillArgs(): string[] {
+  try {
+    const skills = parseHermesSkillsList(runHermes(["skills", "list"], 5_000));
+    const fileTransfer = skills.find((skill) => skill.skillKey === HERMES_FILE_TRANSFER_SKILL);
+    if (fileTransfer && fileTransfer.enabled !== false) {
+      return ["--skills", HERMES_FILE_TRANSFER_SKILL];
+    }
+  } catch {
+    // Hermes without skills support should still be able to answer normal chat.
+  }
+  return [];
+}
+
+function buildClawConnectMobileTurnMetadata(sourceRunId: string | undefined, sessionKey: string): string | undefined {
+  if (!sourceRunId) {
+    return undefined;
+  }
+  // 这个块是 ClawConnect 和 Hermes history 的稳定身份合同；客户端展示时会剥离它。
+  return [
+    "[ClawConnect mobile turn]",
+    `sourceRunId: ${sourceRunId}`,
+    `sessionKey: ${sessionKey}`,
+    "Use this metadata only for ClawConnect file-transfer attribution. Do not mention it in the answer.",
+  ].join("\n");
+}
+
+async function prepareHermesMessage(
+  message: string,
+  attachments: unknown,
+  sessionKey: string,
+  sourceRunId?: string,
+): Promise<string> {
   const refs: string[] = [];
   if (Array.isArray(attachments)) {
     const safeSession = sessionKey.replace(/[^\w.-]/g, "_") || "main";
@@ -639,6 +688,10 @@ async function prepareHermesMessage(message: string, attachments: unknown, sessi
     sections.push(runtimeHint);
   }
   sections.push(CLAWCONNECT_MOBILE_BRIDGE_HINT);
+  const turnMetadata = buildClawConnectMobileTurnMetadata(sourceRunId, sessionKey);
+  if (turnMetadata) {
+    sections.push(turnMetadata);
+  }
   return sections.filter(Boolean).join("\n\n").trim();
 }
 

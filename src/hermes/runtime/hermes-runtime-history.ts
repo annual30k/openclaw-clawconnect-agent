@@ -20,9 +20,18 @@ type HermesHistoryMessage = {
   seq: number;
 };
 
+type ClawConnectMobileTurnMetadata = {
+  sourceRunId?: string;
+  sessionKey?: string;
+};
+
 const DEFAULT_HISTORY_LIMIT = 100;
 const MAX_HISTORY_LIMIT = 200;
 const CURSOR_PREFIX = "seq:";
+const CLAWCONNECT_MOBILE_BRIDGE_MARKER = "[ClawConnect mobile bridge]";
+const CLAWCONNECT_MOBILE_TURN_MARKER = "[ClawConnect mobile turn]";
+const HERMES_RUNTIME_CONTEXT_HINT_REGEX =
+  /(^|\r?\n)[ \t]*\[Hermes runtime context\][\s\S]*?(?=\r?\n[ \t]*\[ClawConnect mobile bridge\]|\r?\n[ \t]*\[ClawConnect mobile turn\]|$)/gi;
 
 type HermesHistoryCacheEntry = {
   parsed: unknown;
@@ -176,25 +185,26 @@ function normalizeHermesHistoryMessages(parsed: unknown): HermesHistoryMessage[]
     }
     const role = normalizeHistoryRole(source.role);
     const rawText = extractHistoryText(source);
+    const mobileTurn = role === "user" ? parseClawConnectMobileTurnMetadata(rawText) : {};
     const normalized = normalizeHistoryText(role, rawText);
     const content = normalizeHistoryContentBlocks(source, normalized);
     if (!normalized && content.length === 0) {
       return [];
     }
     const seq = index + 1;
+    const sourceTurnId = stringParam(source, "turnId", "turn_id") ?? mobileTurn.sourceRunId;
+    const sourceRunId = stringParam(source, "runId", "run_id") ?? mobileTurn.sourceRunId;
+    const sourceClientMessageId = stringParam(source, "clientMessageId", "client_message_id") ?? mobileTurn.sourceRunId;
+    const sourceIdempotencyKey = stringParam(source, "idempotencyKey", "idempotency_key") ?? mobileTurn.sourceRunId;
     return [{
       id: stringParam(source, "id", "messageId", "message_id") ?? `history-${seq}`,
       role,
       content,
-      ...(stringParam(source, "turnId", "turn_id") ? { turnId: stringParam(source, "turnId", "turn_id") } : {}),
-      ...(stringParam(source, "runId", "run_id") ? { runId: stringParam(source, "runId", "run_id") } : {}),
+      ...(sourceTurnId ? { turnId: sourceTurnId } : {}),
+      ...(sourceRunId ? { runId: sourceRunId } : {}),
       ...(stringParam(source, "partId", "part_id") ? { partId: stringParam(source, "partId", "part_id") } : {}),
-      ...(stringParam(source, "clientMessageId", "client_message_id") ? {
-        clientMessageId: stringParam(source, "clientMessageId", "client_message_id"),
-      } : {}),
-      ...(stringParam(source, "idempotencyKey", "idempotency_key") ? {
-        idempotencyKey: stringParam(source, "idempotencyKey", "idempotency_key"),
-      } : {}),
+      ...(sourceClientMessageId ? { clientMessageId: sourceClientMessageId } : {}),
+      ...(sourceIdempotencyKey ? { idempotencyKey: sourceIdempotencyKey } : {}),
       ...(readTimestamp(source) ? { timestamp: readTimestamp(source) } : {}),
       ...(readCreatedAt(source) ? { createdAt: readCreatedAt(source) } : {}),
       seq,
@@ -341,10 +351,47 @@ function compactBlock(block: TimelineContentBlock): TimelineContentBlock {
 
 function normalizeHistoryText(role: string, text: string): string {
   if (role === "user") {
-    return text.trim();
+    return stripClawConnectMobileBridgeMetadata(text).trim();
   }
   const canonical = canonicalizeMobileAssistantText(text);
   return canonical.text.trim();
+}
+
+function parseClawConnectMobileTurnMetadata(text: string): ClawConnectMobileTurnMetadata {
+  const markerIndex = text.indexOf(CLAWCONNECT_MOBILE_TURN_MARKER);
+  if (markerIndex < 0) {
+    return {};
+  }
+  const metadataBlock = text.slice(markerIndex + CLAWCONNECT_MOBILE_TURN_MARKER.length);
+  return {
+    sourceRunId: metadataValue(metadataBlock, "sourceRunId"),
+    sessionKey: metadataValue(metadataBlock, "sessionKey"),
+  };
+}
+
+function metadataValue(block: string, key: string): string | undefined {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`^\\s*${escapedKey}\\s*:\\s*(.+?)\\s*$`, "im").exec(block);
+  const value = match?.[1]?.trim();
+  return value || undefined;
+}
+
+function stripClawConnectMobileBridgeMetadata(text: string): string {
+  const withoutRuntimeContext = text
+    .replace(HERMES_RUNTIME_CONTEXT_HINT_REGEX, "$1")
+    .replace(/\n{3,}/g, "\n\n");
+  const cutoff = [
+    withoutRuntimeContext.indexOf(CLAWCONNECT_MOBILE_BRIDGE_MARKER),
+    withoutRuntimeContext.indexOf(CLAWCONNECT_MOBILE_TURN_MARKER),
+  ]
+    .filter((index) => index >= 0)
+    .sort((left, right) => left - right)[0];
+  const visible = cutoff === undefined ? withoutRuntimeContext : withoutRuntimeContext.slice(0, cutoff);
+  return visible
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*\[file attached:\s+.+\]\s*$/i.test(line.trim()))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
 }
 
 function readTimestamp(record: Record<string, unknown>): number | string | undefined {

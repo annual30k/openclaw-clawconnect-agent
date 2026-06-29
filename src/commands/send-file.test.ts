@@ -646,6 +646,119 @@ test("send-file infers the latest active session when session is omitted", async
   }
 });
 
+test("send-file uses the current ClawConnect chat session from env for Hermes uploads", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-send-file-hermes-session-"));
+  const filePath = join(tempDir, "spiderman.jpg");
+  const fileBytes = Buffer.from("current-hermes-session-image", "utf8");
+  await writeFile(filePath, fileBytes);
+
+  const expectedSessionKey = "ios-750154e6-4730-43af-80b9-8ffbaeb6c744";
+  const expectedSha256 = createHash("sha256").update(fileBytes).digest("hex");
+
+  let initBody: Record<string, unknown> | undefined;
+
+  const server = createServer(async (req, res) => {
+    try {
+      const body = await readRequestBody(req);
+
+      if (req.method === "POST" && req.url === "/api/host/gateways/gw-1/files/init") {
+        initBody = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
+        assert.equal(initBody.sessionKey, expectedSessionKey);
+        assert.equal(initBody.fileName, "spiderman.jpg");
+        assert.equal(initBody.mimeType, "image/jpeg");
+        assert.equal(initBody.sha256, expectedSha256);
+
+        sendJson(res, {
+          fileId: "file_hermes_session",
+          uploadId: "up_hermes_session",
+          chunkSize: 1024,
+          expiresAt: "2030-01-01T00:00:00.000Z",
+          uploadUrl: "/api/host/files/up_hermes_session/chunks",
+        });
+        return;
+      }
+
+      if (req.method === "PUT" && req.url === "/api/host/files/up_hermes_session/chunks/0") {
+        sendJson(res, { ok: true });
+        return;
+      }
+
+      if (req.method === "POST" && req.url === "/api/host/files/up_hermes_session/complete") {
+        sendJson(res, {
+          ok: true,
+          payload: {
+            fileId: "file_hermes_session",
+            gatewayId: "gw-1",
+            sessionKey: expectedSessionKey,
+            fileName: "spiderman.jpg",
+            mimeType: "image/jpeg",
+            sizeBytes: fileBytes.byteLength,
+            sha256: expectedSha256,
+            origin: "host",
+            senderDisplayName: "Host Mac",
+            createdAt: "2030-01-01T00:00:00.000Z",
+            updatedAt: "2030-01-01T00:00:00.000Z",
+            expiresAt: "2030-01-08T00:00:00.000Z",
+            status: "completed",
+            storagePath: "/tmp/file_hermes_session.jpg",
+            downloadPath: "/api/mobile/files/file_hermes_session",
+            downloadUrl: "/api/mobile/files/file_hermes_session",
+            chunkSize: 1024,
+            totalChunks: 1,
+          },
+        });
+        return;
+      }
+
+      throw new Error(`unexpected route: ${req.method} ${req.url}`);
+    } catch (error) {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    }
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const stdout = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+  });
+  const stderr = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+  });
+
+  try {
+    const result = await sendFileCommand(
+      { filePath, gateway: "gw-1", json: true },
+      {
+        loadConfig: () => ({
+          relayServerUrl: baseUrl,
+          gatewayId: "gw-1",
+          relaySecret: "secret-123",
+          displayName: "Host Mac",
+          gatewayType: "hermes",
+        }),
+        fetchImpl: fetch,
+        stdout,
+        stderr,
+        env: { CLAWCONNECT_SESSION_KEY: expectedSessionKey },
+      },
+    );
+
+    assert.equal(result.sessionKey, expectedSessionKey);
+    assert.ok(initBody);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 async function readRequestBody(req: IncomingMessage): Promise<Buffer> {
   const parts: Buffer[] = [];
   for await (const chunk of req) {
