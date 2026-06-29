@@ -88,10 +88,72 @@ export async function inferLatestOpenClawSendFileSourceRunId(input: {
       continue;
     }
 
-    return firstString(message.runId, message.turnId, parsed.id);
+    // OpenClaw 文件回传必须绑定触发工具调用的用户 turn；assistant/tool id 只作为旧 transcript 的兜底。
+    return findNearestUserTurnRunId(lines, index) ?? assistantToolRunId(message, parsed);
   }
 
   return undefined;
+}
+
+function findNearestUserTurnRunId(lines: string[], beforeIndex: number): string | undefined {
+  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+    const parsed = parseJsonRecord(lines[index]);
+    if (!parsed || parsed.type !== "message") {
+      continue;
+    }
+    const message = asRecord(parsed.message);
+    if (!message || message.role !== "user") {
+      continue;
+    }
+    const runId = userTurnRunId(message, parsed);
+    if (runId) {
+      return runId;
+    }
+  }
+
+  return undefined;
+}
+
+function userTurnRunId(message: Record<string, unknown>, parsed: Record<string, unknown>): string | undefined {
+  const explicitRunId = normalizeRunId(firstString(
+    message.sourceRunId,
+    message.source_run_id,
+    message.idempotencyKey,
+    message.idempotency_key,
+    message.clientRunId,
+    message.client_run_id,
+    message.clientMessageId,
+    message.client_message_id,
+    message.runId,
+    message.run_id,
+    message.turnId,
+    message.turn_id,
+  ));
+  if (explicitRunId) {
+    return explicitRunId;
+  }
+
+  return normalizeRunId(firstString(
+    message.messageId,
+    message.message_id,
+    message.id,
+    parsed.id,
+  ));
+}
+
+function assistantToolRunId(message: Record<string, unknown>, parsed: Record<string, unknown>): string | undefined {
+  return normalizeRunId(firstString(
+    message.sourceRunId,
+    message.source_run_id,
+    message.runId,
+    message.run_id,
+    message.turnId,
+    message.turn_id,
+    message.messageId,
+    message.message_id,
+    message.id,
+    parsed.id,
+  ));
 }
 
 async function resolveOpenClawSessionLogPath(
@@ -198,6 +260,20 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function firstString(...values: unknown[]): string | undefined {
   return values.find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
+}
+
+function normalizeRunId(value: string | undefined): string | undefined {
+  let trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  for (const suffix of [":user", ":assistant", ":tool", ":system"]) {
+    if (trimmed.endsWith(suffix)) {
+      trimmed = trimmed.slice(0, -suffix.length);
+      break;
+    }
+  }
+  return trimmed || undefined;
 }
 
 function extractSessionUpdatedAt(value: unknown): number | undefined {

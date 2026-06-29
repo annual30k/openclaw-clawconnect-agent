@@ -102,8 +102,8 @@ async function resolveOpenClawTranscriptSourceRunId(
     return undefined;
   }
   // OpenClaw exec tools do not always inject the relay run id into subprocess
-  // env. Use the target transcript's current send-file tool call as a stable
-  // source id, so returned files attach to the assistant turn instead of time.
+  // env. Infer it from the target transcript so returned files attach to the
+  // triggering user turn instead of the assistant/tool call or arrival time.
   return inferLatestOpenClawSendFileSourceRunId({
     sessionKey,
     filePath: opts.filePath,

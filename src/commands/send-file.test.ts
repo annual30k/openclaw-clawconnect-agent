@@ -380,7 +380,7 @@ test("send-file infers source run id from OpenClaw environment", async () => {
   }
 });
 
-test("send-file infers source run id from the active OpenClaw send-file tool call", async () => {
+test("send-file infers source run id from the triggering OpenClaw user turn", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-send-file-openclaw-run-"));
   const filePath = join(tempDir, "hello.txt");
   await writeFile(filePath, "hello", "utf8");
@@ -405,11 +405,13 @@ test("send-file infers source run id from the active OpenClaw send-file tool cal
     [
       JSON.stringify({
         type: "message",
-        id: "assistant-older",
+        id: "user-spiderman-request",
         timestamp: "2030-01-01T00:00:00.000Z",
         message: {
-          role: "assistant",
-          content: [{ type: "text", text: "older" }],
+          role: "user",
+          idempotencyKey: "client-run-spiderman:user",
+          clientMessageId: "client-run-spiderman:user",
+          content: [{ type: "text", text: "帮我把桌面的蜘蛛侠图片发过来" }],
         },
       }),
       JSON.stringify({
@@ -470,7 +472,7 @@ test("send-file infers source run id from the active OpenClaw send-file tool cal
             downloadPath: "/api/mobile/files/file_openclaw_run",
             chunkSize: 1024,
             totalChunks: 1,
-            sourceRunId: "assistant-send-run",
+            sourceRunId: "client-run-spiderman",
           },
         });
         return;
@@ -510,7 +512,7 @@ test("send-file infers source run id from the active OpenClaw send-file tool cal
       },
     );
 
-    assert.equal(initBody?.sourceRunId, "assistant-send-run");
+    assert.equal(initBody?.sourceRunId, "client-run-spiderman");
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(tempDir, { recursive: true, force: true });
