@@ -29,20 +29,19 @@ import {
   stripHermesSessionResumeNotices,
 } from "./hermes-runtime-process.js";
 import type { HermesChatResult, HermesToolLogEvent, HermesUsageSnapshot } from "./hermes-runtime-types.js";
-import { collectHermesUsageSnapshot, listHermesSessions, readHermesStatusSnapshot } from "./hermes-runtime-usage.js";
+import { collectHermesUsageSnapshot, listHermesSessions, readHermesStatusSnapshotAsync } from "./hermes-runtime-usage.js";
 import { compactStringArray, sanitizeFileName } from "./hermes-runtime-values.js";
 import {
   detectHermesHistoryCompletion,
   selectHermesSessionForCompletedChat,
 } from "./hermes-runtime-history-completion.js";
+import { tryRunHermesApiChat } from "./hermes-runtime-api-client.js";
+import { resolveHermesPreloadedSkillContext } from "./hermes-runtime-preloaded-skills.js";
 import {
   createHermesToolLogWatcher,
   hermesToolState,
   parseHermesToolLogLine,
 } from "./hermes-runtime-tool-log-watcher.js";
-import {
-  parseHermesSkillsList,
-} from "./hermes-runtime-skills.js";
 import {
   isHermesSlashCommandMessage,
   runHermesSlashCommand,
@@ -56,9 +55,16 @@ const HERMES_ASSISTANT_DELTA_FLUSH_MS = 120;
 const HERMES_ASSISTANT_DELTA_MAX_BYTES = 4096;
 const HERMES_HISTORY_COMPLETION_GRACE_MS = 2_000;
 const HERMES_HISTORY_COMPLETION_POLL_MS = 1_000;
+const HERMES_API_EMPTY_OUTPUT_HISTORY_COMPLETION_TIMEOUT_MS = 12_000;
+const HERMES_API_EMPTY_OUTPUT_HISTORY_COMPLETION_POLL_MS = 500;
 const HERMES_COMMAND_DENIED_TIMEOUT_MESSAGE = "Timeout – denying command";
-const HERMES_FILE_TRANSFER_SKILL = "file-transfer";
 const hermesChatQueues = new Map<string, Promise<void>>();
+
+type PreparedHermesMessage = {
+  apiMessage: string;
+  apiInstructions?: string;
+  cliMessage: string;
+};
 
 export async function runHermesChat(
   params: unknown,
@@ -88,15 +94,15 @@ export async function runHermesChat(
   const sourceRunId = typeof context.requestId === "string" && context.requestId.trim().length > 0
     ? context.requestId.trim()
     : undefined;
-  const message = await prepareHermesMessage(rawMessage, record.attachments, sessionKey, sourceRunId);
-  if (!message.trim()) {
+  const preparedMessage = await prepareHermesMessage(rawMessage, record.attachments, sessionKey, sourceRunId);
+  if (!preparedMessage.cliMessage.trim()) {
     throw new Error("message_required");
   }
 
   return await runSerializedHermesChat(sessionKey, async () => {
     return await runHermesChatPrepared({
       rawMessage,
-      message,
+      preparedMessage,
       sessionKey,
       hermesSessionId: record.hermesSessionId,
       context,
@@ -124,7 +130,7 @@ async function runSerializedHermesChat<T>(
 
 async function runHermesChatPrepared(params: {
   rawMessage: string;
-  message: string;
+  preparedMessage: PreparedHermesMessage;
   sessionKey: string;
   hermesSessionId: unknown;
   context: LocalCommandContext;
@@ -134,14 +140,59 @@ async function runHermesChatPrepared(params: {
     : undefined;
   const mappedResume = explicitResume ? undefined : await getMappedHermesSessionId(params.sessionKey);
   let resume = explicitResume ?? mappedResume;
+  const preloadedSkillContext = await resolveHermesPreloadedSkillContext();
+  try {
+    const apiChat = await tryRunHermesApiChat({
+      message: params.preparedMessage.apiMessage,
+      instructions: params.preparedMessage.apiInstructions,
+      sessionKey: params.sessionKey,
+      resume,
+      preloadedSkillNames: preloadedSkillContext.skillNames,
+      context: params.context,
+    });
+    if (apiChat) {
+      const recoveredOutput = await recoverEmptyHermesApiOutputFromHistory({
+        output: apiChat.output,
+        hermesSessionId: apiChat.hermesSessionId,
+        sessionKey: params.sessionKey,
+        userMessage: params.rawMessage,
+        abortSignal: params.context.abortSignal,
+      });
+      return recoveredOutput ? { ...apiChat, output: recoveredOutput } : apiChat;
+    }
+  } catch (error) {
+    if (!mappedResume || !isHermesMissingSessionError(error)) {
+      throw error;
+    }
+    await forgetHermesSession(params.sessionKey, mappedResume);
+    resume = undefined;
+    const retryApiChat = await tryRunHermesApiChat({
+      message: params.preparedMessage.apiMessage,
+      instructions: params.preparedMessage.apiInstructions,
+      sessionKey: params.sessionKey,
+      preloadedSkillNames: preloadedSkillContext.skillNames,
+      context: params.context,
+    });
+    if (retryApiChat) {
+      const recoveredOutput = await recoverEmptyHermesApiOutputFromHistory({
+        output: retryApiChat.output,
+        hermesSessionId: retryApiChat.hermesSessionId,
+        sessionKey: params.sessionKey,
+        userMessage: params.rawMessage,
+        abortSignal: params.context.abortSignal,
+      });
+      return recoveredOutput ? { ...retryApiChat, output: recoveredOutput } : retryApiChat;
+    }
+  }
   const beforeSessions = await listHermesSessions();
   let rawOutput: string;
   try {
     rawOutput = await runHermesChatOnce({
-      message: params.message,
+      message: params.preparedMessage.cliMessage,
       sessionKey: params.sessionKey,
       resume,
       context: params.context,
+      preloadedSkillArgs: preloadedSkillContext.cliArgs,
       historyCompletion: () => detectHermesHistoryCompletion({
         beforeSessions,
         resume,
@@ -156,9 +207,10 @@ async function runHermesChatPrepared(params: {
     await forgetHermesSession(params.sessionKey, mappedResume);
     resume = undefined;
     rawOutput = await runHermesChatOnce({
-      message: params.message,
+      message: params.preparedMessage.cliMessage,
       sessionKey: params.sessionKey,
       context: params.context,
+      preloadedSkillArgs: preloadedSkillContext.cliArgs,
       historyCompletion: () => detectHermesHistoryCompletion({
         beforeSessions,
         sessionKey: params.sessionKey,
@@ -178,7 +230,7 @@ async function runHermesChatPrepared(params: {
   }
   const usage = mappedSession?.hermesSessionId
     ? await collectHermesUsageSnapshot(mappedSession.hermesSessionId)
-    : readHermesStatusSnapshot();
+    : await readHermesStatusSnapshotAsync();
   return {
     output,
     sessionKey: params.sessionKey,
@@ -187,11 +239,53 @@ async function runHermesChatPrepared(params: {
   };
 }
 
+async function recoverEmptyHermesApiOutputFromHistory(params: {
+  output: string;
+  hermesSessionId?: string;
+  sessionKey: string;
+  userMessage: string;
+  abortSignal?: AbortSignal;
+}): Promise<string | undefined> {
+  if (sanitizeHermesChatOutput(params.output).trim()) {
+    return undefined;
+  }
+  if (!params.hermesSessionId?.trim()) {
+    return undefined;
+  }
+
+  const deadline = Date.now() + HERMES_API_EMPTY_OUTPUT_HISTORY_COMPLETION_TIMEOUT_MS;
+  while (Date.now() <= deadline) {
+    if (params.abortSignal?.aborted) {
+      throw new Error("hermes_chat_aborted");
+    }
+    const detectedOutput = await detectHermesHistoryCompletion({
+      beforeSessions: [],
+      resume: params.hermesSessionId,
+      sessionKey: params.sessionKey,
+      userMessage: params.userMessage,
+    });
+    if (detectedOutput) {
+      return detectedOutput;
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      break;
+    }
+    await sleep(Math.min(HERMES_API_EMPTY_OUTPUT_HISTORY_COMPLETION_POLL_MS, remainingMs));
+  }
+  return undefined;
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
 async function runHermesChatOnce(params: {
   message: string;
   sessionKey: string;
   resume?: string;
   context: LocalCommandContext;
+  preloadedSkillArgs?: string[];
   historyCompletion?: () => Promise<string | undefined>;
 }): Promise<string> {
   const args = [
@@ -201,7 +295,7 @@ async function runHermesChatOnce(params: {
     "--quiet",
     "--source",
     "pocketclaw",
-    ...hermesPreloadedSkillArgs(),
+    ...(params.preloadedSkillArgs ?? []),
     "--yolo",
   ];
   if (params.resume) {
@@ -623,18 +717,8 @@ function hermesChatSubprocessEnv(runId: string, sessionKey: string): NodeJS.Proc
   };
 }
 
-function hermesPreloadedSkillArgs(): string[] {
-  try {
-    const skills = parseHermesSkillsList(runHermes(["skills", "list"], 5_000));
-    const fileTransfer = skills.find((skill) => skill.skillKey === HERMES_FILE_TRANSFER_SKILL);
-    if (fileTransfer && fileTransfer.enabled !== false) {
-      return ["--skills", HERMES_FILE_TRANSFER_SKILL];
-    }
-  } catch {
-    // Hermes without skills support should still be able to answer normal chat.
-  }
-  return [];
-}
+const CLAWCONNECT_MOBILE_TURN_INSTRUCTION =
+  "Use [ClawConnect mobile turn] metadata only for ClawConnect file-transfer attribution and message identity. Do not mention it in the answer.";
 
 function buildClawConnectMobileTurnMetadata(sourceRunId: string | undefined, sessionKey: string): string | undefined {
   if (!sourceRunId) {
@@ -645,7 +729,6 @@ function buildClawConnectMobileTurnMetadata(sourceRunId: string | undefined, ses
     "[ClawConnect mobile turn]",
     `sourceRunId: ${sourceRunId}`,
     `sessionKey: ${sessionKey}`,
-    "Use this metadata only for ClawConnect file-transfer attribution. Do not mention it in the answer.",
   ].join("\n");
 }
 
@@ -654,7 +737,7 @@ async function prepareHermesMessage(
   attachments: unknown,
   sessionKey: string,
   sourceRunId?: string,
-): Promise<string> {
+): Promise<PreparedHermesMessage> {
   const refs: string[] = [];
   if (Array.isArray(attachments)) {
     const safeSession = sessionKey.replace(/[^\w.-]/g, "_") || "main";
@@ -679,20 +762,34 @@ async function prepareHermesMessage(
       refs.push(`[file attached: ${filePath} (${mimeType})]`);
     }
   }
-  const sections = [message.trim()];
+  const userSections = [message.trim()];
   if (refs.length > 0) {
-    sections.push(refs.join("\n"));
+    userSections.push(refs.join("\n"));
   }
-  const runtimeHint = buildHermesRuntimeContextHint(readHermesStatusSnapshot());
-  if (runtimeHint) {
-    sections.push(runtimeHint);
-  }
-  sections.push(CLAWCONNECT_MOBILE_BRIDGE_HINT);
+  const runtimeHint = buildHermesRuntimeContextHint(await readHermesStatusSnapshotAsync());
   const turnMetadata = buildClawConnectMobileTurnMetadata(sourceRunId, sessionKey);
+  const apiMessageSections = [...userSections];
   if (turnMetadata) {
-    sections.push(turnMetadata);
+    apiMessageSections.push(turnMetadata);
   }
-  return sections.filter(Boolean).join("\n\n").trim();
+  const apiInstructionSections = [
+    runtimeHint,
+    CLAWCONNECT_MOBILE_BRIDGE_HINT,
+    turnMetadata ? CLAWCONNECT_MOBILE_TURN_INSTRUCTION : undefined,
+  ];
+  const cliMessageSections = [
+    ...userSections,
+    runtimeHint,
+    CLAWCONNECT_MOBILE_BRIDGE_HINT,
+    turnMetadata
+      ? [turnMetadata, CLAWCONNECT_MOBILE_TURN_INSTRUCTION].join("\n")
+      : undefined,
+  ];
+  return {
+    apiMessage: apiMessageSections.filter(Boolean).join("\n\n").trim(),
+    apiInstructions: apiInstructionSections.filter(Boolean).join("\n\n").trim() || undefined,
+    cliMessage: cliMessageSections.filter(Boolean).join("\n\n").trim(),
+  };
 }
 
 export function buildHermesRuntimeContextHint(snapshot: HermesUsageSnapshot): string | undefined {

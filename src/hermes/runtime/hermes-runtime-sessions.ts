@@ -2,9 +2,13 @@
 import type { LocalResult } from "../../core/command-types.js";
 import { forgetHermesSession, getMappedHermesSessionId } from "../hermes-session-store.js";
 import { listHermesSessions } from "./hermes-runtime-usage.js";
-import { runHermesOutput } from "./hermes-runtime-command-utils.js";
+import { runHermesOutput, runHermesOutputAsync } from "./hermes-runtime-command-utils.js";
 import { stringParam, toRecord } from "./hermes-runtime-values.js";
 import { errorMessageWithOutput, isHermesMissingSessionError } from "./hermes-runtime-process.js";
+import {
+  buildEmptyHermesHistoryExport,
+  exportHermesSessionFromStateDb,
+} from "./hermes-runtime-state-db.js";
 
 export async function runHermesSessionsList(): Promise<LocalResult> {
   try {
@@ -54,9 +58,24 @@ export async function runHermesSessionExport(params: unknown): Promise<LocalResu
   const resolved = await resolveHermesSessionIdFromParams(record);
   const sessionId = resolved.sessionId;
   const output = stringParam(record, "output", "outputPath");
+  const requireResolvedSession = record.requireResolvedSession === true;
+  if (sessionId) {
+    const stateDbExport = await exportHermesSessionFromStateDb(sessionId);
+    if (stateDbExport) {
+      return { ok: true, payload: { output: JSON.stringify(stateDbExport) } };
+    }
+  } else if (requireResolvedSession) {
+    return {
+      ok: true,
+      payload: {
+        output: JSON.stringify(buildEmptyHermesHistoryExport(resolved.sessionKey)),
+      },
+    };
+  }
   const args = ["sessions", "export", output ?? "-"];
   if (sessionId) args.push("--session-id", sessionId);
-  const result = runHermesOutput(args, 10 * 60_000);
+  // chat.history 会和 chat.send 共享同一个 relay manager 事件循环；这里必须异步，避免导出历史时饿死实时消息。
+  const result = await runHermesOutputAsync(args, 10 * 60_000);
   if (
     !result.ok
     && resolved.fromMappedSessionKey
@@ -65,7 +84,15 @@ export async function runHermesSessionExport(params: unknown): Promise<LocalResu
     && isHermesMissingSessionError(result.error)
   ) {
     await forgetHermesSession(resolved.sessionKey, sessionId);
-    return runHermesOutput(["sessions", "export", output ?? "-"], 10 * 60_000);
+    if (requireResolvedSession) {
+      return {
+        ok: true,
+        payload: {
+          output: JSON.stringify(buildEmptyHermesHistoryExport(resolved.sessionKey)),
+        },
+      };
+    }
+    return await runHermesOutputAsync(["sessions", "export", output ?? "-"], 10 * 60_000);
   }
   return result;
 }

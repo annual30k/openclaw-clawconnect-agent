@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,6 +41,139 @@ export function restoreEnv(name: string, previousValue: string | undefined): voi
   } else {
     process.env[name] = previousValue;
   }
+}
+
+export function writeHermesStateDb(root: string): string {
+  const dbPath = join(root, "state.db");
+  const script = String.raw`
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+conn = sqlite3.connect(db_path)
+conn.executescript("""
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  user_id TEXT,
+  model TEXT,
+  model_config TEXT,
+  system_prompt TEXT,
+  parent_session_id TEXT,
+  started_at REAL NOT NULL,
+  ended_at REAL,
+  end_reason TEXT,
+  message_count INTEGER DEFAULT 0,
+  tool_call_count INTEGER DEFAULT 0,
+  input_tokens INTEGER DEFAULT 0,
+  output_tokens INTEGER DEFAULT 0,
+  cache_read_tokens INTEGER DEFAULT 0,
+  cache_write_tokens INTEGER DEFAULT 0,
+  reasoning_tokens INTEGER DEFAULT 0,
+  billing_provider TEXT,
+  billing_base_url TEXT,
+  billing_mode TEXT,
+  estimated_cost_usd REAL,
+  actual_cost_usd REAL,
+  cost_status TEXT,
+  cost_source TEXT,
+  pricing_version TEXT,
+  title TEXT,
+  api_call_count INTEGER DEFAULT 0,
+  handoff_state TEXT,
+  handoff_platform TEXT,
+  handoff_error TEXT,
+  cwd TEXT,
+  rewind_count INTEGER NOT NULL DEFAULT 0,
+  archived INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  role TEXT NOT NULL,
+  content TEXT,
+  tool_call_id TEXT,
+  tool_calls TEXT,
+  tool_name TEXT,
+  timestamp REAL NOT NULL,
+  token_count INTEGER,
+  finish_reason TEXT,
+  reasoning TEXT,
+  reasoning_content TEXT,
+  reasoning_details TEXT,
+  codex_reasoning_items TEXT,
+  codex_message_items TEXT,
+  platform_message_id TEXT,
+  observed INTEGER DEFAULT 0,
+  active INTEGER NOT NULL DEFAULT 1
+);
+""")
+conn.commit()
+conn.close()
+`;
+  execFileSync("python3", ["-c", script, dbPath], { stdio: "pipe" });
+  return dbPath;
+}
+
+export function writeStateDbHistoryCompletingHermesBin(root: string): {
+  binPath: string;
+  exportCalledPath: string;
+} {
+  const binPath = join(root, "hermes-state-db-history-completion");
+  const readyPath = join(root, "state-db-history-ready");
+  const exportCalledPath = join(root, "state-db-export-called");
+  const dbPath = join(root, "state.db");
+  const sessionId = "20260622_100613_8947a8";
+  writeFileSync(binPath, [
+    "#!/usr/bin/env node",
+    "const fs = require('fs');",
+    "const { execFileSync } = require('child_process');",
+    "const args = process.argv.slice(2);",
+    `const readyPath = ${JSON.stringify(readyPath)};`,
+    `const exportCalledPath = ${JSON.stringify(exportCalledPath)};`,
+    `const dbPath = ${JSON.stringify(dbPath)};`,
+    `const sessionId = ${JSON.stringify(sessionId)};`,
+    "function writeCompletedTurn(query) {",
+    "  const script = String.raw`",
+    "import sqlite3",
+    "import sys",
+    "db_path, session_id, query = sys.argv[1:4]",
+    "conn = sqlite3.connect(db_path)",
+    "conn.execute(\"INSERT OR REPLACE INTO sessions (id, source, model, started_at, title, message_count) VALUES (?, 'cli', 'gpt-5.5', 1780000000.0, 'Greeting', 2)\", (session_id,))",
+    "conn.execute(\"DELETE FROM messages WHERE session_id = ?\", (session_id,))",
+    "conn.execute(\"INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?, 'user', ?, 1780000001.0, 1)\", (session_id, query))",
+    "conn.execute(\"INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?, 'assistant', 'direct-db reply', 1780000002.0, 1)\", (session_id,))",
+    "conn.commit()",
+    "conn.close()",
+    "`;",
+    "  execFileSync('python3', ['-c', script, dbPath, sessionId, query], { stdio: 'ignore' });",
+    "  fs.writeFileSync(readyPath, '1');",
+    "}",
+    "if (args[0] === 'sessions' && args[1] === 'list') {",
+    "  console.log('Title                            Preview          Last Active   ID');",
+    "  if (fs.existsSync(readyPath)) console.log('Greeting                         direct-db reply  just now      20260622_100613_8947a8');",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'sessions' && args[1] === 'export') {",
+    "  fs.writeFileSync(exportCalledPath, args.join(' '));",
+    "  console.error('sessions export should not be needed for state.db completion');",
+    "  process.exit(2);",
+    "}",
+    "if (args[0] === 'chat') {",
+    "  const queryIndex = args.indexOf('--query');",
+    "  const query = queryIndex >= 0 ? args[queryIndex + 1] : '';",
+    "  setTimeout(() => writeCompletedTurn(query), 100);",
+    "  setTimeout(() => process.exit(0), 3500);",
+    "  return;",
+    "}",
+    "if (args[0] === 'status') { process.exit(0); }",
+    "console.error(`unexpected args: ${args.join(' ')}`);",
+    "process.exit(2);",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return { binPath, exportCalledPath };
 }
 export function writeMutableHistoryHermesBin(root: string, payloadPath: string): string {
   const binPath = join(root, "hermes-history-mutable");
@@ -197,14 +331,18 @@ export function writeAbortPartialHermesBin(root: string): string {
 }
 export function writeSlowPartialHermesBin(root: string): string {
   const binPath = join(root, "hermes-slow-partial");
+  const partialStartedPath = join(root, "partial-started");
   writeFileSync(binPath, [
     "#!/usr/bin/env node",
+    "const fs = require('fs');",
     "const args = process.argv.slice(2);",
+    `const partialStartedPath = ${JSON.stringify(partialStartedPath)};`,
     "if (args[0] === 'sessions' && args[1] === 'list') {",
     "  console.log('Title                            Preview          Last Active   ID');",
     "  process.exit(0);",
     "}",
     "if (args[0] === 'chat') {",
+    "  fs.writeFileSync(partialStartedPath, '1');",
     "  process.stdout.write('partial ');",
     "  setTimeout(() => {",
     "    console.log('reply');",
@@ -219,6 +357,16 @@ export function writeSlowPartialHermesBin(root: string): string {
   chmodSync(binPath, 0o755);
   assert.equal(existsSync(binPath), true);
   return binPath;
+}
+export async function waitForFile(path: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`Timed out waiting for ${path}`);
 }
 export async function waitForHermesDelta(events: unknown[], expectedText: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -418,6 +566,75 @@ export function writeConcurrentDetectingHermesBin(root: string): string {
   chmodSync(binPath, 0o755);
   assert.equal(existsSync(binPath), true);
   return binPath;
+}
+export function writeBarrieredHistoryExportHermesBin(root: string): {
+  binPath: string;
+  exportActivePath: string;
+  allowExportCompletePath: string;
+  concurrentPath: string;
+} {
+  const binPath = join(root, "hermes-history-export-concurrent");
+  const exportActivePath = join(root, "history-export-active");
+  const allowExportCompletePath = join(root, "history-export-complete");
+  const concurrentPath = join(root, "history-export-concurrent");
+  const payload = JSON.stringify({
+    sessionId: "20260529_100000_history",
+    messages: [
+      {
+        id: "m1",
+        role: "user",
+        content: "hello",
+        createdAt: "2026-05-29T02:00:00.000Z",
+      },
+      {
+        id: "m2",
+        role: "assistant",
+        content: "visible reply",
+        createdAt: "2026-05-29T02:00:01.000Z",
+      },
+    ],
+  });
+  writeFileSync(binPath, [
+    "#!/usr/bin/env node",
+    "const fs = require('fs');",
+    "const args = process.argv.slice(2);",
+    `const exportActivePath = ${JSON.stringify(exportActivePath)};`,
+    `const allowExportCompletePath = ${JSON.stringify(allowExportCompletePath)};`,
+    `const concurrentPath = ${JSON.stringify(concurrentPath)};`,
+    `const payload = ${JSON.stringify(payload)};`,
+    "if (args[0] === 'sessions' && args[1] === 'list') {",
+    "  console.log('Title                            Preview          Last Active   ID');",
+    "  console.log('History                          visible reply    just now      20260529_100000_history');",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'sessions' && args[1] === 'export') {",
+    "  fs.writeFileSync(exportActivePath, '1');",
+    "  const interval = setInterval(() => {",
+    "    if (!fs.existsSync(allowExportCompletePath)) return;",
+    "    clearInterval(interval);",
+    "    try { fs.unlinkSync(exportActivePath); } catch {}",
+    "    console.log(payload);",
+    "    process.exit(0);",
+    "  }, 10);",
+    "  setTimeout(() => process.exit(3), 5000);",
+    "  return;",
+    "}",
+    "if (args[0] === 'chat') {",
+    "  const queryIndex = args.indexOf('--query');",
+    "  const rawQuery = queryIndex >= 0 ? args[queryIndex + 1] : '';",
+    "  const query = rawQuery.split('\\n\\n[ClawConnect mobile bridge]')[0];",
+    "  if (fs.existsSync(exportActivePath)) fs.writeFileSync(concurrentPath, '1');",
+    "  console.log(`reply:${query}`);",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'status') { process.exit(0); }",
+    "console.error(`unexpected args: ${args.join(' ')}`);",
+    "process.exit(2);",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(binPath, 0o755);
+  assert.equal(existsSync(binPath), true);
+  return { binPath, exportActivePath, allowExportCompletePath, concurrentPath };
 }
 export function writeResumeMetadataHermesBin(root: string): string {
   const binPath = join(root, "hermes-resume-metadata");

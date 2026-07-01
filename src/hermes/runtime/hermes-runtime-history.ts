@@ -48,7 +48,12 @@ export function clearHermesHistoryCache(): void {
 export async function runHermesChatHistory(params: unknown): Promise<LocalResult> {
   const record = toRecord(params);
   const sessionKey = stringParam(record, "sessionKey", "session_key", "key", "session") ?? "main";
-  const exportResult = await runHermesSessionExport({ ...record, sessionKey, output: "-" });
+  const exportResult = await runHermesSessionExport({
+    ...record,
+    sessionKey,
+    output: "-",
+    requireResolvedSession: true,
+  });
   if (!exportResult.ok) {
     return exportResult;
   }

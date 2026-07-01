@@ -47,6 +47,8 @@ import {
   writeStaleHistoryHermesBin,
   writeRepeatedUserStaleHistoryHermesBin,
   writeConcurrentDetectingHermesBin,
+  writeBarrieredHistoryExportHermesBin,
+  waitForFile,
   writeResumeMetadataHermesBin,
   writeHistoryHermesBin,
   writeUntimedHistoryHermesBin,
@@ -356,6 +358,43 @@ test("runHermesChatHistory invalidates normalized history when the export hash c
     assert.deepEqual(secondMessage?.content, [{ type: "text", text: "second" }]);
     assert.notEqual(secondMessage, firstMessage);
   } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat is not blocked by a concurrent Hermes history export", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-export-concurrent-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  let allowExportCompletePath: string | undefined;
+  try {
+    const storePath = join(root, "sessions.json");
+    const hermesBin = writeBarrieredHistoryExportHermesBin(root);
+    allowExportCompletePath = hermesBin.allowExportCompletePath;
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = hermesBin.binPath;
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId: "20260529_100000_history",
+      displayName: "History",
+      kind: "hermes",
+    });
+
+    const historyPromise = runHermesChatHistory({ sessionKey: "main", limit: 10 });
+    await waitForFile(hermesBin.exportActivePath, 1000);
+    const chatPromise = runHermesChat({ sessionKey: "main", message: "Ping" });
+    await waitForFile(hermesBin.concurrentPath, 1000);
+    writeFileSync(hermesBin.allowExportCompletePath, "1");
+
+    const [history, chat] = await Promise.all([historyPromise, chatPromise]);
+    assert.equal(history.ok, true);
+    assert.equal(chat.output, "reply:Ping");
+  } finally {
+    if (allowExportCompletePath) {
+      writeFileSync(allowExportCompletePath, "1");
+    }
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousBin);
     rmSync(root, { recursive: true, force: true });

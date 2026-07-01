@@ -247,6 +247,62 @@ test("runHermesChatHistory extracts stable mobile turn metadata from Hermes expo
   }
 });
 
+test("runHermesChatHistory returns an empty page for unmapped mobile sessions instead of exporting the latest Hermes session", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hermes-history-unmapped-session-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousHermesBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(dir, "sessions.json");
+    const hermesBin = join(dir, "hermes");
+    const latestSession = {
+      sessionId: "cron_a0c123e0163e_20260701_070044",
+      messages: [
+        {
+          id: "cron-user",
+          role: "user",
+          createdAt: "2026-07-01T07:00:44.000Z",
+          content: "cron weather prompt",
+        },
+        {
+          id: "cron-assistant",
+          role: "assistant",
+          createdAt: "2026-07-01T07:02:22.000Z",
+          content: "cron weather answer",
+        },
+      ],
+    };
+    writeFileSync(hermesBin, [
+      "#!/usr/bin/env node",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'sessions' && args[1] === 'export') {",
+      `  console.log(${JSON.stringify(JSON.stringify(latestSession))});`,
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'list') {",
+      "  console.log('Title                            Preview          Last Active   ID');",
+      "  console.log('福州每日天气简报 · Jul 01 07:02          cron weather prompt  3h ago        cron_a0c123e0163e_20260701_070044');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"));
+    chmodSync(hermesBin, 0o755);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = hermesBin;
+
+    const result = await runHermesChatHistory({ sessionKey: "mobile-new-session", limit: 10 });
+
+    assert.equal(result.ok, true);
+    const payload = result.payload as { messages: unknown[]; timelineSnapshot: { messages: unknown[] } };
+    assert.deepEqual(payload.messages, []);
+    assert.deepEqual(payload.timelineSnapshot.messages, []);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousHermesBin);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Hermes assistant stream payload mirrors OpenClaw chat delta shape", () => {
   const payload = buildHermesAssistantDeltaPayload({
     runId: "run-1",

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -42,8 +45,11 @@ import {
   writeTimeoutDeniedHermesBin,
   writeAbortPartialHermesBin,
   writeSlowPartialHermesBin,
+  waitForFile,
   waitForHermesDelta,
   writeHistoryCompletingHermesBin,
+  writeHermesStateDb,
+  writeStateDbHistoryCompletingHermesBin,
   writeStaleHistoryHermesBin,
   writeRepeatedUserStaleHistoryHermesBin,
   writeConcurrentDetectingHermesBin,
@@ -269,6 +275,331 @@ test("runHermesChat bypasses interactive command approvals for mobile bridge que
   }
 });
 
+test("runHermesChat uses the Hermes API server stream instead of spawning the CLI when configured", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-api-server-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousApiUrl = process.env.CLAWCONNECT_HERMES_API_URL;
+  const previousApiKey = process.env.CLAWCONNECT_HERMES_API_KEY;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  const cliCalledPath = join(root, "cli-called");
+  const apiRequests: Array<{ method: string; url: string; headers: IncomingMessage["headers"]; body: string }> = [];
+  const hermesSessionId = "api_session_0701";
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      apiRequests.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body });
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/sessions") {
+        assert.equal(req.headers.authorization, "Bearer test-api-key");
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({ session: { id: hermesSessionId, title: "mobile-main" } }));
+        return;
+      }
+      if (req.method === "POST" && req.url === `/api/sessions/${hermesSessionId}/chat/stream`) {
+        assert.equal(req.headers.authorization, "Bearer test-api-key");
+        assert.equal(req.headers["x-hermes-session-key"], "mobile-main");
+        const parsed = JSON.parse(body) as { message?: string; instructions?: string };
+        assert.match(parsed.message ?? "", /^hello api/);
+        assert.doesNotMatch(parsed.message ?? "", /\[ClawConnect mobile bridge]/);
+        assert.doesNotMatch(parsed.message ?? "", /\[Hermes runtime context]/);
+        assert.match(parsed.message ?? "", /\[ClawConnect mobile turn]/);
+        assert.match(parsed.message ?? "", /sourceRunId: run-api/);
+        assert.match(parsed.message ?? "", /sessionKey: mobile-main/);
+        assert.match(parsed.instructions ?? "", /\[ClawConnect mobile bridge]/);
+        assert.match(parsed.instructions ?? "", /\[Hermes runtime context]/);
+        assert.match(parsed.instructions ?? "", /Current runtime: model=gpt-5.5, provider=openai-codex\./);
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        });
+        res.write("event: run.started\n");
+        res.write(`data: ${JSON.stringify({ run_id: "run-api", session_id: hermesSessionId })}\n\n`);
+        res.write("event: assistant.delta\n");
+        res.write(`data: ${JSON.stringify({ delta: "api " })}\n\n`);
+        res.write("event: assistant.delta\n");
+        res.write(`data: ${JSON.stringify({ delta: "reply" })}\n\n`);
+        res.write("event: assistant.completed\n");
+        res.write(`data: ${JSON.stringify({ session_id: hermesSessionId, content: "api reply" })}\n\n`);
+        res.write("event: run.completed\n");
+        res.write(`data: ${JSON.stringify({ session_id: hermesSessionId, usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 } })}\n\n`);
+        res.write("event: done\n");
+        res.write("data: {}\n\n");
+        res.end();
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not_found" }));
+    });
+  });
+
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = join(root, "hermes-should-not-run");
+    writeFileSync(binPath, [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"list\" ]; then exit 0; fi",
+      "if [ \"$1\" = \"status\" ]; then",
+      "  printf '%s\\n' 'Hermes CLI Status'",
+      "  printf '%s\\n' '  Model:        gpt-5.5'",
+      "  printf '%s\\n' '  Provider:     openai-codex'",
+      "  exit 0",
+      "fi",
+      `printf '%s\\n' "$@" > '${cliCalledPath.replace(/'/g, "'\\''")}'`,
+      "exit 2",
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(binPath, 0o755);
+
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    process.env.CLAWCONNECT_HERMES_API_URL = `http://127.0.0.1:${address.port}`;
+    process.env.CLAWCONNECT_HERMES_API_KEY = "test-api-key";
+    process.env.CLAWCONNECT_HERMES_STATE_DB = join(root, "missing-state.db");
+    const publishedEvents: unknown[] = [];
+
+    const result = await runHermesChat(
+      { sessionKey: "mobile-main", message: "hello api" },
+      { requestId: "run-api", gatewayId: "gw-hermes", publishEvent: (event) => publishedEvents.push(event) },
+    );
+
+    assert.equal(result.output, "api reply");
+    assert.equal(result.sessionKey, "mobile-main");
+    assert.equal(result.usage?.hermesSessionId, hermesSessionId);
+    assert.equal(result.usage?.contextUsage, 3);
+    assert.equal(existsSync(cliCalledPath), false);
+    assert.equal(apiRequests.some((request) => request.url === "/api/sessions"), true);
+    assert.equal(apiRequests.some((request) => request.url === `/api/sessions/${hermesSessionId}/chat/stream`), true);
+    assert.equal(JSON.stringify(publishedEvents).includes("api "), true);
+    const stored = await listStoredHermesSessions();
+    assert.equal(stored[0]?.sessionKey, "mobile-main");
+    assert.equal(stored[0]?.hermesSessionId, hermesSessionId);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("CLAWCONNECT_HERMES_API_URL", previousApiUrl);
+    restoreEnv("CLAWCONNECT_HERMES_API_KEY", previousApiKey);
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat recovers empty Hermes API final output from state DB history", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-api-empty-final-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousApiUrl = process.env.CLAWCONNECT_HERMES_API_URL;
+  const previousApiKey = process.env.CLAWCONNECT_HERMES_API_KEY;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  const cliCalledPath = join(root, "cli-called");
+  const hermesSessionId = "api_empty_final_0701";
+  const dbPath = writeHermesStateDb(root);
+
+  const seedCompletedTurn = (userContent: string): void => {
+    const script = String.raw`
+import sqlite3
+import sys
+db_path, session_id, user_content = sys.argv[1:4]
+conn = sqlite3.connect(db_path)
+conn.execute("INSERT OR REPLACE INTO sessions (id, source, model, started_at, title, message_count) VALUES (?, 'api', 'gpt-5.5', 1780000000.0, 'API empty final', 2)", (session_id,))
+conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+conn.execute("INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?, 'user', ?, 1780000001.0, 1)", (session_id, user_content))
+conn.execute("INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?, 'assistant', 'state-db api reply', 1780000002.0, 1)", (session_id,))
+conn.commit()
+conn.close()
+`;
+    execFileSync("python3", ["-c", script, dbPath, hermesSessionId, userContent], { stdio: "pipe" });
+  };
+
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/sessions") {
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({ session: { id: hermesSessionId, title: "mobile-empty-final" } }));
+        return;
+      }
+      if (req.method === "POST" && req.url === `/api/sessions/${hermesSessionId}/chat/stream`) {
+        const parsed = JSON.parse(body) as { message?: string };
+        seedCompletedTurn(parsed.message ?? "");
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        });
+        res.write("event: assistant.completed\n");
+        res.write(`data: ${JSON.stringify({ session_id: hermesSessionId, content: "" })}\n\n`);
+        res.write("event: run.completed\n");
+        res.write(`data: ${JSON.stringify({ session_id: hermesSessionId, output: "" })}\n\n`);
+        res.end();
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not_found" }));
+    });
+  });
+
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = join(root, "hermes-should-not-run");
+    writeFileSync(binPath, [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"list\" ]; then exit 0; fi",
+      "if [ \"$1\" = \"status\" ]; then exit 0; fi",
+      `printf '%s\\n' "$@" > '${cliCalledPath.replace(/'/g, "'\\''")}'`,
+      "exit 2",
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(binPath, 0o755);
+
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    process.env.CLAWCONNECT_HERMES_API_URL = `http://127.0.0.1:${address.port}`;
+    process.env.CLAWCONNECT_HERMES_API_KEY = "test-api-key";
+    process.env.CLAWCONNECT_HERMES_STATE_DB = dbPath;
+
+    const result = await runHermesChat(
+      { sessionKey: "mobile-empty-final", message: "hello empty api" },
+      { requestId: "run-empty-api", gatewayId: "gw-hermes", publishEvent: () => undefined },
+    );
+
+    assert.equal(result.output, "state-db api reply");
+    assert.equal(result.sessionKey, "mobile-empty-final");
+    assert.equal(result.usage?.hermesSessionId, hermesSessionId);
+    assert.equal(existsSync(cliCalledPath), false);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("CLAWCONNECT_HERMES_API_URL", previousApiUrl);
+    restoreEnv("CLAWCONNECT_HERMES_API_KEY", previousApiKey);
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat forwards Hermes preloaded skill prompt to the API server", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-api-skills-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousPython = process.env.HERMES_PYTHON;
+  const previousApiUrl = process.env.CLAWCONNECT_HERMES_API_URL;
+  const previousApiKey = process.env.CLAWCONNECT_HERMES_API_KEY;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  const cliCalledPath = join(root, "cli-called");
+  const apiBodies: unknown[] = [];
+  const hermesSessionId = "api_session_with_skill_0701";
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/sessions") {
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({ session: { id: hermesSessionId, title: "mobile-main" } }));
+        return;
+      }
+      if (req.method === "POST" && req.url === `/api/sessions/${hermesSessionId}/chat/stream`) {
+        const parsed = JSON.parse(body) as { message?: string; instructions?: string };
+        apiBodies.push(parsed);
+        assert.match(parsed.message ?? "", /^send with skill/);
+        assert.match(parsed.instructions ?? "", /FILE_TRANSFER_PROMPT/);
+        assert.match(parsed.instructions ?? "", /\[ClawConnect mobile bridge]/);
+        assert.doesNotMatch(parsed.message ?? "", /\[ClawConnect mobile bridge]/);
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        });
+        res.write("event: assistant.completed\n");
+        res.write(`data: ${JSON.stringify({ session_id: hermesSessionId, content: "skill api reply" })}\n\n`);
+        res.write("event: run.completed\n");
+        res.write(`data: ${JSON.stringify({ session_id: hermesSessionId, usage: { input_tokens: 4 } })}\n\n`);
+        res.end();
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not_found" }));
+    });
+  });
+
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = join(root, "hermes-skills-list");
+    writeFileSync(binPath, [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"list\" ]; then",
+      "  printf '%s\\n' '│ file-transfer │ productivity │ local │ local │ enabled │'",
+      "  exit 0",
+      "fi",
+      "if [ \"$1\" = \"chat\" ]; then",
+      `  printf '%s\\n' "$@" > '${cliCalledPath.replace(/'/g, "'\\''")}'`,
+      "  exit 2",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(binPath, 0o755);
+    const pythonPath = join(root, "fake-python");
+    writeFileSync(pythonPath, [
+      "#!/bin/sh",
+      "printf '%s\\n' '{\"prompt\":\"FILE_TRANSFER_PROMPT\",\"loaded\":[\"file-transfer\"],\"missing\":[]}'",
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(pythonPath, 0o755);
+
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    process.env.HERMES_PYTHON = pythonPath;
+    process.env.CLAWCONNECT_HERMES_API_URL = `http://127.0.0.1:${address.port}`;
+    process.env.CLAWCONNECT_HERMES_API_KEY = "test-api-key";
+    process.env.CLAWCONNECT_HERMES_STATE_DB = join(root, "missing-state.db");
+
+    const result = await runHermesChat(
+      { sessionKey: "mobile-main", message: "send with skill" },
+      { requestId: "run-api-skill", gatewayId: "gw-hermes" },
+    );
+
+    assert.equal(result.output, "skill api reply");
+    assert.equal(result.usage?.hermesSessionId, hermesSessionId);
+    assert.equal(result.usage?.contextUsage, 4);
+    assert.equal(apiBodies.length, 1);
+    assert.equal(existsSync(cliCalledPath), false);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("HERMES_PYTHON", previousPython);
+    restoreEnv("CLAWCONNECT_HERMES_API_URL", previousApiUrl);
+    restoreEnv("CLAWCONNECT_HERMES_API_KEY", previousApiKey);
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runHermesChat treats timeout-denied command output as a terminal error", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-timeout-denied-"));
   const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
@@ -349,7 +680,8 @@ test("runHermesChat publishes assistant output before a newline arrives", async 
       },
     );
 
-    await waitForHermesDelta(publishedEvents, "partial", 600);
+    await waitForFile(join(root, "partial-started"), 1000);
+    await waitForHermesDelta(publishedEvents, "partial", 1000);
     const result = await chatPromise;
 
     assert.match(result.output, /partial reply/);
@@ -380,6 +712,36 @@ test("runHermesChat resolves from exported history when Hermes keeps running aft
     assert.equal(JSON.stringify(publishedEvents).includes("你好！有什么我能帮你的吗？"), false);
   } finally {
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat resolves from Hermes state DB without invoking sessions export when the CLI keeps running", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-state-db-completion-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  try {
+    const storePath = join(root, "sessions.json");
+    const dbPath = writeHermesStateDb(root);
+    const hermesBin = writeStateDbHistoryCompletingHermesBin(root);
+    const publishedEvents: unknown[] = [];
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.CLAWCONNECT_HERMES_STATE_DB = dbPath;
+    process.env.HERMES_BIN = hermesBin.binPath;
+
+    const result = await runHermesChat(
+      { sessionKey: "main", message: "Hi" },
+      { requestId: "run-state-db-complete", publishEvent: (event) => publishedEvents.push(event) },
+    );
+
+    assert.equal(result.output, "direct-db reply");
+    assert.equal(existsSync(hermesBin.exportCalledPath), false);
+    assert.equal(JSON.stringify(publishedEvents).includes("direct-db reply"), false);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
     restoreEnv("HERMES_BIN", previousBin);
     rmSync(root, { recursive: true, force: true });
   }

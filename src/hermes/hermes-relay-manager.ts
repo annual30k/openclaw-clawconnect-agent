@@ -30,7 +30,7 @@ import { prepareHermesVoiceInputCommand, resolveHermesVoiceInputSessionKey } fro
 import {
   collectHermesUsageSnapshot,
   handleHermesCommand,
-  readHermesStatusSnapshot,
+  readHermesStatusSnapshotAsync,
   runHermesChat,
 } from "./hermes-runtime.js";
 import {
@@ -133,27 +133,28 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
     relayWs.on("open", () => {
       console.log(`Connected to relay server (hermes gatewayId=${opts.gatewayId})`);
       opts.onConnected?.();
-      const statusSnapshot = readHermesStatusSnapshot();
       send(buildHermesRelayHelloMessage({
         platform: `${process.platform} (Hermes)`,
         agentVersion: "hermes",
         capabilities: opts.capabilities ?? [...gatewayCapabilitiesForType("hermes"), "models"],
       }));
       send({ type: "gateway_connected" });
-      send({
-        type: "event",
-        event: "office",
-        payload: {
-          currentModel: statusSnapshot.currentModel,
-          provider: statusSnapshot.provider,
-          office: {
-            kind: "idle",
-            title: "Hermes Agent",
-            detail: opts.displayName ?? "Hermes gateway connected",
-            phase: "connected",
-            updatedAt: new Date().toISOString(),
+      void readHermesStatusSnapshotAsync().then((statusSnapshot) => {
+        send({
+          type: "event",
+          event: "office",
+          payload: {
+            currentModel: statusSnapshot.currentModel,
+            provider: statusSnapshot.provider,
+            office: {
+              kind: "idle",
+              title: "Hermes Agent",
+              detail: opts.displayName ?? "Hermes gateway connected",
+              phase: "connected",
+              updatedAt: new Date().toISOString(),
+            },
           },
-        },
+        });
       });
       void publishHermesUsageSnapshot(send);
     });

@@ -6,6 +6,7 @@ import {
   HERMES_LOG_DIR,
   HERMES_MODELS_DEV_CACHE_FILE,
   runHermes,
+  runHermesAsync,
   stripAnsi,
 } from "./hermes-runtime-process.js";
 import type { HermesUsageSnapshot } from "./hermes-runtime-types.js";
@@ -26,9 +27,19 @@ import {
   mergeLiveHermesSessionsWithStoredAliases,
   parseHermesSessionsList,
 } from "../hermes-session-store.js";
+import {
+  exportHermesSessionFromStateDb,
+  listHermesSessionsFromStateDb,
+} from "./hermes-runtime-state-db.js";
 
 export async function listHermesSessions(): Promise<ReturnType<typeof parseHermesSessionsList>> {
-  const output = runHermes(["sessions", "list"]);
+  const stateDbSessions = await listHermesSessionsFromStateDb();
+  if (stateDbSessions) {
+    const stored = await listStoredHermesSessions();
+    return mergeLiveHermesSessionsWithStoredAliases(stateDbSessions, stored);
+  }
+  // 这些查询经常和 mobile chat.send 并发到达；异步子进程可以让 ws 消息循环继续转发实时回复。
+  const output = await runHermesAsync(["sessions", "list"]);
   const parsed = parseHermesSessionsList(output);
   const stored = await listStoredHermesSessions();
   return mergeLiveHermesSessionsWithStoredAliases(parsed, stored);
@@ -42,14 +53,25 @@ export function readHermesStatusSnapshot(): HermesUsageSnapshot {
   }
 }
 
+export async function readHermesStatusSnapshotAsync(): Promise<HermesUsageSnapshot> {
+  try {
+    return enrichHermesUsageSnapshot(parseHermesStatusSnapshot(await runHermesAsync(["status"], 10_000)));
+  } catch {
+    return {};
+  }
+}
+
 export async function collectHermesUsageSnapshot(hermesSessionId?: string): Promise<HermesUsageSnapshot> {
-  const status = readHermesStatusSnapshot();
+  const status = await readHermesStatusSnapshotAsync();
   const sessionId = hermesSessionId ?? (await latestHermesSessionId());
   if (!sessionId) {
     return status;
   }
   try {
-    const output = runHermes(["sessions", "export", "-", "--session-id", sessionId], 10 * 60_000);
+    const stateDbExport = await exportHermesSessionFromStateDb(sessionId);
+    const output = stateDbExport
+      ? JSON.stringify(stateDbExport)
+      : await runHermesAsync(["sessions", "export", "-", "--session-id", sessionId], 10 * 60_000);
     return enrichHermesUsageSnapshot(mergeHermesUsageSnapshots(
       status,
       parseHermesSessionUsageSnapshot(output),

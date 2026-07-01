@@ -1,8 +1,11 @@
 
-import { execFileSync, execSync } from "child_process";
+import { execFile as execFileCb, execFileSync, execSync } from "child_process";
 import { existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { promisify } from "util";
+
+const execFile = promisify(execFileCb);
 
 export const IS_WINDOWS = process.platform === "win32";
 export const HERMES_INBOX_DIR = join(homedir(), ".clawconnect", "hermes", "inbox");
@@ -78,6 +81,19 @@ export function runHermes(
     stdio: "pipe",
     timeout: timeoutMs,
   }).toString();
+}
+
+export async function runHermesAsync(
+  args: string[],
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  env: NodeJS.ProcessEnv = SUBPROCESS_ENV,
+): Promise<string> {
+  const { stdout } = await execFile(resolveHermesBin(), args, {
+    encoding: "utf8",
+    env,
+    timeout: timeoutMs,
+  });
+  return stdout;
 }
 
 export function runHermesWithInput(args: string[], input: string, timeoutMs = DEFAULT_TIMEOUT_MS): string {
@@ -158,13 +174,37 @@ export function sleep(ms: number): Promise<void> {
 }
 
 export function runHermesPython(script: string, extraEnv: NodeJS.ProcessEnv = {}): string {
+  const cwd = resolveHermesAgentCwd();
   const venvPython = join(HERMES_HOME_DIR, "hermes-agent", "venv", "bin", "python");
   const python = process.env.HERMES_PYTHON?.trim()
     || (existsSync(venvPython) ? venvPython : join(homedir(), ".local", "bin", "python3.11"));
   return execFileSync(python, ["-c", script], {
-    cwd: join(HERMES_HOME_DIR, "hermes-agent"),
+    cwd,
     env: { ...SUBPROCESS_ENV, ...extraEnv },
     stdio: "pipe",
     timeout: DEFAULT_TIMEOUT_MS,
   }).toString();
+}
+
+export async function runHermesPythonAsync(
+  script: string,
+  extraEnv: NodeJS.ProcessEnv = {},
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<string> {
+  const cwd = resolveHermesAgentCwd();
+  const venvPython = join(HERMES_HOME_DIR, "hermes-agent", "venv", "bin", "python");
+  const python = process.env.HERMES_PYTHON?.trim()
+    || (existsSync(venvPython) ? venvPython : join(homedir(), ".local", "bin", "python3.11"));
+  const { stdout } = await execFile(python, ["-c", script], {
+    cwd,
+    encoding: "utf8",
+    env: { ...SUBPROCESS_ENV, ...extraEnv },
+    timeout: timeoutMs,
+  });
+  return stdout;
+}
+
+function resolveHermesAgentCwd(): string {
+  const agentDir = join(HERMES_HOME_DIR, "hermes-agent");
+  return existsSync(agentDir) ? agentDir : homedir();
 }
