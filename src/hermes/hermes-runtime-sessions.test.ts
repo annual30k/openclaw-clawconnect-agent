@@ -379,6 +379,7 @@ test("runHermesChat uses the Hermes API server stream instead of spawning the CL
     assert.equal(apiRequests.some((request) => request.url === "/api/sessions"), true);
     assert.equal(apiRequests.some((request) => request.url === `/api/sessions/${hermesSessionId}/chat/stream`), true);
     assert.equal(JSON.stringify(publishedEvents).includes("api "), true);
+    assert.deepEqual(assistantTimelineDeltaTexts(publishedEvents), ["api ", "api reply"]);
     const stored = await listStoredHermesSessions();
     assert.equal(stored[0]?.sessionKey, "mobile-main");
     assert.equal(stored[0]?.hermesSessionId, hermesSessionId);
@@ -685,12 +686,35 @@ test("runHermesChat publishes assistant output before a newline arrives", async 
     const result = await chatPromise;
 
     assert.match(result.output, /partial reply/);
+    assert.deepEqual(assistantTimelineDeltaTexts(publishedEvents), ["partial ", "partial reply\n"]);
   } finally {
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousBin);
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+function assistantTimelineDeltaTexts(events: unknown[]): string[] {
+  const texts: string[] = [];
+  for (const event of events) {
+    if (!isRecord(event) || event.type !== "event" || event.event !== "chat" || !isRecord(event.payload)) {
+      continue;
+    }
+    const timelineEvents = Array.isArray(event.payload.timelineEvents) ? event.payload.timelineEvents : [];
+    for (const timelineEvent of timelineEvents) {
+      if (!isRecord(timelineEvent) || timelineEvent.eventType !== "message.part.delta" || timelineEvent.role !== "assistant") {
+        continue;
+      }
+      const content = Array.isArray(timelineEvent.content) ? timelineEvent.content : [];
+      texts.push(content.map((block) => isRecord(block) && typeof block.text === "string" ? block.text : "").join(""));
+    }
+  }
+  return texts;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 test("runHermesChat resolves from exported history when Hermes keeps running after answer", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-completion-"));

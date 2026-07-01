@@ -448,7 +448,8 @@ async function runHermesChatStreaming(
           sessionKey,
           seq: seq += 1,
           timestampMs,
-          delta,
+          // canonical message.part.delta 是同一 part 的绝对状态；Hermes CLI stdout 这里 flush 的只是增量片段。
+          delta: output,
         }),
       });
     } catch (error) {

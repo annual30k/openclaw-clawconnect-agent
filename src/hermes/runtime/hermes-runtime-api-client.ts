@@ -269,7 +269,8 @@ async function consumeHermesApiChatStream(
             run: { runId, sessionKey: params.sessionKey },
             seq: seq += 1,
             timestampMs: Date.now(),
-            delta,
+            // canonical message.part.delta 是同一 part 的绝对状态；Hermes API 的 assistant.delta 是增量片段。
+            delta: deltaOutput,
             includeTimelineEvents: true,
           }),
         });
