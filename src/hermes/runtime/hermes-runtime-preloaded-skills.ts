@@ -11,6 +11,7 @@ const HERMES_SKILL_PROMPT_TIMEOUT_MS = 10_000;
 
 export type HermesPreloadedSkillContext = {
   cliArgs: string[];
+  requiredToolsets: string[];
   skillNames: string[];
 };
 
@@ -22,13 +23,14 @@ export async function resolveHermesPreloadedSkillContext(): Promise<HermesPreloa
     if (fileTransfer && fileTransfer.enabled !== false) {
       return {
         cliArgs: ["--skills", HERMES_FILE_TRANSFER_SKILL],
+        requiredToolsets: ["terminal"],
         skillNames: [HERMES_FILE_TRANSFER_SKILL],
       };
     }
   } catch {
     // Hermes without skills support should still be able to answer normal chat.
   }
-  return { cliArgs: [], skillNames: [] };
+  return { cliArgs: [], requiredToolsets: [], skillNames: [] };
 }
 
 export async function buildHermesPreloadedSkillsPrompt(

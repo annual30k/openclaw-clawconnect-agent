@@ -148,6 +148,7 @@ async function runHermesChatPrepared(params: {
       sessionKey: params.sessionKey,
       resume,
       preloadedSkillNames: preloadedSkillContext.skillNames,
+      requiredToolsets: preloadedSkillContext.requiredToolsets,
       context: params.context,
     });
     if (apiChat) {
@@ -171,6 +172,7 @@ async function runHermesChatPrepared(params: {
       instructions: params.preparedMessage.apiInstructions,
       sessionKey: params.sessionKey,
       preloadedSkillNames: preloadedSkillContext.skillNames,
+      requiredToolsets: preloadedSkillContext.requiredToolsets,
       context: params.context,
     });
     if (retryApiChat) {

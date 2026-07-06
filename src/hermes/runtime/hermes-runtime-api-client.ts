@@ -16,6 +16,7 @@ import { hermesToolState } from "./hermes-runtime-tool-log-watcher.js";
 const DEFAULT_HERMES_API_HOST = "127.0.0.1";
 const DEFAULT_HERMES_API_PORT = "8642";
 const HERMES_API_HEALTH_TIMEOUT_MS = 1_500;
+const HERMES_API_TOOLSETS_TIMEOUT_MS = 1_500;
 
 type HermesApiConfig = {
   baseUrl: string;
@@ -37,6 +38,7 @@ export async function tryRunHermesApiChat(params: {
   sessionKey: string;
   resume?: string;
   preloadedSkillNames?: string[];
+  requiredToolsets?: string[];
   context: LocalCommandContext;
 }): Promise<HermesApiChatResult | undefined> {
   const config = readHermesApiConfig();
@@ -45,6 +47,10 @@ export async function tryRunHermesApiChat(params: {
   }
   const healthy = await isHermesApiHealthy(config);
   if (!healthy) {
+    return undefined;
+  }
+  const requiredToolsetsAvailable = await hasRequiredHermesApiToolsets(config, params.requiredToolsets);
+  if (!requiredToolsetsAvailable) {
     return undefined;
   }
   return await runHermesApiChat(config, params);
@@ -113,6 +119,49 @@ async function isHermesApiHealthy(config: HermesApiConfig): Promise<boolean> {
   }
 }
 
+async function hasRequiredHermesApiToolsets(
+  config: HermesApiConfig,
+  requiredToolsets: string[] | undefined,
+): Promise<boolean> {
+  const required = new Set(compactStringArray(requiredToolsets ?? []));
+  if (required.size === 0) {
+    return true;
+  }
+  try {
+    const response = await fetchWithTimeout(`${config.baseUrl}/v1/toolsets`, {
+      headers: buildHermesApiHeaders(config),
+    }, HERMES_API_TOOLSETS_TIMEOUT_MS);
+    if (!response.ok) {
+      return false;
+    }
+    const payload = await readJsonResponse(response);
+    const data = payload && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>).data
+      : undefined;
+    const enabledToolsets = new Set<string>();
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          continue;
+        }
+        const record = item as Record<string, unknown>;
+        const name = stringValue(record.name);
+        if (name && record.enabled === true) {
+          enabledToolsets.add(name);
+        }
+      }
+    }
+    for (const toolset of required) {
+      if (!enabledToolsets.has(toolset)) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function runHermesApiChat(
   config: HermesApiConfig,
   params: {
@@ -121,6 +170,7 @@ async function runHermesApiChat(
     sessionKey: string;
     resume?: string;
     preloadedSkillNames?: string[];
+    requiredToolsets?: string[];
     context: LocalCommandContext;
   },
 ): Promise<HermesApiChatResult | undefined> {
