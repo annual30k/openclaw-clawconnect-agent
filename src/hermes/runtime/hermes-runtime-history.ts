@@ -25,6 +25,11 @@ type ClawConnectMobileTurnMetadata = {
   sessionKey?: string;
 };
 
+type ActiveClawConnectMobileTurn = {
+  turnId: string;
+  runId: string;
+};
+
 const DEFAULT_HISTORY_LIMIT = 100;
 const MAX_HISTORY_LIMIT = 200;
 const CURSOR_PREFIX = "seq:";
@@ -183,10 +188,12 @@ function normalizeHermesHistoryMessages(parsed: unknown): HermesHistoryMessage[]
           : [];
 
   const sessionId = stringParam(record, "sessionId", "session_id", "id");
-  const messages = rawMessages.flatMap((entry, index): HermesHistoryMessage[] => {
+  const messages: HermesHistoryMessage[] = [];
+  let activeMobileTurn: ActiveClawConnectMobileTurn | undefined;
+  rawMessages.forEach((entry, index) => {
     const source = toRecord(entry);
     if (Object.keys(source).length === 0) {
-      return [];
+      return;
     }
     const role = normalizeHistoryRole(source.role);
     const rawText = extractHistoryText(source);
@@ -194,14 +201,14 @@ function normalizeHermesHistoryMessages(parsed: unknown): HermesHistoryMessage[]
     const normalized = normalizeHistoryText(role, rawText);
     const content = normalizeHistoryContentBlocks(source, normalized);
     if (!normalized && content.length === 0) {
-      return [];
+      return;
     }
     const seq = index + 1;
     const sourceTurnId = stringParam(source, "turnId", "turn_id") ?? mobileTurn.sourceRunId;
     const sourceRunId = stringParam(source, "runId", "run_id") ?? mobileTurn.sourceRunId;
     const sourceClientMessageId = stringParam(source, "clientMessageId", "client_message_id") ?? mobileTurn.sourceRunId;
     const sourceIdempotencyKey = stringParam(source, "idempotencyKey", "idempotency_key") ?? mobileTurn.sourceRunId;
-    return [{
+    const message: HermesHistoryMessage = {
       id: stringParam(source, "id", "messageId", "message_id") ?? `history-${seq}`,
       role,
       content,
@@ -213,9 +220,31 @@ function normalizeHermesHistoryMessages(parsed: unknown): HermesHistoryMessage[]
       ...(readTimestamp(source) ? { timestamp: readTimestamp(source) } : {}),
       ...(readCreatedAt(source) ? { createdAt: readCreatedAt(source) } : {}),
       seq,
-    }];
+    };
+    const resolvedMessage = activeMobileTurn && (role === "assistant" || role === "tool")
+      ? inheritClawConnectMobileTurn(message, activeMobileTurn)
+      : message;
+    messages.push(resolvedMessage);
+    if (role === "user") {
+      activeMobileTurn = sourceRunId && sourceTurnId
+        ? { turnId: sourceTurnId, runId: sourceRunId }
+        : undefined;
+    }
   });
   return withHermesHistoryFallbackTimestamps(messages, sessionId);
+}
+
+function inheritClawConnectMobileTurn(
+  message: HermesHistoryMessage,
+  turn: ActiveClawConnectMobileTurn,
+): HermesHistoryMessage {
+  // 显式的 mobile turn 元数据是 ClawConnect 与 Hermes history 的身份合同；
+  // 同一用户 turn 内的后续 host 输出必须继承它，避免历史刷新把回答当成独立旧消息排序。
+  return {
+    ...message,
+    turnId: message.turnId ?? turn.turnId,
+    runId: message.runId ?? turn.runId,
+  };
 }
 
 function normalizeHistoryRole(value: unknown): string {

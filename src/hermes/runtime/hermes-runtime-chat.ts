@@ -29,7 +29,12 @@ import {
   stripHermesSessionResumeNotices,
 } from "./hermes-runtime-process.js";
 import type { HermesChatResult, HermesToolLogEvent, HermesUsageSnapshot } from "./hermes-runtime-types.js";
-import { collectHermesUsageSnapshot, listHermesSessions, readHermesStatusSnapshotAsync } from "./hermes-runtime-usage.js";
+import {
+  collectHermesUsageSnapshot,
+  listHermesSessions,
+  readCachedHermesStatusSnapshot,
+  readHermesStatusSnapshotAsync,
+} from "./hermes-runtime-usage.js";
 import { compactStringArray, sanitizeFileName } from "./hermes-runtime-values.js";
 import {
   detectHermesHistoryCompletion,
@@ -57,13 +62,23 @@ const HERMES_HISTORY_COMPLETION_GRACE_MS = 2_000;
 const HERMES_HISTORY_COMPLETION_POLL_MS = 1_000;
 const HERMES_API_EMPTY_OUTPUT_HISTORY_COMPLETION_TIMEOUT_MS = 12_000;
 const HERMES_API_EMPTY_OUTPUT_HISTORY_COMPLETION_POLL_MS = 500;
+const HERMES_RUNTIME_CONTEXT_CACHE_MAX_AGE_MS = 5 * 60_000;
 const HERMES_COMMAND_DENIED_TIMEOUT_MESSAGE = "Timeout – denying command";
 const hermesChatQueues = new Map<string, Promise<void>>();
+const EMPTY_PRELOADED_SKILL_CONTEXT = {
+  cliArgs: [] as string[],
+  requiredToolsets: [] as string[],
+  skillNames: [] as string[],
+};
 
 type PreparedHermesMessage = {
   apiMessage: string;
   apiInstructions?: string;
   cliMessage: string;
+};
+
+type HermesChatPreparationPlan = {
+  preloadFileTransferSkill: boolean;
 };
 
 export async function runHermesChat(
@@ -94,7 +109,8 @@ export async function runHermesChat(
   const sourceRunId = typeof context.requestId === "string" && context.requestId.trim().length > 0
     ? context.requestId.trim()
     : undefined;
-  const preparedMessage = await prepareHermesMessage(rawMessage, record.attachments, sessionKey, sourceRunId);
+  const preparationPlan = planHermesChatPreparation(rawMessage);
+  const preparedMessage = await prepareHermesMessage(rawMessage, record.attachments, sessionKey, sourceRunId, preparationPlan);
   if (!preparedMessage.cliMessage.trim()) {
     throw new Error("message_required");
   }
@@ -106,6 +122,7 @@ export async function runHermesChat(
       sessionKey,
       hermesSessionId: record.hermesSessionId,
       context,
+      preparationPlan,
     });
   });
 }
@@ -134,13 +151,16 @@ async function runHermesChatPrepared(params: {
   sessionKey: string;
   hermesSessionId: unknown;
   context: LocalCommandContext;
+  preparationPlan: HermesChatPreparationPlan;
 }): Promise<HermesChatResult> {
   const explicitResume = typeof params.hermesSessionId === "string" && params.hermesSessionId.trim().length > 0
     ? params.hermesSessionId.trim()
     : undefined;
   const mappedResume = explicitResume ? undefined : await getMappedHermesSessionId(params.sessionKey);
   let resume = explicitResume ?? mappedResume;
-  const preloadedSkillContext = await resolveHermesPreloadedSkillContext();
+  const preloadedSkillContext = params.preparationPlan.preloadFileTransferSkill
+    ? await resolveHermesPreloadedSkillContext({ forceFileTransfer: true })
+    : EMPTY_PRELOADED_SKILL_CONTEXT;
   try {
     const apiChat = await tryRunHermesApiChat({
       message: params.preparedMessage.apiMessage,
@@ -740,6 +760,7 @@ async function prepareHermesMessage(
   attachments: unknown,
   sessionKey: string,
   sourceRunId?: string,
+  preparationPlan: HermesChatPreparationPlan = planHermesChatPreparation(message),
 ): Promise<PreparedHermesMessage> {
   const refs: string[] = [];
   if (Array.isArray(attachments)) {
@@ -769,7 +790,9 @@ async function prepareHermesMessage(
   if (refs.length > 0) {
     userSections.push(refs.join("\n"));
   }
-  const runtimeHint = buildHermesRuntimeContextHint(await readHermesStatusSnapshotAsync());
+  const runtimeHint = buildHermesRuntimeContextHint(
+    readCachedHermesStatusSnapshot(HERMES_RUNTIME_CONTEXT_CACHE_MAX_AGE_MS),
+  );
   const turnMetadata = buildClawConnectMobileTurnMetadata(sourceRunId, sessionKey);
   const apiMessageSections = [...userSections];
   if (turnMetadata) {
@@ -793,6 +816,37 @@ async function prepareHermesMessage(
     apiInstructions: apiInstructionSections.filter(Boolean).join("\n\n").trim() || undefined,
     cliMessage: cliMessageSections.filter(Boolean).join("\n\n").trim(),
   };
+}
+
+function planHermesChatPreparation(message: string): HermesChatPreparationPlan {
+  return {
+    preloadFileTransferSkill: shouldPreloadHermesFileTransferSkill(message),
+  };
+}
+
+function shouldPreloadHermesFileTransferSkill(message: string): boolean {
+  const text = message.trim();
+  const lower = text.toLowerCase();
+  if (!text) {
+    return false;
+  }
+  if (/\bfile-transfer\b|clawconnect\s+send-file/.test(lower)) {
+    return true;
+  }
+
+  const pathOrExtension = /(?:^|\s|["'“”‘’])(?:~|\/|[a-z]:\\)|\.(?:png|jpe?g|gif|webp|heic|pdf|docx?|xlsx?|pptx?|zip|txt|md)\b/i.test(text);
+  const englishSend = /\b(send|transfer|upload|attach|share|copy)\b/i.test(text);
+  const englishFile = /\b(file|image|photo|picture|screenshot|document|attachment)\b/i.test(text) || pathOrExtension;
+  const englishTarget = /\b(phone|iphone|mobile|clawlink|this device|me)\b/i.test(text);
+  if (englishSend && englishFile && englishTarget) {
+    return true;
+  }
+
+  const chineseSend = /发送|发给|发到|发过来|传到|传给|传输|上传|分享|转发|给我|发/.test(text);
+  const chineseFile = /文件|图片|照片|截图|文档|附件|桌面|本机|路径|微信图片/.test(text) || pathOrExtension;
+  const chineseTarget = /手机|移动端|这台|给我|发过来|iPhone|ClawLink/i.test(text);
+  // 文件传输技能会触发 Hermes CLI 的 skills list；普通文本必须不走这条慢路径。
+  return chineseSend && chineseFile && chineseTarget;
 }
 
 export function buildHermesRuntimeContextHint(snapshot: HermesUsageSnapshot): string | undefined {

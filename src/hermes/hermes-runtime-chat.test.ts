@@ -12,6 +12,7 @@ import {
   parseHermesSkillsList,
   parseHermesSessionUsageSnapshot,
   parseHermesStatusSnapshot,
+  readHermesStatusSnapshotAsync,
   selectHermesSessionForCompletedChat,
   stripHermesSecurityReviewNotices,
   stripHermesSessionResumeNotices,
@@ -371,21 +372,15 @@ test("runHermesChat is not blocked by a concurrent Hermes history export", async
   let allowExportCompletePath: string | undefined;
   try {
     const storePath = join(root, "sessions.json");
-    const hermesBin = writeBarrieredHistoryExportHermesBin(root);
+    const hermesSessionId = "20260707_120000_concurrent";
+    const hermesBin = writeBarrieredHistoryExportHermesBin(root, hermesSessionId);
     allowExportCompletePath = hermesBin.allowExportCompletePath;
     process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
     process.env.HERMES_BIN = hermesBin.binPath;
-    await rememberHermesSession("main", {
-      sessionKey: "main",
-      hermesSessionId: "20260529_100000_history",
-      displayName: "History",
-      kind: "hermes",
-    });
-
-    const historyPromise = runHermesChatHistory({ sessionKey: "main", limit: 10 });
-    await waitForFile(hermesBin.exportActivePath, 1000);
+    const historyPromise = runHermesChatHistory({ sessionKey: "main", sessionId: hermesSessionId, limit: 10 });
+    await waitForFile(hermesBin.exportActivePath, 5000);
     const chatPromise = runHermesChat({ sessionKey: "main", message: "Ping" });
-    await waitForFile(hermesBin.concurrentPath, 1000);
+    await waitForFile(hermesBin.concurrentPath, 5000);
     writeFileSync(hermesBin.allowExportCompletePath, "1");
 
     const [history, chat] = await Promise.all([historyPromise, chatPromise]);
@@ -395,6 +390,78 @@ test("runHermesChat is not blocked by a concurrent Hermes history export", async
     if (allowExportCompletePath) {
       writeFileSync(allowExportCompletePath, "1");
     }
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat includes cached runtime context without message keyword matching", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-runtime-cache-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeFakeHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+
+    await readHermesStatusSnapshotAsync();
+    const result = await runHermesChat({ sessionKey: "main", message: "你好" });
+
+    assert.equal(result.output, "fresh reply");
+    const args = readFileSync(`${binPath}.args`, "utf8");
+    assert.match(args, /\[Hermes runtime context]/);
+    assert.match(args, /model=gpt-5\.5, provider=OpenAI Codex/);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat does not reuse cached runtime context across Hermes environments", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-runtime-cache-scope-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const firstBinPath = writeFakeHermesBin(root);
+    const secondBinPath = join(root, "hermes-empty-status");
+    const secondArgsPath = `${secondBinPath}.args`;
+    writeFileSync(secondBinPath, [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"list\" ]; then",
+      "  echo 'Title                            Preview          Last Active   ID'",
+      "  echo 'Second reply                     second reply     just now      20260528_181501_abcd12'",
+      "  exit 0",
+      "fi",
+      "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"export\" ]; then",
+      "  echo '{\"model\":\"second-model\",\"input_tokens\":1}'",
+      "  exit 0",
+      "fi",
+      "if [ \"$1\" = \"status\" ]; then exit 0; fi",
+      "if [ \"$1\" = \"chat\" ]; then",
+      `  printf '%s\\n' "$@" > '${secondArgsPath.replace(/'/g, "'\\''")}'`,
+      "  echo 'second reply'",
+      "  exit 0",
+      "fi",
+      "echo \"unexpected args: $@\" >&2",
+      "exit 2",
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(secondBinPath, 0o755);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = firstBinPath;
+    await readHermesStatusSnapshotAsync();
+
+    process.env.HERMES_BIN = secondBinPath;
+    const result = await runHermesChat({ sessionKey: "main", message: "hello" });
+
+    assert.equal(result.output, "second reply");
+    const args = readFileSync(secondArgsPath, "utf8");
+    assert.doesNotMatch(args, /\[Hermes runtime context]/);
+  } finally {
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousBin);
     rmSync(root, { recursive: true, force: true });

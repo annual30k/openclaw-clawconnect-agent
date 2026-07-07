@@ -567,7 +567,7 @@ export function writeConcurrentDetectingHermesBin(root: string): string {
   assert.equal(existsSync(binPath), true);
   return binPath;
 }
-export function writeBarrieredHistoryExportHermesBin(root: string): {
+export function writeBarrieredHistoryExportHermesBin(root: string, sessionId = "20260529_100000_history"): {
   binPath: string;
   exportActivePath: string;
   allowExportCompletePath: string;
@@ -578,7 +578,7 @@ export function writeBarrieredHistoryExportHermesBin(root: string): {
   const allowExportCompletePath = join(root, "history-export-complete");
   const concurrentPath = join(root, "history-export-concurrent");
   const payload = JSON.stringify({
-    sessionId: "20260529_100000_history",
+    sessionId,
     messages: [
       {
         id: "m1",
@@ -604,7 +604,7 @@ export function writeBarrieredHistoryExportHermesBin(root: string): {
     `const payload = ${JSON.stringify(payload)};`,
     "if (args[0] === 'sessions' && args[1] === 'list') {",
     "  console.log('Title                            Preview          Last Active   ID');",
-    "  console.log('History                          visible reply    just now      20260529_100000_history');",
+    `  console.log('History                          visible reply    just now      ${sessionId}');`,
     "  process.exit(0);",
     "}",
     "if (args[0] === 'sessions' && args[1] === 'export') {",

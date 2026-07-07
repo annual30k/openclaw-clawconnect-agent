@@ -187,6 +187,58 @@ test("runHermesChat passes stable mobile turn metadata and preloads file-transfe
   }
 });
 
+test("runHermesChat starts ordinary text chat without preflight status or skills list", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hermes-ordinary-chat-fast-start-"));
+  const previousHermesBin = process.env.HERMES_BIN;
+  try {
+    const hermesBin = join(dir, "hermes");
+    const callsPath = join(dir, "calls.log");
+    writeFileSync(hermesBin, [
+      "#!/usr/bin/env node",
+      "const fs = require('fs');",
+      "const args = process.argv.slice(2);",
+      `fs.appendFileSync(${JSON.stringify(callsPath)}, (args[0] || '') + ':' + (args[1] || '') + '\\n');`,
+      "if (args[0] === 'status') {",
+      "  console.log('  Model:        gpt-5.5');",
+      "  console.log('  Provider:     OpenAI Codex');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'skills' && args[1] === 'list') {",
+      "  console.log('│ file-transfer │ productivity │ local │ local │ enabled │');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'list') {",
+      "  console.log('Title                            Preview          Last Active   ID');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'export') {",
+      "  console.log(JSON.stringify({ sessionId: 's1', messages: [] }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'chat') {",
+      "  console.log('plain reply');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"));
+    chmodSync(hermesBin, 0o755);
+    process.env.HERMES_BIN = hermesBin;
+
+    const result = await runHermesChat({ message: "hello", sessionKey: "main" });
+    const calls = readFileSync(callsPath, "utf8").trim().split(/\r?\n/);
+    const chatIndex = calls.findIndex((call) => call.startsWith("chat:"));
+
+    assert.equal(result.output, "plain reply");
+    assert.notEqual(chatIndex, -1);
+    assert.equal(calls.slice(0, chatIndex).includes("status:"), false);
+    assert.equal(calls.slice(0, chatIndex).includes("skills:list"), false);
+  } finally {
+    restoreEnv("HERMES_BIN", previousHermesBin);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("runHermesChatHistory extracts stable mobile turn metadata from Hermes export", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hermes-history-turn-metadata-"));
   const previousHermesBin = process.env.HERMES_BIN;
@@ -233,14 +285,18 @@ test("runHermesChatHistory extracts stable mobile turn metadata from Hermes expo
     const result = await runHermesChatHistory({ sessionKey: "main", limit: 10 });
     assert.equal(result.ok, true);
     const payload = result.payload as {
-      timelineSnapshot: { messages: Array<{ role: string; content: Array<{ text?: string }>; runId?: string; idempotencyKey?: string; clientMessageId?: string }> };
+      timelineSnapshot: { messages: Array<{ role: string; content: Array<{ text?: string }>; turnId?: string; runId?: string; idempotencyKey?: string; clientMessageId?: string }> };
     };
     const user = payload.timelineSnapshot.messages.find((message) => message.role === "user");
+    const assistant = payload.timelineSnapshot.messages.find((message) => message.role === "assistant");
 
+    assert.equal(user?.turnId, "client-run-file-1");
     assert.equal(user?.runId, "client-run-file-1");
     assert.equal(user?.idempotencyKey, "client-run-file-1");
     assert.equal(user?.clientMessageId, "client-run-file-1");
     assert.equal(user?.content[0]?.text, "帮把桌面上的图片发过来");
+    assert.equal(assistant?.turnId, "client-run-file-1");
+    assert.equal(assistant?.runId, "client-run-file-1");
   } finally {
     restoreEnv("HERMES_BIN", previousHermesBin);
     rmSync(dir, { recursive: true, force: true });

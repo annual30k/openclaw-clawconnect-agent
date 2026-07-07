@@ -44,6 +44,10 @@ import {
   readHermesSlashCommandSearchParams,
   searchHermesSlashCommandCatalog,
 } from "./relay/hermes-slash-command-catalog.js";
+import {
+  createHermesStateDbRealtimeWatcher,
+  resolveHermesStateDbRealtimePath,
+} from "./relay/hermes-state-db-realtime.js";
 
 export {
   collectHermesSlashCommandCatalog,
@@ -129,6 +133,21 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
     const send = (message: ToServer): void => {
       sendRelayJson(relayWs, message);
     };
+    const stateDbRealtimePath = resolveHermesStateDbRealtimePath();
+    const stateDbRealtimeWatcher = stateDbRealtimePath
+      ? createHermesStateDbRealtimeWatcher({
+        gatewayId: opts.gatewayId,
+        dbPath: stateDbRealtimePath,
+        publishPayload: (payload) => {
+          send({ type: "event", event: "chat", payload });
+          publishHermesOfficeSnapshot(send, "chat", payload);
+        },
+        onError: (error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(`[hermes-relay] state.db realtime sync failed: ${message}`);
+        },
+      })
+      : undefined;
 
     relayWs.on("open", () => {
       console.log(`Connected to relay server (hermes gatewayId=${opts.gatewayId})`);
@@ -157,6 +176,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         });
       });
       void publishHermesUsageSnapshot(send);
+      stateDbRealtimeWatcher?.start();
     });
 
     relayWs.on("message", async (raw) => {
@@ -409,6 +429,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
     relayWs.on("close", (code, reason) => {
       console.log(`Hermes relay connection closed: ${code} ${reason.toString()}`);
       opts.onDisconnected?.();
+      stateDbRealtimeWatcher?.stop();
       activeChatRuns.forEach((entry) => entry.controller.abort());
       activeChatRuns.clear();
       resolve(shouldRetryRelayClose(code, opts.signal));

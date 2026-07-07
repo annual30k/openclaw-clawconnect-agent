@@ -32,6 +32,8 @@ import {
   listHermesSessionsFromStateDb,
 } from "./hermes-runtime-state-db.js";
 
+let cachedHermesStatusSnapshot: { cacheKey: string; snapshot: HermesUsageSnapshot; updatedAt: number } | undefined;
+
 export async function listHermesSessions(): Promise<ReturnType<typeof parseHermesSessionsList>> {
   const stateDbSessions = await listHermesSessionsFromStateDb();
   if (stateDbSessions) {
@@ -47,18 +49,37 @@ export async function listHermesSessions(): Promise<ReturnType<typeof parseHerme
 
 export function readHermesStatusSnapshot(): HermesUsageSnapshot {
   try {
-    return enrichHermesUsageSnapshot(parseHermesStatusSnapshot(runHermes(["status"], 10_000)));
+    const snapshot = enrichHermesUsageSnapshot(parseHermesStatusSnapshot(runHermes(["status"], 10_000)));
+    rememberHermesStatusSnapshot(snapshot);
+    return snapshot;
   } catch {
+    forgetHermesStatusSnapshot();
     return {};
   }
 }
 
-export async function readHermesStatusSnapshotAsync(): Promise<HermesUsageSnapshot> {
+export async function readHermesStatusSnapshotAsync(timeoutMs = 10_000): Promise<HermesUsageSnapshot> {
   try {
-    return enrichHermesUsageSnapshot(parseHermesStatusSnapshot(await runHermesAsync(["status"], 10_000)));
+    const snapshot = enrichHermesUsageSnapshot(parseHermesStatusSnapshot(await runHermesAsync(["status"], timeoutMs)));
+    rememberHermesStatusSnapshot(snapshot);
+    return snapshot;
   } catch {
+    forgetHermesStatusSnapshot();
     return {};
   }
+}
+
+export function readCachedHermesStatusSnapshot(maxAgeMs = Number.POSITIVE_INFINITY): HermesUsageSnapshot {
+  if (!cachedHermesStatusSnapshot) {
+    return {};
+  }
+  if (cachedHermesStatusSnapshot.cacheKey !== hermesStatusSnapshotCacheKey()) {
+    return {};
+  }
+  if (maxAgeMs >= 0 && Date.now() - cachedHermesStatusSnapshot.updatedAt > maxAgeMs) {
+    return {};
+  }
+  return { ...cachedHermesStatusSnapshot.snapshot };
 }
 
 export async function collectHermesUsageSnapshot(hermesSessionId?: string): Promise<HermesUsageSnapshot> {
@@ -190,6 +211,26 @@ function enrichHermesUsageSnapshot(snapshot: HermesUsageSnapshot): HermesUsageSn
   }
   const contextLimit = readHermesContextLimit(snapshot.currentModel, snapshot.provider);
   return contextLimit !== undefined ? { ...snapshot, contextLimit } : snapshot;
+}
+
+function rememberHermesStatusSnapshot(snapshot: HermesUsageSnapshot): void {
+  cachedHermesStatusSnapshot = {
+    cacheKey: hermesStatusSnapshotCacheKey(),
+    snapshot: { ...snapshot },
+    updatedAt: Date.now(),
+  };
+}
+
+function forgetHermesStatusSnapshot(): void {
+  cachedHermesStatusSnapshot = undefined;
+}
+
+function hermesStatusSnapshotCacheKey(): string {
+  return [
+    process.env.HERMES_BIN?.trim() ?? "",
+    process.env.HERMES_HOME?.trim() ?? "",
+    process.env.CLAWCONNECT_HERMES_STATE_DB?.trim() ?? "",
+  ].join("\0");
 }
 
 export function readHermesContextLimit(model: string, provider?: string): number | undefined {

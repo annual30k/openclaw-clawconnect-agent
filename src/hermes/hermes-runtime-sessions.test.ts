@@ -15,6 +15,7 @@ import {
   parseHermesSkillsList,
   parseHermesSessionUsageSnapshot,
   parseHermesStatusSnapshot,
+  readHermesStatusSnapshotAsync,
   selectHermesSessionForCompletedChat,
   stripHermesSecurityReviewNotices,
   stripHermesSessionResumeNotices,
@@ -314,7 +315,7 @@ test("runHermesChat uses the Hermes API server stream instead of spawning the CL
         assert.match(parsed.message ?? "", /sessionKey: mobile-main/);
         assert.match(parsed.instructions ?? "", /\[ClawConnect mobile bridge]/);
         assert.match(parsed.instructions ?? "", /\[Hermes runtime context]/);
-        assert.match(parsed.instructions ?? "", /Current runtime: model=gpt-5.5, provider=openai-codex\./);
+        assert.match(parsed.instructions ?? "", /model=gpt-5\.5, provider=openai-codex/);
         res.writeHead(200, {
           "content-type": "text/event-stream",
           "cache-control": "no-cache",
@@ -365,6 +366,7 @@ test("runHermesChat uses the Hermes API server stream instead of spawning the CL
     process.env.CLAWCONNECT_HERMES_API_KEY = "test-api-key";
     process.env.CLAWCONNECT_HERMES_STATE_DB = join(root, "missing-state.db");
     const publishedEvents: unknown[] = [];
+    await readHermesStatusSnapshotAsync();
 
     const result = await runHermesChat(
       { sessionKey: "mobile-main", message: "hello api" },
@@ -536,7 +538,7 @@ test("runHermesChat forwards Hermes preloaded skill prompt to the API server", a
       if (req.method === "POST" && req.url === `/api/sessions/${hermesSessionId}/chat/stream`) {
         const parsed = JSON.parse(body) as { message?: string; instructions?: string };
         apiBodies.push(parsed);
-        assert.match(parsed.message ?? "", /^send with skill/);
+        assert.match(parsed.message ?? "", /^send image file to phone with skill/);
         assert.match(parsed.instructions ?? "", /FILE_TRANSFER_PROMPT/);
         assert.match(parsed.instructions ?? "", /\[ClawConnect mobile bridge]/);
         assert.doesNotMatch(parsed.message ?? "", /\[ClawConnect mobile bridge]/);
@@ -591,7 +593,7 @@ test("runHermesChat forwards Hermes preloaded skill prompt to the API server", a
     process.env.CLAWCONNECT_HERMES_STATE_DB = join(root, "missing-state.db");
 
     const result = await runHermesChat(
-      { sessionKey: "mobile-main", message: "send with skill" },
+      { sessionKey: "mobile-main", message: "send image file to phone with skill" },
       { requestId: "run-api-skill", gatewayId: "gw-hermes" },
     );
 
@@ -717,6 +719,128 @@ test("runHermesChat uses the CLI path for preloaded file-transfer mobile sends w
     assert.equal(args.includes("file-transfer"), true);
     assert.equal(args.includes("--yolo"), true);
     assert.match(readFileSync(chatQueryPath, "utf8"), /\[ClawConnect mobile turn\]/);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("HERMES_PYTHON", previousPython);
+    restoreEnv("CLAWCONNECT_HERMES_API_URL", previousApiUrl);
+    restoreEnv("CLAWCONNECT_HERMES_API_KEY", previousApiKey);
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat keeps explicit file-transfer mobile sends off the API path when skills list is unavailable", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-file-transfer-skills-list-failed-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousPython = process.env.HERMES_PYTHON;
+  const previousApiUrl = process.env.CLAWCONNECT_HERMES_API_URL;
+  const previousApiKey = process.env.CLAWCONNECT_HERMES_API_KEY;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  const chatArgsPath = join(root, "chat-args.json");
+  const apiChatCalls: string[] = [];
+  const hermesSessionId = "api_session_file_transfer_skills_failed";
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      if (req.method === "GET" && req.url === "/v1/toolsets") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          data: [
+            { name: "terminal", enabled: false },
+            { name: "file", enabled: true },
+          ],
+        }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/sessions") {
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({ session: { id: hermesSessionId, title: "main" } }));
+        return;
+      }
+      if (req.method === "POST" && req.url === `/api/sessions/${hermesSessionId}/chat/stream`) {
+        apiChatCalls.push(req.url);
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        });
+        res.write("event: assistant.completed\n");
+        res.write(`data: ${JSON.stringify({ session_id: hermesSessionId, content: "当前这轮没有可用的直接终端/命令工具" })}\n\n`);
+        res.write("event: run.completed\n");
+        res.write(`data: ${JSON.stringify({ session_id: hermesSessionId })}\n\n`);
+        res.end();
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not_found" }));
+    });
+  });
+
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = join(root, "hermes-file-transfer-cli");
+    writeFileSync(binPath, [
+      "#!/usr/bin/env node",
+      "const fs = require('fs');",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'skills' && args[1] === 'list') {",
+      "  process.exit(2);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'list') {",
+      "  console.log('Title                            Preview          Last Active   ID');",
+      "  console.log('File transfer                    发送完成           just now      20260706_093100_filetx');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'export') {",
+      "  console.log(JSON.stringify({ sessionId: '20260706_093100_filetx', messages: [] }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'status') { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      `  fs.writeFileSync(${JSON.stringify(chatArgsPath)}, JSON.stringify(args));`,
+      "  console.log('发送完成');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(binPath, 0o755);
+    const pythonPath = join(root, "fake-python");
+    writeFileSync(pythonPath, [
+      "#!/bin/sh",
+      "printf '%s\\n' '{\"prompt\":\"FILE_TRANSFER_PROMPT\",\"loaded\":[\"file-transfer\"],\"missing\":[]}'",
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(pythonPath, 0o755);
+
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    process.env.HERMES_PYTHON = pythonPath;
+    process.env.CLAWCONNECT_HERMES_API_URL = `http://127.0.0.1:${address.port}`;
+    process.env.CLAWCONNECT_HERMES_API_KEY = "test-api-key";
+    process.env.CLAWCONNECT_HERMES_STATE_DB = join(root, "missing-state.db");
+
+    const result = await runHermesChat(
+      { sessionKey: "main", message: "把桌面的蜘蛛侠图片发过来" },
+      { requestId: "run-file-transfer-skills-failed", gatewayId: "gw-hermes" },
+    );
+
+    assert.equal(result.output, "发送完成");
+    assert.deepEqual(apiChatCalls, []);
+    const args = JSON.parse(readFileSync(chatArgsPath, "utf8")) as string[];
+    assert.equal(args.includes("--skills"), true);
+    assert.equal(args.includes("file-transfer"), true);
+    assert.equal(args.includes("--yolo"), true);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);

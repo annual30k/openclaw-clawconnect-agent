@@ -15,22 +15,38 @@ export type HermesPreloadedSkillContext = {
   skillNames: string[];
 };
 
-export async function resolveHermesPreloadedSkillContext(): Promise<HermesPreloadedSkillContext> {
+type ResolveHermesPreloadedSkillContextOptions = {
+  forceFileTransfer?: boolean;
+};
+
+export async function resolveHermesPreloadedSkillContext(
+  options: ResolveHermesPreloadedSkillContextOptions = {},
+): Promise<HermesPreloadedSkillContext> {
   try {
     const output = await runHermesAsync(["skills", "list"], HERMES_SKILLS_LIST_TIMEOUT_MS);
     const skills = parseHermesSkillsList(output);
     const fileTransfer = skills.find((skill) => skill.skillKey === HERMES_FILE_TRANSFER_SKILL);
     if (fileTransfer && fileTransfer.enabled !== false) {
-      return {
-        cliArgs: ["--skills", HERMES_FILE_TRANSFER_SKILL],
-        requiredToolsets: ["terminal"],
-        skillNames: [HERMES_FILE_TRANSFER_SKILL],
-      };
+      return fileTransferContext();
+    }
+    if (!fileTransfer && options.forceFileTransfer) {
+      return fileTransferContext();
     }
   } catch {
-    // Hermes without skills support should still be able to answer normal chat.
+    // 普通聊天不能被 skills 探测失败影响；显式文件传输则必须保留 terminal 约束，避免落到无终端的 API 文本回复。
+    if (options.forceFileTransfer) {
+      return fileTransferContext();
+    }
   }
   return { cliArgs: [], requiredToolsets: [], skillNames: [] };
+}
+
+function fileTransferContext(): HermesPreloadedSkillContext {
+  return {
+    cliArgs: ["--skills", HERMES_FILE_TRANSFER_SKILL],
+    requiredToolsets: ["terminal"],
+    skillNames: [HERMES_FILE_TRANSFER_SKILL],
+  };
 }
 
 export async function buildHermesPreloadedSkillsPrompt(
