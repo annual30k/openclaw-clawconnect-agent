@@ -2,7 +2,8 @@ import { existsSync, unlinkSync } from "fs";
 import { execFileSync } from "child_process";
 import { t } from "../i18n/index.js";
 import { getServicePlatform, getServiceStatus, getServicePaths, installService, restartService, setRestrictiveFilePermissions, stopService, uninstallService, } from "../platform/service-manager.js";
-import { profileConfigPath, profileDisplayName } from "../config/profile.js";
+import { getActiveProfile, profileConfigPath, profileDisplayName } from "../config/profile.js";
+import { pairCommandForProfile } from "./profile-hints.js";
 export function isInstalled() {
     const platform = getServicePlatform();
     const servicePaths = getServicePaths();
@@ -112,7 +113,7 @@ export function resetCommand() {
     else {
         console.log(t("install.noConfig"));
     }
-    console.log(t("install.resetComplete"));
+    console.log(t("install.resetCompleteWithCommand", pairCommandForProfile(getActiveProfile())));
 }
 function servicePathsProfile() {
     const profile = getServicePaths().profile;

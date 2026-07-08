@@ -11,7 +11,8 @@ import {
   stopService,
   uninstallService,
 } from "../platform/service-manager.js";
-import { profileConfigPath, profileDisplayName } from "../config/profile.js";
+import { getActiveProfile, profileConfigPath, profileDisplayName } from "../config/profile.js";
+import { pairCommandForProfile } from "./profile-hints.js";
 
 export function isInstalled(): boolean {
   const platform = getServicePlatform();
@@ -123,7 +124,7 @@ export function resetCommand(): void {
     console.log(t("install.noConfig"));
   }
 
-  console.log(t("install.resetComplete"));
+  console.log(t("install.resetCompleteWithCommand", pairCommandForProfile(getActiveProfile())));
 }
 
 function servicePathsProfile(): string | undefined {

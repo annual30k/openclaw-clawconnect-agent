@@ -8,6 +8,7 @@ const en: Record<string, MsgValue> = {
   // pair
   "pair.alreadyRegistered": (id) => `Gateway already registered (id=${id}). Refreshing access code…`,
   "pair.invalidCredentials": "Invalid credentials (401). The server doesn't recognize this gateway.\nRun `clawconnect reset` to clear config and re-register.",
+  "pair.invalidCredentialsWithCommands": (resetCommand, pairCommand) => `Invalid credentials (401). The server doesn't recognize this gateway.\nRun \`${resetCommand}\` to clear this profile config, then run \`${pairCommand}\` to re-register.`,
   "pair.refreshFailed": (status, body) => `Failed to refresh access code: ${status} ${body}`,
   "pair.registering": "Registering with relay server…",
   "pair.registrationFailed": (status, body) => `Registration failed: ${status} ${body}`,
@@ -42,6 +43,7 @@ const en: Record<string, MsgValue> = {
   "install.removeConfigFailed": "Failed to remove config:",
   "install.noConfig": "No config file found.",
   "install.resetComplete": "\nReset complete. Run `clawconnect pair` to re-register.",
+  "install.resetCompleteWithCommand": (command) => `\nReset complete. Run \`${command}\` to re-register.`,
 
   // update
   "update.localInstallWarning": "Detected a local source checkout. `clawconnect update` only upgrades the globally installed npm package.",
@@ -102,6 +104,7 @@ const zh: Record<string, MsgValue> = {
   // pair
   "pair.alreadyRegistered": (id) => `网关已注册 (id=${id})，正在刷新访问码…`,
   "pair.invalidCredentials": "凭证无效 (401)，服务器无法识别此网关。\n请运行 `clawconnect reset` 清除配置后重新注册。",
+  "pair.invalidCredentialsWithCommands": (resetCommand, pairCommand) => `凭证无效 (401)，服务器无法识别此网关。\n请运行 \`${resetCommand}\` 清除此 profile 配置，然后运行 \`${pairCommand}\` 重新注册。`,
   "pair.refreshFailed": (status, body) => `刷新访问码失败：${status} ${body}`,
   "pair.registering": "正在向中继服务器注册…",
   "pair.registrationFailed": (status, body) => `注册失败：${status} ${body}`,
@@ -136,6 +139,7 @@ const zh: Record<string, MsgValue> = {
   "install.removeConfigFailed": "删除配置文件失败：",
   "install.noConfig": "未找到配置文件。",
   "install.resetComplete": "\n重置完成。请运行 `clawconnect pair` 重新注册。",
+  "install.resetCompleteWithCommand": (command) => `\n重置完成。请运行 \`${command}\` 重新注册。`,
 
   // update
   "update.localInstallWarning": "检测到当前是本地源码目录运行。`clawconnect update` 只会升级全局 npm 安装的版本。",

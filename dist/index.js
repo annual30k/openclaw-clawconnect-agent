@@ -11,13 +11,14 @@ import { statusCommand } from "./commands/status.js";
 import { setTokenCommand } from "./commands/set-token.js";
 import { updateCommand } from "./commands/update.js";
 import { listProfileNames, setActiveProfile } from "./config/profile.js";
+import { MAIN_HELP_TEXT, PAIR_HERMES_HELP_TEXT, PAIR_OPENCLAW_HELP_TEXT, RESET_PROFILE_HELP_TEXT, } from "./commands/profile-hints.js";
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
 ensureUserEnvFile();
 loadAgentEnv();
 ensureWindowsConsoleUtf8();
 const program = new Command();
-const profileOption = ["-p, --profile <name>", "Profile name (for example: hermes, openclaw)"];
+const profileOption = ["-p, --profile <name>", "Profile name (for example: hermes, openclaw). Shortcut commands use isolated profiles."];
 const LOCAL_RELAY_SERVER_URL = "http://127.0.0.1:8080";
 async function runPairCommand(opts) {
     setActiveProfile(opts.profile);
@@ -47,7 +48,8 @@ function runInstallCommand(opts) {
 program
     .name("clawconnect")
     .description("ClawConnect host agent — connects OpenClaw gateway hosts to your relay server")
-    .version(version);
+    .version(version)
+    .addHelpText("after", MAIN_HELP_TEXT);
 program
     .command("pair")
     .description("Register with relay server and display QR code for iOS pairing")
@@ -73,6 +75,7 @@ program
     .option("-n, --name <name>", "Display name for this host", "Mac OpenClaw")
     .option("--local", `Use local relay server (${LOCAL_RELAY_SERVER_URL})`, false)
     .option("--code-only", "Print only the access code and skip QR code output", false)
+    .addHelpText("after", PAIR_OPENCLAW_HELP_TEXT)
     .action(async (opts) => {
     try {
         await runPairCommand({
@@ -93,6 +96,7 @@ program
     .option("-n, --name <name>", "Display name for this host", "Mac Hermes Agent")
     .option("--local", `Use local relay server (${LOCAL_RELAY_SERVER_URL})`, false)
     .option("--code-only", "Print only the access code and skip QR code output", false)
+    .addHelpText("after", PAIR_HERMES_HELP_TEXT)
     .action(async (opts) => {
     try {
         await runPairCommand({
@@ -243,11 +247,26 @@ program
 });
 program
     .command("reset")
-    .description("Clear saved config and stop service — use when switching servers or on auth errors")
+    .description("Clear saved config and stop service — use with --profile when resetting pair-openclaw or pair-hermes")
     .option(...profileOption)
+    .addHelpText("after", RESET_PROFILE_HELP_TEXT)
     .action((opts) => {
     setActiveProfile(opts.profile);
     resetCommand();
+});
+program
+    .command("reset-openclaw")
+    .description("Shortcut: reset the OpenClaw profile")
+    .addHelpText("after", "Equivalent to: clawconnect reset --profile openclaw\n")
+    .action(() => {
+    runWithProfile("openclaw", resetCommand);
+});
+program
+    .command("reset-hermes")
+    .description("Shortcut: reset the Hermes Agent profile")
+    .addHelpText("after", "Equivalent to: clawconnect reset --profile hermes\n")
+    .action(() => {
+    runWithProfile("hermes", resetCommand);
 });
 program
     .command("update")

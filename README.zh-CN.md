@@ -93,6 +93,13 @@ clawconnect install
 
 不带 `--profile` 时，`clawconnect install` 会安装当前能找到的所有已配对 profile。只想指定一个 profile 时，可以用 `clawconnect install-openclaw`、`clawconnect install-hermes`，或 `clawconnect install --profile <name>`。
 
+清除失效凭证时也必须使用同一个 profile。如果 `pair-openclaw` 或 `pair-hermes` 提示凭证无效，不要只运行默认 `clawconnect reset`，而是重置对应 profile：
+
+```bash
+clawconnect reset-openclaw
+clawconnect reset-hermes
+```
+
 查看两个实例：
 
 ```bash
@@ -235,6 +242,15 @@ clawconnect uninstall
 ```bash
 clawconnect reset
 ```
+
+快捷配对命令使用独立 profile。修复 OpenClaw 或 Hermes 配对时，请使用对应的 reset 命令：
+
+```bash
+clawconnect reset-openclaw
+clawconnect reset-hermes
+```
+
+自定义 profile 仍使用 `clawconnect reset --profile <name>`。
 
 ### 11. 升级到最新版本
 

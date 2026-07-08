@@ -86,6 +86,13 @@ clawconnect install
 
 Without `--profile`, `clawconnect install` installs every paired profile it finds. To target one profile explicitly, use `clawconnect install-openclaw`, `clawconnect install-hermes`, or `clawconnect install --profile <name>`.
 
+The same profile rule applies when clearing stale credentials. If `pair-openclaw` or `pair-hermes` reports invalid credentials, reset the matching profile instead of the default config:
+
+```bash
+clawconnect reset-openclaw
+clawconnect reset-hermes
+```
+
 Check both instances:
 
 ```bash
@@ -223,6 +230,15 @@ Stop the service and clear local pairing config:
 ```bash
 clawconnect reset
 ```
+
+Shortcut pair commands use isolated profiles. Use the matching reset command when repairing those pairings:
+
+```bash
+clawconnect reset-openclaw
+clawconnect reset-hermes
+```
+
+For custom profiles, use `clawconnect reset --profile <name>`.
 
 ### Update to the Latest Version
 

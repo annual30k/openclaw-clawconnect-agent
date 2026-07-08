@@ -10,6 +10,7 @@ import { getServicePlatform } from "../platform/service-manager.js";
 import { toRelayHttpBase } from "../core/relay/file-upload-utils.js";
 import { getDefaultRelayServerUrl } from "../config/env.js";
 import { gatewayCapabilitiesForType, normalizeGatewayType } from "../gateway-profiles.js";
+import { pairCommandForProfile, resetCommandForProfile } from "./profile-hints.js";
 
 interface PairOptions {
   server?: string;
@@ -56,7 +57,11 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
     if (!res.ok) {
       const body = await res.text();
       if (res.status === 401) {
-        throw new Error(t("pair.invalidCredentials"));
+        throw new Error(t(
+          "pair.invalidCredentialsWithCommands",
+          resetCommandForProfile(opts.profile),
+          pairCommandForProfile(opts.profile)
+        ));
       }
       throw new Error(t("pair.refreshFailed", String(res.status), body));
     }
