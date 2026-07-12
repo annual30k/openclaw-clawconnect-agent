@@ -218,6 +218,58 @@ test("transcript history provider returns a canonical timeline snapshot page", a
   }
 });
 
+test("transcript history provider uses transcript message id as timeline identity fallback", async () => {
+  const fixture = await createTranscriptFixture(2, [
+    {
+      type: "message",
+      id: "transcript-user-1",
+      timestamp: "2026-05-28T01:00:00.000Z",
+      message: {
+        role: "user",
+        content: "hello from transcript id",
+      },
+    },
+    {
+      type: "message",
+      id: "transcript-assistant-1",
+      timestamp: "2026-05-28T01:00:01.000Z",
+      message: {
+        role: "assistant",
+        content: "answer from transcript id",
+      },
+    },
+  ]);
+  try {
+    const page = await readChatHistoryFromTranscriptFile({
+      sessionKey: "agent:main:main",
+      transcriptPath: fixture.path,
+      limit: 20,
+    });
+    const snapshot = (page as HistoryResponse & {
+      timelineSnapshot?: { messages: Array<Record<string, unknown>> };
+    }).timelineSnapshot;
+
+    assert.deepEqual(snapshot?.messages.map((message) => ({
+      turnId: message.turnId,
+      runId: message.runId,
+      messageId: message.messageId,
+    })), [
+      {
+        turnId: "transcript-user-1",
+        runId: "transcript-user-1",
+        messageId: "transcript-user-1",
+      },
+      {
+        turnId: "transcript-assistant-1",
+        runId: "transcript-assistant-1",
+        messageId: "transcript-assistant-1",
+      },
+    ]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("transcript history provider does not emit epoch timestamps when message time is missing", async () => {
   const fixture = await createTranscriptFixture(2, [
     {

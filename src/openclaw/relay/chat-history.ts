@@ -132,16 +132,18 @@ export async function readChatHistoryFromTranscriptFile(
         const role = normalizeTimelineRole(message.role);
         const clientMessageId = historyString(message, "clientMessageId", "client_message_id");
         const idempotencyKey = historyString(message, "idempotencyKey", "idempotency_key");
+        const messageId = historyString(message, "messageId", "message_id", "id");
         const turnId =
           historyString(message, "turnId", "turn_id")
           ?? idempotencyKey
           ?? clientMessageId
+          ?? messageId
           ?? `history-${request.sessionKey}-${seq}-${role}`;
         const content = normalizeTimelineContentBlocks(message.content);
         return {
           turnId,
           runId: historyString(message, "runId", "run_id") ?? turnId,
-          messageId: historyString(message, "messageId", "message_id", "id") ?? `${role}-${turnId}`,
+          messageId: messageId ?? `${role}-${turnId}`,
           role,
           messageState: normalizeTimelineMessageState(message),
           createdAt: normalizeTimelineCreatedAt(message) ?? fallbackTimelineCreatedAt(page.messages, index),
