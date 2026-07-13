@@ -302,7 +302,12 @@ export async function runGatewayLifecycleStreaming(
   const requestId = context.requestId;
   const gatewayId = context.gatewayId;
 
-  const emitLine = (stream: "stdout" | "stderr", line: string): void => {
+  const emitLine = (
+    stream: "stdout" | "stderr" | "status",
+    line: string,
+    completion?: { status: "completed" | "failed"; exitCode?: number | null },
+  ): void => {
+    // 网关维护必须使用独立事件并携带确定的终态，避免客户端与 doctor 修复日志串线或永久停留在执行中。
     const trimmed = line.replace(/\u001B\[[0-9;]*[A-Za-z]/g, "").replace(/\r$/, "");
     if (!trimmed && stream !== "stderr") {
       return;
@@ -311,7 +316,7 @@ export async function runGatewayLifecycleStreaming(
     if (publishEvent) {
       publishEvent({
         type: "event",
-        event: "doctor_fix_log",
+        event: "maintenance_log",
         payload: {
           gatewayId,
           requestId,
@@ -320,6 +325,8 @@ export async function runGatewayLifecycleStreaming(
           seq: sequence += 1,
           ts: Date.parse(timestamp),
           text: trimmed,
+          action,
+          ...completion,
         },
       });
     }
@@ -356,7 +363,7 @@ export async function runGatewayLifecycleStreaming(
   pump(child.stdout, "stdout");
   pump(child.stderr, "stderr");
 
-  emitLine("stdout", `Running: openclaw gateway ${action}...`);
+  emitLine("status", `Running: openclaw gateway ${action}`);
 
   return await new Promise<LocalResult>((resolve) => {
     let settled = false;
@@ -372,7 +379,7 @@ export async function runGatewayLifecycleStreaming(
       if (publishEvent) {
         publishEvent({
           type: "event",
-          event: "doctor_fix_log",
+          event: "maintenance_log",
           payload: {
             gatewayId,
             requestId,
@@ -381,6 +388,8 @@ export async function runGatewayLifecycleStreaming(
             seq: sequence += 1,
             ts: Date.now(),
             text: `failed to start gateway ${action}: ${String(error)}`,
+            action,
+            status: "failed",
           },
         });
       }
@@ -395,23 +404,12 @@ export async function runGatewayLifecycleStreaming(
         typeof code === "number"
           ? `openclaw gateway ${action} exited with code ${code}`
           : `openclaw gateway ${action} exited${signal ? ` with signal ${signal}` : ""}`;
-      if (publishEvent) {
-        publishEvent({
-          type: "event",
-          event: "doctor_fix_log",
-          payload: {
-            gatewayId,
-            requestId,
-            runId: requestId,
-            stream: "status",
-            seq: sequence += 1,
-            ts: Date.now(),
-            text: exitSummary,
-          },
-        });
-      }
+      emitLine("status", exitSummary, {
+        status: code === 0 ? "completed" : "failed",
+        exitCode: code,
+      });
 
-      if (code && code !== 0) {
+      if (code !== 0) {
         finish({
           ok: false,
           error: output.trim() ? `${exitSummary}\n${output.trim()}` : exitSummary,
@@ -430,8 +428,8 @@ export async function runGatewayLifecycleStreaming(
 export async function runDoctorFix(context: LocalCommandContext = {}): Promise<LocalResult> {
   const openclawBin = getOpenclawBin();
   const spawnArgs = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
-    ? [openclawBin, "doctor", "--fix"]
-    : ["doctor", "--fix"];
+    ? [openclawBin, "doctor", "--fix", "--non-interactive", "--yes"]
+    : ["doctor", "--fix", "--non-interactive", "--yes"];
   const spawnExe = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
     ? process.execPath
     : openclawBin;
@@ -526,6 +524,8 @@ export async function runDoctorFix(context: LocalCommandContext = {}): Promise<L
             requestId,
             runId: requestId,
             stream: "stderr",
+            status: "failed",
+            exitCode: null,
             seq: sequence += 1,
             ts: Date.now(),
             text: `failed to start: ${String(error)}`,
@@ -552,6 +552,8 @@ export async function runDoctorFix(context: LocalCommandContext = {}): Promise<L
             requestId,
             runId: requestId,
             stream: "status",
+            status: code === 0 ? "completed" : "failed",
+            exitCode: code,
             seq: sequence += 1,
             ts: Date.now(),
             text: exitSummary,
@@ -559,7 +561,8 @@ export async function runDoctorFix(context: LocalCommandContext = {}): Promise<L
         });
       }
 
-      if (code && code !== 0) {
+      // 被 signal 终止时 code 为 null，也必须形成失败终态，不能让客户端误报修复成功。
+      if (code !== 0) {
         finish({
           ok: false,
           error: output.trim() ? `${exitSummary}\n${output.trim()}` : exitSummary,

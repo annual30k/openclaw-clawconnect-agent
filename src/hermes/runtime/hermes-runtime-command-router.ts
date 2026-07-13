@@ -14,7 +14,7 @@ import {
   runHermesCronRun,
   runHermesCronUpdate,
 } from "./hermes-runtime-cron.js";
-import { runClawConnectProfileRestart, runHermesLifecycle } from "./hermes-runtime-lifecycle.js";
+import { runHermesLifecycle } from "./hermes-runtime-lifecycle.js";
 import { runHermesModelList, runHermesModelSelect } from "./hermes-runtime-models.js";
 import { runHermesLogs } from "./hermes-runtime-command-utils.js";
 import { runHermesChatHistory } from "./hermes-runtime-history.js";
@@ -113,7 +113,8 @@ export function handleHermesCommand(
       return runHermesLifecycle("stop", context);
     case "hermes.gateway.restart":
     case "hermes.agent.restart":
-      return runClawConnectProfileRestart(context);
+      // 两个移动端入口都重启 Hermes 自身；ClawConnect 仅作为在线控制通道，不能在此自重启。
+      return runHermesLifecycle("restart", context);
     case "hermes.backup.create":
       return runHermesBackupCreate(params);
     case "hermes.backup.list":
