@@ -54,9 +54,11 @@ export async function runHermesModelSelect(params: unknown): Promise<LocalResult
   }
 
   try {
-    runHermes(["config", "set", "model.default", resolvedModel], 10_000);
     if (providerId) {
-      runHermes(["config", "set", "model.provider", providerId], 10_000);
+      // 使用 Hermes 官方模型赋值入口，跨 provider 时会同步清理旧 base_url/api_key/api_mode。
+      runHermesPython(hermesModelAssignmentScript(providerId, resolvedModel));
+    } else {
+      runHermes(["config", "set", "model.default", resolvedModel], 10_000);
     }
     const snapshot = readHermesStatusSnapshot();
     return {
@@ -72,6 +74,19 @@ export async function runHermesModelSelect(params: unknown): Promise<LocalResult
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+export function hermesModelAssignmentScript(providerId: string, modelId: string): string {
+  return [
+    "from hermes_cli.inventory import load_picker_context",
+    "from hermes_cli.providers import resolve_provider_full",
+    "from hermes_cli.web_server import _apply_model_assignment_sync",
+    "ctx = load_picker_context()",
+    `provider = ${JSON.stringify(providerId)}`,
+    "provider_def = resolve_provider_full(provider, ctx.user_providers, ctx.custom_providers)",
+    "base_url = provider_def.base_url if provider_def is not None else \"\"",
+    `_apply_model_assignment_sync("main", provider, ${JSON.stringify(modelId)}, "", base_url)`,
+  ].join("\n");
 }
 
 export function hermesModelListResultFromPayload(
@@ -106,8 +121,9 @@ export function modelItemsFromHermesModelOptionsPayload(
 ): HermesModelListItem[] {
   const record = toRecord(payload);
   const providers = Array.isArray(record.providers) ? record.providers.map(toRecord) : [];
-  const selectedProvider = stringValue(record.provider) ?? current.provider ?? config.provider;
-  const selectedModel = stringValue(record.model) ?? current.currentModel ?? config.model;
+  // Hermes picker inventory 在切换后可能滞后；运行时状态和持久化配置代表已接受的选择，必须优先。
+  const selectedProvider = current.provider ?? config.provider ?? stringValue(record.provider);
+  const selectedModel = current.currentModel ?? config.model ?? stringValue(record.model);
   const items: HermesModelListItem[] = [];
 
   for (const provider of providers) {

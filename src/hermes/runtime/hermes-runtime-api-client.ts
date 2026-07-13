@@ -216,6 +216,12 @@ async function createHermesApiSession(config: HermesApiConfig, sessionKey: strin
   }, HERMES_API_HEALTH_TIMEOUT_MS);
   const payload = await readJsonResponse(response);
   if (!response.ok) {
+    const existingSessionId = response.status === 400
+      ? await findExistingHermesApiSessionByTitle(config, sessionKey)
+      : undefined;
+    if (existingSessionId) {
+      return existingSessionId;
+    }
     throw new Error(`Hermes API session create failed: ${extractHermesApiError(payload, response.status)}`);
   }
   const sessionId = extractSessionId(payload);
@@ -223,6 +229,32 @@ async function createHermesApiSession(config: HermesApiConfig, sessionKey: strin
     throw new Error("Hermes API session create failed: missing session id");
   }
   return sessionId;
+}
+
+async function findExistingHermesApiSessionByTitle(
+  config: HermesApiConfig,
+  sessionKey: string,
+): Promise<string | undefined> {
+  try {
+    const response = await fetchWithTimeout(`${config.baseUrl}/api/sessions`, {
+      headers: buildHermesApiHeaders(config),
+    }, HERMES_API_HEALTH_TIMEOUT_MS);
+    if (!response.ok) return undefined;
+    const payload = await readJsonResponse(response);
+    const data = payload && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>).data
+      : undefined;
+    if (!Array.isArray(data)) return undefined;
+    const matches = data.filter((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+      const record = item as Record<string, unknown>;
+      return stringValue(record.title) === sessionKey && stringValue(record.source) === "api_server";
+    });
+    if (matches.length !== 1) return undefined;
+    return stringValue((matches[0] as Record<string, unknown>).id) || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function openHermesApiChatStream(

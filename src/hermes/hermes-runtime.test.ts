@@ -21,6 +21,7 @@ import {
 } from "./hermes-runtime.js";
 import { runHermesSessionExport } from "./runtime/hermes-runtime-sessions.js";
 import {
+  hermesModelAssignmentScript,
   hermesModelListResultFromPayload,
   modelItemsFromHermesModelOptionsPayload,
 } from "./runtime/hermes-runtime-models.js";
@@ -31,6 +32,7 @@ import {
   rememberHermesSession,
 } from "./hermes-session-store.js";
 import {
+  mergeHermesLiveAndSessionUsage,
   readHermesContextLimitFromModelsDevCacheRecord,
 } from "./runtime/hermes-runtime-usage.js";
 
@@ -233,6 +235,63 @@ test("runHermesChat starts ordinary text chat without preflight status or skills
     assert.notEqual(chatIndex, -1);
     assert.equal(calls.slice(0, chatIndex).includes("status:"), false);
     assert.equal(calls.slice(0, chatIndex).includes("skills:list"), false);
+  } finally {
+    restoreEnv("HERMES_BIN", previousHermesBin);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat rejects an empty successful Hermes response", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hermes-empty-response-"));
+  const previousHermesBin = process.env.HERMES_BIN;
+  try {
+    const hermesBin = join(dir, "hermes");
+    writeFileSync(hermesBin, [
+      "#!/usr/bin/env node",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'sessions' && args[1] === 'list') process.exit(0);",
+      "if (args[0] === 'status') process.exit(0);",
+      "if (args[0] === 'chat') process.exit(0);",
+      "process.exit(2);",
+      "",
+    ].join("\n"));
+    chmodSync(hermesBin, 0o755);
+    process.env.HERMES_BIN = hermesBin;
+
+    await assert.rejects(
+      runHermesChat({ message: "ping", sessionKey: "main" }),
+      /Hermes 未返回可见回复.*模型额度.*Provider 凭据/,
+    );
+  } finally {
+    restoreEnv("HERMES_BIN", previousHermesBin);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat rejects provider failure text returned with exit zero", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hermes-provider-failure-"));
+  const previousHermesBin = process.env.HERMES_BIN;
+  try {
+    const hermesBin = join(dir, "hermes");
+    writeFileSync(hermesBin, [
+      "#!/usr/bin/env node",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'sessions' && args[1] === 'list') process.exit(0);",
+      "if (args[0] === 'status') process.exit(0);",
+      "if (args[0] === 'chat') {",
+      "  console.log('API call failed after 3 retries: HTTP 429: Token Plan usage limit reached');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"));
+    chmodSync(hermesBin, 0o755);
+    process.env.HERMES_BIN = hermesBin;
+
+    await assert.rejects(
+      runHermesChat({ message: "ping", sessionKey: "main" }),
+      /API call failed after 3 retries: HTTP 429/,
+    );
   } finally {
     restoreEnv("HERMES_BIN", previousHermesBin);
     rmSync(dir, { recursive: true, force: true });
@@ -505,6 +564,26 @@ test("parseHermesSessionUsageSnapshot reads compact context window values", () =
   assert.equal(snapshot.contextLimit, 1000000);
 });
 
+test("live Hermes status keeps old session model metadata from replacing the current model", () => {
+  const snapshot = mergeHermesLiveAndSessionUsage({
+    currentModel: "gpt-5.6-luna",
+    provider: "OpenAI Codex",
+    contextLimit: 1000000,
+  }, {
+    currentModel: "hermes-agent",
+    contextUsage: 237603,
+    contextLimit: 400000,
+  }, "api_1782874930_1ddb81e1");
+
+  assert.deepEqual(snapshot, {
+    currentModel: "gpt-5.6-luna",
+    provider: "OpenAI Codex",
+    contextUsage: 237603,
+    contextLimit: 1000000,
+    hermesSessionId: "api_1782874930_1ddb81e1",
+  });
+});
+
 test("Hermes context limit falls back to model id across provider cache entries", () => {
   const cache = {
     "future-provider": {
@@ -735,6 +814,41 @@ test("Codex provider models come from Hermes payload rather than fixed fallback 
 
   assert.deepEqual(items.map((item) => item.modelId), ["custom-codex-from-hermes"]);
   assert.equal(items[0]?.isSelected, true);
+});
+
+test("model options prefer current Hermes status when picker context is stale", () => {
+  const items = modelItemsFromHermesModelOptionsPayload({
+    provider: "xiaomi",
+    model: "mimo-v2.5-pro",
+    providers: [
+      {
+        slug: "xiaomi",
+        name: "Xiaomi",
+        is_current: true,
+        models: ["mimo-v2.5-pro"],
+      },
+      {
+        slug: "openai-codex",
+        name: "OpenAI Codex",
+        models: ["gpt-5.6-luna"],
+      },
+    ],
+  }, {
+    provider: "openai-codex",
+    currentModel: "gpt-5.6-luna",
+  });
+
+  assert.equal(items.find((item) => item.modelId === "mimo-v2.5-pro")?.isSelected, false);
+  assert.equal(items.find((item) => item.modelId === "gpt-5.6-luna")?.isSelected, true);
+});
+
+test("Hermes model assignment uses the official provider-aware config path", () => {
+  const script = hermesModelAssignmentScript("openai-api", "gpt-4o-mini");
+
+  assert.match(script, /_apply_model_assignment_sync/);
+  assert.match(script, /resolve_provider_full/);
+  assert.match(script, /provider = "openai-api"/);
+  assert.match(script, /provider, "gpt-4o-mini", "", base_url/);
 });
 
 test("Hermes model list does not synthesize fallback models when Hermes returns none", () => {

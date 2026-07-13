@@ -396,6 +396,77 @@ test("runHermesChat uses the Hermes API server stream instead of spawning the CL
   }
 });
 
+test("runHermesChat recovers the unique existing API session after a title conflict", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-api-title-conflict-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousApiUrl = process.env.CLAWCONNECT_HERMES_API_URL;
+  const previousApiKey = process.env.CLAWCONNECT_HERMES_API_KEY;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  const hermesSessionId = "api_existing_main";
+  const requests: string[] = [];
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      requests.push(`${req.method} ${req.url}`);
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/sessions") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "Title 'main' is already in use" } }));
+        return;
+      }
+      if (req.method === "GET" && req.url === "/api/sessions") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          object: "list",
+          data: [{ id: hermesSessionId, source: "api_server", title: "main" }],
+        }));
+        return;
+      }
+      if (req.method === "POST" && req.url === `/api/sessions/${hermesSessionId}/chat/stream`) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write("event: assistant.completed\n");
+        res.write(`data: ${JSON.stringify({ session_id: hermesSessionId, content: "MIMO_OK" })}\n\n`);
+        res.write("event: done\n");
+        res.write("data: {}\n\n");
+        res.end();
+        return;
+      }
+      res.writeHead(404).end();
+    });
+  });
+
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = join(root, "sessions.json");
+    process.env.CLAWCONNECT_HERMES_API_URL = `http://127.0.0.1:${address.port}`;
+    process.env.CLAWCONNECT_HERMES_API_KEY = "test-api-key";
+    process.env.CLAWCONNECT_HERMES_STATE_DB = join(root, "missing-state.db");
+
+    const result = await runHermesChat({ sessionKey: "main", message: "hello" });
+
+    assert.equal(result.output, "MIMO_OK");
+    assert.deepEqual(requests.slice(0, 4), [
+      "GET /health",
+      "POST /api/sessions",
+      "GET /api/sessions",
+      `POST /api/sessions/${hermesSessionId}/chat/stream`,
+    ]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("CLAWCONNECT_HERMES_API_URL", previousApiUrl);
+    restoreEnv("CLAWCONNECT_HERMES_API_KEY", previousApiKey);
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runHermesChat recovers empty Hermes API final output from state DB history", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-api-empty-final-"));
   const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;

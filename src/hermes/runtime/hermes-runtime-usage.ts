@@ -93,17 +93,30 @@ export async function collectHermesUsageSnapshot(hermesSessionId?: string): Prom
     const output = stateDbExport
       ? JSON.stringify(stateDbExport)
       : await runHermesAsync(["sessions", "export", "-", "--session-id", sessionId], 10 * 60_000);
-    return enrichHermesUsageSnapshot(mergeHermesUsageSnapshots(
+    return mergeHermesLiveAndSessionUsage(
       status,
       parseHermesSessionUsageSnapshot(output),
-      { hermesSessionId: sessionId },
-    ));
+      sessionId,
+    );
   } catch {
     return {
       ...status,
       hermesSessionId: sessionId,
     };
   }
+}
+
+export function mergeHermesLiveAndSessionUsage(
+  status: HermesUsageSnapshot,
+  session: HermesUsageSnapshot,
+  hermesSessionId?: string,
+): HermesUsageSnapshot {
+  // 会话导出可能记录旧模型或内部 agent 名称；实时 status 对模型、provider 和上下文上限更权威。
+  return enrichHermesUsageSnapshot(mergeHermesUsageSnapshots(
+    session,
+    status,
+    hermesSessionId ? { hermesSessionId } : {},
+  ));
 }
 
 export function parseHermesStatusSnapshot(output: string): HermesUsageSnapshot {
