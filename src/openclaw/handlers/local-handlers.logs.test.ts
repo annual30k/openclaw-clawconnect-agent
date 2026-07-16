@@ -59,6 +59,7 @@ test("logs command returns all log lines from the newest file by default", () =>
   assert.equal(result?.ok, true);
 
   const payload = result?.payload as any;
+  assert.equal(payload.source, "connection");
   assert.equal(payload.logPath, latestLogPath);
   assert.equal(payload.totalLines, 120);
   assert.equal(payload.returnedLines, 120);
@@ -89,6 +90,29 @@ test("logs command strips ANSI codes", async () => {
   const payload = result?.payload as any;
   
   assert.equal(payload.lines[0], "SUCCESS");
+});
+
+test("logs command reads OpenClaw gateway and error sources explicitly", async () => {
+  const gatewayLogPath = join(logsDir, "gateway.log");
+  const gatewayErrorLogPath = join(logsDir, "gateway.err.log");
+  await writeFile(gatewayLogPath, "gateway-started\ngateway-ready\n");
+  await writeFile(gatewayErrorLogPath, "gateway-failed\n");
+
+  const gatewayPayload = handleLocalCommand("clawpilot.logs", { source: "gateway" })?.payload as any;
+  const errorPayload = handleLocalCommand("clawpilot.logs", { source: "gateway-error" })?.payload as any;
+
+  assert.equal(gatewayPayload.source, "gateway");
+  assert.equal(gatewayPayload.logPath, gatewayLogPath);
+  assert.deepEqual(gatewayPayload.lines, ["gateway-started", "gateway-ready"]);
+  assert.equal(errorPayload.source, "gateway-error");
+  assert.equal(errorPayload.logPath, gatewayErrorLogPath);
+  assert.deepEqual(errorPayload.lines, ["gateway-failed"]);
+});
+
+test("logs command rejects unknown sources", () => {
+  const result = handleLocalCommand("clawpilot.logs", { source: "../../secrets" });
+  assert.equal(result?.ok, false);
+  assert.equal(result?.error, "invalid_log_source");
 });
 
 test("logs command reads the active profile log before newer default logs", async () => {

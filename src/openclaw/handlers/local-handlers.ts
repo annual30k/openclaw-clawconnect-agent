@@ -17,6 +17,8 @@ import {
 const OPENCLAW_DIR = join(homedir(), ".openclaw");
 const CLAWCONNECT_DIR = join(homedir(), ".clawconnect");
 const OPENCLAW_CONFIG = join(OPENCLAW_DIR, "openclaw.json");
+const LOG_SOURCES = ["connection", "gateway", "gateway-error"] as const;
+type LogSource = typeof LOG_SOURCES[number];
 
 // ---------------------------------------------------------------------------
 
@@ -304,7 +306,11 @@ function readLogs(params: unknown = undefined): LocalResult {
     const p = params && typeof params === "object" && !Array.isArray(params)
       ? (params as Record<string, unknown>)
       : {};
-    const limit = typeof p.limit === "number" ? p.limit : 500;
+    const limit = Math.min(1000, Math.max(1, typeof p.limit === "number" ? Math.floor(p.limit) : 500));
+    const source = normalizeLogSource(p.source);
+    if (!source) {
+      return { ok: false, error: "invalid_log_source" };
+    }
 
     const candidates: string[] = [];
     const profileCandidates: string[] = [];
@@ -312,7 +318,7 @@ function readLogs(params: unknown = undefined): LocalResult {
       if (existsSync(path)) profileCandidates.push(path);
     };
 
-    const activeProfile = getActiveProfile();
+    const activeProfile = source === "connection" ? getActiveProfile() : undefined;
     let currentGatewayId: string | undefined;
     if (activeProfile) {
       addExistingProfileLog(profileLogPath(activeProfile));
@@ -324,8 +330,13 @@ function readLogs(params: unknown = undefined): LocalResult {
       }
     }
 
-    // 当前网关通常运行在隔离 profile 内；有 profile 日志时不要被默认 profile 的陈旧错误日志抢占。
-    if (profileCandidates.length > 0) {
+    if (source === "gateway" || source === "gateway-error") {
+      const filename = source === "gateway" ? "gateway.log" : "gateway.err.log";
+      for (const path of [join(OPENCLAW_DIR, "logs", filename), join(OPENCLAW_DIR, filename)]) {
+        if (existsSync(path)) candidates.push(path);
+      }
+    } else if (profileCandidates.length > 0) {
+      // 当前网关通常运行在隔离 profile 内；有 profile 日志时不要被默认 profile 的陈旧错误日志抢占。
       candidates.push(...profileCandidates);
     } else {
       // Primary: ~/.clawconnect/ — where the service (Linux systemd/nohup,
@@ -351,7 +362,17 @@ function readLogs(params: unknown = undefined): LocalResult {
     }
 
     if (candidates.length === 0) {
-      return { ok: true, payload: { output: "No log files found." } };
+      return {
+        ok: true,
+        payload: {
+          source,
+          lines: [],
+          totalLines: 0,
+          returnedLines: 0,
+          truncated: false,
+          output: "",
+        },
+      };
     }
 
     const sorted = candidates
@@ -450,6 +471,7 @@ function readLogs(params: unknown = undefined): LocalResult {
     return {
       ok: true,
       payload: {
+        source,
         logPath: latest,
         lines,
         totalLines,
@@ -461,6 +483,11 @@ function readLogs(params: unknown = undefined): LocalResult {
   } catch (err) {
     return { ok: false, error: errorMessage(err) };
   }
+}
+
+function normalizeLogSource(value: unknown): LogSource | null {
+  const source = typeof value === "string" ? value.trim().toLowerCase() : "connection";
+  return LOG_SOURCES.includes(source as LogSource) ? source as LogSource : null;
 }
 
 function restartGateway(context: LocalCommandContext = {}): LocalResult | Promise<LocalResult> {
