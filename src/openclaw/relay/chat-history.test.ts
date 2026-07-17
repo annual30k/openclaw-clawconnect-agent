@@ -270,6 +270,61 @@ test("transcript history provider uses transcript message id as timeline identit
   }
 });
 
+test("transcript history provider carries the mobile run id through the parent chain", async () => {
+  const fixture = await createTranscriptFixture(3, [
+    {
+      type: "message",
+      id: "transcript-user-mobile",
+      timestamp: "2026-05-28T01:00:00.000Z",
+      message: {
+        role: "user",
+        content: "mobile prompt",
+        idempotencyKey: "mobile-run-42:user",
+      },
+    },
+    {
+      type: "message",
+      id: "transcript-assistant-tool",
+      parentId: "transcript-user-mobile",
+      timestamp: "2026-05-28T01:00:01.000Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tool-1", name: "image" }],
+      },
+    },
+    {
+      type: "message",
+      id: "transcript-assistant-final",
+      parentId: "transcript-assistant-tool",
+      timestamp: "2026-05-28T01:00:02.000Z",
+      message: {
+        role: "assistant",
+        content: "final answer",
+      },
+    },
+  ]);
+  try {
+    const page = await readChatHistoryFromTranscriptFile({
+      sessionKey: "agent:main:main",
+      transcriptPath: fixture.path,
+      limit: 20,
+    });
+    const snapshot = page.timelineSnapshot;
+
+    assert.deepEqual(snapshot?.messages.map((message) => ({
+      messageId: message.messageId,
+      turnId: message.turnId,
+      runId: message.runId,
+    })), [
+      { messageId: "transcript-user-mobile", turnId: "mobile-run-42:user", runId: "mobile-run-42:user" },
+      { messageId: "transcript-assistant-tool", turnId: "mobile-run-42", runId: "mobile-run-42" },
+      { messageId: "transcript-assistant-final", turnId: "mobile-run-42", runId: "mobile-run-42" },
+    ]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("transcript history provider does not emit epoch timestamps when message time is missing", async () => {
   const fixture = await createTranscriptFixture(2, [
     {

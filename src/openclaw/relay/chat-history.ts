@@ -24,6 +24,9 @@ export type HistoryMessage = {
   idempotencyKey?: string;
   stopReason?: string;
   errorMessage?: string;
+  parentId?: string;
+  turnId?: string;
+  runId?: string;
 };
 
 export type HistoryContentBlock = Record<string, unknown> & {
@@ -197,6 +200,7 @@ async function readIndexedTranscriptMessages(transcriptPath: string): Promise<Hi
       messages.push(message);
     }
   }
+  restoreTranscriptTurnLineage(messages);
 
   transcriptHistoryCache.set(transcriptPath, {
     size: stats.size,
@@ -236,7 +240,57 @@ function parseTranscriptHistoryLine(line: string, seq: number): HistoryMessage |
   if (createdAt && (typeof message.createdAt !== "string" || message.createdAt.trim().length === 0)) {
     message.createdAt = createdAt;
   }
+  if (typeof parsed.parentId === "string" && parsed.parentId.trim().length > 0) {
+    message.parentId = parsed.parentId.trim();
+  }
   return message;
+}
+
+/**
+ * OpenClaw transcript entries form an explicit parent chain, while realtime
+ * events use the mobile request id as runId. Carry the originating user
+ * idempotency key through that chain so history and realtime resolve to the
+ * same canonical message without comparing text or timestamps.
+ */
+function restoreTranscriptTurnLineage(messages: HistoryMessage[]): void {
+  const byId = new Map<string, HistoryMessage>();
+  for (const message of messages) {
+    const id = cleanHistoryString(message.id);
+    if (id) byId.set(id, message);
+  }
+
+  for (const message of messages) {
+    if (message.role === "user" || cleanHistoryString(message.runId) || cleanHistoryString(message.turnId)) {
+      continue;
+    }
+    let parentId = cleanHistoryString(message.parentId);
+    const visited = new Set<string>();
+    while (parentId && !visited.has(parentId)) {
+      visited.add(parentId);
+      const parent = byId.get(parentId);
+      if (!parent) break;
+      if (parent.role === "user") {
+        const turnId = normalizeTranscriptTurnId(parent.idempotencyKey)
+          ?? cleanHistoryString(parent.clientMessageId)
+          ?? cleanHistoryString(parent.id);
+        if (turnId) {
+          message.turnId = turnId;
+          message.runId = turnId;
+        }
+        break;
+      }
+      parentId = cleanHistoryString(parent.parentId);
+    }
+  }
+}
+
+function normalizeTranscriptTurnId(value: unknown): string | undefined {
+  const cleaned = cleanHistoryString(value);
+  return cleaned?.replace(/:(?:user|assistant|tool|system)$/i, "") || undefined;
+}
+
+function cleanHistoryString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
 function paginateHistoryMessages(
