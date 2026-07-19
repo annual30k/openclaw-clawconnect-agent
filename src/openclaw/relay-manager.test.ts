@@ -581,6 +581,133 @@ test("relay manager removes duplicate OpenClaw prompt mirrors before serving tra
   }
 });
 
+test("relay manager reuses one OpenClaw model request for concurrent and terminal chat.send retries", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let relaySocket: WebSocket | undefined;
+  let gatewaySocket: WebSocket | undefined;
+  let modelRequests = 0;
+
+  relayServer.on("connection", (socket) => {
+    relaySocket = socket;
+    socket.on("message", (raw) => {
+      relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
+    });
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({
+      type: "event",
+      event: "connect.challenge",
+      payload: { nonce: "nonce-idempotency" },
+    }));
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as {
+        type?: string;
+        id?: string;
+        method?: string;
+        params?: Record<string, unknown>;
+      };
+      if (message.type !== "req" || !message.id) {
+        return;
+      }
+      if (message.method === "chat.send") {
+        modelRequests += 1;
+        setTimeout(() => {
+          if (message.params?.idempotencyKey === "openclaw-client-run-idempotency-error") {
+            socket.send(JSON.stringify({
+              type: "res",
+              id: message.id,
+              ok: false,
+              error: { message: "provider_unavailable" },
+            }));
+            return;
+          }
+          socket.send(JSON.stringify({
+            type: "res",
+            id: message.id,
+            ok: true,
+            payload: { runId: "openclaw-idempotent-run" },
+          }));
+        }, 40);
+        return;
+      }
+      socket.send(JSON.stringify({ type: "res", id: message.id, ok: true, payload: sessionDefaultsPayload() }));
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-openclaw-idempotency-test",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+
+  const sendChat = (
+    id: string,
+    message = "只执行一次",
+    idempotencyKey = "openclaw-client-run-idempotency-1",
+  ) => {
+    relaySocket?.send(JSON.stringify({
+      type: "cmd",
+      id,
+      method: "chat.send",
+      params: {
+        sessionKey: "main",
+        message,
+        idempotencyKey,
+      },
+    }));
+  };
+
+  try {
+    await waitFor(() => Boolean(relaySocket) && relayMessages.some((message) => message.type === "gateway_connected"), 4_000);
+    sendChat("retry-concurrent-1");
+    sendChat("retry-concurrent-2");
+    await waitFor(() => ["retry-concurrent-1", "retry-concurrent-2"].every((id) => (
+      relayMessages.some((message) => message.type === "res" && message.id === id && message.ok === true)
+    )), 4_000);
+    assert.equal(modelRequests, 1);
+
+    sendChat("retry-terminal");
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "retry-terminal"), 4_000);
+    assert.equal(modelRequests, 1);
+
+    sendChat("retry-conflict", "同一个键但内容变了");
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "retry-conflict"), 4_000);
+    const conflict = relayMessages.find((message) => message.type === "res" && message.id === "retry-conflict");
+    assert.equal(conflict?.ok, false);
+    assert.match(String((conflict?.error as { message?: string } | undefined)?.message), /chat_send_idempotency_conflict/);
+    assert.equal(modelRequests, 1);
+
+    sendChat("retry-error-1", "失败也只执行一次", "openclaw-client-run-idempotency-error");
+    sendChat("retry-error-2", "失败也只执行一次", "openclaw-client-run-idempotency-error");
+    await waitFor(() => ["retry-error-1", "retry-error-2"].every((id) => (
+      relayMessages.some((message) => message.type === "res" && message.id === id && message.ok === false)
+    )), 4_000);
+    assert.equal(modelRequests, 2);
+    sendChat("retry-error-terminal", "失败也只执行一次", "openclaw-client-run-idempotency-error");
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "retry-error-terminal"), 4_000);
+    const terminalError = relayMessages.find((message) => message.type === "res" && message.id === "retry-error-terminal");
+    assert.equal(terminalError?.ok, false);
+    assert.match(String((terminalError?.error as { message?: string } | undefined)?.message), /provider_unavailable/);
+    assert.equal(modelRequests, 2);
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+  }
+});
+
 function extractPayloadText(payload: Record<string, unknown>): string {
   const message = isRecord(payload.message) ? payload.message : undefined;
   const content = Array.isArray(message?.content) ? message.content : [];

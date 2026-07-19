@@ -1,7 +1,7 @@
 import { createReadStream } from "fs";
 import { stat, open, type FileHandle } from "fs/promises";
 import { basename, resolve } from "path";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import {
   DEFAULT_FILE_CHUNK_SIZE,
   calculateChunkCount,
@@ -19,6 +19,8 @@ export interface FileUploadRequest {
   durationMs?: number;
   transcript?: string;
   sourceRunId?: string;
+  sourceRole?: "user" | "assistant";
+  idempotencyKey?: string;
 }
 
 export interface FileUploadDependencies {
@@ -128,6 +130,7 @@ export async function uploadFileToRelay(
   }
 
   const clientCreatedAt = new Date().toISOString();
+  const uploadIdempotencyKey = normalizeOptionalText(opts.idempotencyKey) ?? randomUUID();
 
   const absolutePath = resolve(opts.filePath);
   let fileStat: Awaited<ReturnType<typeof stat>>;
@@ -169,7 +172,9 @@ export async function uploadFileToRelay(
           senderDisplayName: opts.senderDisplayName,
           transcript: typeof opts.transcript === "string" ? opts.transcript.trim() : undefined,
           sourceRunId: normalizeOptionalText(opts.sourceRunId),
+          sourceRole: opts.sourceRole,
           clientCreatedAt,
+          idempotencyKey: uploadIdempotencyKey,
         }),
       }, "init upload"),
   );

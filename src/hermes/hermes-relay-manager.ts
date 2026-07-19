@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { statSync } from "fs";
 import { WebSocket } from "ws";
 import { uploadFileToRelay, type FileUploadRequest, type FileUploadResult } from "../core/relay/file-upload.js";
@@ -17,6 +18,11 @@ import {
   type MobileChatRun,
   resolveMobileChatRun,
 } from "../core/relay/mobile-chat-run-bridge.js";
+import {
+  buildChatSendIdempotencyRequest,
+  ChatSendIdempotencyGuard,
+  type ChatSendIdempotencyClaim,
+} from "../core/relay/chat-send-idempotency.js";
 import { voiceInputSetupMessage } from "../core/relay/voice-input.js";
 import {
   buildAttachmentStateChangedEvent,
@@ -67,7 +73,14 @@ type ToServer =
   | { type: "gateway_connected" }
   | { type: "gateway_disconnected"; reason: string }
   | { type: "event"; event: string; payload: unknown }
-  | { type: "res"; id: string; ok: boolean; payload?: unknown; error?: { message?: string } };
+  | {
+    type: "res";
+    id: string;
+    ok: boolean;
+    responsePhase?: "accepted" | "terminal";
+    payload?: unknown;
+    error?: { code?: string; message?: string };
+  };
 
 interface FromServer {
   type: "cmd" | "hello" | "heartbeat" | "event";
@@ -86,6 +99,11 @@ export type HermesRelayHelloMessage = {
   slashCommands?: readonly RelaySlashCommandDescriptor[];
 };
 
+type StartedHermesChatClaim = Extract<ChatSendIdempotencyClaim<MobileChatRun>, { status: "started" }>;
+
+// Relay 连接重建不应清掉刚完成的运行结果，否则同一 chat.send 会再次触发 Hermes 模型。
+const hermesChatSendIdempotency = new ChatSendIdempotencyGuard<MobileChatRun>();
+
 export interface HermesRelayManagerOptions {
   relayServerUrl: string;
   gatewayId: string;
@@ -96,6 +114,22 @@ export interface HermesRelayManagerOptions {
   onConnected?: () => void;
   onDisconnected?: () => void;
 }
+
+export interface HermesRelayManagerDependencies {
+  runChat: typeof runHermesChat;
+  readStatusSnapshot: typeof readHermesStatusSnapshotAsync;
+  publishUsageSnapshot: typeof publishHermesUsageSnapshot;
+  resolveStateDbRealtimePath: typeof resolveHermesStateDbRealtimePath;
+  createStateDbRealtimeWatcher: typeof createHermesStateDbRealtimeWatcher;
+}
+
+const DEFAULT_HERMES_RELAY_MANAGER_DEPENDENCIES: HermesRelayManagerDependencies = {
+  runChat: runHermesChat,
+  readStatusSnapshot: readHermesStatusSnapshotAsync,
+  publishUsageSnapshot: publishHermesUsageSnapshot,
+  resolveStateDbRealtimePath: resolveHermesStateDbRealtimePath,
+  createStateDbRealtimeWatcher: createHermesStateDbRealtimeWatcher,
+};
 
 export function buildHermesRelayHelloMessage(opts: {
   platform: string;
@@ -113,6 +147,13 @@ export function buildHermesRelayHelloMessage(opts: {
 }
 
 export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Promise<boolean> {
+  return runHermesRelayManagerWithDependencies(opts, DEFAULT_HERMES_RELAY_MANAGER_DEPENDENCIES);
+}
+
+export async function runHermesRelayManagerWithDependencies(
+  opts: HermesRelayManagerOptions,
+  dependencies: HermesRelayManagerDependencies,
+): Promise<boolean> {
   const wsUrl = buildRelayUrl(opts.relayServerUrl, opts.gatewayId, opts.relaySecret);
   const recentMobileFiles = new Map<string, Array<Record<string, unknown>>>();
   const sentArtifacts = new Map<string, number>();
@@ -133,9 +174,9 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
     const send = (message: ToServer): void => {
       sendRelayJson(relayWs, message);
     };
-    const stateDbRealtimePath = resolveHermesStateDbRealtimePath();
+    const stateDbRealtimePath = dependencies.resolveStateDbRealtimePath();
     const stateDbRealtimeWatcher = stateDbRealtimePath
-      ? createHermesStateDbRealtimeWatcher({
+      ? dependencies.createStateDbRealtimeWatcher({
         gatewayId: opts.gatewayId,
         dbPath: stateDbRealtimePath,
         publishPayload: (payload) => {
@@ -158,7 +199,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         capabilities: opts.capabilities ?? [...gatewayCapabilitiesForType("hermes"), "models"],
       }));
       send({ type: "gateway_connected" });
-      void readHermesStatusSnapshotAsync().then((statusSnapshot) => {
+      void dependencies.readStatusSnapshot().then((statusSnapshot) => {
         send({
           type: "event",
           event: "office",
@@ -175,7 +216,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
           },
         });
       });
-      void publishHermesUsageSnapshot(send);
+      void dependencies.publishUsageSnapshot(send);
       stateDbRealtimeWatcher?.start();
     });
 
@@ -184,6 +225,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
       let methodForLog = "";
       let acknowledgedChatRun: { runId: string; sessionKey: string } | undefined;
       let voiceInputRun: { runId: string; sessionKey: string } | undefined;
+      let idempotencyClaim: StartedHermesChatClaim | undefined;
       try {
         const msg = parseRelayFrame<FromServer>(raw);
         if (!msg) {
@@ -199,7 +241,7 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         }
         if (msg.type === "event") {
           if (msg.event === "file") {
-            await rememberMobileFileEvent(msg.payload, recentMobileFiles, opts);
+            rememberMobileFileEvent(msg.payload, recentMobileFiles);
           }
           return;
         }
@@ -281,14 +323,84 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         });
         const runId = run.runId;
         const sessionKey = run.sessionKey;
+        const paramsRecord = msg.params && typeof msg.params === "object" && !Array.isArray(msg.params)
+          ? (msg.params as Record<string, unknown>)
+          : undefined;
+        const idempotencyRequest = paramsRecord
+          ? buildChatSendIdempotencyRequest({
+            gatewayId: opts.gatewayId,
+            sessionKey,
+            idempotencyKey: paramsRecord.idempotencyKey,
+            payload: {
+              method: "chat.send",
+              params: {
+                ...paramsRecord,
+                sessionKey,
+              },
+            },
+          })
+          : undefined;
+        if (idempotencyRequest) {
+          const claim = hermesChatSendIdempotency.claim(idempotencyRequest);
+          if (claim.status === "reused") {
+            try {
+              const acceptedRun = await claim.promise;
+              if (requestId) {
+                send({
+                  type: "res",
+                  id: requestId,
+                  ok: true,
+                  responsePhase: "accepted",
+                  payload: acceptedRun,
+                });
+              }
+              const terminal = await claim.terminal;
+              if (requestId && terminal.status !== "released") {
+                send(terminal.status === "completed"
+                  ? {
+                    type: "res",
+                    id: requestId,
+                    ok: true,
+                    responsePhase: "terminal",
+                    payload: acceptedRun,
+                  }
+                  : {
+                    type: "res",
+                    id: requestId,
+                    ok: false,
+                    responsePhase: "terminal",
+                    error: { code: "hermes_chat_failed", message: errorMessage(terminal.error) },
+                  });
+              }
+            } catch (error) {
+              if (requestId) {
+                send({
+                  type: "res",
+                  id: requestId,
+                  ok: false,
+                  error: { message: error instanceof Error ? error.message : String(error) },
+                });
+              }
+            }
+            return;
+          }
+          idempotencyClaim = claim;
+        }
         const abortController = new AbortController();
         rememberActiveHermesChatRun(activeChatRuns, run, msg.params, requestId, abortController);
+        acknowledgedChatRun = { runId, sessionKey };
+        idempotencyClaim?.accept(acknowledgedChatRun);
         if (requestId) {
-          acknowledgedChatRun = { runId, sessionKey };
-          send({ type: "res", id: requestId, ok: true, payload: acknowledgedChatRun });
+          send({
+            type: "res",
+            id: requestId,
+            ok: true,
+            responsePhase: "accepted",
+            payload: acknowledgedChatRun,
+          });
         }
         const paramsWithFiles = await attachRecentMobileFiles(msg.params, recentMobileFiles, opts);
-        const chat = await runHermesChat(paramsWithFiles, {
+        const chat = await dependencies.runChat(paramsWithFiles, {
           requestId: runId,
           gatewayId: opts.gatewayId,
           abortSignal: abortController.signal,
@@ -378,11 +490,25 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
         });
         publishHermesOfficeSnapshot(send, "chat", finalChatPayload);
 
-        if (requestId && !acknowledgedChatRun) {
-          send({ type: "res", id: requestId, ok: true, payload: { runId, sessionKey: chat.sessionKey } });
+        idempotencyClaim?.complete();
+        if (requestId) {
+          send({
+            type: "res",
+            id: requestId,
+            ok: true,
+            responsePhase: "terminal",
+            payload: acknowledgedChatRun,
+          });
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        // Relay 断开时不会再收到当前 requestId 的终态。释放本地 owner 后，重连使用
+        // 同一稳定幂等键才能重新进入模型；普通模型错误和用户中止仍是明确终态。
+        if (acknowledgedChatRun && relayWs.readyState !== WebSocket.OPEN) {
+          idempotencyClaim?.release();
+          forgetActiveHermesChatRun(activeChatRuns, acknowledgedChatRun);
+          return;
+        }
         if (message === "hermes_chat_aborted") {
           if (acknowledgedChatRun) {
             const abortedPayload = buildMobileAssistantAbortedPayload({
@@ -396,6 +522,18 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
             });
             publishHermesOfficeSnapshot(send, "chat", abortedPayload);
             forgetActiveHermesChatRun(activeChatRuns, acknowledgedChatRun);
+            idempotencyClaim?.complete(error);
+            if (requestId) {
+              send({
+                type: "res",
+                id: requestId,
+                ok: false,
+                responsePhase: "terminal",
+                error: { code: "hermes_chat_aborted", message },
+              });
+            }
+          } else {
+            idempotencyClaim?.reject(error);
           }
           return;
         }
@@ -417,10 +555,18 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
             payload: errorPayload,
           });
           publishHermesOfficeSnapshot(send, "chat", errorPayload);
-          if (setupMessage && requestId && !acknowledgedChatRun) {
-            send({ type: "res", id: requestId, ok: true, payload: chatRun });
+          idempotencyClaim?.complete(error);
+          if (requestId) {
+            send({
+              type: "res",
+              id: requestId,
+              ok: false,
+              responsePhase: "terminal",
+              error: { code: "hermes_chat_failed", message: setupMessage ?? message },
+            });
           }
         } else if (requestId) {
+          idempotencyClaim?.reject(error);
           send({ type: "res", id: requestId, ok: false, error: { message } });
         }
       }
@@ -439,6 +585,10 @@ export async function runHermesRelayManager(opts: HermesRelayManagerOptions): Pr
       console.error("Hermes relay WebSocket error:", error.message);
     });
   });
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function buildHermesArtifactUploadRequest(params: {
@@ -655,27 +805,28 @@ async function publishHermesUsageSnapshot(send: (message: ToServer) => void): Pr
   }
 }
 
-async function rememberMobileFileEvent(
+function rememberMobileFileEvent(
   payload: unknown,
   recentMobileFiles: Map<string, Array<Record<string, unknown>>>,
-  opts: HermesRelayManagerOptions,
-): Promise<void> {
+): void {
   const block = extractFileBlock(payload);
   if (!block || block.origin !== "mobile") {
     return;
   }
   const sessionKey = typeof block.sessionKey === "string" && block.sessionKey.trim() ? block.sessionKey.trim() : "main";
+  const fileId = optionalNonEmptyString(block.fileId);
   const downloadUrl = typeof block.downloadUrl === "string" ? block.downloadUrl : "";
   const fileName = typeof block.fileName === "string" ? block.fileName : typeof block.name === "string" ? block.name : "attachment";
-  if (!downloadUrl) {
+  if (!fileId && !downloadUrl) {
     return;
   }
-  const content = await downloadFileAsBase64(downloadUrl, opts);
   const attachments = recentMobileFiles.get(sessionKey) ?? [];
   attachments.push({
+    ...block,
+    ...(fileId ? { fileId } : {}),
     fileName,
     mimeType: typeof block.mimeType === "string" ? block.mimeType : "application/octet-stream",
-    content,
+    ...(downloadUrl ? { downloadUrl } : {}),
   });
   recentMobileFiles.set(sessionKey, attachments.slice(-12));
 }
@@ -690,17 +841,128 @@ async function attachRecentMobileFiles(
     : {};
   const sessionKey = typeof record.sessionKey === "string" && record.sessionKey.trim() ? record.sessionKey.trim() : "main";
   const pending = recentMobileFiles.get(sessionKey) ?? [];
-  if (pending.length === 0) {
+  const commandRunId = optionalNonEmptyString(record.idempotencyKey);
+  const { matched: matchedPending, unmatched: unmatchedPending } = partitionRecentHermesAttachments(
+    pending,
+    commandRunId,
+  );
+  const existing = Array.isArray(record.attachments) ? record.attachments : [];
+  if (existing.length > 0) {
+    // 新协议由 Relay 在 chat.send 内携带本轮精确 fileId；必须优先使用它，
+    // 不能再从 session 级缓存猜测附件，否则并发/重连时可能把上一轮图片配给当前问题。
+    updateRecentMobileFiles(recentMobileFiles, sessionKey, unmatchedPending);
+    return {
+      ...record,
+      attachments: await Promise.all(existing.map((attachment) => (
+        hydrateCanonicalHermesAttachment(attachment, opts)
+      ))),
+    };
+  }
+  if (matchedPending.length === 0) {
     return params;
   }
-  const existing = Array.isArray(record.attachments) ? record.attachments : [];
-  recentMobileFiles.delete(sessionKey);
-  if (existing.length > 0) {
+  // 兼容尚未在 chat.send 携带 fileId 的旧客户端，但也必须按 sourceRunId 精确领取；
+  // 不能把同 session 上一轮未消费的图片猜给当前文本消息。
+  updateRecentMobileFiles(recentMobileFiles, sessionKey, unmatchedPending);
+  return {
+    ...record,
+    attachments: await Promise.all(matchedPending.map((attachment) => (
+      hydratePendingHermesAttachment(attachment, opts)
+    ))),
+  };
+}
+
+export function partitionRecentHermesAttachments(
+  attachments: Array<Record<string, unknown>>,
+  commandRunId: string | undefined,
+): { matched: Array<Record<string, unknown>>; unmatched: Array<Record<string, unknown>> } {
+  if (!commandRunId) {
+    // A session is not an attachment identity. Old commands without a stable
+    // run id must leave pending files untouched instead of borrowing the
+    // previous turn's upload.
+    return { matched: [], unmatched: attachments };
+  }
+  const matched: Array<Record<string, unknown>> = [];
+  const unmatched: Array<Record<string, unknown>> = [];
+  for (const attachment of attachments) {
+    if (optionalNonEmptyString(attachment.sourceRunId) === commandRunId) {
+      matched.push(attachment);
+    } else {
+      unmatched.push(attachment);
+    }
+  }
+  return { matched, unmatched };
+}
+
+function updateRecentMobileFiles(
+  recentMobileFiles: Map<string, Array<Record<string, unknown>>>,
+  sessionKey: string,
+  attachments: Array<Record<string, unknown>>,
+): void {
+  if (attachments.length > 0) {
+    recentMobileFiles.set(sessionKey, attachments);
+  } else {
+    recentMobileFiles.delete(sessionKey);
+  }
+}
+
+async function hydratePendingHermesAttachment(
+  attachment: Record<string, unknown>,
+  opts: HermesRelayManagerOptions,
+): Promise<unknown> {
+  if (optionalNonEmptyString(attachment.fileId)) {
+    return hydrateCanonicalHermesAttachment(attachment, opts);
+  }
+  if (optionalNonEmptyString(attachment.content)) {
+    return attachment;
+  }
+  const downloadUrl = optionalNonEmptyString(attachment.downloadUrl);
+  if (!downloadUrl) {
+    throw new Error("legacy_attachment_download_url_missing");
+  }
+  return {
+    ...attachment,
+    content: await downloadFileAsBase64(downloadUrl, opts),
+  };
+}
+
+export async function hydrateCanonicalHermesAttachment(
+  attachment: unknown,
+  opts: Pick<HermesRelayManagerOptions, "relayServerUrl" | "relaySecret"> & { fetchImpl?: typeof fetch },
+): Promise<unknown> {
+  if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
+    return attachment;
+  }
+  const record = { ...(attachment as Record<string, unknown>) };
+  const fileId = optionalNonEmptyString(record.fileId);
+  if (!fileId) {
     return record;
+  }
+  const downloadUrl = new URL(`/api/mobile/files/${encodeURIComponent(fileId)}`, opts.relayServerUrl);
+  const response = await (opts.fetchImpl ?? fetch)(downloadUrl, {
+    headers: {
+      Accept: "application/octet-stream",
+      "X-Relay-Secret": opts.relaySecret,
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`canonical_attachment_download_failed:${response.status}`);
+  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const expectedSize = optionalNonNegativeInteger(record.sizeBytes);
+  if (expectedSize !== undefined && buffer.length !== expectedSize) {
+    throw new Error("canonical_attachment_size_mismatch");
+  }
+  const expectedSha256 = optionalNonEmptyString(record.sha256)?.toLowerCase();
+  if (expectedSha256) {
+    const actualSha256 = createHash("sha256").update(buffer).digest("hex");
+    if (actualSha256 !== expectedSha256) {
+      throw new Error("canonical_attachment_sha256_mismatch");
+    }
   }
   return {
     ...record,
-    attachments: pending,
+    content: buffer.toString("base64"),
   };
 }
 
@@ -727,11 +989,24 @@ function extractFileBlock(payload: unknown): Record<string, unknown> | undefined
 
 async function downloadFileAsBase64(downloadUrl: string, opts: HermesRelayManagerOptions): Promise<string> {
   const url = new URL(downloadUrl, opts.relayServerUrl);
-  url.searchParams.set("secret", opts.relaySecret);
-  const response = await fetch(url);
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/octet-stream",
+      "X-Relay-Secret": opts.relaySecret,
+    },
+  });
   if (!response.ok) {
     throw new Error(`file_download_failed:${response.status}`);
   }
   const buffer = Buffer.from(await response.arrayBuffer());
   return buffer.toString("base64");
+}
+
+function optionalNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function optionalNonNegativeInteger(value: unknown): number | undefined {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : undefined;
 }

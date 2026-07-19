@@ -257,17 +257,45 @@ process.exit(0);
     console.log(`Gateway registered: ${registeredGatewayId}, accessCode=${accessCode}`);
 
     console.log("3. Registering Mobile User via HTTP...");
-    const userRes = await fetch(`http://${HOST}:${PORT}/api/auth/register`, {
+    const userRegistrationBody = {
+      email: testEmail,
+      password: testPassword,
+      name: "E2E User",
+      deviceId,
+      platform: "ios"
+    };
+    const registerMobileUser = (body: Record<string, unknown>) => fetch(`http://${HOST}:${PORT}/api/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        email: testEmail,
-        password: testPassword,
-        name: "E2E User",
-        deviceId,
-        platform: "ios"
-      })
+      body: JSON.stringify(body)
     });
+    let userRes = await registerMobileUser(userRegistrationBody);
+
+    // 法律文档版本由 Relay 控制；E2E 先读取服务端当前版本再明确同意，
+    // 避免测试脚本把版本常量复制一份并在服务端升级后静默过期。
+    if (!userRes.ok) {
+      const registrationError = await userRes.json() as {
+        error?: string;
+        termsVersion?: string;
+        privacyVersion?: string;
+      };
+      if (
+        registrationError.error === "legal_consent_required"
+        && registrationError.termsVersion
+        && registrationError.privacyVersion
+      ) {
+        userRes = await registerMobileUser({
+          ...userRegistrationBody,
+          legalConsent: {
+            accepted: true,
+            termsVersion: registrationError.termsVersion,
+            privacyVersion: registrationError.privacyVersion,
+          },
+        });
+      } else {
+        throw new Error(`Failed to register user: ${userRes.status} ${JSON.stringify(registrationError)}`);
+      }
+    }
 
     if (!userRes.ok) {
       throw new Error(`Failed to register user: ${userRes.status} ${await userRes.text()}`);
@@ -370,15 +398,17 @@ process.exit(0);
       type: "cmd",
       id: chatCmdId,
       gatewayId: registeredGatewayId,
-      method: "hermes.chat.send",
+      method: "chat.send",
       params: {
         message: "Hello Hermes, run a web search for OpenClaw.",
-        sessionKey: "main"
+        sessionKey: "main",
+        idempotencyKey: chatCmdId,
       }
     }));
 
     console.log("8. Listening for response and events...");
     let ackReceived = false;
+    let terminalResponseReceived = false;
     let toolStartReceived = false;
     let toolStreamReceived = false;
     let toolCompleteReceived = false;
@@ -392,6 +422,7 @@ process.exit(0);
       const maybeResolve = () => {
         if (
           ackReceived &&
+          terminalResponseReceived &&
           toolStartReceived &&
           toolStreamReceived &&
           toolCompleteReceived &&
@@ -410,8 +441,13 @@ process.exit(0);
 
         if (msg.type === "res" && msg.id === chatCmdId) {
           if (msg.ok) {
-            ackReceived = true;
-            console.log("[PASS] Received Command ACK");
+            if (msg.responsePhase === "terminal") {
+              terminalResponseReceived = true;
+              console.log("[PASS] Received terminal chat response");
+            } else {
+              ackReceived = true;
+              console.log("[PASS] Received accepted chat response");
+            }
             maybeResolve();
           } else {
             reject(new Error(`Command failed on Relay: ${JSON.stringify(msg.error)}`));

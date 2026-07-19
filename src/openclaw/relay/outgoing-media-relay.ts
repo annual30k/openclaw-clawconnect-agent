@@ -1,11 +1,13 @@
 import { existsSync } from "fs";
-import { readFile } from "fs/promises";
+import { readFile, stat } from "fs/promises";
 import { homedir } from "os";
 import { extname, join, resolve } from "path";
+import { createHash } from "crypto";
 import { uploadFileToRelay, type FileUploadRequest, type FileUploadResult } from "../../core/relay/file-upload.js";
 
 const OUTGOING_MEDIA_RE = /\/api\/chat\/media\/outgoing\/[^/]+\/([^/]+)\/full(?:$|[?#])/;
 const OPENCLAW_MEDIA_CONTROL_PREFIX_RE = /^MEDIA:\s*(?:file:\/\/|~\/|\/)/i;
+const OPENCLAW_INPUT_MEDIA_MARKER_RE = /\[media attached:\s+(.+?)\s+\(([^)\r\n]+)\)\s+\|\s+(.+?)\]/g;
 
 export type OutgoingMediaRelayOptions = {
   relayServerUrl: string;
@@ -34,6 +36,11 @@ type OutgoingMediaRecord = {
     filename?: string;
   };
 };
+
+const inFlightUploadsByCache = new WeakMap<
+  Map<string, FileUploadResult>,
+  Map<string, Promise<FileUploadResult>>
+>();
 
 export async function relayOutgoingMediaInPayload(
   payload: unknown,
@@ -133,13 +140,47 @@ async function relayOutgoingMediaInMessageList(
 ): Promise<{ messages: unknown[]; changed: boolean }> {
   let changed = false;
   const nextMessages = await Promise.all(messages.map(async (message) => {
-    const wrapperInput = sessionKey ? { sessionKey, message } : { message };
+    const restoredMessage = restoreOpenClawInputMediaInHistoryMessage(message);
+    const wrapperInput = sessionKey ? { sessionKey, message: restoredMessage } : { message: restoredMessage };
     const wrapper = await relayOutgoingMediaInPayload(wrapperInput, opts) as Record<string, unknown>;
     const nextMessage = wrapper.message ?? message;
     changed ||= nextMessage !== message;
     return nextMessage;
   }));
   return { messages: nextMessages, changed };
+}
+
+function restoreOpenClawInputMediaInHistoryMessage(message: unknown): unknown {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return message;
+  const record = message as Record<string, unknown>;
+  if (record.role !== "user" || !Array.isArray(record.content) || record.content.some(isUploadedMediaBlock)) {
+    return message;
+  }
+  const sourceRunId = firstString(record.runId, record.turnId, record.idempotencyKey, record.clientMessageId, record.messageId, record.id);
+  if (!sourceRunId) return message;
+
+  const mediaPaths: string[] = [];
+  let changed = false;
+  const sanitizedContent = record.content.flatMap((block) => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) return [block];
+    const contentBlock = block as Record<string, unknown>;
+    if (contentBlock.type !== "text" || typeof contentBlock.text !== "string") return [block];
+    const text = contentBlock.text;
+    const sanitized = text.replace(OPENCLAW_INPUT_MEDIA_MARKER_RE, (_marker, firstPath: string, _mime: string, secondPath: string) => {
+      const path = secondPath.trim() || firstPath.trim();
+      if (path.startsWith("/")) mediaPaths.push(path);
+      return "";
+    }).replace(/\n{3,}/g, "\n\n").trim();
+    if (sanitized === text) return [block];
+    changed = true;
+    return sanitized ? [{ ...contentBlock, text: sanitized }] : [];
+  });
+  if (!changed || mediaPaths.length === 0) return message;
+
+  // 用户入站附件在 chat.send 前已经由 Relay 持久化为 canonical timeline block。
+  // Host history 这里只移除 OpenClaw 内部路径标记，绝不能读取或重新上传路径；
+  // Relay 会用稳定 sourceRunId 把原始 canonical 附件合回这条 user 记录。
+  return { ...record, content: sanitizedContent };
 }
 
 async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOptionsWithSourceRun): Promise<unknown> {
@@ -160,10 +201,14 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
     if (!filePath || !sessionKey) {
       return block;
     }
-    const cacheKey = `${opts.gatewayId}:${sessionKey}:${attachmentId}`;
-    let upload = opts.cache?.get(cacheKey);
-    if (!upload) {
-      upload = await uploadFileToRelay({
+    const cacheKey = await outgoingFileCacheKey({
+      gatewayId: opts.gatewayId,
+      sessionKey,
+      identity: `attachment:${attachmentId}`,
+      filePath,
+      sourceRunId: opts.sourceRunId,
+    });
+    const upload = await cachedUpload(opts, cacheKey, {
         relayServerUrl: opts.relayServerUrl,
         relaySecret: opts.relaySecret,
         gatewayId: opts.gatewayId,
@@ -172,8 +217,6 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
         senderDisplayName: opts.senderDisplayName,
         sourceRunId: opts.sourceRunId,
       });
-      opts.cache?.set(cacheKey, upload);
-    }
 
     return {
       ...source,
@@ -272,10 +315,14 @@ async function relayLocalArtifactPathsInContent(
   const blocks: Record<string, unknown>[] = [];
   for (const filePath of paths) {
     try {
-      const cacheKey = `${opts.gatewayId}:${sessionKey}:artifact:${filePath}`;
-      let upload = opts.cache?.get(cacheKey);
-      if (!upload) {
-        const request: FileUploadRequest = {
+      const cacheKey = await outgoingFileCacheKey({
+        gatewayId: opts.gatewayId,
+        sessionKey,
+        identity: `artifact:${filePath}`,
+        filePath,
+        sourceRunId: runId,
+      });
+      const request: FileUploadRequest = {
           relayServerUrl: opts.relayServerUrl,
           relaySecret: opts.relaySecret,
           gatewayId: opts.gatewayId,
@@ -284,9 +331,7 @@ async function relayLocalArtifactPathsInContent(
           senderDisplayName: opts.senderDisplayName,
           sourceRunId: runId,
         };
-        upload = await uploadFileToRelay(request);
-        opts.cache?.set(cacheKey, upload);
-      }
+      const upload = await cachedUpload(opts, cacheKey, request);
       blocks.push(uploadToContentBlock(upload));
     } catch (error) {
       console.warn(`[relay] failed to publish local artifact ${filePath}: ${String(error)}`);
@@ -312,7 +357,7 @@ function uploadToContentBlock(upload: FileUploadResult): Record<string, unknown>
       : "file";
   return compact({
     type,
-    attachmentId: upload.fileId,
+    attachmentId: stableRelayAttachmentId(upload),
     fileId: upload.fileId,
     fileName: upload.fileName,
     name: upload.fileName,
@@ -328,11 +373,77 @@ function uploadToContentBlock(upload: FileUploadResult): Record<string, unknown>
     downloadPath: upload.downloadPath,
     expiresAt: upload.expiresAt,
     sourceRunId: upload.sourceRunId,
+    sha256: upload.sha256,
+    contentHash: upload.sha256,
     gatewayId: upload.gatewayId,
     sessionKey: upload.sessionKey,
     status: "available",
     transferState: "available",
   });
+}
+
+function stableRelayAttachmentId(upload: FileUploadResult): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify([
+      "relay-file-attachment-v3",
+      upload.gatewayId.trim(),
+      upload.sessionKey.trim(),
+      upload.fileId.trim(),
+    ]))
+    .digest("hex")
+    .slice(0, 24);
+  return `att_${digest}`;
+}
+
+async function outgoingFileCacheKey(input: {
+  gatewayId: string;
+  sessionKey: string;
+  identity: string;
+  filePath: string;
+  sourceRunId?: string;
+}): Promise<string> {
+  const metadata = await stat(input.filePath);
+  return JSON.stringify([
+    "openclaw-outgoing-file-v2",
+    input.gatewayId,
+    input.sessionKey,
+    input.identity,
+    input.sourceRunId?.trim() || "no-source-run",
+    metadata.size,
+    metadata.mtimeMs,
+    metadata.ctimeMs,
+  ]);
+}
+
+async function cachedUpload(
+  opts: OutgoingMediaRelayOptions,
+  cacheKey: string,
+  request: FileUploadRequest,
+): Promise<FileUploadResult> {
+  const cached = opts.cache?.get(cacheKey);
+  if (cached) return cached;
+
+  const idempotencyKey = `openclaw-outgoing:${createHash("sha256").update(cacheKey).digest("hex")}`;
+  if (!opts.cache) {
+    return uploadFileToRelay({ ...request, idempotencyKey });
+  }
+  let inFlight = inFlightUploadsByCache.get(opts.cache);
+  if (!inFlight) {
+    inFlight = new Map();
+    inFlightUploadsByCache.set(opts.cache, inFlight);
+  }
+  const existing = inFlight.get(cacheKey);
+  if (existing) return existing;
+
+  const pending = uploadFileToRelay({ ...request, idempotencyKey });
+  inFlight.set(cacheKey, pending);
+  try {
+    const uploaded = await pending;
+    opts.cache.set(cacheKey, uploaded);
+    return uploaded;
+  } finally {
+    inFlight.delete(cacheKey);
+  }
 }
 
 function sanitizeOpenClawMediaControlBlocks(content: unknown[]): { content: unknown[]; changed: boolean } {

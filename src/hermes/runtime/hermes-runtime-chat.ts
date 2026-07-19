@@ -1,6 +1,6 @@
 
 import { randomUUID } from "crypto";
-import { mkdir, writeFile } from "fs/promises";
+import { mkdir, readdir, rm, stat, writeFile } from "fs/promises";
 import { join } from "path";
 import { spawn } from "child_process";
 import type { LocalCommandContext } from "../../core/command-types.js";
@@ -65,6 +65,8 @@ const HERMES_API_EMPTY_OUTPUT_HISTORY_COMPLETION_POLL_MS = 500;
 const HERMES_RUNTIME_CONTEXT_CACHE_MAX_AGE_MS = 5 * 60_000;
 const HERMES_COMMAND_DENIED_TIMEOUT_MESSAGE = "Timeout – denying command";
 const HERMES_EMPTY_RESPONSE_MESSAGE = "Hermes 未返回可见回复，请检查当前模型额度或 Provider 凭据后重试。";
+const HERMES_INBOX_TTL_MS = 24 * 60 * 60 * 1000;
+const USER_FILE_MARKER_PREFIX_RE = /\[file attached:/gi;
 const hermesChatQueues = new Map<string, Promise<void>>();
 const EMPTY_PRELOADED_SKILL_CONTEXT = {
   cliArgs: [] as string[],
@@ -792,6 +794,7 @@ async function prepareHermesMessage(
 ): Promise<PreparedHermesMessage> {
   const refs: string[] = [];
   if (Array.isArray(attachments)) {
+    await cleanupExpiredHermesInbox();
     const safeSession = sessionKey.replace(/[^\w.-]/g, "_") || "main";
     for (const attachment of attachments) {
       if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
@@ -814,7 +817,7 @@ async function prepareHermesMessage(
       refs.push(`[file attached: ${filePath} (${mimeType})]`);
     }
   }
-  const userSections = [message.trim()];
+  const userSections = [sanitizeHermesUserAttachmentMarkers(message).trim()];
   if (refs.length > 0) {
     userSections.push(refs.join("\n"));
   }
@@ -844,6 +847,45 @@ async function prepareHermesMessage(
     apiInstructions: apiInstructionSections.filter(Boolean).join("\n\n").trim() || undefined,
     cliMessage: cliMessageSections.filter(Boolean).join("\n\n").trim(),
   };
+}
+
+export function sanitizeHermesUserAttachmentMarkers(message: string): string {
+  // Hermes 的本地文件提示只能由桥接层生成；让用户输入的同形标记失活，
+  // 避免把任意 Host 路径伪装成移动端附件交给运行时读取。
+  return message.replace(USER_FILE_MARKER_PREFIX_RE, "［file attached:");
+}
+
+export async function cleanupExpiredHermesInbox(
+  inboxDir = HERMES_INBOX_DIR,
+  nowMs = Date.now(),
+  ttlMs = HERMES_INBOX_TTL_MS,
+): Promise<void> {
+  let sessions;
+  try {
+    sessions = await readdir(inboxDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  await Promise.all(sessions.filter((entry) => entry.isDirectory() && !entry.isSymbolicLink()).map(async (session) => {
+    const sessionDir = join(inboxDir, session.name);
+    let runs;
+    try {
+      runs = await readdir(sessionDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    await Promise.all(runs.filter((entry) => entry.isDirectory() && !entry.isSymbolicLink()).map(async (run) => {
+      const runDir = join(sessionDir, run.name);
+      try {
+        const metadata = await stat(runDir);
+        if (nowMs - metadata.mtimeMs >= Math.max(0, ttlMs)) {
+          await rm(runDir, { recursive: true, force: true });
+        }
+      } catch {
+        // 清理失败不能阻断当前聊天；下一轮发送会再次尝试。
+      }
+    }));
+  }));
 }
 
 function planHermesChatPreparation(message: string): HermesChatPreparationPlan {

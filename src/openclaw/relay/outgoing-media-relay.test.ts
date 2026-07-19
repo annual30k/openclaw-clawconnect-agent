@@ -50,6 +50,43 @@ test("relayOutgoingMediaInPayload uploads OpenClaw outgoing media and rewrites t
   }
 });
 
+test("relayOutgoingMediaInPayload shares one upload while identical blocks resolve concurrently", async () => {
+  const fixture = await createOutgoingMediaFixture();
+  const server = await createFileUploadRelayServer("file_outgoing_shared");
+  try {
+    const outgoingUrl = `/api/chat/media/outgoing/agent%3Amain%3Asession_1/${fixture.attachmentId}/full`;
+    const payload = {
+      message: {
+        runId: "assistant-run-shared",
+        role: "assistant",
+        content: [
+          { type: "image", url: outgoingUrl, mimeType: "image/jpeg" },
+          { type: "image", url: outgoingUrl, mimeType: "image/jpeg" },
+        ],
+      },
+    };
+
+    const result = await relayOutgoingMediaInPayload(payload, {
+      relayServerUrl: server.baseUrl,
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      recordsDir: fixture.recordsDir,
+      cache: new Map(),
+    }) as typeof payload;
+
+    assert.equal(server.initRequestCount(), 1);
+    assert.deepEqual(
+      result.message.content.map((block) => (block as Record<string, unknown>).fileId),
+      ["file_outgoing_shared", "file_outgoing_shared"],
+    );
+    assert.equal(typeof server.initBody()?.idempotencyKey, "string");
+    assert.notEqual(server.initBody()?.idempotencyKey, "");
+  } finally {
+    await server.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("relayOutgoingMediaInHistoryResponse rewrites outgoing media inside chat history", async () => {
   const fixture = await createOutgoingMediaFixture();
   const server = await createFileUploadRelayServer("file_outgoing_history");
@@ -83,6 +120,38 @@ test("relayOutgoingMediaInHistoryResponse rewrites outgoing media inside chat hi
   } finally {
     await server.close();
     await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("relayOutgoingMediaInHistoryResponse strips staged user media without reuploading host paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-input-media-history-"));
+  const imagePath = join(root, "22.JPG");
+  await writeFile(imagePath, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+  const server = await createFileUploadRelayServer("file_input_history");
+  try {
+    const history = {
+      sessionKey: "agent:main:session_1",
+      messages: [{
+        id: "user-message-1",
+        runId: "client-run-1:user",
+        role: "user",
+        content: [{ type: "text", text: `分析一下这个图片\n\n[media attached: ${imagePath} (image/jpeg) | ${imagePath}]` }],
+      }],
+    };
+
+    const result = await relayOutgoingMediaInHistoryResponse(history, {
+      relayServerUrl: server.baseUrl,
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      cache: new Map(),
+    }) as typeof history;
+
+    assert.equal(result.messages[0].content[0]?.text, "分析一下这个图片");
+    assert.equal(result.messages[0].content.length, 1);
+    assert.equal(server.initRequestCount(), 0);
+  } finally {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -208,6 +277,40 @@ test("relayOutgoingMediaInPayload uploads assistant local artifact paths when us
   }
 });
 
+test("relayOutgoingMediaInPayload invalidates cached local artifacts by file version and source run", async () => {
+  const root = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-artifact-cache-version-"));
+  const imagePath = join(root, "mutable.png");
+  await writeFile(imagePath, Buffer.from([1, 2, 3, 4]));
+  const server = await createFileUploadRelayServer("file_mutable");
+  const cache = new Map();
+  const publish = (runId: string) => relayOutgoingMediaInPayload({
+    runId,
+    sessionKey: "agent:main:session_1",
+    state: "final",
+    message: { role: "assistant", content: [{ type: "text", text: `sent ${imagePath}` }] },
+  }, {
+    relayServerUrl: server.baseUrl,
+    relaySecret: "secret",
+    gatewayId: "gw_test",
+    cache,
+    userMessage: `send ${imagePath} to my phone`,
+  });
+  try {
+    const first = await publish("run-same") as any;
+    await writeFile(imagePath, Buffer.from([1, 2, 3, 4, 5]));
+    const changedFile = await publish("run-same") as any;
+    const changedRun = await publish("run-next") as any;
+
+    assert.equal(server.initRequestCount(), 3);
+    assert.equal(first.message.content[1].fileId, "file_mutable");
+    assert.equal(changedFile.message.content[1].fileId, "file_mutable_2");
+    assert.equal(changedRun.message.content[1].fileId, "file_mutable_3");
+  } finally {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("relayOutgoingMediaInPayload leaves local paths alone without send intent", async () => {
   const root = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-artifact-no-intent-"));
   const imagePath = join(root, "photo.jpg");
@@ -264,41 +367,58 @@ async function createOutgoingMediaFixture() {
 }
 
 async function createFileUploadRelayServer(fileId: string) {
-  const receivedChunks: Buffer[] = [];
-  let initSourceRunId: unknown;
+  const uploads = new Map<string, {
+    chunks: Buffer[];
+    fileId: string;
+    sizeBytes: number;
+    sourceRunId?: string;
+  }>();
+  let lastInitBody: Record<string, unknown> | undefined;
   let initRequestCount = 0;
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? "";
     if (req.method === "POST" && url === "/api/host/gateways/gw_test/files/init") {
       initRequestCount += 1;
       const initBody = JSON.parse((await readRequestBody(req)).toString("utf8")) as Record<string, unknown>;
-      initSourceRunId = initBody.sourceRunId;
+      lastInitBody = initBody;
+      const uploadId = `upload_test_${initRequestCount}`;
+      const resolvedFileId = initRequestCount === 1 ? fileId : `${fileId}_${initRequestCount}`;
+      uploads.set(uploadId, {
+        chunks: [],
+        fileId: resolvedFileId,
+        sizeBytes: Number(initBody.sizeBytes ?? 0),
+        sourceRunId: typeof initBody.sourceRunId === "string" ? initBody.sourceRunId : undefined,
+      });
       writeJson(res, {
-        fileId,
-        uploadId: "upload_test",
+        fileId: resolvedFileId,
+        uploadId,
         chunkSize: 1024,
         expiresAt: "2026-06-02T00:00:00.000Z",
-        uploadUrl: "/api/host/files/upload_test/chunks",
+        uploadUrl: `/api/host/files/${uploadId}/chunks`,
       });
       return;
     }
-    if (req.method === "PUT" && url === "/api/host/files/upload_test/chunks/0") {
-      receivedChunks.push(await readRequestBody(req));
+    const chunkMatch = /^\/api\/host\/files\/(upload_test_\d+)\/chunks\/0$/.exec(url);
+    if (req.method === "PUT" && chunkMatch) {
+      uploads.get(chunkMatch[1]!)?.chunks.push(await readRequestBody(req));
       writeJson(res, { ok: true });
       return;
     }
-    if (req.method === "POST" && url === "/api/host/files/upload_test/complete") {
+    const completeMatch = /^\/api\/host\/files\/(upload_test_\d+)\/complete$/.exec(url);
+    if (req.method === "POST" && completeMatch) {
       await readRequestBody(req);
-      assert.equal(Buffer.concat(receivedChunks).length, 4);
+      const upload = uploads.get(completeMatch[1]!);
+      assert(upload);
+      assert.equal(Buffer.concat(upload.chunks).length, upload.sizeBytes);
       writeJson(res, {
         ok: true,
         payload: {
-          fileId,
+          fileId: upload.fileId,
           gatewayId: "gw_test",
           sessionKey: "agent:main:session_1",
           fileName: "photo.jpg",
           mimeType: "image/jpeg",
-          sizeBytes: 4,
+          sizeBytes: upload.sizeBytes,
           imageWidth: 20,
           imageHeight: 10,
           sha256: "sha",
@@ -308,10 +428,10 @@ async function createFileUploadRelayServer(fileId: string) {
           expiresAt: "2026-06-02T00:00:00.000Z",
           status: "ready",
           storagePath: "files/test",
-          downloadPath: `/api/mobile/files/${fileId}`,
+          downloadPath: `/api/mobile/files/${upload.fileId}`,
           chunkSize: 1024,
           totalChunks: 1,
-          sourceRunId: typeof initSourceRunId === "string" ? initSourceRunId : undefined,
+          sourceRunId: upload.sourceRunId,
         },
       });
       return;
@@ -325,6 +445,7 @@ async function createFileUploadRelayServer(fileId: string) {
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     initRequestCount: () => initRequestCount,
+    initBody: () => lastInitBody,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }

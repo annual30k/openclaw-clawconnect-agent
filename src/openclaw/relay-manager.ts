@@ -41,6 +41,10 @@ import {
   buildMobileAssistantErrorPayload,
   buildMobileAssistantFinalPayload,
 } from "../core/relay/mobile-chat-run-bridge.js";
+import {
+  buildChatSendIdempotencyRequest,
+  ChatSendIdempotencyGuard,
+} from "../core/relay/chat-send-idempotency.js";
 import { prepareChatSendParams } from "./relay/chat-send-attachments.js";
 import { relayOutgoingMediaInHistoryResponse, relayOutgoingMediaInPayload } from "./relay/outgoing-media-relay.js";
 import { prepareOpenClawVoiceInputCommand } from "./relay/openclaw-voice-input.js";
@@ -77,6 +81,14 @@ import {
   resolveChatPayloadTimestamp,
   shouldUseLegacyOpenClawHistoryFallback,
 } from "./relay/relay-manager-payload-helpers.js";
+
+type OpenClawChatCommandExecution = {
+  params: unknown;
+  result: unknown;
+};
+
+// 保留在连接实例之外，使 Relay WebSocket 断线重连后的同轮重投仍能复用终态结果。
+const openClawChatSendIdempotency = new ChatSendIdempotencyGuard<OpenClawChatCommandExecution>();
 
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -583,70 +595,102 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         msg.method = voiceInput.method;
       }
 
-      if (msg.method === "chat.send") {
-        msg.params = await prepareChatSendParams(msg.params);
-      }
-
-      const params = canonicalizeRelayParams(msg.method, msg.params, sessionDefaults);
-      const paramsRecord =
-        params && typeof params === "object" && !Array.isArray(params)
-          ? (params as Record<string, unknown>)
-          : undefined;
-      const chatSendDedupeRequest = msg.method === "chat.send"
-        ? chatSendDedupe.buildRequest(paramsRecord)
+      const commandMethod = msg.method;
+      const rawCommandParams = msg.params;
+      const rawParamsRecord = rawCommandParams && typeof rawCommandParams === "object" && !Array.isArray(rawCommandParams)
+        ? (rawCommandParams as Record<string, unknown>)
+        : undefined;
+      const rawSessionKey = typeof rawParamsRecord?.sessionKey === "string" && rawParamsRecord.sessionKey.trim()
+        ? rawParamsRecord.sessionKey.trim()
+        : sessionDefaults.mainSessionKey;
+      const normalizedSessionKey = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
+      const chatSendIdempotencyRequest = commandMethod === "chat.send" && rawParamsRecord
+        ? buildChatSendIdempotencyRequest({
+          gatewayId: opts.gatewayId,
+          sessionKey: typeof normalizedSessionKey === "string" && normalizedSessionKey.trim()
+            ? normalizedSessionKey.trim()
+            : sessionDefaults.mainSessionKey,
+          idempotencyKey: rawParamsRecord.idempotencyKey,
+          payload: {
+            method: "chat.send",
+            params: {
+              ...rawParamsRecord,
+              sessionKey: normalizedSessionKey,
+            },
+          },
+        })
         : undefined;
 
-      if (!gatewayClient && msg.method !== "chat.history") {
-        throw new Error("gateway not connected");
-      }
+      const executeCommand = async (): Promise<OpenClawChatCommandExecution> => {
+        const preparedParams = commandMethod === "chat.send"
+          ? await prepareChatSendParams(rawCommandParams, {
+            relayServerUrl: opts.relayServerUrl,
+            relaySecret: opts.relaySecret,
+          })
+          : rawCommandParams;
+        const params = canonicalizeRelayParams(commandMethod, preparedParams, sessionDefaults);
+        if (!gatewayClient && commandMethod !== "chat.history") {
+          throw new Error("gateway not connected");
+        }
+        const result = commandMethod === "chat.history"
+          ? await requestChatHistoryFromClawConnect(params)
+          : await gatewayClient!.request(commandMethod, params);
+        return { params, result };
+      };
+      const commandExecution = chatSendIdempotencyRequest
+        ? openClawChatSendIdempotency.execute(chatSendIdempotencyRequest, executeCommand)
+        : { status: "started" as const, promise: executeCommand() };
 
-      const commandPromise = msg.method === "chat.history"
-        ? requestChatHistoryFromClawConnect(params)
-        : gatewayClient!.request(msg.method, params);
-
-      commandPromise
-        .then(async (result) => {
-          let resolvedRunId: string | undefined;
-          if ((msg.method === "chat.send" || msg.method === "agent") && params && typeof params === "object" && !Array.isArray(params)) {
-            const paramsRecord = params as Record<string, unknown>;
-            const sessionKey =
-              typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
-                ? paramsRecord.sessionKey.trim()
-                : sessionDefaults.mainSessionKey;
-            const resultRecord = result && typeof result === "object" && !Array.isArray(result)
-              ? (result as Record<string, unknown>)
+      commandExecution.promise
+        .then(async ({ params, result }) => {
+          if (commandExecution.status === "started") {
+            const paramsRecord =
+              params && typeof params === "object" && !Array.isArray(params)
+                ? (params as Record<string, unknown>)
+                : undefined;
+            const chatSendDedupeRequest = commandMethod === "chat.send"
+              ? chatSendDedupe.buildRequest(paramsRecord)
               : undefined;
-            const runId =
-              typeof resultRecord?.runId === "string" && resultRecord.runId.trim().length > 0
-                ? resultRecord.runId.trim()
-                : requestId;
-            resolvedRunId = runId;
-            if (runId) {
-              const promptText =
-                typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
-                  ? paramsRecord.message.trim()
-                  : undefined;
-              const runContext = {
-                sessionKey,
-                requestedAtMs: Date.now(),
-                promptText,
-              };
-              scheduleChatHistoryFallback(runId, runContext);
+            if ((commandMethod === "chat.send" || commandMethod === "agent") && params && typeof params === "object" && !Array.isArray(params)) {
+              const paramsRecord = params as Record<string, unknown>;
+              const sessionKey =
+                typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
+                  ? paramsRecord.sessionKey.trim()
+                  : sessionDefaults.mainSessionKey;
+              const resultRecord = result && typeof result === "object" && !Array.isArray(result)
+                ? (result as Record<string, unknown>)
+                : undefined;
+              const runId =
+                typeof resultRecord?.runId === "string" && resultRecord.runId.trim().length > 0
+                  ? resultRecord.runId.trim()
+                  : requestId;
+              if (runId) {
+                const promptText =
+                  typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
+                    ? paramsRecord.message.trim()
+                    : undefined;
+                const runContext = {
+                  sessionKey,
+                  requestedAtMs: Date.now(),
+                  promptText,
+                };
+                scheduleChatHistoryFallback(runId, runContext);
+              }
+              if (commandMethod === "chat.send" && chatSendDedupeRequest) {
+                chatSendDedupe.register(chatSendDedupeRequest, runId);
+              }
+              // Let a model switch settle before publishing context usage again.
+              // Forced refreshes can replay a stale model snapshot and overwrite the new selection.
+              scheduleContextUsageRefresh(sessionKey, 1200);
             }
-            if (msg.method === "chat.send" && chatSendDedupeRequest) {
-              chatSendDedupe.register(chatSendDedupeRequest, runId);
-            }
-            // Let a model switch settle before publishing context usage again.
-            // Forced refreshes can replay a stale model snapshot and overwrite the new selection.
-            scheduleContextUsageRefresh(sessionKey, 1200);
           }
           if (requestId) {
-            const responsePayload = await relayOutgoingMediaForResponse(msg.method, result);
+            const responsePayload = await relayOutgoingMediaForResponse(commandMethod, result);
             send({ type: "res", id: requestId, ok: true, payload: responsePayload });
           }
         })
         .catch((err: unknown) => {
-          console.error(`[relay] cmd failed method=${msg.method} id=${requestId ?? "(no-id)"}: ${String(err)}`);
+          console.error(`[relay] cmd failed method=${commandMethod} id=${requestId ?? "(no-id)"}: ${String(err)}`);
           if (requestId) {
             send({ type: "res", id: requestId, ok: false, error: { message: String(err) } });
           }
