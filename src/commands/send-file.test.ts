@@ -389,6 +389,7 @@ test("send-file infers source run id from the triggering OpenClaw user turn", as
   const sessionsDir = join(sessionStoreRoot, "agents", "main", "sessions");
   await mkdir(sessionsDir, { recursive: true });
   const sessionKey = "agent:main:ios-device-1";
+  const relaySessionKey = "ios-device-1";
   const transcriptPath = join(sessionsDir, "session-1.jsonl");
   await writeFile(
     join(sessionsDir, "sessions.json"),
@@ -439,6 +440,7 @@ test("send-file infers source run id from the triggering OpenClaw user turn", as
       const body = await readRequestBody(req);
       if (req.method === "POST" && req.url === "/api/host/gateways/gw-1/files/init") {
         initBody = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
+        assert.equal(initBody.sessionKey, relaySessionKey);
         sendJson(res, {
           fileId: "file_openclaw_run",
           uploadId: "up_openclaw_run",
@@ -458,7 +460,7 @@ test("send-file infers source run id from the triggering OpenClaw user turn", as
           payload: {
             fileId: "file_openclaw_run",
             gatewayId: "gw-1",
-            sessionKey,
+            sessionKey: relaySessionKey,
             fileName: "hello.txt",
             mimeType: "text/plain",
             sizeBytes: 5,
@@ -513,6 +515,7 @@ test("send-file infers source run id from the triggering OpenClaw user turn", as
     );
 
     assert.equal(initBody?.sourceRunId, "client-run-spiderman");
+    assert.equal(initBody?.sessionKey, relaySessionKey);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(tempDir, { recursive: true, force: true });
@@ -527,13 +530,14 @@ test("send-file infers the latest active session when session is omitted", async
 
   const sessionStoreRoot = join(tempDir, ".openclaw");
   const sessionsDir = join(sessionStoreRoot, "agents", "main", "sessions");
+  const hostSessionKey = "agent:main:ios-selected";
   await mkdir(sessionsDir, { recursive: true });
   await writeFile(
     join(sessionsDir, "sessions.json"),
     JSON.stringify(
       {
         "agent:main:main": { updatedAt: 1000 },
-        "agent:main:ios-selected": { updatedAt: 2000 },
+        [hostSessionKey]: { updatedAt: 2000 },
         "agent:main:archive": { updatedAt: 1500 },
       },
       null,
@@ -541,7 +545,7 @@ test("send-file infers the latest active session when session is omitted", async
     ),
   );
 
-  const expectedSessionKey = "agent:main:ios-selected";
+  const expectedSessionKey = "ios-selected";
   const expectedSha256 = createHash("sha256").update(fileBytes).digest("hex");
 
   let initBody: Record<string, unknown> | undefined;

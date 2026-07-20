@@ -54,10 +54,11 @@ export async function sendFileCommand(
     throw new Error("gateway_id_required");
   }
 
-  const sessionKey = await resolveTargetSessionKey(opts.session, config, deps.sessionStoreRoot, env);
+  const hostSessionKey = await resolveTargetSessionKey(opts.session, config, deps.sessionStoreRoot, env);
+  const sessionKey = relayUploadSessionKey(hostSessionKey, config);
   const sourceRunId =
     resolveSourceRunId(opts.sourceRunId, env)
-    ?? await resolveOpenClawTranscriptSourceRunId(opts, config, sessionKey, deps.sessionStoreRoot);
+    ?? await resolveOpenClawTranscriptSourceRunId(opts, config, hostSessionKey, deps.sessionStoreRoot);
   writeLog(stderr, `[send-file] preparing ${opts.filePath} for gateway ${gatewayId} session ${sessionKey}`);
 
   const result = await uploadFileToRelay(
@@ -90,6 +91,19 @@ export async function sendFileCommand(
   }
 
   return result;
+}
+
+function relayUploadSessionKey(hostSessionKey: string, config: ClawConnectConfig): string {
+  const normalized = normalizeSessionKey(hostSessionKey);
+  if (config.gatewayType && config.gatewayType !== "openclaw") {
+    return normalized;
+  }
+  // OpenClaw stores transcripts under agent:<agentId>:<session>, while Relay
+  // and all mobile clients address the same chat as <session>. Keep the Host
+  // key for transcript/sourceRunId lookup, but persist the file in the mobile
+  // session from the start so file, attachment timeline, and reply share scope.
+  const match = /^agent:[^:]+:(.+)$/i.exec(normalized);
+  return normalizeSessionKey(match?.[1] ?? normalized);
 }
 
 async function resolveOpenClawTranscriptSourceRunId(
