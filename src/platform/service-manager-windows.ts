@@ -1,17 +1,21 @@
 import { execFileSync } from "child_process";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { join } from "path";
 import {
   ensureLogDir,
   getProfileErrorLogPath,
+  getProfileLogDir,
   getProfileLogPath,
   getProgramArgs,
   resolveServiceEntryPath,
+  setRestrictiveFilePermissions,
 } from "./service-manager-common.js";
 import type { ServiceStatus } from "./service-manager-common.js";
 import { getActiveProfile, normalizeProfileName } from "../config/profile.js";
 import { decodeTextBuffer } from "./text-file-decoder.js";
 
 export const TASK_NAME = "ClawConnectAgent";
+export const WINDOWS_SERVICE_RUNNER_NAME = "clawconnect-service.ps1";
 
 export function windowsTaskName(profile?: string): string {
   const normalized = normalizeProfileName(profile);
@@ -57,6 +61,33 @@ export function buildWindowsServiceProcessCommand(
   return buildWindowsPowerShellBootstrap(
     `& ${qps(execPath)} ${execArgs.map((arg) => qps(arg)).join(" ")} >> ${qps(logPath)} 2>> ${qps(errorLogPath)}`,
   );
+}
+
+export function windowsServiceRunnerPath(profile?: string): string {
+  return join(getProfileLogDir(profile), WINDOWS_SERVICE_RUNNER_NAME);
+}
+
+export function buildWindowsServiceTaskCommand(runnerPath: string): string {
+  return `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "${runnerPath}"`;
+}
+
+export function writeWindowsServiceRunner(
+  profile: string | undefined,
+  args: string[],
+  logPath: string,
+  errorLogPath: string,
+): string {
+  const runnerPath = windowsServiceRunnerPath(profile);
+  const script = `${buildWindowsServiceProcessCommand(args, logPath, errorLogPath)}\r\n`;
+  // Windows PowerShell 5.1 treats UTF-8 files without a BOM as the active ANSI
+  // code page. Keep the BOM so user names and install paths remain intact.
+  const utf8WithBom = Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from(script, "utf8"),
+  ]);
+  writeFileSync(runnerPath, utf8WithBom);
+  setRestrictiveFilePermissions(runnerPath);
+  return runnerPath;
 }
 
 /**
@@ -153,6 +184,18 @@ export function installWindowsService(profile?: string): boolean {
     normalizeWindowsServiceLogEncoding(logPath);
     normalizeWindowsServiceLogEncoding(errorLogPath);
 
+    // Keep the scheduled task command short. schtasks limits /tr to 261
+    // characters, while NVM/npm paths plus UTF-8 bootstrap and log redirects
+    // can easily exceed it when embedded inline.
+    const runnerPath = writeWindowsServiceRunner(
+      resolvedProfile,
+      args,
+      logPath,
+      errorLogPath,
+    );
+    const taskCommand = buildWindowsServiceTaskCommand(runnerPath);
+    const taskArguments = taskCommand.slice("powershell.exe ".length);
+
     // ── Attempt 1: PowerShell ScheduledTasks module ──────────────────────
     // Supports RestartOnFailure (crash recovery) and full settings control.
     // Available on Windows 10 / Server 2016+.
@@ -161,16 +204,8 @@ export function installWindowsService(profile?: string): boolean {
       // This is the most reliable native way to run a background console app on login.
       // Stdout/stderr are redirected to log files, matching the behavior of the
       // Linux (systemd/nohup) and macOS (launchd) service managers.
-      const innerCmd = buildWindowsServiceProcessCommand(args, logPath, errorLogPath);
-
-      // The -Argument value uses a PowerShell double-quote string ("" → literal ")
-      // so that single quotes from qps() inside it are preserved literally.
-      // Escape any `$` or `` ` `` in the paths to prevent PowerShell variable expansion.
-      const escapedInner = innerCmd.replace(/`/g, "``").replace(/\$/g, "`$");
-      const quotedArg = `"-WindowStyle Hidden -Command ""${escapedInner}"""`;
-
       const psScript = [
-        `$action   = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ${quotedArg}`,
+        `$action   = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ${qps(taskArguments)}`,
         `$trigger  = New-ScheduledTaskTrigger -AtLogon`,
         `$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest`,
         `$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`,
@@ -185,17 +220,9 @@ export function installWindowsService(profile?: string): boolean {
     }
 
     // ── Attempt 2: Basic schtasks (no crash recovery) ────────────────────
-    // Wrap in powershell -WindowStyle Hidden so no console window pops up at login.
-    // schtasks stores /tr as-is; CreateProcess parses it with CommandLineToArgvW.
-    // The inner command is passed as a single argument to -Command via double quotes
-    // escaped as \" per CommandLineToArgvW convention.
-    // Stdout/stderr are redirected to log files via PowerShell >> / 2>> operators.
-    const fallbackInner = buildWindowsServiceProcessCommand(args, logPath, errorLogPath);
-    const fallbackTr = `powershell.exe -WindowStyle Hidden -Command "${fallbackInner.replace(/"/g, '\\"')}"`;
-
     execFileSync(
       "schtasks",
-      ["/create", "/tn", taskName, "/tr", fallbackTr, "/sc", "onlogon", "/f"],
+      ["/create", "/tn", taskName, "/tr", taskCommand, "/sc", "onlogon", "/f"],
       { stdio: "pipe" }
     );
     execFileSync("schtasks", ["/run", "/tn", taskName], { stdio: "pipe" });
@@ -209,6 +236,7 @@ export function installWindowsService(profile?: string): boolean {
 export function uninstallWindowsService(profile?: string): boolean {
   const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
   const taskName = windowsTaskName(resolvedProfile);
+  const runnerPath = windowsServiceRunnerPath(resolvedProfile);
   try {
     let changed = false;
     try {
@@ -220,6 +248,12 @@ export function uninstallWindowsService(profile?: string): boolean {
 
     if (killWindowsProcess(resolvedProfile)) {
       changed = true;
+    }
+    try {
+      unlinkSync(runnerPath);
+      changed = true;
+    } catch {
+      // runner might not exist
     }
     return changed;
   } catch (err) {

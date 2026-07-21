@@ -7,6 +7,7 @@ import {
   buildWindowsPowerShellBootstrap,
   buildWindowsProcessQueryScript,
   buildWindowsServiceProcessCommand,
+  buildWindowsServiceTaskCommand,
   normalizeWindowsServiceLogEncoding,
   windowsTaskName,
 } from "./service-manager-windows.js";
@@ -33,6 +34,18 @@ test("Windows service commands safely invoke paths containing spaces, quotes, an
   assert.match(script, /'C:\\Users\\O''Brien\\Claw Connect\\index\.js'/);
   assert.match(script, /'--profile' 'Hermes Agent'/);
   assert.match(script, />> 'C:\\Users\\O''Brien\\Logs\\claw & connect\.log'/);
+});
+
+test("Windows scheduled task uses a short runner command instead of inline service paths", () => {
+  const runnerPath = "C:\\Users\\Administrator\\.clawconnect\\profiles\\openclaw\\clawconnect-service.ps1";
+  const command = buildWindowsServiceTaskCommand(runnerPath);
+
+  assert.equal(
+    command,
+    `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "${runnerPath}"`,
+  );
+  assert.ok(command.length <= 261);
+  assert.doesNotMatch(command, /node_modules|clawconnect-error\.log/);
 });
 
 test("Windows service install migrates old UTF-16LE logs before UTF-8 appends", () => {
