@@ -7,8 +7,10 @@ import {
   buildWindowsPowerShellBootstrap,
   buildWindowsProcessQueryScript,
   buildWindowsServiceProcessCommand,
+  buildWindowsStartupRegistryArgs,
   buildWindowsServiceTaskCommand,
   normalizeWindowsServiceLogEncoding,
+  WINDOWS_RUN_KEY,
   windowsTaskName,
 } from "./service-manager-windows.js";
 
@@ -46,6 +48,25 @@ test("Windows scheduled task uses a short runner command instead of inline servi
   );
   assert.ok(command.length <= 261);
   assert.doesNotMatch(command, /node_modules|clawconnect-error\.log/);
+});
+
+test("Windows standard-user fallback installs a profile-specific HKCU startup entry", () => {
+  const command = 'powershell.exe -NoProfile -File "C:\\Users\\Dev User\\.clawconnect\\clawconnect-service.ps1"';
+
+  assert.deepEqual(
+    buildWindowsStartupRegistryArgs("ClawConnectAgent-openclaw", command),
+    [
+      "add",
+      WINDOWS_RUN_KEY,
+      "/v",
+      "ClawConnectAgent-openclaw",
+      "/t",
+      "REG_SZ",
+      "/d",
+      command,
+      "/f",
+    ],
+  );
 });
 
 test("Windows service install migrates old UTF-16LE logs before UTF-8 appends", () => {

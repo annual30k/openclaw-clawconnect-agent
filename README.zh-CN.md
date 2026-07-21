@@ -216,9 +216,9 @@ clawconnect install
 - macOS：安装为 `launchd` 用户服务
 - Linux：优先使用 `systemd --user`
 - 如果 Linux 当前环境不支持 `systemd --user`，会自动回退到 `nohup`
-- Windows：注册为 Windows Task Scheduler 任务，登录时自动静默启动（`powershell -WindowStyle Hidden`）
+- Windows：优先注册为有限权限的 Windows Task Scheduler 任务；若系统策略要求管理员权限，则自动使用当前用户的启动项，二者都会在登录时静默启动且无需管理员提权
 
-Windows 的不同 profile 使用独立计划任务（例如 `ClawConnectAgent-openclaw`、`ClawConnectAgent-hermes`）和独立 UTF-8 日志，不会互相覆盖。
+Windows 的不同 profile 使用独立后台启动项（例如 `ClawConnectAgent-openclaw`、`ClawConnectAgent-hermes`）和独立 UTF-8 日志，不会互相覆盖。
 
 在不支持 `systemd --user` 的 Linux 环境下，会生成一个备用启动脚本：
 

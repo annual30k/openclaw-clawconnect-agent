@@ -183,9 +183,9 @@ clawconnect install
 
 - macOS: installs a `launchd` user agent
 - Linux: prefers `systemd --user`, and falls back to `nohup` when `systemctl --user` is unavailable
-- Windows: registers a Windows Task Scheduler task that auto-starts at logon with silent console (`powershell -WindowStyle Hidden`)
+- Windows: registers a limited-privilege Windows Task Scheduler task when allowed, otherwise uses the current user's Startup registry entry; both auto-start silently at logon without requiring administrator elevation
 
-Windows profiles use isolated scheduled tasks and UTF-8 logs, for example `ClawConnectAgent-openclaw` and `ClawConnectAgent-hermes`.
+Windows profiles use isolated background startup entries and UTF-8 logs, for example `ClawConnectAgent-openclaw` and `ClawConnectAgent-hermes`.
 
 On Linux hosts without `systemd --user`, `clawconnect install` will generate a fallback launcher at:
 

@@ -1,4 +1,4 @@
-import { execFileSync } from "child_process";
+import { execFileSync, spawn } from "child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import {
@@ -16,6 +16,7 @@ import { decodeTextBuffer } from "./text-file-decoder.js";
 
 export const TASK_NAME = "ClawConnectAgent";
 export const WINDOWS_SERVICE_RUNNER_NAME = "clawconnect-service.ps1";
+export const WINDOWS_RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 export function windowsTaskName(profile?: string): string {
   const normalized = normalizeProfileName(profile);
@@ -69,6 +70,102 @@ export function windowsServiceRunnerPath(profile?: string): string {
 
 export function buildWindowsServiceTaskCommand(runnerPath: string): string {
   return `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "${runnerPath}"`;
+}
+
+export function buildWindowsStartupRegistryArgs(
+  taskName: string,
+  taskCommand: string,
+): string[] {
+  return [
+    "add",
+    WINDOWS_RUN_KEY,
+    "/v",
+    taskName,
+    "/t",
+    "REG_SZ",
+    "/d",
+    taskCommand,
+    "/f",
+  ];
+}
+
+function removeWindowsStartupEntry(taskName: string): boolean {
+  try {
+    execFileSync("reg.exe", ["delete", WINDOWS_RUN_KEY, "/v", taskName, "/f"], {
+      stdio: "pipe",
+      windowsHide: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasWindowsStartupEntry(taskName: string): boolean {
+  try {
+    execFileSync("reg.exe", ["query", WINDOWS_RUN_KEY, "/v", taskName], {
+      stdio: "pipe",
+      windowsHide: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasWindowsScheduledTask(taskName: string): boolean {
+  try {
+    execFileSync("schtasks", ["/query", "/tn", taskName], {
+      stdio: "pipe",
+      windowsHide: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function startWindowsRunner(runnerPath: string): void {
+  const child = spawn(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-WindowStyle",
+      "Hidden",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      runnerPath,
+    ],
+    {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    },
+  );
+  // Avoid an unhandled error event if process creation is blocked by policy.
+  child.once("error", () => undefined);
+  child.unref();
+}
+
+function startScheduledTaskOrRunner(taskName: string, runnerPath: string): void {
+  try {
+    execFileSync("schtasks", ["/run", "/tn", taskName], { stdio: "pipe" });
+  } catch {
+    startWindowsRunner(runnerPath);
+  }
+}
+
+function installWindowsStartupEntry(
+  taskName: string,
+  taskCommand: string,
+  runnerPath: string,
+): void {
+  execFileSync("reg.exe", buildWindowsStartupRegistryArgs(taskName, taskCommand), {
+    stdio: "pipe",
+    windowsHide: true,
+  });
+  startWindowsRunner(runnerPath);
 }
 
 export function writeWindowsServiceRunner(
@@ -207,28 +304,59 @@ export function installWindowsService(profile?: string): boolean {
       const psScript = [
         `$action   = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ${qps(taskArguments)}`,
         `$trigger  = New-ScheduledTaskTrigger -AtLogon`,
-        `$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest`,
+        `$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited`,
         `$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`,
         `Register-ScheduledTask -TaskName ${qps(taskName)} -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null`,
       ].join("\n");
 
       execFileSync("powershell", ["-NoProfile", "-Command", psScript], { stdio: "pipe" });
-      execFileSync("schtasks", ["/run", "/tn", taskName], { stdio: "pipe" });
+      removeWindowsStartupEntry(taskName);
+      startScheduledTaskOrRunner(taskName, runnerPath);
       return true;
-    } catch (err) {
+    } catch {
       // Fall through to basic schtasks below
     }
 
     // ── Attempt 2: Basic schtasks (no crash recovery) ────────────────────
-    execFileSync(
-      "schtasks",
-      ["/create", "/tn", taskName, "/tr", taskCommand, "/sc", "onlogon", "/f"],
-      { stdio: "pipe" }
-    );
-    execFileSync("schtasks", ["/run", "/tn", taskName], { stdio: "pipe" });
+    try {
+      execFileSync(
+        "schtasks",
+        [
+          "/create",
+          "/tn",
+          taskName,
+          "/tr",
+          taskCommand,
+          "/sc",
+          "onlogon",
+          "/rl",
+          "LIMITED",
+          "/f",
+        ],
+        { stdio: "pipe" },
+      );
+      removeWindowsStartupEntry(taskName);
+      startScheduledTaskOrRunner(taskName, runnerPath);
+      return true;
+    } catch {
+      // Some Windows policies reserve Task Scheduler registration for
+      // administrators. HKCU Run is a per-user startup mechanism and does not
+      // require elevation.
+    }
+
+    // An older task can be readable but not replaceable by the current
+    // unelevated shell. Keep that login trigger instead of installing a second
+    // autostart path, and launch the newly written runner immediately.
+    if (hasWindowsScheduledTask(taskName)) {
+      removeWindowsStartupEntry(taskName);
+      startScheduledTaskOrRunner(taskName, runnerPath);
+      return true;
+    }
+
+    installWindowsStartupEntry(taskName, taskCommand, runnerPath);
     return true;
   } catch (err) {
-    console.error("[clawconnect] Failed to install Windows task:", err);
+    console.error("[clawconnect] Failed to install Windows background startup:", err);
     return false;
   }
 }
@@ -247,6 +375,9 @@ export function uninstallWindowsService(profile?: string): boolean {
     }
 
     if (killWindowsProcess(resolvedProfile)) {
+      changed = true;
+    }
+    if (removeWindowsStartupEntry(taskName)) {
       changed = true;
     }
     try {
@@ -274,6 +405,15 @@ export function restartWindowsService(profile?: string): boolean {
 
   killWindowsProcess(resolvedProfile);
 
+  if (hasWindowsStartupEntry(taskName)) {
+    try {
+      startWindowsRunner(windowsServiceRunnerPath(resolvedProfile));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   try {
     execFileSync("schtasks", ["/run", "/tn", taskName], { stdio: "pipe" });
     return true;
@@ -298,13 +438,9 @@ export function getWindowsServiceStatus(profile?: string): ServiceStatus {
   const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
   const taskName = windowsTaskName(resolvedProfile);
   const logPath = getProfileLogPath(resolvedProfile);
-  let installed = false;
-  try {
-    execFileSync("schtasks", ["/query", "/tn", taskName], { stdio: "pipe" });
-    installed = true;
-  } catch {
-    installed = false;
-  }
+  const installedViaTask = hasWindowsScheduledTask(taskName);
+  const installedViaStartup = hasWindowsStartupEntry(taskName);
+  const installed = installedViaTask || installedViaStartup;
 
   let running = false;
   if (installed) {
@@ -331,8 +467,11 @@ export function getWindowsServiceStatus(profile?: string): ServiceStatus {
     installed,
     running,
     serviceName: taskName,
-    manager: "Windows Task Scheduler",
+    manager: installedViaTask ? "Windows Task Scheduler" : "Windows Startup",
+    servicePath: windowsServiceRunnerPath(resolvedProfile),
     logPath,
-    startHint: `schtasks /run /tn "${taskName}"`,
+    startHint: installedViaTask
+      ? `schtasks /run /tn "${taskName}"`
+      : buildWindowsServiceTaskCommand(windowsServiceRunnerPath(resolvedProfile)),
   };
 }
