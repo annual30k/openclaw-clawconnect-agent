@@ -1,8 +1,10 @@
 import { existsSync } from "fs";
 import { delimiter, dirname, join, resolve } from "path";
 import { homedir } from "os";
-import { execFileSync, execSync, spawn } from "child_process";
+import { execFileSync, spawn } from "child_process";
 import type { LocalCommandContext, LocalResult } from "../../core/command-types.js";
+import { buildExecutableInvocation } from "../../platform/process-invocation.js";
+import { resolveConfiguredPath, resolveOpenClawStateDir } from "./openclaw-paths.js";
 
 export type GatewayRuntimeState = "running" | "stopped" | "unknown";
 
@@ -22,7 +24,7 @@ export type GatewayRuntimeState = "running" | "stopped" | "unknown";
 const NODE_BIN_DIR = dirname(process.execPath);
 const IS_WINDOWS = process.platform === "win32";
 
-const SUBPROCESS_ENV: NodeJS.ProcessEnv = (() => {
+function buildSubprocessEnv(): NodeJS.ProcessEnv {
   // On Windows, environment variables are case-insensitive.  process.env may
   // contain both `PATH` and `Path`, and spreading both into the child-process
   // environment block can lead to unpredictable path resolution.
@@ -44,7 +46,7 @@ const SUBPROCESS_ENV: NodeJS.ProcessEnv = (() => {
   }
   env.PATH = [
     NODE_BIN_DIR,
-    join(homedir(), ".openclaw", "bin"),
+    join(resolveOpenClawStateDir(), "bin"),
     join(homedir(), ".local", "bin"),
     join(homedir(), ".npm-global", "bin"),
     process.env.PNPM_HOME,
@@ -65,15 +67,17 @@ const SUBPROCESS_ENV: NodeJS.ProcessEnv = (() => {
     .join(delimiter);
 
   return env;
-})();
+}
 
 function canRunOpenclawBin(candidate: string): boolean {
   try {
-    if (IS_WINDOWS && (candidate.endsWith(".js") || candidate.endsWith(".mjs"))) {
-      execFileSync(process.execPath, [candidate, "--version"], { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 });
-    } else {
-      execFileSync(candidate, ["--version"], { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 });
-    }
+    const invocation = buildExecutableInvocation(candidate, ["--version"]);
+    execFileSync(invocation.command, invocation.args, {
+      stdio: "pipe",
+      env: buildSubprocessEnv(),
+      timeout: 3000,
+      windowsHide: true,
+    });
     return true;
   } catch {
     return false;
@@ -82,8 +86,9 @@ function canRunOpenclawBin(candidate: string): boolean {
 
 function bundledOpenclawBin(): string | null {
   const explicitPackageBin = process.env.OPENCLAW_PACKAGE_BIN?.trim();
-  if (explicitPackageBin && existsSync(explicitPackageBin)) {
-    return explicitPackageBin;
+  const explicitPackagePath = explicitPackageBin ? resolveConfiguredPath(explicitPackageBin) : undefined;
+  if (explicitPackagePath && existsSync(explicitPackagePath)) {
+    return explicitPackagePath;
   }
 
   // On Windows, node_modules might be in a different structure if globally installed.
@@ -137,8 +142,12 @@ export function selectOpenclawBinCandidate(
 function resolveOpenclawBin(): string {
   let pathBin: string | undefined;
   try {
-    const whichCmd = IS_WINDOWS ? "where openclaw" : "which openclaw";
-    const p = execSync(whichCmd, { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 })
+    const p = execFileSync(IS_WINDOWS ? "where.exe" : "which", ["openclaw"], {
+      stdio: "pipe",
+      env: buildSubprocessEnv(),
+      timeout: 3000,
+      windowsHide: true,
+    })
       .toString().trim();
     // 'where' might return multiple lines, take the first one.
     pathBin = p.split(/\r?\n/)[0] || undefined;
@@ -147,27 +156,63 @@ function resolveOpenclawBin(): string {
   }
 
   const extraBins = [
-    join(homedir(), ".openclaw", "bin", IS_WINDOWS ? "openclaw.cmd" : "openclaw"),
-    join(homedir(), ".openclaw", "bin", "openclaw"),
+    join(resolveOpenClawStateDir(), "bin", IS_WINDOWS ? "openclaw.cmd" : "openclaw"),
+    ...(IS_WINDOWS ? [join(resolveOpenClawStateDir(), "bin", "openclaw.ps1")] : []),
+    join(resolveOpenClawStateDir(), "bin", "openclaw"),
     join(homedir(), ".local", "bin", "openclaw"),
     join(homedir(), ".npm-global", "bin", "openclaw"),
     ...(process.env.PNPM_HOME ? [join(process.env.PNPM_HOME, "openclaw")] : []),
     join(homedir(), ".local", "share", "pnpm", "openclaw"),
+    ...openClawInstallDirCandidates(process.env.OPENCLAW_INSTALL_DIR),
   ];
 
   return selectOpenclawBinCandidate({
-    explicitBin: process.env.OPENCLAW_BIN,
+    explicitBin: process.env.OPENCLAW_BIN?.trim()
+      ? resolveConfiguredPath(process.env.OPENCLAW_BIN)
+      : undefined,
     pathBin,
     extraBins,
     packageBin: bundledOpenclawBin(),
   });
 }
 
+export function openClawInstallDirCandidates(installDir: string | undefined): string[] {
+  const configuredRoot = installDir?.trim();
+  if (!configuredRoot) {
+    return [];
+  }
+  const root = resolveConfiguredPath(configuredRoot);
+  return [
+    join(root, "openclaw.mjs"),
+    join(root, "dist", "index.js"),
+    join(root, "bin", IS_WINDOWS ? "openclaw.cmd" : "openclaw"),
+    ...(IS_WINDOWS ? [join(root, "bin", "openclaw.ps1")] : []),
+    join(root, IS_WINDOWS ? "openclaw.cmd" : "openclaw"),
+    ...(IS_WINDOWS ? [join(root, "openclaw.ps1")] : []),
+    join(root, "node_modules", "openclaw", "openclaw.mjs"),
+  ];
+}
+
 let cachedOpenclawBin: string | null = null;
+let cachedOpenclawBinKey: string | null = null;
 
 function getOpenclawBin(): string {
-  if (cachedOpenclawBin == null) {
+  // A long-lived process can receive a different runtime configuration before
+  // a profile is started. Cache discovery only while all relevant inputs stay
+  // unchanged, so an explicit override can never be masked by an older PATH hit.
+  const discoveryKey = [
+    process.env.OPENCLAW_BIN,
+    process.env.OPENCLAW_PACKAGE_BIN,
+    process.env.OPENCLAW_INSTALL_DIR,
+    process.env.OPENCLAW_STATE_DIR,
+    process.env.CLAWCONNECT_OPENCLAW_HOME,
+    process.env.OPENCLAW_HOME,
+    process.env.PNPM_HOME,
+    process.env.PATH,
+  ].join("\0");
+  if (cachedOpenclawBin == null || cachedOpenclawBinKey !== discoveryKey) {
     cachedOpenclawBin = resolveOpenclawBin();
+    cachedOpenclawBinKey = discoveryKey;
   }
   return cachedOpenclawBin;
 }
@@ -189,25 +234,20 @@ export function errorMessage(err: unknown): string {
 
 /** Run openclaw with the resolved path and the enriched subprocess environment. */
 export function openclaw(args: string[]): Buffer {
-  const bin = getOpenclawBin();
-  if (IS_WINDOWS && (bin.endsWith(".js") || bin.endsWith(".mjs"))) {
-    return execFileSync(process.execPath, [bin, ...args], { stdio: "pipe", env: SUBPROCESS_ENV });
-  }
-  return execFileSync(bin, args, { stdio: "pipe", env: SUBPROCESS_ENV });
+  const invocation = buildExecutableInvocation(getOpenclawBin(), args);
+  return execFileSync(invocation.command, invocation.args, {
+    stdio: "pipe",
+    env: buildSubprocessEnv(),
+    windowsHide: true,
+  });
 }
 
 function launchGatewayLifecycleCommand(action: "start" | "restart", source = "clawconnect"): LocalResult {
   try {
-    const openclawBin = getOpenclawBin();
-    const spawnArgs = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
-      ? [openclawBin, "gateway", action]
-      : ["gateway", action];
-    const spawnExe = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
-      ? process.execPath
-      : openclawBin;
+    const invocation = buildExecutableInvocation(getOpenclawBin(), ["gateway", action]);
 
-    const child = spawn(spawnExe, spawnArgs, {
-      env: SUBPROCESS_ENV,
+    const child = spawn(invocation.command, invocation.args, {
+      env: buildSubprocessEnv(),
       stdio: "ignore",
       detached: true,
       windowsHide: true,
@@ -278,16 +318,10 @@ export async function runGatewayLifecycleStreaming(
   action: "start" | "restart",
   context: LocalCommandContext = {}
 ): Promise<LocalResult> {
-  const openclawBin = getOpenclawBin();
-  const spawnArgs = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
-    ? [openclawBin, "gateway", action]
-    : ["gateway", action];
-  const spawnExe = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
-    ? process.execPath
-    : openclawBin;
+  const invocation = buildExecutableInvocation(getOpenclawBin(), ["gateway", action]);
 
-  const child = spawn(spawnExe, spawnArgs, {
-    env: SUBPROCESS_ENV,
+  const child = spawn(invocation.command, invocation.args, {
+    env: buildSubprocessEnv(),
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -426,16 +460,15 @@ export async function runGatewayLifecycleStreaming(
 }
 
 export async function runDoctorFix(context: LocalCommandContext = {}): Promise<LocalResult> {
-  const openclawBin = getOpenclawBin();
-  const spawnArgs = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
-    ? [openclawBin, "doctor", "--fix", "--non-interactive", "--yes"]
-    : ["doctor", "--fix", "--non-interactive", "--yes"];
-  const spawnExe = IS_WINDOWS && (openclawBin.endsWith(".js") || openclawBin.endsWith(".mjs"))
-    ? process.execPath
-    : openclawBin;
+  const invocation = buildExecutableInvocation(getOpenclawBin(), [
+    "doctor",
+    "--fix",
+    "--non-interactive",
+    "--yes",
+  ]);
 
-  const child = spawn(spawnExe, spawnArgs, {
-    env: SUBPROCESS_ENV,
+  const child = spawn(invocation.command, invocation.args, {
+    env: buildSubprocessEnv(),
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });

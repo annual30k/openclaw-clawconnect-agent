@@ -3,7 +3,14 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AGENT_ENV_TEMPLATE, ensureUserEnvFile, getDefaultRelayServerUrl, loadAgentEnv, parseEnvFile } from "./env.js";
+import {
+  AGENT_ENV_TEMPLATE,
+  ensureUserEnvFile,
+  getConfiguredGatewayPort,
+  getDefaultRelayServerUrl,
+  loadAgentEnv,
+  parseEnvFile,
+} from "./env.js";
 
 test("parseEnvFile handles comments, exports, and quotes", () => {
   assert.deepEqual(
@@ -46,6 +53,13 @@ test("loadAgentEnv reads env files without overriding shell env", async () => {
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test("getConfiguredGatewayPort accepts only valid TCP ports", () => {
+  assert.equal(getConfiguredGatewayPort({ OPENCLAW_GATEWAY_PORT: "19001" }), 19001);
+  assert.equal(getConfiguredGatewayPort({ OPENCLAW_GATEWAY_PORT: "0" }), undefined);
+  assert.equal(getConfiguredGatewayPort({ OPENCLAW_GATEWAY_PORT: "65536" }), undefined);
+  assert.equal(getConfiguredGatewayPort({ OPENCLAW_GATEWAY_PORT: "abc" }), undefined);
 });
 
 test("ensureUserEnvFile creates the full commented env template without overwriting", async () => {

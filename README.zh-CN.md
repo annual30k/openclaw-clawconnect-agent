@@ -143,12 +143,39 @@ $EDITOR ~/.clawconnect/.env
 
 - `CLAWCONNECT_RELAY_SERVER_URL`：未传 `--server` 时，`clawconnect pair` 使用的默认中继地址
 - `CLAWCONNECT_GATEWAY_URL`：可选，本机 OpenClaw Gateway WebSocket 地址覆盖值
+- `OPENCLAW_GATEWAY_PORT`：只覆盖 OpenClaw Gateway 端口；`CLAWCONNECT_GATEWAY_URL` 优先级更高
+- `OPENCLAW_HOME` / `OPENCLAW_STATE_DIR` / `OPENCLAW_CONFIG_PATH`：OpenClaw 官方路径覆盖；源码、Homebrew、容器挂载、独立服务用户和多网关安装都应使用这些值
+- `OPENCLAW_BIN` / `OPENCLAW_PACKAGE_BIN` / `OPENCLAW_INSTALL_DIR`：OpenClaw 不在 PATH 或不是 npm 安装时，指定 CLI/JS 入口或安装根目录
+- `HERMES_HOME` / `HERMES_BIN` / `HERMES_PYTHON`：Hermes 数据目录、CLI 与 Python 覆盖；Windows 会先自动探测 `%LOCALAPPDATA%\hermes`
+- `HERMES_SKILLS_DIR` / `CLAWCONNECT_HERMES_STATE_DB`：可选，单独指定 Hermes 技能目录和状态数据库路径
+- `CLAWCONNECT_HERMES_API_URL` / `CLAWCONNECT_HERMES_API_KEY`：Hermes API 完整地址与鉴权；也兼容 Hermes 自己的 `API_SERVER_HOST`、`API_SERVER_PORT`、`API_SERVER_KEY`
 - `CLAWCONNECT_ENV_FILE`：可选，显式指定 env 文件路径；未设置时会依次读取 `~/.clawconnect/.env`、`.env.local`、`.env`
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD`：Gateway 鉴权兜底值
 - `CLAWCONNECT_ASR_COMMAND`：宿主机语音转文字命令。ClawLink 发送 `chat.voice.send` 后，agent 会把音频保存到临时文件，并执行这个命令；命令必须把识别文本输出到 stdout。可用占位符：`{file}`、`{language}`、`{mimeType}`
 - `OPENCLAW_ASR_COMMAND`：旧版语音转文字命令兜底值；同时设置时优先使用 `CLAWCONNECT_ASR_COMMAND`
 
 Shell 里已经设置的环境变量优先级高于 env 文件。`clawconnect run`、`status`、`send-file` 会继续使用 `~/.clawconnect/config.json` 或 `~/.clawconnect/profiles/<profile>/config.json` 里已配对保存的 relay；如果要切换中继服务器，请执行 `clawconnect pair --profile <name> --server <url>` 或 `clawconnect reset --profile <name>`。
+
+例如 OpenClaw 使用自定义状态目录和 `19001` 端口时：
+
+```dotenv
+OPENCLAW_STATE_DIR=D:\OpenClawData
+OPENCLAW_CONFIG_PATH=D:\OpenClawData\openclaw.json
+OPENCLAW_GATEWAY_PORT=19001
+OPENCLAW_BIN=D:\Apps\OpenClaw\openclaw.cmd
+```
+
+Hermes 原生 Windows 非默认安装可配置：
+
+```dotenv
+HERMES_HOME=D:\HermesData
+HERMES_BIN=D:\Hermes\hermes-agent\venv\Scripts\hermes.exe
+HERMES_PYTHON=D:\Hermes\hermes-agent\venv\Scripts\python.exe
+CLAWCONNECT_HERMES_STATE_DB=D:\HermesData\state.db
+CLAWCONNECT_HERMES_API_URL=http://127.0.0.1:9642
+```
+
+保存后执行 `clawconnect restart --profile <name>`，再用 `clawconnect status --profile <name>` 核对实际使用的 Gateway、state/config、Hermes home/API。如仅使用 Hermes CLI，可以不配置 API URL。
 
 ### 3. 前台运行
 
@@ -190,6 +217,8 @@ clawconnect install
 - Linux：优先使用 `systemd --user`
 - 如果 Linux 当前环境不支持 `systemd --user`，会自动回退到 `nohup`
 - Windows：注册为 Windows Task Scheduler 任务，登录时自动静默启动（`powershell -WindowStyle Hidden`）
+
+Windows 的不同 profile 使用独立计划任务（例如 `ClawConnectAgent-openclaw`、`ClawConnectAgent-hermes`）和独立 UTF-8 日志，不会互相覆盖。
 
 在不支持 `systemd --user` 的 Linux 环境下，会生成一个备用启动脚本：
 

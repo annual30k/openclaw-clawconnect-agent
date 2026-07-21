@@ -1,6 +1,7 @@
 import { readdirSync, statSync, copyFileSync, existsSync, readFileSync, openSync, readSync, closeSync } from "fs";
-import { join } from "path";
+import { basename, join } from "path";
 import { homedir } from "os";
+import JSON5 from "json5";
 import { createBackup, deleteBackup, listBackups, restoreBackup, updateBackup } from "../backups/backup-manager.js";
 import { readConfig } from "../../config/config.js";
 import { getActiveProfile, profileErrorLogPath, profileLogPath } from "../../config/profile.js";
@@ -13,10 +14,14 @@ import {
   requestGatewayRemoteRestart,
   requestGatewayRestart,
 } from "../runtime/local-runtime.js";
+import {
+  resolveOpenClawConfigDir,
+  resolveOpenClawConfigPath,
+  resolveOpenClawStateDir,
+} from "../runtime/openclaw-paths.js";
+import { decodeTextBuffer } from "../../platform/text-file-decoder.js";
 
-const OPENCLAW_DIR = join(homedir(), ".openclaw");
 const CLAWCONNECT_DIR = join(homedir(), ".clawconnect");
-const OPENCLAW_CONFIG = join(OPENCLAW_DIR, "openclaw.json");
 const LOG_SOURCES = ["connection", "gateway", "gateway-error"] as const;
 type LogSource = typeof LOG_SOURCES[number];
 
@@ -136,16 +141,17 @@ function maskString(value: string): string {
 
 function readOpenclawConfig(): LocalResult {
   try {
-    if (!existsSync(OPENCLAW_CONFIG)) {
-      return { ok: false, error: `openclaw config not found: ${OPENCLAW_CONFIG}` };
+    const openClawConfigPath = resolveOpenClawConfigPath();
+    if (!existsSync(openClawConfigPath)) {
+      return { ok: false, error: `openclaw config not found: ${openClawConfigPath}` };
     }
 
-    const raw = readFileSync(OPENCLAW_CONFIG, "utf-8");
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const raw = readFileSync(openClawConfigPath, "utf-8");
+    const parsed = JSON5.parse(raw) as Record<string, unknown>;
     const masked = maskSensitive(parsed);
     const output = JSON.stringify(masked, null, 2);
 
-    return { ok: true, payload: { output: `[${OPENCLAW_CONFIG}]\n${output}` } };
+    return { ok: true, payload: { output: `[${openClawConfigPath}]\n${output}` } };
   } catch (err) {
     return { ok: false, error: errorMessage(err) };
   }
@@ -207,28 +213,34 @@ function restoreConfig(): LocalResult {
       return { ok: true, payload: { restoredFrom: backups[0].filename } };
     }
 
-    if (!existsSync(OPENCLAW_DIR)) {
-      return { ok: false, error: `openclaw config dir not found: ${OPENCLAW_DIR}` };
+    const openClawConfigDir = resolveOpenClawConfigDir();
+    const openClawConfigPath = resolveOpenClawConfigPath();
+    if (!existsSync(openClawConfigDir)) {
+      return { ok: false, error: `openclaw config dir not found: ${openClawConfigDir}` };
     }
 
-    const bakFiles = readdirSync(OPENCLAW_DIR)
-      .filter(name => name.startsWith("openclaw.json.bak"))
+    const bakFiles = readdirSync(openClawConfigDir)
+      .filter(name => isOpenClawConfigBackupName(name, openClawConfigPath))
       .map(name => {
-        const path = join(OPENCLAW_DIR, name);
+        const path = join(openClawConfigDir, name);
         return { name, path, mtime: statSync(path).mtimeMs };
       })
       .sort((a, b) => b.mtime - a.mtime);
 
     if (bakFiles.length === 0) {
-      return { ok: false, error: "No backup files found in ~/.openclaw/" };
+      return { ok: false, error: `No backup files found in ${openClawConfigDir}` };
     }
     const latest = bakFiles[0];
-    copyFileSync(latest.path, OPENCLAW_CONFIG);
+    copyFileSync(latest.path, openClawConfigPath);
     console.log(`[clawconnect] Config restored from ${latest.name}`);
     return { ok: true, payload: { restoredFrom: latest.name } };
   } catch (err) {
     return { ok: false, error: errorMessage(err) };
   }
+}
+
+export function isOpenClawConfigBackupName(name: string, configPath: string): boolean {
+  return name.startsWith(`${basename(configPath)}.bak`);
 }
 
 function readBackups(): LocalResult {
@@ -303,6 +315,7 @@ function stripAnsi(text: string): string {
 
 function readLogs(params: unknown = undefined): LocalResult {
   try {
+    const openClawStateDir = resolveOpenClawStateDir();
     const p = params && typeof params === "object" && !Array.isArray(params)
       ? (params as Record<string, unknown>)
       : {};
@@ -332,7 +345,7 @@ function readLogs(params: unknown = undefined): LocalResult {
 
     if (source === "gateway" || source === "gateway-error") {
       const filename = source === "gateway" ? "gateway.log" : "gateway.err.log";
-      for (const path of [join(OPENCLAW_DIR, "logs", filename), join(OPENCLAW_DIR, filename)]) {
+      for (const path of [join(openClawStateDir, "logs", filename), join(openClawStateDir, filename)]) {
         if (existsSync(path)) candidates.push(path);
       }
     } else if (profileCandidates.length > 0) {
@@ -349,14 +362,14 @@ function readLogs(params: unknown = undefined): LocalResult {
 
       // Fallback: ~/.openclaw/logs/ or ~/.openclaw/*.log — for openclaw
       // tool logs or legacy installations.
-      const logsDir = join(OPENCLAW_DIR, "logs");
+      const logsDir = join(openClawStateDir, "logs");
       if (existsSync(logsDir)) {
         for (const f of readdirSync(logsDir)) {
           if (f.endsWith(".log")) candidates.push(join(logsDir, f));
         }
-      } else if (existsSync(OPENCLAW_DIR)) {
-        for (const f of readdirSync(OPENCLAW_DIR)) {
-          if (f.endsWith(".log")) candidates.push(join(OPENCLAW_DIR, f));
+      } else if (existsSync(openClawStateDir)) {
+        for (const f of readdirSync(openClawStateDir)) {
+          if (f.endsWith(".log")) candidates.push(join(openClawStateDir, f));
         }
       }
     }
@@ -403,31 +416,7 @@ function readLogs(params: unknown = undefined): LocalResult {
       buffer = readFileSync(latest);
     }
 
-    // Detect text encoding of the log file.
-    // ... (rest of the detection logic)
-    let rawContent: string;
-    let encoding: BufferEncoding;
-
-    if (buffer.length >= 2 && buffer[0] === 0xFF && buffer[1] === 0xFE) {
-      // BOM 0xFF 0xFE → UTF-16LE (common on Windows)
-      rawContent = buffer.toString("utf16le");
-      encoding = "utf16le";
-    } else {
-      // Assume UTF-8 first
-      rawContent = buffer.toString("utf-8");
-      encoding = "utf-8";
-
-      // Validate by checking for null characters
-      let nullCount = 0;
-      const checkLength = Math.min(rawContent.length, 200);
-      for (let i = 0; i < checkLength; i++) {
-        if (rawContent.charCodeAt(i) === 0) nullCount++;
-      }
-      if (checkLength > 20 && nullCount > checkLength * 0.1) {
-        rawContent = buffer.toString("utf16le");
-        encoding = "utf16le";
-      }
-    }
+    const { text: rawContent, encoding } = decodeTextBuffer(buffer);
 
     const allLines = rawContent
       .replace(/\r\n/g, "\n")

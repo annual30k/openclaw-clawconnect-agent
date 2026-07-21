@@ -20,7 +20,7 @@ import {
   CLAWCONNECT_MOBILE_BRIDGE_HINT,
   HERMES_INBOX_DIR,
   SUBPROCESS_ENV,
-  resolveHermesBin,
+  hermesInvocation,
   isHermesCommandDeniedTimeoutLine,
   isHermesMissingSessionError,
   runHermes,
@@ -368,7 +368,8 @@ async function runHermesChatStreaming(
   env: NodeJS.ProcessEnv,
   historyCompletion?: () => Promise<string | undefined>,
 ): Promise<string> {
-  const child = spawn(resolveHermesBin(), args, {
+  const invocation = hermesInvocation(args);
+  const child = spawn(invocation.command, invocation.args, {
     env,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,

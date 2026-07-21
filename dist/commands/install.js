@@ -1,27 +1,10 @@
 import { existsSync, unlinkSync } from "fs";
-import { execFileSync } from "child_process";
 import { t } from "../i18n/index.js";
 import { getServicePlatform, getServiceStatus, getServicePaths, installService, restartService, setRestrictiveFilePermissions, stopService, uninstallService, } from "../platform/service-manager.js";
 import { getActiveProfile, profileConfigPath, profileDisplayName } from "../config/profile.js";
 import { pairCommandForProfile } from "./profile-hints.js";
 export function isInstalled() {
-    const platform = getServicePlatform();
-    const servicePaths = getServicePaths();
-    if (platform === "macos")
-        return existsSync(servicePaths.macPlistPath);
-    if (platform === "linux") {
-        return existsSync(servicePaths.linuxServicePath) || existsSync(servicePaths.linuxNohupStartScriptPath);
-    }
-    if (platform === "windows") {
-        try {
-            execFileSync("schtasks", ["/query", "/tn", "ClawConnectAgent"], { stdio: "pipe" });
-            return true;
-        }
-        catch {
-            return false;
-        }
-    }
-    return false;
+    return getServiceStatus().installed;
 }
 export function installCommand() {
     const platform = getServicePlatform();
@@ -49,7 +32,8 @@ export function installCommand() {
         console.log(t("install.startManually", `bash "${servicePaths.linuxNohupStartScriptPath}"`));
     }
     else if (platform === "windows") {
-        console.log(t("install.startManually", 'schtasks /run /tn "ClawConnectAgent"'));
+        const taskName = getServiceStatus().serviceName;
+        console.log(t("install.startManually", `schtasks /run /tn "${taskName}"`));
     }
 }
 export function restartCommand() {

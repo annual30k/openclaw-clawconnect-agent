@@ -2,7 +2,7 @@
 import { spawn } from "child_process";
 import type { LocalCommandContext, LocalResult } from "../../core/command-types.js";
 import { getActiveProfile, profileDisplayName } from "../../config/profile.js";
-import { SUBPROCESS_ENV, resolveHermesBin, stripAnsi } from "./hermes-runtime-process.js";
+import { SUBPROCESS_ENV, hermesInvocation, stripAnsi } from "./hermes-runtime-process.js";
 
 export function buildClawConnectProfileRestartArgs(profile: string | undefined | null, entrypoint = process.argv[1]): string[] {
   const args = [entrypoint, "restart"].filter((arg): arg is string => Boolean(arg));
@@ -83,7 +83,8 @@ export async function runHermesLifecycle(
   const publishEvent = context.publishEvent;
   const requestId = context.requestId;
   const gatewayId = context.gatewayId;
-  const child = spawn(resolveHermesBin(), args, {
+  const invocation = hermesInvocation(args);
+  const child = spawn(invocation.command, invocation.args, {
     env: SUBPROCESS_ENV,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,

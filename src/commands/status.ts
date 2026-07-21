@@ -1,9 +1,13 @@
 import { existsSync, readFileSync } from "fs";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { configExists, readConfig, readGatewayUrl } from "../config/config.js";
 import { listProfileNames, profileDisplayName } from "../config/profile.js";
 import { t } from "../i18n/index.js";
 import { getServiceStatus } from "../platform/service-manager.js";
+import { decodeTextBuffer } from "../platform/text-file-decoder.js";
+import { resolveOpenClawConfigPath, resolveOpenClawStateDir } from "../openclaw/runtime/openclaw-paths.js";
+import { resolveHermesHomeDir } from "../hermes/runtime/hermes-runtime-paths.js";
+import { resolveHermesApiSettings } from "../hermes/runtime/hermes-runtime-api-settings.js";
 
 type HealthState = {
   kind: "ok" | "warn" | "error" | "unknown";
@@ -50,6 +54,20 @@ function statusOne(profile?: string): void {
 
   if (gatewayType === "openclaw") {
     console.log(t("status.gateway", readGatewayUrl()));
+    console.log(`OpenClaw state:  ${resolveOpenClawStateDir()}`);
+    console.log(`OpenClaw config: ${resolveOpenClawConfigPath()}`);
+    const openClawInstall = process.env.OPENCLAW_BIN?.trim()
+      || process.env.OPENCLAW_PACKAGE_BIN?.trim()
+      || process.env.OPENCLAW_INSTALL_DIR?.trim();
+    if (openClawInstall) {
+      console.log(`OpenClaw runtime: ${openClawInstall}`);
+    }
+  } else {
+    console.log(`Hermes home: ${resolveHermesHomeDir()}`);
+    const hermesApi = resolveHermesApiSettings();
+    if (hermesApi.configured) {
+      console.log(`Hermes API:  ${hermesApi.baseUrl}`);
+    }
   }
 
   const service = getServiceStatus(profile);
@@ -100,14 +118,23 @@ export function readHealth(logPath: string, gatewayType: GatewayType = "openclaw
 function readTailLines(path: string, maxLines: number): string[] {
   let raw: string;
   try {
-    raw = readFileSync(path, "utf-8");
+    raw = decodeTextBuffer(readFileSync(path)).text;
   } catch {
-    // Windows: agent process may hold the log file with exclusive write lock,
-    // causing EBUSY/EPERM on read. Attempt to read via 'type' command which 
-    // often bypasses simple write locks.
+    // Windows 兜底通过环境变量传路径并返回 Base64，避免 cmd 路径转义和控制台代码页污染日志内容。
     if (process.platform === "win32") {
       try {
-        raw = execSync(`type "${path}"`, { stdio: "pipe", windowsHide: true }).toString();
+        const base64 = execFileSync("powershell.exe", [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "[Convert]::ToBase64String([IO.File]::ReadAllBytes($env:CLAWCONNECT_LOG_PATH))",
+        ], {
+          encoding: "utf8",
+          env: { ...process.env, CLAWCONNECT_LOG_PATH: path },
+          stdio: "pipe",
+          windowsHide: true,
+        }).trim();
+        raw = decodeTextBuffer(Buffer.from(base64, "base64")).text;
       } catch {
         return [];
       }

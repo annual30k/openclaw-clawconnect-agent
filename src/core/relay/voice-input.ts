@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { promisify } from "node:util";
 import { extensionForMimeType } from "./attachment-staging.js";
+import { buildShellCommandInvocation, quoteShellArgument } from "../../platform/process-invocation.js";
 
 const execFile = promisify(execFileCb);
 
@@ -88,12 +89,20 @@ async function transcribeAudioWithConfiguredCommand(opts: VoiceTranscriptionOpti
     throw new Error("voice_asr_not_configured");
   }
   const rendered = command
-    .replaceAll("{file}", shellQuote(opts.audioPath))
-    .replaceAll("{language}", shellQuote(opts.languageHint ?? ""))
-    .replaceAll("{mimeType}", shellQuote(opts.mimeType));
-  const { stdout } = await execFile("sh", ["-lc", rendered], {
+    .replaceAll("{file}", quoteShellArgument(opts.audioPath))
+    .replaceAll("{language}", quoteShellArgument(opts.languageHint ?? ""))
+    .replaceAll("{mimeType}", quoteShellArgument(opts.mimeType));
+  const invocation = buildShellCommandInvocation(rendered);
+  const { stdout } = await execFile(invocation.command, invocation.args, {
     timeout: 120_000,
     maxBuffer: 10 * 1024 * 1024,
+    encoding: "utf8",
+    windowsHide: true,
+    env: {
+      ...process.env,
+      PYTHONUTF8: "1",
+      PYTHONIOENCODING: "utf-8",
+    },
   });
   return stdout.trim();
 }
@@ -149,8 +158,4 @@ function sanitizeFileName(value: string | undefined, mimeType: string): string {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
 }

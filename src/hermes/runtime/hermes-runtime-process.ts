@@ -2,14 +2,17 @@
 import { execFile as execFileCb, execFileSync, execSync } from "child_process";
 import { existsSync } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { delimiter, dirname, join } from "path";
 import { promisify } from "util";
+import { buildExecutableInvocation, type ProcessInvocation } from "../../platform/process-invocation.js";
+import { resolveConfiguredPath } from "../../openclaw/runtime/openclaw-paths.js";
+import { resolveHermesHomeDir, resolveHermesPythonBin } from "./hermes-runtime-paths.js";
 
 const execFile = promisify(execFileCb);
 
 export const IS_WINDOWS = process.platform === "win32";
 export const HERMES_INBOX_DIR = join(homedir(), ".clawconnect", "hermes", "inbox");
-export const HERMES_HOME_DIR = process.env.HERMES_HOME?.trim() || join(homedir(), ".hermes");
+export const HERMES_HOME_DIR = resolveHermesHomeDir();
 export const HERMES_CRON_JOBS_FILE = join(HERMES_HOME_DIR, "cron", "jobs.json");
 export const HERMES_LOG_DIR = join(HERMES_HOME_DIR, "logs");
 export const HERMES_AGENT_LOG_FILE = join(HERMES_LOG_DIR, "agent.log");
@@ -27,34 +30,53 @@ export const CLAWCONNECT_MOBILE_BRIDGE_HINT = [
   "Do not say you cannot send attachments merely because you are running in a CLI environment.",
 ].join(" ");
 
-export const SUBPROCESS_ENV: NodeJS.ProcessEnv = {
-  ...process.env,
-  HOME: homedir(),
-  PATH: [
+export const SUBPROCESS_ENV: NodeJS.ProcessEnv = (() => {
+  const env: NodeJS.ProcessEnv = {};
+  const seen = new Set<string>();
+  for (const [key, value] of Object.entries(process.env)) {
+    const upper = key.toUpperCase();
+    if (upper === "PATH") continue;
+    if (!seen.has(upper)) {
+      seen.add(upper);
+      env[key] = value;
+    }
+  }
+  env.HOME = homedir();
+  env.HERMES_HOME = HERMES_HOME_DIR;
+  env.PYTHONUTF8 = "1";
+  env.PYTHONIOENCODING = "utf-8";
+  env.PATH = [
+    dirname(process.execPath),
+    join(HERMES_HOME_DIR, "bin"),
+    join(HERMES_HOME_DIR, "hermes-agent", "venv", IS_WINDOWS ? "Scripts" : "bin"),
     join(homedir(), ".local", "bin"),
-    join(homedir(), ".hermes", "bin"),
     join(homedir(), ".npm-global", "bin"),
     process.env.PNPM_HOME,
     join(homedir(), ".local", "share", "pnpm"),
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/local/bin",
-    "/usr/local/sbin",
-    "/usr/bin",
-    "/bin",
+    ...(IS_WINDOWS ? [] : [
+      "/opt/homebrew/bin",
+      "/opt/homebrew/sbin",
+      "/usr/local/bin",
+      "/usr/local/sbin",
+      "/usr/bin",
+      "/bin",
+    ]),
     process.env.PATH ?? "",
-  ].filter(Boolean).join(IS_WINDOWS ? ";" : ":"),
-};
+  ].filter(Boolean).join(delimiter);
+  return env;
+})();
 
 export function resolveHermesBin(): string {
   const explicit = process.env.HERMES_BIN?.trim();
-  if (explicit && existsSync(explicit)) {
-    return explicit;
+  const explicitPath = explicit ? resolveConfiguredPath(explicit) : undefined;
+  if (explicitPath && existsSync(explicitPath)) {
+    return explicitPath;
   }
 
   try {
-    const whichCmd = IS_WINDOWS ? "where hermes" : "command -v hermes";
-    const resolved = execSync(whichCmd, { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 }).toString().trim();
+    const resolved = IS_WINDOWS
+      ? execFileSync("where.exe", ["hermes"], { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000, windowsHide: true }).toString().trim()
+      : execSync("command -v hermes", { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 }).toString().trim();
     const first = resolved.split(/\r?\n/)[0]?.trim();
     if (first) {
       return first;
@@ -63,12 +85,31 @@ export function resolveHermesBin(): string {
     // fall through
   }
 
-  const local = join(homedir(), ".local", "bin", IS_WINDOWS ? "hermes.cmd" : "hermes");
-  if (existsSync(local)) {
+  const candidates = IS_WINDOWS
+    ? [
+        join(HERMES_HOME_DIR, "hermes-agent", "venv", "Scripts", "hermes.exe"),
+        join(HERMES_HOME_DIR, "hermes-agent", "venv", "Scripts", "hermes.cmd"),
+        join(HERMES_HOME_DIR, "hermes-agent", "venv", "Scripts", "hermes.ps1"),
+        join(HERMES_HOME_DIR, "bin", "hermes.cmd"),
+        join(HERMES_HOME_DIR, "bin", "hermes.ps1"),
+        join(homedir(), ".local", "bin", "hermes.exe"),
+        join(homedir(), ".local", "bin", "hermes.cmd"),
+      ]
+    : [
+        join(HERMES_HOME_DIR, "hermes-agent", "venv", "bin", "hermes"),
+        join(HERMES_HOME_DIR, "bin", "hermes"),
+        join(homedir(), ".local", "bin", "hermes"),
+      ];
+  const local = candidates.find((candidate) => existsSync(candidate));
+  if (local) {
     return local;
   }
 
   return "hermes";
+}
+
+export function hermesInvocation(args: string[]): ProcessInvocation {
+  return buildExecutableInvocation(resolveHermesBin(), args);
 }
 
 export function runHermes(
@@ -76,7 +117,8 @@ export function runHermes(
   timeoutMs = DEFAULT_TIMEOUT_MS,
   env: NodeJS.ProcessEnv = SUBPROCESS_ENV,
 ): string {
-  return execFileSync(resolveHermesBin(), args, {
+  const invocation = hermesInvocation(args);
+  return execFileSync(invocation.command, invocation.args, {
     env,
     stdio: "pipe",
     timeout: timeoutMs,
@@ -88,7 +130,8 @@ export async function runHermesAsync(
   timeoutMs = DEFAULT_TIMEOUT_MS,
   env: NodeJS.ProcessEnv = SUBPROCESS_ENV,
 ): Promise<string> {
-  const { stdout } = await execFile(resolveHermesBin(), args, {
+  const invocation = hermesInvocation(args);
+  const { stdout } = await execFile(invocation.command, invocation.args, {
     encoding: "utf8",
     env,
     timeout: timeoutMs,
@@ -97,7 +140,8 @@ export async function runHermesAsync(
 }
 
 export function runHermesWithInput(args: string[], input: string, timeoutMs = DEFAULT_TIMEOUT_MS): string {
-  return execFileSync(resolveHermesBin(), args, {
+  const invocation = hermesInvocation(args);
+  return execFileSync(invocation.command, invocation.args, {
     env: SUBPROCESS_ENV,
     input,
     stdio: ["pipe", "pipe", "pipe"],
@@ -175,9 +219,7 @@ export function sleep(ms: number): Promise<void> {
 
 export function runHermesPython(script: string, extraEnv: NodeJS.ProcessEnv = {}): string {
   const cwd = resolveHermesAgentCwd();
-  const venvPython = join(HERMES_HOME_DIR, "hermes-agent", "venv", "bin", "python");
-  const python = process.env.HERMES_PYTHON?.trim()
-    || (existsSync(venvPython) ? venvPython : join(homedir(), ".local", "bin", "python3.11"));
+  const python = resolveHermesPythonBin();
   return execFileSync(python, ["-c", script], {
     cwd,
     env: { ...SUBPROCESS_ENV, ...extraEnv },
@@ -192,9 +234,7 @@ export async function runHermesPythonAsync(
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<string> {
   const cwd = resolveHermesAgentCwd();
-  const venvPython = join(HERMES_HOME_DIR, "hermes-agent", "venv", "bin", "python");
-  const python = process.env.HERMES_PYTHON?.trim()
-    || (existsSync(venvPython) ? venvPython : join(homedir(), ".local", "bin", "python3.11"));
+  const python = resolveHermesPythonBin();
   const { stdout } = await execFile(python, ["-c", script], {
     cwd,
     encoding: "utf8",

@@ -136,6 +136,12 @@ Supported values:
 
 - `CLAWCONNECT_RELAY_SERVER_URL` — default relay URL used by `clawconnect pair` when `--server` is omitted
 - `CLAWCONNECT_GATEWAY_URL` — optional local Gateway websocket URL override
+- `OPENCLAW_GATEWAY_PORT` — optional OpenClaw Gateway port override; the full `CLAWCONNECT_GATEWAY_URL` wins
+- `OPENCLAW_HOME` / `OPENCLAW_STATE_DIR` / `OPENCLAW_CONFIG_PATH` — official OpenClaw path overrides for source, package-manager, container, service-user, or multi-gateway layouts
+- `OPENCLAW_BIN` / `OPENCLAW_PACKAGE_BIN` / `OPENCLAW_INSTALL_DIR` — locate a non-npm or non-PATH OpenClaw CLI/runtime
+- `HERMES_HOME` / `HERMES_BIN` / `HERMES_PYTHON` — override Hermes data, CLI, and Python paths; native Windows auto-detects `%LOCALAPPDATA%\hermes`
+- `HERMES_SKILLS_DIR` / `CLAWCONNECT_HERMES_STATE_DB` — optional explicit Hermes skills and state database paths
+- `CLAWCONNECT_HERMES_API_URL` / `CLAWCONNECT_HERMES_API_KEY` — explicit Hermes API connection; Hermes `API_SERVER_HOST`, `API_SERVER_PORT`, and `API_SERVER_KEY` remain supported
 - `CLAWCONNECT_ENV_FILE` — optional explicit env file path. When unset, the agent reads `~/.clawconnect/.env`, then `.env.local`, then `.env`
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD` — Gateway auth fallback
 - `CLAWCONNECT_ASR_COMMAND` — host-side speech-to-text command for ClawLink `chat.voice.send` messages. The agent saves the audio to a temporary file and runs this command; it must print the transcript to stdout. Placeholders: `{file}`, `{language}`, `{mimeType}`
@@ -178,6 +184,8 @@ clawconnect install
 - macOS: installs a `launchd` user agent
 - Linux: prefers `systemd --user`, and falls back to `nohup` when `systemctl --user` is unavailable
 - Windows: registers a Windows Task Scheduler task that auto-starts at logon with silent console (`powershell -WindowStyle Hidden`)
+
+Windows profiles use isolated scheduled tasks and UTF-8 logs, for example `ClawConnectAgent-openclaw` and `ClawConnectAgent-hermes`.
 
 On Linux hosts without `systemd --user`, `clawconnect install` will generate a fallback launcher at:
 

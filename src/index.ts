@@ -4,7 +4,6 @@ import { createRequire } from "module";
 import { ensureWindowsConsoleUtf8 } from "./platform/service-manager-common.js";
 import { DEFAULT_RELAY_SERVER_URL, ensureUserEnvFile, loadAgentEnv } from "./config/env.js";
 import { pairCommand } from "./commands/pair.js";
-import { runCommand } from "./commands/run.js";
 import { sendFileCommand } from "./commands/send-file.js";
 import { installCommand, uninstallCommand, stopCommand, restartCommand, resetCommand } from "./commands/install.js";
 import { statusCommand } from "./commands/status.js";
@@ -174,6 +173,8 @@ program
   .action(async (opts: { profile?: string }) => {
     try {
       setActiveProfile(opts.profile);
+      // 运行时模块包含 OpenClaw/Hermes 路径与子进程环境快照；必须在 .env 加载后再初始化。
+      const { runCommand } = await import("./commands/run.js");
       await runCommand();
     } catch (err) {
       console.error("Error:", err instanceof Error ? err.message : err);

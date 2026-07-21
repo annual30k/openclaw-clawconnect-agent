@@ -1,10 +1,11 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
-import { join } from "path";
-import { homedir } from "os";
-import { DEFAULT_GATEWAY_URL, getConfiguredGatewayUrl } from "./env.js";
+import JSON5 from "json5";
+import { DEFAULT_GATEWAY_URL, getConfiguredGatewayPort, getConfiguredGatewayUrl } from "./env.js";
+import { parseEnvFile } from "./env.js";
 import { setRestrictiveDirPermissions, setRestrictiveFilePermissions, } from "../platform/service-manager-common.js";
 import { CLAWCONNECT_HOME, profileConfigPath, profileRoot } from "./profile.js";
-const OPENCLAW_CONFIG_PATH = join(homedir(), ".openclaw", "openclaw.json");
+import { resolveOpenClawConfigPath, resolveOpenClawStateDir } from "../openclaw/runtime/openclaw-paths.js";
+import { join } from "node:path";
 export function getConfigPath(profile) {
     return profileConfigPath(profile);
 }
@@ -33,10 +34,22 @@ export function readGatewayUrl() {
     if (configuredGatewayUrl) {
         return configuredGatewayUrl;
     }
+    const configuredGatewayPort = getConfiguredGatewayPort();
+    if (configuredGatewayPort) {
+        return `ws://localhost:${configuredGatewayPort}`;
+    }
+    const stateEnvGatewayPort = getConfiguredGatewayPort(readOpenClawStateEnv());
+    if (stateEnvGatewayPort) {
+        return `ws://localhost:${stateEnvGatewayPort}`;
+    }
     try {
-        const raw = readFileSync(OPENCLAW_CONFIG_PATH, "utf-8");
-        const json = JSON.parse(raw);
-        const port = json?.gateway?.port ?? 18789;
+        const raw = readFileSync(resolveOpenClawConfigPath(), "utf-8");
+        const json = JSON5.parse(raw);
+        const configuredPort = json?.gateway?.port;
+        const port = typeof configuredPort === "number" && Number.isInteger(configuredPort)
+            && configuredPort >= 1 && configuredPort <= 65_535
+            ? configuredPort
+            : 18789;
         return `ws://localhost:${port}`;
     }
     catch {
@@ -46,7 +59,7 @@ export function readGatewayUrl() {
 /**
  * Reads the gateway token or password. Priority order:
  * 1. ~/.clawconnect/config.json (gatewayToken / gatewayPassword)
- * 2. ~/.openclaw/openclaw.json (gateway.token / gateway.auth.token)
+ * 2. The resolved OpenClaw config (gateway.token / gateway.auth.token)
  * 3. Environment variables (OPENCLAW_GATEWAY_TOKEN / OPENCLAW_GATEWAY_PASSWORD)
  */
 export function readGatewayAuth(cfg) {
@@ -55,8 +68,8 @@ export function readGatewayAuth(cfg) {
     }
     // Try to read the token from OpenClaw's own config
     try {
-        const raw = readFileSync(OPENCLAW_CONFIG_PATH, "utf-8");
-        const json = JSON.parse(raw);
+        const raw = readFileSync(resolveOpenClawConfigPath(), "utf-8");
+        const json = JSON5.parse(raw);
         const token = json?.gateway?.token ?? json?.gateway?.auth?.token ?? undefined;
         const password = json?.gateway?.password ?? json?.gateway?.auth?.password ?? undefined;
         if (token || password)
@@ -71,6 +84,21 @@ export function readGatewayAuth(cfg) {
     if (envToken || envPassword) {
         return { token: envToken, password: envPassword };
     }
+    const stateEnv = readOpenClawStateEnv();
+    if (stateEnv.OPENCLAW_GATEWAY_TOKEN || stateEnv.OPENCLAW_GATEWAY_PASSWORD) {
+        return {
+            token: stateEnv.OPENCLAW_GATEWAY_TOKEN,
+            password: stateEnv.OPENCLAW_GATEWAY_PASSWORD,
+        };
+    }
     return {};
+}
+function readOpenClawStateEnv() {
+    try {
+        return parseEnvFile(readFileSync(join(resolveOpenClawStateDir(), ".env"), "utf8"));
+    }
+    catch {
+        return {};
+    }
 }
 //# sourceMappingURL=config.js.map

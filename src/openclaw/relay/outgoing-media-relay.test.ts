@@ -5,9 +5,20 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
+  extractDeliverablePathCandidates,
   relayOutgoingMediaInHistoryResponse,
   relayOutgoingMediaInPayload,
 } from "./outgoing-media-relay.js";
+
+test("outgoing artifact detection recognizes Windows drive and UNC paths", () => {
+  assert.deepEqual(extractDeliverablePathCandidates([
+    "已生成 C:\\Users\\测试 User\\Desktop\\report.xlsx。",
+    "备用文件 \\\\fileserver\\shared\\image.png",
+  ].join("\n")), [
+    "C:\\Users\\测试 User\\Desktop\\report.xlsx",
+    "\\\\fileserver\\shared\\image.png",
+  ]);
+});
 
 test("relayOutgoingMediaInPayload uploads OpenClaw outgoing media and rewrites the image block", async () => {
   const fixture = await createOutgoingMediaFixture();
@@ -235,6 +246,42 @@ test("relayOutgoingMediaInPayload does not treat OpenClaw MEDIA markers as senda
   } finally {
     await server.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows OpenClaw MEDIA and input attachment markers are removed without host path uploads", async () => {
+  const server = await createFileUploadRelayServer("windows_path_should_not_upload");
+  try {
+    const drivePath = "C:\\Users\\测试 User\\Pictures\\shot.png";
+    const uncPath = "\\\\fileserver\\共享\\report.pdf";
+    const payload = {
+      runId: "windows-user-run:user",
+      sessionKey: "agent:main:session_1",
+      message: {
+        id: "windows-user-message",
+        runId: "windows-user-run:user",
+        role: "user",
+        content: [{
+          type: "text",
+          text: `检查附件\n[media attached: ${drivePath} (image/png) | ${drivePath}]\nMEDIA:${uncPath}`,
+        }],
+      },
+    };
+
+    const result = await relayOutgoingMediaInHistoryResponse({
+      sessionKey: payload.sessionKey,
+      messages: [payload.message],
+    }, {
+      relayServerUrl: server.baseUrl,
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      cache: new Map(),
+    }) as { messages: Array<{ content: Array<{ text?: string }> }> };
+
+    assert.deepEqual(result.messages[0]?.content, [{ type: "text", text: "检查附件" }]);
+    assert.equal(server.initRequestCount(), 0);
+  } finally {
+    await server.close();
   }
 });
 

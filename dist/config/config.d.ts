@@ -18,7 +18,7 @@ export declare function readGatewayUrl(): string;
 /**
  * Reads the gateway token or password. Priority order:
  * 1. ~/.clawconnect/config.json (gatewayToken / gatewayPassword)
- * 2. ~/.openclaw/openclaw.json (gateway.token / gateway.auth.token)
+ * 2. The resolved OpenClaw config (gateway.token / gateway.auth.token)
  * 3. Environment variables (OPENCLAW_GATEWAY_TOKEN / OPENCLAW_GATEWAY_PASSWORD)
  */
 export declare function readGatewayAuth(cfg: ClawConnectConfig): {

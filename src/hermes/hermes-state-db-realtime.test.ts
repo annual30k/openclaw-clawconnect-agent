@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
@@ -9,6 +9,7 @@ import {
   createHermesStateDbRealtimeWatcher,
   queryHermesStateDbMaxMessageId,
   queryHermesStateDbRealtimeRows,
+  resolveHermesStateDbRealtimePath,
   resolveHermesStateDbRealtimePython,
   type HermesStateDbRealtimeCursor,
   type HermesStateDbRealtimeMessageRow,
@@ -201,6 +202,27 @@ test("Hermes state db realtime Python resolver supports Windows virtualenv layou
       process.env.HERMES_PYTHON = previousPython;
     }
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Hermes state db realtime path expands custom home and explicit database paths", () => {
+  const previousHome = process.env.HERMES_HOME;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  try {
+    process.env.HERMES_HOME = "~/custom-hermes-state";
+    delete process.env.CLAWCONNECT_HERMES_STATE_DB;
+    assert.equal(
+      resolveHermesStateDbRealtimePath(),
+      join(homedir(), "custom-hermes-state", "state.db"),
+    );
+
+    process.env.CLAWCONNECT_HERMES_STATE_DB = "~/custom-hermes.db";
+    assert.equal(resolveHermesStateDbRealtimePath(), join(homedir(), "custom-hermes.db"));
+  } finally {
+    if (previousHome === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = previousHome;
+    if (previousStateDb === undefined) delete process.env.CLAWCONNECT_HERMES_STATE_DB;
+    else process.env.CLAWCONNECT_HERMES_STATE_DB = previousStateDb;
   }
 });
 

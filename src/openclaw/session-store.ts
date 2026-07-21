@@ -1,8 +1,8 @@
 import { readdir, readFile } from "fs/promises";
-import { homedir } from "os";
 import { basename, isAbsolute, join, resolve } from "path";
+import { resolveOpenClawStateDir } from "./runtime/openclaw-paths.js";
 
-export async function inferLatestOpenClawSessionKey(sessionStoreRoot = join(homedir(), ".openclaw")): Promise<string | undefined> {
+export async function inferLatestOpenClawSessionKey(sessionStoreRoot = resolveOpenClawStateDir()): Promise<string | undefined> {
   const agentsDir = join(sessionStoreRoot, "agents");
   let agentEntries;
   try {
@@ -158,7 +158,7 @@ function assistantToolRunId(message: Record<string, unknown>, parsed: Record<str
 
 async function resolveOpenClawSessionLogPath(
   sessionKey: string,
-  sessionStoreRoot = join(homedir(), ".openclaw"),
+  sessionStoreRoot = resolveOpenClawStateDir(),
 ): Promise<string | undefined> {
   const trimmedSessionKey = sessionKey.trim();
   if (!trimmedSessionKey) {

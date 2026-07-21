@@ -1,14 +1,13 @@
 import { createHash, randomUUID } from "crypto";
 import { mkdir, readdir, rm, stat, writeFile } from "fs/promises";
-import { homedir } from "os";
 import { join } from "path";
 import {
   buildAttachmentStagingPath,
   resolveAttachmentMimeType,
   type RelayAttachmentLike,
 } from "../../core/relay/attachment-staging.js";
+import { resolveOpenClawStateDir } from "../runtime/openclaw-paths.js";
 
-const DEFAULT_OUTBOUND_DIR = join(homedir(), ".openclaw", "media", "outbound");
 const DEFAULT_STAGING_TTL_MS = 24 * 60 * 60 * 1000;
 const USER_MEDIA_MARKER_PREFIX_RE = /\[media attached:/gi;
 const CLIENT_ONLY_CHAT_SEND_FIELDS = [
@@ -64,7 +63,7 @@ export async function prepareChatSendParams(
     return params;
   }
 
-  const outboundDir = options?.outboundDir ?? DEFAULT_OUTBOUND_DIR;
+  const outboundDir = options?.outboundDir ?? join(resolveOpenClawStateDir(), "media", "outbound");
   const logger = options?.logger ?? console;
   const fileReferences: string[] = [];
   const stagingErrors: Error[] = [];

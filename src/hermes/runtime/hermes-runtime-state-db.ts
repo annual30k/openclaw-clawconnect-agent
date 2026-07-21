@@ -1,13 +1,12 @@
 import { execFile as execFileCb } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
 import { promisify } from "node:util";
 import type { HermesSessionItem } from "../hermes-session-store.js";
 import {
-  HERMES_HOME_DIR,
   SUBPROCESS_ENV,
 } from "./hermes-runtime-process.js";
+import { resolveHermesPythonBin, resolveHermesStateDbPath } from "./hermes-runtime-paths.js";
 import { stringValue, toRecord } from "./hermes-runtime-values.js";
 
 const execFile = promisify(execFileCb);
@@ -155,24 +154,8 @@ export function buildEmptyHermesHistoryExport(sessionIdentity: string | undefine
   };
 }
 
-function resolveHermesStateDbPath(): string | undefined {
-  const explicit = process.env.CLAWCONNECT_HERMES_STATE_DB?.trim();
-  if (explicit) {
-    return explicit;
-  }
-  if (process.env.HERMES_BIN?.trim()) {
-    return undefined;
-  }
-  return join(process.env.HERMES_HOME?.trim() || HERMES_HOME_DIR, "state.db");
-}
-
 function resolveHermesStateDbPython(): string {
-  const explicit = process.env.HERMES_PYTHON?.trim();
-  if (explicit) {
-    return explicit;
-  }
-  const venvPython = join(process.env.HERMES_HOME?.trim() || HERMES_HOME_DIR, "hermes-agent", "venv", "bin", "python");
-  return existsSync(venvPython) ? venvPython : "python3";
+  return resolveHermesPythonBin();
 }
 
 async function runHermesStateDbQuery(mode: "list" | "export", args: string[]): Promise<unknown | undefined> {

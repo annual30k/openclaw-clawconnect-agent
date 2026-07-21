@@ -1,6 +1,6 @@
-import { homedir } from "os";
 import { isAbsolute, join, resolve } from "path";
 import { open as openFile, readFile } from "fs/promises";
+import { resolveOpenClawStateDir } from "../runtime/openclaw-paths.js";
 
 const TRANSCRIPT_TAIL_CHUNK_BYTES = 64 * 1024;
 
@@ -268,8 +268,7 @@ function resolveAgentIdFromSessionKey(sessionKey: string, defaults: GatewaySessi
 }
 
 function resolveOpenClawHome(): string {
-  const configured = process.env.CLAWCONNECT_OPENCLAW_HOME?.trim();
-  return configured || join(homedir(), ".openclaw");
+  return resolveOpenClawStateDir();
 }
 
 function resolveSessionsDir(sessionKey: string, defaults: GatewaySessionDefaults): string {

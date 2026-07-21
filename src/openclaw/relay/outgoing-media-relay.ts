@@ -4,9 +4,10 @@ import { homedir } from "os";
 import { extname, join, resolve } from "path";
 import { createHash } from "crypto";
 import { uploadFileToRelay, type FileUploadRequest, type FileUploadResult } from "../../core/relay/file-upload.js";
+import { resolveOpenClawStateDir } from "../runtime/openclaw-paths.js";
 
 const OUTGOING_MEDIA_RE = /\/api\/chat\/media\/outgoing\/[^/]+\/([^/]+)\/full(?:$|[?#])/;
-const OPENCLAW_MEDIA_CONTROL_PREFIX_RE = /^MEDIA:\s*(?:file:\/\/|~\/|\/)/i;
+const OPENCLAW_MEDIA_CONTROL_PREFIX_RE = /^MEDIA:\s*(?:file:\/\/|~[\\/]|\/|[A-Za-z]:[\\/]|\\\\)/i;
 const OPENCLAW_INPUT_MEDIA_MARKER_RE = /\[media attached:\s+(.+?)\s+\(([^)\r\n]+)\)\s+\|\s+(.+?)\]/g;
 
 export type OutgoingMediaRelayOptions = {
@@ -168,7 +169,7 @@ function restoreOpenClawInputMediaInHistoryMessage(message: unknown): unknown {
     const text = contentBlock.text;
     const sanitized = text.replace(OPENCLAW_INPUT_MEDIA_MARKER_RE, (_marker, firstPath: string, _mime: string, secondPath: string) => {
       const path = secondPath.trim() || firstPath.trim();
-      if (path.startsWith("/")) mediaPaths.push(path);
+      if (isAbsoluteHostPath(path)) mediaPaths.push(path);
       return "";
     }).replace(/\n{3,}/g, "\n\n").trim();
     if (sanitized === text) return [block];
@@ -275,7 +276,7 @@ function payloadSourceRunId(payload: Record<string, unknown>): string | undefine
 }
 
 async function readOutgoingMediaRecord(attachmentId: string, recordsDir?: string): Promise<OutgoingMediaRecord> {
-  const root = recordsDir ?? join(homedir(), ".openclaw", "media", "outgoing", "records");
+  const root = recordsDir ?? join(resolveOpenClawStateDir(), "media", "outgoing", "records");
   const raw = await readFile(join(root, `${attachmentId}.json`), "utf8");
   return JSON.parse(raw) as OutgoingMediaRecord;
 }
@@ -491,6 +492,12 @@ function stripOpenClawMediaControlLines(text: string): string {
   return stripped;
 }
 
+function isAbsoluteHostPath(value: string): boolean {
+  return value.startsWith("/")
+    || /^[A-Za-z]:[\\/]/.test(value)
+    || /^\\\\[^\\/]/.test(value);
+}
+
 function compact(record: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined));
 }
@@ -510,8 +517,13 @@ const DELIVERABLE_EXTENSION_PATTERN = DELIVERABLE_EXTENSIONS
   .sort((a, b) => b.length - a.length)
   .join("|");
 
-const DELIVERABLE_PATH_REGEX_SOURCE = String.raw`(?:~|\/)[^\n"'` + "`" + String.raw`<>|]*?\.(?:${DELIVERABLE_EXTENSION_PATTERN})(?=$|[\s).,"'` + "`" + String.raw`，。；;:：!?？])`;
+const DELIVERABLE_PATH_START = String.raw`(?:~[\\/]|\/|[A-Za-z]:[\\/]|\\\\[^\\/\s"'` + "`" + String.raw`<>|]+[\\/])`;
+const DELIVERABLE_PATH_REGEX_SOURCE = DELIVERABLE_PATH_START + String.raw`[^\n"'` + "`" + String.raw`<>|]*?\.(?:${DELIVERABLE_EXTENSION_PATTERN})(?=$|[\s).,"'` + "`" + String.raw`，。；;:：!?？])`;
 const DELIVERABLE_PATH_REGEX = new RegExp(String.raw`(?:^|[\s("'` + "`" + String.raw`:：])(${DELIVERABLE_PATH_REGEX_SOURCE})`, "gi");
+
+export function extractDeliverablePathCandidates(text: string): string[] {
+  return [...text.matchAll(DELIVERABLE_PATH_REGEX)].map((match) => match[1]);
+}
 
 function extractDeliverablePaths(text: string, userMessage?: string): string[] {
   if (userMessage !== undefined && !hasDeliverableSendIntent(userMessage)) {
@@ -519,9 +531,10 @@ function extractDeliverablePaths(text: string, userMessage?: string): string[] {
   }
   const allowed = new Set(DELIVERABLE_EXTENSIONS);
   const paths = new Set<string>();
-  for (const match of text.matchAll(DELIVERABLE_PATH_REGEX)) {
-    const rawPath = match[1];
-    const absolutePath = rawPath.startsWith("~/") ? join(homedir(), rawPath.slice(2)) : rawPath;
+  for (const rawPath of extractDeliverablePathCandidates(text)) {
+    const absolutePath = rawPath.startsWith("~/") || rawPath.startsWith("~\\")
+      ? join(homedir(), rawPath.slice(2))
+      : rawPath;
     if (allowed.has(extname(absolutePath).toLowerCase()) && existsSync(resolve(absolutePath))) {
       paths.add(resolve(absolutePath));
     }

@@ -1,7 +1,8 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
-import { basename, join } from "path";
+import { basename, dirname, join, relative, sep } from "path";
 import type { LocalResult } from "../../core/command-types.js";
+import { resolveConfiguredPath } from "../../openclaw/runtime/openclaw-paths.js";
 import {
   DEFAULT_TIMEOUT_MS,
   HERMES_HOME_DIR,
@@ -319,19 +320,23 @@ function listDirectoryPaths(dir: string): string[] {
 }
 
 function dirnameForFile(filePath: string): string {
-  return filePath.slice(0, -"/SKILL.md".length);
+  return dirname(filePath);
 }
 
 function normalizeSkillCategoryFromPath(filePath: string): string | undefined {
   const skillsDir = hermesSkillsDir();
-  const relative = filePath.startsWith(`${skillsDir}/`) ? filePath.slice(skillsDir.length + 1) : "";
-  const parts = relative.split("/");
+  const relativePath = relative(skillsDir, filePath);
+  if (!relativePath || relativePath.startsWith("..") || relativePath === filePath) {
+    return undefined;
+  }
+  const parts = relativePath.split(sep);
   const category = parts.length >= 3 ? parts[0]?.trim() : "";
   return category ? category : undefined;
 }
 
 function hermesSkillsDir(): string {
-  return process.env.HERMES_SKILLS_DIR?.trim() || join(HERMES_HOME_DIR, "hermes-agent", "skills");
+  const explicit = process.env.HERMES_SKILLS_DIR?.trim();
+  return explicit ? resolveConfiguredPath(explicit) : join(HERMES_HOME_DIR, "hermes-agent", "skills");
 }
 
 function parseHermesMcpList(output: string): Array<Record<string, unknown>> {

@@ -156,7 +156,7 @@ export function installService(profile?: string): boolean {
     case "linux":
       return installLinuxService();
     case "windows":
-      return installWindowsService();
+      return installWindowsService(profile);
     default:
       return false;
   }
@@ -169,7 +169,7 @@ export function restartService(profile?: string): boolean {
     case "linux":
       return restartLinuxService();
     case "windows":
-      return restartWindowsService();
+      return restartWindowsService(profile);
     default:
       return false;
   }
@@ -182,7 +182,7 @@ export function stopService(profile?: string): boolean {
     case "linux":
       return stopLinuxService();
     case "windows":
-      return stopWindowsService();
+      return stopWindowsService(profile);
     default:
       return false;
   }
@@ -195,7 +195,7 @@ export function uninstallService(profile?: string): boolean {
     case "linux":
       return uninstallLinuxService();
     case "windows":
-      return uninstallWindowsService();
+      return uninstallWindowsService(profile);
     default:
       return false;
   }
@@ -232,7 +232,7 @@ export function getServiceStatus(profile?: string): ServiceStatus {
   }
 
   if (platform === "windows") {
-    return getWindowsServiceStatus();
+    return getWindowsServiceStatus(resolvedProfile);
   }
 
   return {

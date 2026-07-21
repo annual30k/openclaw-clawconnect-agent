@@ -1,6 +1,7 @@
 import readline from "readline";
 import { readConfig, writeConfig } from "../config/config.js";
 import { t } from "../i18n/index.js";
+import { resolveOpenClawConfigPath } from "../openclaw/runtime/openclaw-paths.js";
 export async function setTokenCommand() {
     // Require pairing to be done first
     let config;
@@ -15,7 +16,7 @@ export async function setTokenCommand() {
     console.log(t("setToken.whereToFind"));
     console.log(t("setToken.option1"));
     console.log(t("setToken.option2"));
-    console.log(t("setToken.option2cmd"));
+    console.log(t("setToken.option2path", resolveOpenClawConfigPath()));
     console.log(t("setToken.option3"));
     // Prompt for the token
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

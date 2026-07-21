@@ -2,9 +2,8 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameS
 import { createHash, randomUUID } from "node:crypto";
 import { extname, join } from "node:path";
 import { homedir } from "node:os";
+import { resolveOpenClawConfigDir, resolveOpenClawConfigPath } from "../runtime/openclaw-paths.js";
 
-const OPENCLAW_DIR = join(homedir(), ".openclaw");
-const OPENCLAW_CONFIG = join(OPENCLAW_DIR, "openclaw.json");
 const BACKUP_ROOT = join(homedir(), ".clawconnect", "backups", "openclaw");
 const BACKUP_META_FILENAME = "backup.meta.json";
 const MAX_BACKUPS = 5;
@@ -317,10 +316,11 @@ function enforceBackupLimit(backups: StoredBackupRecord[]): void {
 }
 
 function readOpenclawConfigSnapshot(): string {
-  if (!existsSync(OPENCLAW_CONFIG)) {
-    fail("openclaw_config_not_found", `openclaw config not found: ${OPENCLAW_CONFIG}`);
+  const openClawConfigPath = resolveOpenClawConfigPath();
+  if (!existsSync(openClawConfigPath)) {
+    fail("openclaw_config_not_found", `openclaw config not found: ${openClawConfigPath}`);
   }
-  return readFileSync(OPENCLAW_CONFIG, "utf8");
+  return readFileSync(openClawConfigPath, "utf8");
 }
 
 export function listBackups(): BackupListResult {
@@ -423,10 +423,12 @@ export function deleteBackup(params: unknown): BackupMutationResult {
 export function restoreBackup(params: unknown): BackupMutationResult {
   const backupId = parseBackupIdInput(params);
   const existing = loadBackupOrThrow(backupId);
-  if (!existsSync(OPENCLAW_DIR)) {
-    fail("openclaw_config_dir_not_found", `openclaw config dir not found: ${OPENCLAW_DIR}`);
+  const openClawConfigDir = resolveOpenClawConfigDir();
+  const openClawConfigPath = resolveOpenClawConfigPath();
+  if (!existsSync(openClawConfigDir)) {
+    fail("openclaw_config_dir_not_found", `openclaw config dir not found: ${openClawConfigDir}`);
   }
-  copyFileSync(existing.payloadPath, OPENCLAW_CONFIG);
+  copyFileSync(existing.payloadPath, openClawConfigPath);
 
   const backups = readStoredBackups();
   return {

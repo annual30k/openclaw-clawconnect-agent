@@ -1,20 +1,15 @@
-import { existsSync, readFileSync } from "fs";
-import { homedir } from "os";
-import { join } from "path";
 import { TextDecoder } from "util";
 import type { LocalCommandContext } from "../../core/command-types.js";
 import { buildMobileAssistantDeltaPayload } from "../../core/relay/mobile-chat-run-bridge.js";
 import { buildToolInvocationUpdatedEvent } from "../../core/relay/timeline-event-builder.js";
-import { parseEnvFile } from "../../config/env.js";
 import { rememberHermesSession } from "../hermes-session-store.js";
 import { buildHermesPreloadedSkillsPrompt } from "./hermes-runtime-preloaded-skills.js";
 import type { HermesChatResult, HermesToolLogEvent, HermesUsageSnapshot } from "./hermes-runtime-types.js";
-import { CHAT_TIMEOUT_MS, HERMES_HOME_DIR, sanitizeHermesChatOutput } from "./hermes-runtime-process.js";
+import { resolveHermesApiSettings } from "./hermes-runtime-api-settings.js";
+import { CHAT_TIMEOUT_MS, sanitizeHermesChatOutput } from "./hermes-runtime-process.js";
 import { compactStringArray } from "./hermes-runtime-values.js";
 import { hermesToolState } from "./hermes-runtime-tool-log-watcher.js";
 
-const DEFAULT_HERMES_API_HOST = "127.0.0.1";
-const DEFAULT_HERMES_API_PORT = "8642";
 const HERMES_API_HEALTH_TIMEOUT_MS = 1_500;
 const HERMES_API_TOOLSETS_TIMEOUT_MS = 1_500;
 
@@ -60,6 +55,7 @@ function readHermesApiConfig(): HermesApiConfig | undefined {
   if (isTruthyEnv(process.env.CLAWCONNECT_HERMES_API_DISABLED)) {
     return undefined;
   }
+  const settings = resolveHermesApiSettings();
   const explicitUrl = firstNonEmpty(
     process.env.CLAWCONNECT_HERMES_API_URL,
     process.env.HERMES_API_SERVER_URL,
@@ -72,40 +68,11 @@ function readHermesApiConfig(): HermesApiConfig | undefined {
     // HERMES_BIN 是测试和诊断替换 Hermes CLI 的显式契约；不能让真实 ~/.hermes/.env API 配置绕过 fake binary。
     return undefined;
   }
-  const hermesEnv = readHermesEnvFile();
-  const apiKey = firstNonEmpty(
-    explicitApiKey,
-    hermesEnv.API_SERVER_KEY,
-  );
+  const apiKey = settings.apiKey;
   if (!apiKey) {
     return undefined;
   }
-
-  if (explicitUrl) {
-    return { baseUrl: normalizeBaseUrl(explicitUrl), apiKey };
-  }
-
-  const host = firstNonEmpty(
-    process.env.API_SERVER_HOST,
-    hermesEnv.API_SERVER_HOST,
-  ) ?? DEFAULT_HERMES_API_HOST;
-  const port = firstNonEmpty(
-    process.env.API_SERVER_PORT,
-    hermesEnv.API_SERVER_PORT,
-  ) ?? DEFAULT_HERMES_API_PORT;
-  return { baseUrl: normalizeBaseUrl(`http://${host}:${port}`), apiKey };
-}
-
-function readHermesEnvFile(): Record<string, string> {
-  const envPath = join(process.env.HERMES_HOME?.trim() || HERMES_HOME_DIR || join(homedir(), ".hermes"), ".env");
-  if (!existsSync(envPath)) {
-    return {};
-  }
-  try {
-    return parseEnvFile(readFileSync(envPath, "utf8"));
-  } catch {
-    return {};
-  }
+  return { baseUrl: settings.baseUrl, apiKey };
 }
 
 async function isHermesApiHealthy(config: HermesApiConfig): Promise<boolean> {
@@ -622,10 +589,6 @@ async function fetchWithTimeout(
       abortSignal.removeEventListener("abort", abortHandler);
     }
   }
-}
-
-function normalizeBaseUrl(value: string): string {
-  return value.trim().replace(/\/+$/g, "");
 }
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {

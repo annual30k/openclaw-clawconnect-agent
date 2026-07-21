@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
+  openClawInstallDirCandidates,
   parseGatewayRuntimeState,
   resolveGatewayRemoteRestartAction,
   selectOpenclawBinCandidate,
@@ -73,4 +76,15 @@ test("selectOpenclawBinCandidate prefers a working explicit binary", () => {
     }),
     "/explicit/openclaw",
   );
+});
+
+test("OpenClaw install directory overrides expand tilde paths", () => {
+  const root = join(homedir(), "custom-openclaw");
+  assert.deepEqual(openClawInstallDirCandidates("~/custom-openclaw"), [
+    join(root, "openclaw.mjs"),
+    join(root, "dist", "index.js"),
+    join(root, "bin", process.platform === "win32" ? "openclaw.cmd" : "openclaw"),
+    join(root, process.platform === "win32" ? "openclaw.cmd" : "openclaw"),
+    join(root, "node_modules", "openclaw", "openclaw.mjs"),
+  ]);
 });

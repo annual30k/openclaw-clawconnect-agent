@@ -1,16 +1,22 @@
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "fs";
 import { execFileSync } from "child_process";
-import { homedir } from "os";
-import { join } from "path";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import {
   ensureLogDir,
-  ERROR_LOG_PATH,
+  getProfileErrorLogPath,
+  getProfileLogPath,
   getProgramArgs,
-  LOG_PATH,
+  resolveServiceEntryPath,
 } from "./service-manager-common.js";
 import type { ServiceStatus } from "./service-manager-common.js";
+import { getActiveProfile, normalizeProfileName } from "../config/profile.js";
+import { decodeTextBuffer } from "./text-file-decoder.js";
 
 export const TASK_NAME = "ClawConnectAgent";
+
+export function windowsTaskName(profile?: string): string {
+  const normalized = normalizeProfileName(profile);
+  return normalized ? `${TASK_NAME}-${normalized}` : TASK_NAME;
+}
 
 function qps(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
@@ -29,48 +35,28 @@ export function buildWindowsPowerShellBootstrap(command: string): string {
   ].join("; ");
 }
 
-/**
- * Build a command-line string suitable for Windows CommandLineToArgvW
- * (used by CreateProcess when schtasks later runs the task).
- *
- * - Args containing spaces or tabs are double-quoted.
- * - A literal `"` inside an arg is escaped as `\"` per Windows convention.
- * - Backslashes before a `"` are doubled to prevent them from being
- *   interpreted as escaping the quote character.
- */
-function buildWindowsCommandLine(args: string[]): string {
-  return args
-    .map((arg) => {
-      if (/[ \t"]/.test(arg)) {
-        // Proper CommandLineToArgvW quoting:
-        //   1. backslashes before a " must be doubled
-        //   2. each " becomes \"
-        //   3. wrap the result in quotes
-        let result = "";
-        for (let i = 0; i < arg.length; i++) {
-          let backslashCount = 0;
-          while (i < arg.length && arg[i] === "\\") {
-            backslashCount++;
-            i++;
-          }
-          if (i >= arg.length) {
-            // All backslashes at end: double them before the closing quote
-            result += "\\".repeat(backslashCount * 2);
-          } else if (arg[i] === '"') {
-            // Backslashes before a quote: double + add escape quote
-            result += "\\".repeat(backslashCount * 2 + 1);
-            result += '"';
-          } else {
-            // Normal character: backslashes are literal
-            result += "\\".repeat(backslashCount);
-            result += arg[i];
-          }
-        }
-        return `"${result}"`;
-      }
-      return arg;
-    })
-    .join(" ");
+export function normalizeWindowsServiceLogEncoding(path: string): void {
+  if (!existsSync(path)) {
+    return;
+  }
+  const decoded = decodeTextBuffer(readFileSync(path));
+  if (decoded.encoding !== "utf8") {
+    writeFileSync(path, decoded.text, "utf8");
+  }
+}
+
+export function buildWindowsServiceProcessCommand(
+  args: string[],
+  logPath: string,
+  errorLogPath: string,
+): string {
+  const [execPath, ...execArgs] = args;
+  if (!execPath) {
+    throw new Error("Windows service executable is required");
+  }
+  return buildWindowsPowerShellBootstrap(
+    `& ${qps(execPath)} ${execArgs.map((arg) => qps(arg)).join(" ")} >> ${qps(logPath)} 2>> ${qps(errorLogPath)}`,
+  );
 }
 
 /**
@@ -78,19 +64,34 @@ function buildWindowsCommandLine(args: string[]): string {
  * Uses execFileSync to bypass cmd.exe, avoiding CMD quote-mangling.
  * Returns true if any processes were killed.
  */
-function killWindowsProcess(): boolean {
+export function buildWindowsProcessQueryScript(profile?: string): string {
+  const profileFilter = normalizeProfileName(profile)
+    ? `($_.CommandLine -match ('(?:^|\\s)--profile(?:\\s+|=)' + [regex]::Escape($env:CLAW_PROFILE_NAME) + '(?:\\s|$)'))`
+    : `($_.CommandLine -notmatch '(?:^|\\s)--profile(?:\\s|=)')`;
+  return `Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape($env:CLAW_SCRIPT_PATH) -and ${profileFilter} } | Select-Object -ExpandProperty ProcessId`;
+}
+
+function windowsProcessQueryEnv(profile?: string): NodeJS.ProcessEnv {
+  const scriptPath = process.argv[1];
+  return {
+    ...process.env,
+    CLAW_SCRIPT_PATH: scriptPath ? resolveServiceEntryPath(scriptPath) : "",
+    CLAW_PROFILE_NAME: normalizeProfileName(profile) ?? "",
+  };
+}
+
+function killWindowsProcess(profile?: string): boolean {
   const scriptPath = process.argv[1];
   if (!scriptPath) return false;
 
   const currentPid = process.pid;
 
   try {
-    const psScript =
-      `Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape($env:CLAW_SCRIPT_PATH) } | Select-Object -ExpandProperty ProcessId`;
+    const psScript = buildWindowsProcessQueryScript(profile);
     const output = execFileSync(
       "powershell",
       ["-NoProfile", "-Command", psScript],
-      { stdio: "pipe", env: { ...process.env, CLAW_SCRIPT_PATH: scriptPath } }
+      { stdio: "pipe", env: windowsProcessQueryEnv(profile) }
     )
       .toString()
       .trim();
@@ -133,26 +134,34 @@ function killWindowsProcess(): boolean {
   }
 }
 
-export function installWindowsService(): boolean {
-  const args = getProgramArgs();
+export function installWindowsService(profile?: string): boolean {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+  const taskName = windowsTaskName(resolvedProfile);
+  const logPath = getProfileLogPath(resolvedProfile);
+  const errorLogPath = getProfileErrorLogPath(resolvedProfile);
+  const args = getProgramArgs(resolvedProfile);
 
   try {
-    ensureLogDir();
+    ensureLogDir(resolvedProfile);
+    try {
+      execFileSync("schtasks", ["/end", "/tn", taskName], { stdio: "pipe" });
+    } catch {
+      // First install or already stopped.
+    }
+    killWindowsProcess(resolvedProfile);
+    // 旧版 PowerShell 可能创建 UTF-16LE 日志；转换后再以 UTF-8 追加，避免一个文件混合两种编码。
+    normalizeWindowsServiceLogEncoding(logPath);
+    normalizeWindowsServiceLogEncoding(errorLogPath);
 
     // ── Attempt 1: PowerShell ScheduledTasks module ──────────────────────
     // Supports RestartOnFailure (crash recovery) and full settings control.
     // Available on Windows 10 / Server 2016+.
     try {
-      const execPath = args[0];
-      const execArgs = args.slice(1);
-
       // We use 'powershell -WindowStyle Hidden' to launch node without a visible console window.
       // This is the most reliable native way to run a background console app on login.
       // Stdout/stderr are redirected to log files, matching the behavior of the
       // Linux (systemd/nohup) and macOS (launchd) service managers.
-      const innerCmd = buildWindowsPowerShellBootstrap(
-        `& ${qps(execPath)} ${execArgs.map((a) => qps(a)).join(" ")} >> ${qps(LOG_PATH)} 2>> ${qps(ERROR_LOG_PATH)}`
-      );
+      const innerCmd = buildWindowsServiceProcessCommand(args, logPath, errorLogPath);
 
       // The -Argument value uses a PowerShell double-quote string ("" → literal ")
       // so that single quotes from qps() inside it are preserved literally.
@@ -165,36 +174,31 @@ export function installWindowsService(): boolean {
         `$trigger  = New-ScheduledTaskTrigger -AtLogon`,
         `$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest`,
         `$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`,
-        `Register-ScheduledTask -TaskName ${qps(TASK_NAME)} -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null`,
+        `Register-ScheduledTask -TaskName ${qps(taskName)} -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null`,
       ].join("\n");
 
       execFileSync("powershell", ["-NoProfile", "-Command", psScript], { stdio: "pipe" });
-      execFileSync("schtasks", ["/run", "/tn", TASK_NAME], { stdio: "pipe" });
+      execFileSync("schtasks", ["/run", "/tn", taskName], { stdio: "pipe" });
       return true;
     } catch (err) {
       // Fall through to basic schtasks below
     }
 
     // ── Attempt 2: Basic schtasks (no crash recovery) ────────────────────
-    const cmdLine = buildWindowsCommandLine(args);
     // Wrap in powershell -WindowStyle Hidden so no console window pops up at login.
     // schtasks stores /tr as-is; CreateProcess parses it with CommandLineToArgvW.
     // The inner command is passed as a single argument to -Command via double quotes
     // escaped as \" per CommandLineToArgvW convention.
     // Stdout/stderr are redirected to log files via PowerShell >> / 2>> operators.
-    const escLogPath = LOG_PATH.replace(/'/g, "''");
-    const escErrPath = ERROR_LOG_PATH.replace(/'/g, "''");
-    const fallbackInner = buildWindowsPowerShellBootstrap(
-      `${cmdLine} >> '${escLogPath}' 2>> '${escErrPath}'`
-    );
+    const fallbackInner = buildWindowsServiceProcessCommand(args, logPath, errorLogPath);
     const fallbackTr = `powershell.exe -WindowStyle Hidden -Command "${fallbackInner.replace(/"/g, '\\"')}"`;
 
     execFileSync(
       "schtasks",
-      ["/create", "/tn", TASK_NAME, "/tr", fallbackTr, "/sc", "onlogon", "/f"],
+      ["/create", "/tn", taskName, "/tr", fallbackTr, "/sc", "onlogon", "/f"],
       { stdio: "pipe" }
     );
-    execFileSync("schtasks", ["/run", "/tn", TASK_NAME], { stdio: "pipe" });
+    execFileSync("schtasks", ["/run", "/tn", taskName], { stdio: "pipe" });
     return true;
   } catch (err) {
     console.error("[clawconnect] Failed to install Windows task:", err);
@@ -202,17 +206,19 @@ export function installWindowsService(): boolean {
   }
 }
 
-export function uninstallWindowsService(): boolean {
+export function uninstallWindowsService(profile?: string): boolean {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+  const taskName = windowsTaskName(resolvedProfile);
   try {
     let changed = false;
     try {
-      execFileSync("schtasks", ["/delete", "/tn", TASK_NAME, "/f"], { stdio: "pipe" });
+      execFileSync("schtasks", ["/delete", "/tn", taskName, "/f"], { stdio: "pipe" });
       changed = true;
     } catch {
       // task might not exist
     }
 
-    if (killWindowsProcess()) {
+    if (killWindowsProcess(resolvedProfile)) {
       changed = true;
     }
     return changed;
@@ -222,38 +228,45 @@ export function uninstallWindowsService(): boolean {
   }
 }
 
-export function restartWindowsService(): boolean {
+export function restartWindowsService(profile?: string): boolean {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+  const taskName = windowsTaskName(resolvedProfile);
   // Try to stop the task first
   try {
-    execFileSync("schtasks", ["/end", "/tn", TASK_NAME], { stdio: "pipe" });
+    execFileSync("schtasks", ["/end", "/tn", taskName], { stdio: "pipe" });
   } catch {
     // ignore if not running
   }
 
-  killWindowsProcess();
+  killWindowsProcess(resolvedProfile);
 
   try {
-    execFileSync("schtasks", ["/run", "/tn", TASK_NAME], { stdio: "pipe" });
+    execFileSync("schtasks", ["/run", "/tn", taskName], { stdio: "pipe" });
     return true;
   } catch {
     // If the task doesn't exist, install it
-    return installWindowsService();
+    return installWindowsService(resolvedProfile);
   }
 }
 
-export function stopWindowsService(): boolean {
+export function stopWindowsService(profile?: string): boolean {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+  const taskName = windowsTaskName(resolvedProfile);
   try {
-    execFileSync("schtasks", ["/end", "/tn", TASK_NAME], { stdio: "pipe" });
+    execFileSync("schtasks", ["/end", "/tn", taskName], { stdio: "pipe" });
   } catch {
     // ignore if not running
   }
-  return killWindowsProcess();
+  return killWindowsProcess(resolvedProfile);
 }
 
-export function getWindowsServiceStatus(): ServiceStatus {
+export function getWindowsServiceStatus(profile?: string): ServiceStatus {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+  const taskName = windowsTaskName(resolvedProfile);
+  const logPath = getProfileLogPath(resolvedProfile);
   let installed = false;
   try {
-    execFileSync("schtasks", ["/query", "/tn", TASK_NAME], { stdio: "pipe" });
+    execFileSync("schtasks", ["/query", "/tn", taskName], { stdio: "pipe" });
     installed = true;
   } catch {
     installed = false;
@@ -264,12 +277,11 @@ export function getWindowsServiceStatus(): ServiceStatus {
     try {
       const scriptPath = process.argv[1];
       if (scriptPath) {
-        const psScript =
-          `Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape($env:CLAW_SCRIPT_PATH) } | Select-Object -ExpandProperty ProcessId`;
+        const psScript = buildWindowsProcessQueryScript(resolvedProfile);
         const output = execFileSync(
           "powershell",
           ["-NoProfile", "-Command", psScript],
-          { stdio: "pipe", env: { ...process.env, CLAW_SCRIPT_PATH: scriptPath } }
+          { stdio: "pipe", env: windowsProcessQueryEnv(resolvedProfile) }
         )
           .toString()
           .trim();
@@ -284,9 +296,9 @@ export function getWindowsServiceStatus(): ServiceStatus {
     platform: "windows",
     installed,
     running,
-    serviceName: TASK_NAME,
+    serviceName: taskName,
     manager: "Windows Task Scheduler",
-    logPath: LOG_PATH,
-    startHint: `schtasks /run /tn "${TASK_NAME}"`,
+    logPath,
+    startHint: `schtasks /run /tn "${taskName}"`,
   };
 }

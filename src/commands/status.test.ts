@@ -70,3 +70,15 @@ test("readHealth keeps OpenClaw gateway event parsing for OpenClaw configs", () 
   assert.deepEqual(health.relay, { kind: "ok", detail: "connected" });
   assert.deepEqual(health.gateway, { kind: "ok", detail: "connected" });
 });
+
+test("readHealth parses Windows PowerShell UTF-16LE service logs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawconnect-status-utf16-"));
+  const logPath = join(dir, "clawconnect.log");
+  const log = ["启动 ClawConnect", "Relay connected.", "Gateway connected."].join("\r\n");
+  writeFileSync(logPath, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(log, "utf16le")]));
+
+  const health = readHealth(logPath, "openclaw");
+
+  assert.deepEqual(health.relay, { kind: "ok", detail: "connected" });
+  assert.deepEqual(health.gateway, { kind: "ok", detail: "connected" });
+});

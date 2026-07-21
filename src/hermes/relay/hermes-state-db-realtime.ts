@@ -1,7 +1,6 @@
 import { execFile as execFileCb } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
 import { promisify } from "node:util";
 import { canonicalizeMobileAssistantText } from "../../core/relay/mobile-chat-run-bridge.js";
 import {
@@ -11,9 +10,9 @@ import {
   parseCanonicalTimelineEvent,
 } from "../../core/relay/timeline-event-log.js";
 import {
-  HERMES_HOME_DIR,
   SUBPROCESS_ENV,
 } from "../runtime/hermes-runtime-process.js";
+import { resolveHermesPythonBin, resolveHermesStateDbPath } from "../runtime/hermes-runtime-paths.js";
 
 const execFile = promisify(execFileCb);
 
@@ -305,28 +304,11 @@ export function createHermesStateDbRealtimeWatcher(params: {
 }
 
 export function resolveHermesStateDbRealtimePath(): string | undefined {
-  const explicit = process.env.CLAWCONNECT_HERMES_STATE_DB?.trim();
-  if (explicit) {
-    return explicit;
-  }
-  if (process.env.HERMES_BIN?.trim()) {
-    return undefined;
-  }
-  return join(process.env.HERMES_HOME?.trim() || HERMES_HOME_DIR, "state.db");
+  return resolveHermesStateDbPath();
 }
 
 export function resolveHermesStateDbRealtimePython(): string {
-  const explicit = process.env.HERMES_PYTHON?.trim();
-  if (explicit) {
-    return explicit;
-  }
-  const hermesHome = process.env.HERMES_HOME?.trim() || HERMES_HOME_DIR;
-  const candidates = [
-    join(hermesHome, "hermes-agent", "venv", "bin", "python"),
-    join(hermesHome, "hermes-agent", "venv", "Scripts", "python.exe"),
-    join(hermesHome, "hermes-agent", "venv", "Scripts", "python"),
-  ];
-  return candidates.find((candidate) => existsSync(candidate)) ?? "python3";
+  return resolveHermesPythonBin();
 }
 
 async function runHermesStateDbRealtimeQuery(

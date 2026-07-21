@@ -29,11 +29,20 @@ CLAWCONNECT_RELAY_SERVER_URL=https://clawlinks.cn
 # CLAWCONNECT_ENV_FILE=/Users/you/.clawconnect/.env
 
 # Optional: force the local OpenClaw Gateway websocket URL instead of reading
-# ~/.openclaw/openclaw.json and falling back to ws://localhost:18789.
+# OPENCLAW_CONFIG_PATH / OPENCLAW_STATE_DIR and falling back to ws://localhost:18789.
 # CLAWCONNECT_GATEWAY_URL=ws://localhost:18789
 
+# Optional: override only the OpenClaw Gateway port. The full URL above wins.
+# OPENCLAW_GATEWAY_PORT=18789
+
+# Optional: OpenClaw official path overrides. These support source, Homebrew,
+# container-mounted, dedicated-service-user, and multi-gateway installations.
+# OPENCLAW_HOME=/path/to/openclaw-user-home
+# OPENCLAW_STATE_DIR=/path/to/openclaw-state
+# OPENCLAW_CONFIG_PATH=/path/to/openclaw.json
+
 # Optional: Gateway auth fallback.
-# Prefer \`clawconnect set-token\` or ~/.openclaw/openclaw.json when possible.
+# Prefer \`clawconnect set-token\` or the resolved OPENCLAW_CONFIG_PATH when possible.
 # OPENCLAW_GATEWAY_TOKEN=
 # OPENCLAW_GATEWAY_PASSWORD=
 
@@ -45,6 +54,19 @@ CLAWCONNECT_RELAY_SERVER_URL=https://clawlinks.cn
 # Optional: override how local maintenance commands find the OpenClaw CLI.
 # OPENCLAW_BIN=/usr/local/bin/openclaw
 # OPENCLAW_PACKAGE_BIN=/path/to/openclaw/package/dist/index.js
+# OPENCLAW_INSTALL_DIR=/path/to/openclaw/source-or-package
+
+# Optional: Hermes source/data/runtime overrides. Native Windows installs are
+# auto-detected under %LOCALAPPDATA%\hermes; Unix/WSL defaults to ~/.hermes.
+# HERMES_HOME=/path/to/hermes-data
+# HERMES_BIN=/path/to/hermes
+# HERMES_PYTHON=/path/to/python
+# HERMES_SKILLS_DIR=/path/to/hermes-skills
+# CLAWCONNECT_HERMES_STATE_DB=/path/to/state.db
+# CLAWCONNECT_HERMES_API_URL=http://127.0.0.1:8642
+# CLAWCONNECT_HERMES_API_KEY=
+# API_SERVER_HOST=127.0.0.1
+# API_SERVER_PORT=8642
 `;
 
 type EnvMap = Record<string, string | undefined>;
@@ -61,6 +83,15 @@ export function getDefaultRelayServerUrl(env: EnvMap = process.env): string {
 
 export function getConfiguredGatewayUrl(env: EnvMap = process.env): string | undefined {
   return normalizeNonEmpty(env.CLAWCONNECT_GATEWAY_URL);
+}
+
+export function getConfiguredGatewayPort(env: EnvMap = process.env): number | undefined {
+  const value = normalizeNonEmpty(env.OPENCLAW_GATEWAY_PORT);
+  if (!value || !/^\d+$/.test(value)) {
+    return undefined;
+  }
+  const port = Number.parseInt(value, 10);
+  return port >= 1 && port <= 65_535 ? port : undefined;
 }
 
 export function getUserEnvPath(): string {

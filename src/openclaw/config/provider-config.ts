@@ -1,11 +1,11 @@
 import { readFile, writeFile, mkdir, readdir } from "fs/promises";
 import { join } from "path";
-import { homedir } from "os";
 import { PROVIDER_REGISTRY } from "../config/provider-registry.js";
+import { resolveOpenClawAgentsDir, resolveOpenClawConfigPath } from "../runtime/openclaw-paths.js";
+import JSON5 from "json5";
 
-const OPENCLAW_DIR    = join(homedir(), ".openclaw");
-const OPENCLAW_CONFIG = join(OPENCLAW_DIR, "openclaw.json");
-const AGENTS_DIR      = join(OPENCLAW_DIR, "agents");
+const openClawConfigPath = (): string => resolveOpenClawConfigPath();
+const agentsDir = (): string => resolveOpenClawAgentsDir();
 
 // ---------------------------------------------------------------------------
 // Types
@@ -45,7 +45,7 @@ function maskKey(key: string): string {
 
 async function resolveAgentId(): Promise<string> {
   try {
-    const entries = await readdir(AGENTS_DIR, { withFileTypes: true });
+    const entries = await readdir(agentsDir(), { withFileTypes: true });
     const dirs = entries.filter(e => e.isDirectory()).map(e => e.name);
     if (dirs.length > 0) return dirs[0];
   } catch {
@@ -57,7 +57,7 @@ async function resolveAgentId(): Promise<string> {
 async function readJson(filePath: string): Promise<Record<string, unknown>> {
   try {
     const raw = await readFile(filePath, "utf-8");
-    return JSON.parse(raw) as Record<string, unknown>;
+    return JSON5.parse(raw) as Record<string, unknown>;
   } catch {
     return {};
   }
@@ -82,7 +82,7 @@ function getNestedObj(
 }
 
 function authProfilesPath(agentId: string): string {
-  return join(AGENTS_DIR, agentId, "agent", "auth-profiles.json");
+  return join(agentsDir(), agentId, "agent", "auth-profiles.json");
 }
 
 /** Extract the first model ID from a provider's models array in openclaw.json */
@@ -122,7 +122,7 @@ function modelContextWindow(modelRaw: Record<string, unknown>): string {
 // ---------------------------------------------------------------------------
 
 export async function listProviderEntries(): Promise<ProviderEntry[]> {
-  const config = await readJson(OPENCLAW_CONFIG);
+  const config = await readJson(openClawConfigPath());
 
   const agentId = await resolveAgentId();
   const authProfiles = await readJson(authProfilesPath(agentId));
@@ -202,7 +202,7 @@ export async function listProviderEntries(): Promise<ProviderEntry[]> {
 }
 
 export async function listConfiguredModels(): Promise<ConfiguredModelEntry[]> {
-  const config = await readJson(OPENCLAW_CONFIG);
+  const config = await readJson(openClawConfigPath());
 
   const agents = (config["agents"] as Record<string, unknown> | undefined) ?? {};
   const defaults = (agents["defaults"] as Record<string, unknown> | undefined) ?? {};
@@ -272,7 +272,7 @@ export async function addProvider(params: {
 
   // --- Update openclaw.json (skip for builtIn providers) ---
   if (!info?.builtIn) {
-    const config = await readJson(OPENCLAW_CONFIG);
+    const config = await readJson(openClawConfigPath());
     const models = getNestedObj(config, ["models"]);
     const providers = getNestedObj(models, ["providers"]);
 
@@ -283,14 +283,14 @@ export async function addProvider(params: {
     }
     providers[id] = providerEntry;
 
-    await writeJson(OPENCLAW_CONFIG, config);
+    await writeJson(openClawConfigPath(), config);
   }
 
   // --- Update auth-profiles.json (only if apiKey provided) ---
   if (apiKey != null && apiKey.length > 0) {
     const agentId = await resolveAgentId();
     const profilesPath = authProfilesPath(agentId);
-    const profilesDir = join(AGENTS_DIR, agentId, "agent");
+    const profilesDir = join(agentsDir(), agentId, "agent");
 
     await mkdir(profilesDir, { recursive: true });
 
@@ -311,11 +311,11 @@ export async function deleteProvider(id: string): Promise<void> {
 
   // --- Update openclaw.json (skip for builtIn) ---
   if (!info?.builtIn) {
-    const config = await readJson(OPENCLAW_CONFIG);
+    const config = await readJson(openClawConfigPath());
     const models = getNestedObj(config, ["models"]);
     const providers = getNestedObj(models, ["providers"]);
     delete providers[id];
-    await writeJson(OPENCLAW_CONFIG, config);
+    await writeJson(openClawConfigPath(), config);
   }
 
   // --- Update auth-profiles.json ---
@@ -343,7 +343,7 @@ export async function setDefaultProvider(id: string): Promise<void> {
     modelId = info.defaultModelId ?? null;
   } else {
     // Read from models.providers entry
-    const config = await readJson(OPENCLAW_CONFIG);
+    const config = await readJson(openClawConfigPath());
     const models = (config["models"] as Record<string, unknown>) ?? {};
     const providers = (models["providers"] as Record<string, unknown>) ?? {};
     const providerRaw = (providers[id] as Record<string, unknown>) ?? {};
@@ -352,20 +352,20 @@ export async function setDefaultProvider(id: string): Promise<void> {
 
   const primary = modelId ? `${id}/${modelId}` : id;
 
-  const config = await readJson(OPENCLAW_CONFIG);
+  const config = await readJson(openClawConfigPath());
   const agents = getNestedObj(config, ["agents"]);
   const defaults = getNestedObj(agents, ["defaults"]);
   const model = getNestedObj(defaults, ["model"]);
   model["primary"] = primary;
 
-  await writeJson(OPENCLAW_CONFIG, config);
+  await writeJson(openClawConfigPath(), config);
 }
 
 export async function setDefaultModel(providerId: string, modelId: string): Promise<void> {
-  const config = await readJson(OPENCLAW_CONFIG);
+  const config = await readJson(openClawConfigPath());
   const agents = getNestedObj(config, ["agents"]);
   const defaults = getNestedObj(agents, ["defaults"]);
   const model = getNestedObj(defaults, ["model"]);
   model["primary"] = `${providerId}/${modelId}`;
-  await writeJson(OPENCLAW_CONFIG, config);
+  await writeJson(openClawConfigPath(), config);
 }

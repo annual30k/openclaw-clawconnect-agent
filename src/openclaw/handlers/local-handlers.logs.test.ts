@@ -109,6 +109,19 @@ test("logs command reads OpenClaw gateway and error sources explicitly", async (
   assert.deepEqual(errorPayload.lines, ["gateway-failed"]);
 });
 
+test("logs command decodes Windows UTF-16LE gateway logs without garbling Chinese", async () => {
+  const gatewayLogPath = join(logsDir, "gateway.log");
+  const text = "网关启动\r\nGateway connected.\r\n";
+  await writeFile(gatewayLogPath, Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from(text, "utf16le"),
+  ]));
+
+  const payload = handleLocalCommand("clawpilot.logs", { source: "gateway" })?.payload as any;
+
+  assert.deepEqual(payload.lines, ["网关启动", "Gateway connected."]);
+});
+
 test("logs command rejects unknown sources", () => {
   const result = handleLocalCommand("clawpilot.logs", { source: "../../secrets" });
   assert.equal(result?.ok, false);

@@ -1,7 +1,7 @@
 
 import { readdirSync, statSync, unlinkSync } from "fs";
 import { homedir } from "os";
-import { basename, join, resolve } from "path";
+import { basename, isAbsolute, join, resolve } from "path";
 import type { LocalResult } from "../../core/command-types.js";
 import { HERMES_HOME_DIR, runHermes } from "./hermes-runtime-process.js";
 import { runHermesOutput } from "./hermes-runtime-command-utils.js";
@@ -32,7 +32,7 @@ function normalizeHermesBackupOutputPath(record: Record<string, unknown>): strin
   if (!rawFilename) {
     return undefined;
   }
-  if (rawFilename.startsWith("/") || rawFilename.startsWith("~/")) {
+  if (isAbsolute(rawFilename) || rawFilename.startsWith("~/") || rawFilename.startsWith("~\\")) {
     return rawFilename;
   }
   let filename = sanitizeFileName(rawFilename);
@@ -104,13 +104,15 @@ function listHermesBackups(): Array<Record<string, unknown>> {
 }
 
 function findHermesBackup(idOrPath: string): Record<string, unknown> | undefined {
-  const resolved = idOrPath.startsWith("/") || idOrPath.startsWith("~") ? resolve(idOrPath.replace(/^~(?=\/)/, homedir())) : undefined;
+  const resolved = isAbsolute(idOrPath) || idOrPath.startsWith("~")
+    ? resolve(idOrPath.replace(/^~(?=[\\/])/, homedir()))
+    : undefined;
   return listHermesBackups().find((backup) => backup.id === idOrPath || backup.path === idOrPath || backup.path === resolved);
 }
 
 function backupRecordFromPath(filePath: string): Record<string, unknown> | undefined {
   try {
-    const resolved = resolve(filePath.replace(/^~(?=\/)/, homedir()));
+    const resolved = resolve(filePath.replace(/^~(?=[\\/])/, homedir()));
     const stat = statSync(resolved);
     return {
       id: resolved,
