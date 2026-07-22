@@ -14,6 +14,7 @@ type HealthState = {
   detail?: string;
 };
 type GatewayType = "openclaw" | "hermes";
+const WINDOWS_LOG_READ_TIMEOUT_MS = 5_000;
 
 export function statusCommand(opts: { profile?: string } = {}): void {
   if (opts.profile === "all") {
@@ -132,6 +133,7 @@ function readTailLines(path: string, maxLines: number): string[] {
           encoding: "utf8",
           env: { ...process.env, CLAWCONNECT_LOG_PATH: path },
           stdio: "pipe",
+          timeout: WINDOWS_LOG_READ_TIMEOUT_MS,
           windowsHide: true,
         }).trim();
         raw = decodeTextBuffer(Buffer.from(base64, "base64")).text;
@@ -147,7 +149,12 @@ function readTailLines(path: string, maxLines: number): string[] {
 }
 
 function parseRelayHealth(lines: string[], gatewayType: GatewayType): HealthState {
-  const connectedIndex = findLastIndex(lines, (line) => line.includes("Relay connected."));
+  const connectedIndex = findLastIndex(
+    lines,
+    (line) =>
+      line.includes("Relay connected.")
+      || (gatewayType === "hermes" && line.includes("Connected to relay server (hermes gatewayId=")),
+  );
   const disconnectedIndex = findLastIndex(
     lines,
     (line) =>

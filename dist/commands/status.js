@@ -8,6 +8,7 @@ import { decodeTextBuffer } from "../platform/text-file-decoder.js";
 import { resolveOpenClawConfigPath, resolveOpenClawStateDir } from "../openclaw/runtime/openclaw-paths.js";
 import { resolveHermesHomeDir } from "../hermes/runtime/hermes-runtime-paths.js";
 import { resolveHermesApiSettings } from "../hermes/runtime/hermes-runtime-api-settings.js";
+const WINDOWS_LOG_READ_TIMEOUT_MS = 5_000;
 export function statusCommand(opts = {}) {
     if (opts.profile === "all") {
         const profiles = listProfileNames();
@@ -122,6 +123,7 @@ function readTailLines(path, maxLines) {
                     encoding: "utf8",
                     env: { ...process.env, CLAWCONNECT_LOG_PATH: path },
                     stdio: "pipe",
+                    timeout: WINDOWS_LOG_READ_TIMEOUT_MS,
                     windowsHide: true,
                 }).trim();
                 raw = decodeTextBuffer(Buffer.from(base64, "base64")).text;
@@ -138,7 +140,8 @@ function readTailLines(path, maxLines) {
     return lines.slice(-maxLines);
 }
 function parseRelayHealth(lines, gatewayType) {
-    const connectedIndex = findLastIndex(lines, (line) => line.includes("Relay connected."));
+    const connectedIndex = findLastIndex(lines, (line) => line.includes("Relay connected.")
+        || (gatewayType === "hermes" && line.includes("Connected to relay server (hermes gatewayId=")));
     const disconnectedIndex = findLastIndex(lines, (line) => line.includes("Relay disconnected.") ||
         line.includes("Relay connection closed:") ||
         (gatewayType === "hermes" && line.includes("Hermes relay connection closed:")));

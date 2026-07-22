@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,10 +7,13 @@ import test from "node:test";
 import {
   buildWindowsPowerShellBootstrap,
   buildWindowsProcessQueryScript,
+  buildWindowsScheduledTaskStateScript,
   buildWindowsServiceProcessCommand,
   buildWindowsStartupRegistryArgs,
   buildWindowsServiceTaskCommand,
+  getWindowsServiceStatus,
   normalizeWindowsServiceLogEncoding,
+  WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
   WINDOWS_RUN_KEY,
   windowsTaskName,
 } from "./service-manager-windows.js";
@@ -85,5 +89,71 @@ test("Windows services and process queries are isolated by ClawConnect profile",
   assert.equal(windowsTaskName(), "ClawConnectAgent");
   assert.equal(windowsTaskName("Hermes Agent"), "ClawConnectAgent-hermes-agent");
   assert.match(buildWindowsProcessQueryScript("openclaw"), /CLAW_PROFILE_NAME/);
+  assert.match(buildWindowsProcessQueryScript("openclaw"), /OperationTimeoutSec 3/);
+  assert.match(buildWindowsScheduledTaskStateScript(), /CLAW_TASK_NAME/);
   assert.match(buildWindowsProcessQueryScript(), /-notmatch/);
+});
+
+test("Windows status trusts a running scheduled task when process command lines are hidden", () => {
+  const calls: string[] = [];
+  const execFileSyncImpl = ((command: string, args: readonly string[]) => {
+    calls.push(command);
+    if (command === "schtasks") {
+      return Buffer.from("task exists");
+    }
+    if (command === "reg.exe") {
+      throw new Error("startup entry missing");
+    }
+    assert.equal(command, "powershell");
+    assert.match(args.join(" "), /Get-ScheduledTask/);
+    return Buffer.from("Running\r\n");
+  }) as typeof execFileSync;
+
+  const status = getWindowsServiceStatus("hermes", {
+    execFileSyncImpl,
+    scriptPath: "C:\\Program Files\\clawconnect-agent\\dist\\index.js",
+  });
+
+  assert.equal(status.installed, true);
+  assert.equal(status.running, true);
+  assert.equal(status.manager, "Windows Task Scheduler");
+  assert.deepEqual(calls, ["schtasks", "reg.exe", "powershell"]);
+});
+
+test("Windows status bounds every system probe and degrades a timed-out process query", () => {
+  const calls: Array<{ command: string; timeout: number | undefined }> = [];
+  const timedOutProbes: string[] = [];
+  const execFileSyncImpl = ((command: string, args: readonly string[], options: { timeout?: number }) => {
+    calls.push({ command, timeout: options.timeout });
+    if (command === "schtasks") {
+      return Buffer.from("task exists");
+    }
+    if (command === "reg.exe") {
+      throw new Error("startup entry missing");
+    }
+    assert.equal(command, "powershell");
+    if (args.join(" ").includes("Get-ScheduledTask")) {
+      return Buffer.from("Ready\r\n");
+    }
+    assert.match(args.join(" "), /Get-CimInstance Win32_Process/);
+    const timeout = new Error("process query timed out");
+    Object.assign(timeout, { code: "ETIMEDOUT" });
+    throw timeout;
+  }) as typeof execFileSync;
+
+  const status = getWindowsServiceStatus("hermes", {
+    execFileSyncImpl,
+    onQueryTimeout: (probe) => timedOutProbes.push(probe),
+    scriptPath: "C:\\Program Files\\clawconnect-agent\\dist\\index.js",
+  });
+
+  assert.equal(status.installed, true);
+  assert.equal(status.running, false);
+  assert.equal(status.manager, "Windows Task Scheduler");
+  assert.deepEqual(
+    calls.map((call) => call.command),
+    ["schtasks", "reg.exe", "powershell", "powershell"],
+  );
+  assert.ok(calls.every((call) => call.timeout === WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS));
+  assert.deepEqual(timedOutProbes, ["running process"]);
 });

@@ -57,6 +57,7 @@ export type HermesStateDbRealtimeBuildResult = {
 const CLAWCONNECT_MOBILE_TURN_MARKER = "[ClawConnect mobile turn]";
 const CLAWCONNECT_MOBILE_BRIDGE_MARKER = "[ClawConnect mobile bridge]";
 const HERMES_STATE_DB_REALTIME_QUERY_TIMEOUT_MS = 5_000;
+const HERMES_STATE_DB_REALTIME_QUERY_ATTEMPTS = 2;
 const HERMES_STATE_DB_REALTIME_DEFAULT_LIMIT = 200;
 const HERMES_STATE_DB_REALTIME_DEFAULT_POLL_INTERVAL_MS = 750;
 const HERMES_RUNTIME_CONTEXT_HINT_REGEX =
@@ -317,17 +318,66 @@ async function runHermesStateDbRealtimeQuery(
   args: string[],
   pythonBin = resolveHermesStateDbRealtimePython(),
 ): Promise<unknown> {
-  const { stdout } = await execFile(pythonBin, ["-c", HERMES_STATE_DB_REALTIME_QUERY_SCRIPT, mode, dbPath, ...args], {
-    cwd: homedir(),
-    encoding: "utf8",
-    env: { ...SUBPROCESS_ENV, ...process.env },
-    timeout: HERMES_STATE_DB_REALTIME_QUERY_TIMEOUT_MS,
+  return readHermesStateDbRealtimePayload(async () => {
+    const { stdout } = await execFile(
+      pythonBin,
+      ["-c", HERMES_STATE_DB_REALTIME_QUERY_SCRIPT, mode, dbPath, ...args],
+      {
+        cwd: homedir(),
+        encoding: "utf8",
+        env: { ...SUBPROCESS_ENV, ...process.env },
+        timeout: HERMES_STATE_DB_REALTIME_QUERY_TIMEOUT_MS,
+        windowsHide: true,
+      },
+    );
+    return stdout;
   });
-  const parsed = JSON.parse(stdout.trim()) as { ok?: boolean; payload?: unknown; error?: unknown };
-  if (parsed.ok === true) {
-    return parsed.payload;
+}
+
+class HermesStateDbRealtimeOutputError extends Error {}
+
+export async function readHermesStateDbRealtimePayload(
+  readOutput: () => Promise<string>,
+  maxAttempts = HERMES_STATE_DB_REALTIME_QUERY_ATTEMPTS,
+): Promise<unknown> {
+  const attempts = Math.max(1, Math.floor(maxAttempts));
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let parsed: unknown;
+    try {
+      const output = (await readOutput()).trim();
+      if (!output) {
+        throw new HermesStateDbRealtimeOutputError("Hermes state.db realtime query returned empty output");
+      }
+      try {
+        parsed = JSON.parse(output);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new HermesStateDbRealtimeOutputError(
+          `Hermes state.db realtime query returned invalid JSON: ${detail}`,
+        );
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new HermesStateDbRealtimeOutputError("Hermes state.db realtime query returned an invalid payload");
+      }
+    } catch (error) {
+      if (error instanceof HermesStateDbRealtimeOutputError && attempt < attempts) {
+        continue;
+      }
+      if (error instanceof HermesStateDbRealtimeOutputError && attempts > 1) {
+        throw new HermesStateDbRealtimeOutputError(`${error.message} after ${attempts} attempts`);
+      }
+      throw error;
+    }
+
+    const result = parsed as { ok?: boolean; payload?: unknown; error?: unknown };
+    if (result.ok === true) {
+      return result.payload;
+    }
+    throw new Error(
+      typeof result.error === "string" ? result.error : "Hermes state.db realtime query failed",
+    );
   }
-  throw new Error(typeof parsed.error === "string" ? parsed.error : "Hermes state.db realtime query failed");
+  throw new Error("Hermes state.db realtime query failed");
 }
 
 function parseHermesStateDbRealtimeMessageRow(value: unknown): HermesStateDbRealtimeMessageRow[] {

@@ -9,6 +9,7 @@ import {
   createHermesStateDbRealtimeWatcher,
   queryHermesStateDbMaxMessageId,
   queryHermesStateDbRealtimeRows,
+  readHermesStateDbRealtimePayload,
   resolveHermesStateDbRealtimePath,
   resolveHermesStateDbRealtimePython,
   type HermesStateDbRealtimeCursor,
@@ -31,6 +32,42 @@ function message(row: Partial<HermesStateDbRealtimeMessageRow> & {
     ...row,
   };
 }
+
+test("Hermes state db realtime retries a transient empty subprocess output", async () => {
+  const outputs = ["", '{"ok":true,"payload":42}'];
+  let attempts = 0;
+  const payload = await readHermesStateDbRealtimePayload(async () => {
+    attempts += 1;
+    return outputs.shift() ?? "";
+  });
+
+  assert.equal(payload, 42);
+  assert.equal(attempts, 2);
+});
+
+test("Hermes state db realtime caps retries for truncated JSON output", async () => {
+  let attempts = 0;
+  await assert.rejects(
+    readHermesStateDbRealtimePayload(async () => {
+      attempts += 1;
+      return '{"ok":true';
+    }),
+    /invalid JSON: .* after 2 attempts/,
+  );
+  assert.equal(attempts, 2);
+});
+
+test("Hermes state db realtime does not retry a structured query failure", async () => {
+  let attempts = 0;
+  await assert.rejects(
+    readHermesStateDbRealtimePayload(async () => {
+      attempts += 1;
+      return '{"ok":false,"error":"database is locked"}';
+    }),
+    /database is locked/,
+  );
+  assert.equal(attempts, 1);
+});
 
 test("Hermes state db realtime emits completed PC TUI transcript rows with stable timeline identities", () => {
   const cursor: HermesStateDbRealtimeCursor = { lastMessageId: 9, openTurnsBySession: {} };

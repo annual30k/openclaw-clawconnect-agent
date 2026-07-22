@@ -17,6 +17,15 @@ import { decodeTextBuffer } from "./text-file-decoder.js";
 export const TASK_NAME = "ClawConnectAgent";
 export const WINDOWS_SERVICE_RUNNER_NAME = "clawconnect-service.ps1";
 export const WINDOWS_RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+export const WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS = 5_000;
+
+export interface WindowsServiceStatusProbeOptions {
+  execFileSyncImpl?: typeof execFileSync;
+  onQueryTimeout?: (probe: string) => void;
+  scriptPath?: string;
+}
+
+type WindowsQueryTimeoutReporter = (probe: string) => void;
 
 export function windowsTaskName(profile?: string): string {
   const normalized = normalizeProfileName(profile);
@@ -101,28 +110,89 @@ function removeWindowsStartupEntry(taskName: string): boolean {
   }
 }
 
-function hasWindowsStartupEntry(taskName: string): boolean {
+function hasWindowsStartupEntry(
+  taskName: string,
+  execFileSyncImpl: typeof execFileSync = execFileSync,
+  onQueryTimeout: WindowsQueryTimeoutReporter = reportWindowsQueryTimeout,
+): boolean {
   try {
-    execFileSync("reg.exe", ["query", WINDOWS_RUN_KEY, "/v", taskName], {
+    execFileSyncImpl("reg.exe", ["query", WINDOWS_RUN_KEY, "/v", taskName], {
       stdio: "pipe",
       windowsHide: true,
+      timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
     });
     return true;
-  } catch {
+  } catch (error) {
+    if (isProcessTimeoutError(error)) {
+      onQueryTimeout("startup registry");
+    }
     return false;
   }
 }
 
-function hasWindowsScheduledTask(taskName: string): boolean {
+function hasWindowsScheduledTask(
+  taskName: string,
+  execFileSyncImpl: typeof execFileSync = execFileSync,
+  onQueryTimeout: WindowsQueryTimeoutReporter = reportWindowsQueryTimeout,
+): boolean {
   try {
-    execFileSync("schtasks", ["/query", "/tn", taskName], {
+    execFileSyncImpl("schtasks", ["/query", "/tn", taskName], {
       stdio: "pipe",
       windowsHide: true,
+      timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
     });
     return true;
-  } catch {
+  } catch (error) {
+    if (isProcessTimeoutError(error)) {
+      onQueryTimeout("scheduled task");
+    }
     return false;
   }
+}
+
+export function buildWindowsScheduledTaskStateScript(): string {
+  return `[string](Get-ScheduledTask -TaskName $env:CLAW_TASK_NAME -ErrorAction Stop).State`;
+}
+
+function isWindowsScheduledTaskRunning(
+  taskName: string,
+  execFileSyncImpl: typeof execFileSync = execFileSync,
+  onQueryTimeout: WindowsQueryTimeoutReporter = reportWindowsQueryTimeout,
+): boolean {
+  try {
+    const output = execFileSyncImpl(
+      "powershell",
+      ["-NoProfile", "-Command", buildWindowsScheduledTaskStateScript()],
+      {
+        stdio: "pipe",
+        env: { ...process.env, CLAW_TASK_NAME: taskName },
+        timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
+        windowsHide: true,
+      },
+    )
+      .toString()
+      .trim();
+    return /^running$/i.test(output);
+  } catch (error) {
+    if (isProcessTimeoutError(error)) {
+      onQueryTimeout("scheduled task state");
+    }
+    return false;
+  }
+}
+
+function isProcessTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const candidate = error as NodeJS.ErrnoException & { killed?: boolean };
+  return candidate.code === "ETIMEDOUT" || candidate.killed === true;
+}
+
+function reportWindowsQueryTimeout(probe: string): void {
+  console.error(
+    `[clawconnect] Windows ${probe} query timed out after ${WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS}ms; continuing with an unknown result.`,
+  );
 }
 
 function startWindowsRunner(runnerPath: string): void {
@@ -187,6 +257,22 @@ export function writeWindowsServiceRunner(
   return runnerPath;
 }
 
+function refreshWindowsServiceRunner(profile?: string): string {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+  const logPath = getProfileLogPath(resolvedProfile);
+  const errorLogPath = getProfileErrorLogPath(resolvedProfile);
+  ensureLogDir(resolvedProfile);
+  // 升级 npm 包后 runner 必须改用当前 Node/CLI 绝对路径；同时先归一化旧版 PowerShell 日志编码。
+  normalizeWindowsServiceLogEncoding(logPath);
+  normalizeWindowsServiceLogEncoding(errorLogPath);
+  return writeWindowsServiceRunner(
+    resolvedProfile,
+    getProgramArgs(resolvedProfile),
+    logPath,
+    errorLogPath,
+  );
+}
+
 /**
  * Kill any running node processes that are executing this specific script.
  * Uses execFileSync to bypass cmd.exe, avoiding CMD quote-mangling.
@@ -196,11 +282,13 @@ export function buildWindowsProcessQueryScript(profile?: string): string {
   const profileFilter = normalizeProfileName(profile)
     ? `($_.CommandLine -match ('(?:^|\\s)--profile(?:\\s+|=)' + [regex]::Escape($env:CLAW_PROFILE_NAME) + '(?:\\s|$)'))`
     : `($_.CommandLine -notmatch '(?:^|\\s)--profile(?:\\s|=)')`;
-  return `Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape($env:CLAW_SCRIPT_PATH) -and ${profileFilter} } | Select-Object -ExpandProperty ProcessId`;
+  return `Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -OperationTimeoutSec 3 | Where-Object { $_.CommandLine -match [regex]::Escape($env:CLAW_SCRIPT_PATH) -and ${profileFilter} } | Select-Object -ExpandProperty ProcessId`;
 }
 
-function windowsProcessQueryEnv(profile?: string): NodeJS.ProcessEnv {
-  const scriptPath = process.argv[1];
+function windowsProcessQueryEnv(
+  profile?: string,
+  scriptPath = process.argv[1],
+): NodeJS.ProcessEnv {
   return {
     ...process.env,
     CLAW_SCRIPT_PATH: scriptPath ? resolveServiceEntryPath(scriptPath) : "",
@@ -219,7 +307,12 @@ function killWindowsProcess(profile?: string): boolean {
     const output = execFileSync(
       "powershell",
       ["-NoProfile", "-Command", psScript],
-      { stdio: "pipe", env: windowsProcessQueryEnv(profile) }
+      {
+        stdio: "pipe",
+        env: windowsProcessQueryEnv(profile),
+        timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
+        windowsHide: true,
+      }
     )
       .toString()
       .trim();
@@ -265,31 +358,19 @@ function killWindowsProcess(profile?: string): boolean {
 export function installWindowsService(profile?: string): boolean {
   const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
   const taskName = windowsTaskName(resolvedProfile);
-  const logPath = getProfileLogPath(resolvedProfile);
-  const errorLogPath = getProfileErrorLogPath(resolvedProfile);
-  const args = getProgramArgs(resolvedProfile);
 
   try {
-    ensureLogDir(resolvedProfile);
     try {
       execFileSync("schtasks", ["/end", "/tn", taskName], { stdio: "pipe" });
     } catch {
       // First install or already stopped.
     }
     killWindowsProcess(resolvedProfile);
-    // 旧版 PowerShell 可能创建 UTF-16LE 日志；转换后再以 UTF-8 追加，避免一个文件混合两种编码。
-    normalizeWindowsServiceLogEncoding(logPath);
-    normalizeWindowsServiceLogEncoding(errorLogPath);
 
     // Keep the scheduled task command short. schtasks limits /tr to 261
     // characters, while NVM/npm paths plus UTF-8 bootstrap and log redirects
     // can easily exceed it when embedded inline.
-    const runnerPath = writeWindowsServiceRunner(
-      resolvedProfile,
-      args,
-      logPath,
-      errorLogPath,
-    );
+    const runnerPath = refreshWindowsServiceRunner(resolvedProfile);
     const taskCommand = buildWindowsServiceTaskCommand(runnerPath);
     const taskArguments = taskCommand.slice("powershell.exe ".length);
 
@@ -405,9 +486,18 @@ export function restartWindowsService(profile?: string): boolean {
 
   killWindowsProcess(resolvedProfile);
 
+  let runnerPath: string;
+  try {
+    // `npm install -g` 可能改变 Node 或全局包路径；普通 restart 也必须刷新 runner，不能继续执行旧版本入口。
+    runnerPath = refreshWindowsServiceRunner(resolvedProfile);
+  } catch (error) {
+    console.error("[clawconnect] Failed to refresh Windows service runner:", error);
+    return false;
+  }
+
   if (hasWindowsStartupEntry(taskName)) {
     try {
-      startWindowsRunner(windowsServiceRunnerPath(resolvedProfile));
+      startWindowsRunner(runnerPath);
       return true;
     } catch {
       return false;
@@ -434,31 +524,47 @@ export function stopWindowsService(profile?: string): boolean {
   return killWindowsProcess(resolvedProfile);
 }
 
-export function getWindowsServiceStatus(profile?: string): ServiceStatus {
+export function getWindowsServiceStatus(
+  profile?: string,
+  options: WindowsServiceStatusProbeOptions = {},
+): ServiceStatus {
   const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
   const taskName = windowsTaskName(resolvedProfile);
   const logPath = getProfileLogPath(resolvedProfile);
-  const installedViaTask = hasWindowsScheduledTask(taskName);
-  const installedViaStartup = hasWindowsStartupEntry(taskName);
+  const execFileSyncImpl = options.execFileSyncImpl ?? execFileSync;
+  const onQueryTimeout = options.onQueryTimeout ?? reportWindowsQueryTimeout;
+  const installedViaTask = hasWindowsScheduledTask(taskName, execFileSyncImpl, onQueryTimeout);
+  const installedViaStartup = hasWindowsStartupEntry(taskName, execFileSyncImpl, onQueryTimeout);
   const installed = installedViaTask || installedViaStartup;
 
-  let running = false;
-  if (installed) {
+  // Task Scheduler already tracks the blocking PowerShell runner. Prefer that
+  // state over Win32_Process.CommandLine, which can be blank under Windows
+  // privacy/UAC policies even for processes owned by the current user.
+  let running = installedViaTask
+    && isWindowsScheduledTaskRunning(taskName, execFileSyncImpl, onQueryTimeout);
+  if (installed && !running) {
     try {
-      const scriptPath = process.argv[1];
+      const scriptPath = options.scriptPath ?? process.argv[1];
       if (scriptPath) {
         const psScript = buildWindowsProcessQueryScript(resolvedProfile);
-        const output = execFileSync(
+        const output = execFileSyncImpl(
           "powershell",
           ["-NoProfile", "-Command", psScript],
-          { stdio: "pipe", env: windowsProcessQueryEnv(resolvedProfile) }
+          {
+            stdio: "pipe",
+            env: windowsProcessQueryEnv(resolvedProfile, scriptPath),
+            timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
+            windowsHide: true,
+          }
         )
           .toString()
           .trim();
         running = /\d+/.test(output);
       }
-    } catch {
-      // ignore
+    } catch (error) {
+      if (isProcessTimeoutError(error)) {
+        onQueryTimeout("running process");
+      }
     }
   }
 

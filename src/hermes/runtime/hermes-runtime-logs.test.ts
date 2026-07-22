@@ -93,7 +93,12 @@ test("readHermesLogTail tolerates legacy Windows UTF-16LE log files", () => {
 test("readHermesLogTail returns an empty report when Hermes has not created the log yet", () => {
   const root = mkdtempSync(join(tmpdir(), "clawconnect-hermes-empty-"));
   try {
-    const result = readHermesLogTail({ logName: "gateway", limit: 300 }, root);
+    const connectionLogPath = join(root, "clawconnect.log");
+    const result = readHermesLogTail(
+      { logName: "gateway", limit: 300 },
+      root,
+      connectionLogPath,
+    );
 
     assert.equal(result.ok, true);
     if (!result.ok) return;
@@ -106,6 +111,43 @@ test("readHermesLogTail returns an empty report when Hermes has not created the 
       truncated: false,
       output: `[${join(root, "gateway.log")}]`,
     });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("readHermesLogTail falls back to the active profile connection log when gateway.log is absent", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawconnect-hermes-connection-fallback-"));
+  const logs = join(root, "hermes-logs");
+  const connectionLogPath = join(root, "profiles", "hermes", "clawconnect.log");
+  try {
+    mkdirSync(logs, { recursive: true });
+    mkdirSync(join(root, "profiles", "hermes"), { recursive: true });
+    writeFileSync(connectionLogPath, [
+      "Starting ClawConnect host agent...",
+      "Connected to relay server (hermes gatewayId=gw_windows)",
+      "Agent connected.",
+      "",
+    ].join("\r\n"));
+
+    const result = readHermesLogTail(
+      { logName: "gateway", limit: 2 },
+      logs,
+      connectionLogPath,
+    );
+
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    const payload = result.payload as Record<string, unknown>;
+    assert.equal(payload.source, "connection");
+    assert.equal(payload.logPath, connectionLogPath);
+    assert.deepEqual(payload.lines, [
+      "Connected to relay server (hermes gatewayId=gw_windows)",
+      "Agent connected.",
+    ]);
+    assert.equal(payload.totalLines, 3);
+    assert.equal(payload.returnedLines, 2);
+    assert.equal(payload.truncated, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

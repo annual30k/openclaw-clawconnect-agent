@@ -40,6 +40,23 @@ test("readHealth treats Hermes relay reconnection as recovered after stale repla
   assert.deepEqual(health.gateway, { kind: "ok", detail: "connected" });
 });
 
+test("readHealth recognizes the current Hermes connection log after a stale 1006 close", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawconnect-status-"));
+  const logPath = join(dir, "clawconnect.log");
+  writeFileSync(logPath, [
+    "Connected to relay server (hermes gatewayId=gw_1)",
+    "Hermes relay connection closed: 1006",
+    "中继已断开，正在重连…",
+    "Connected to relay server (hermes gatewayId=gw_1)",
+    "中继已连接。",
+  ].join("\n"));
+
+  const health = readHealth(logPath, "hermes");
+
+  assert.deepEqual(health.relay, { kind: "ok", detail: "connected" });
+  assert.deepEqual(health.gateway, { kind: "ok", detail: "connected" });
+});
+
 test("readHealth reports Hermes replacement close when no later relay connection exists", () => {
   const dir = mkdtempSync(join(tmpdir(), "clawconnect-status-"));
   const logPath = join(dir, "clawconnect.log");

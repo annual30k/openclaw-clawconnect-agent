@@ -7,6 +7,7 @@ import {
   statSync,
 } from "node:fs";
 import { join } from "node:path";
+import { profileLogPath } from "../../config/profile.js";
 import type { LocalResult } from "../../core/command-types.js";
 import { decodeTextBuffer } from "../../platform/text-file-decoder.js";
 import {
@@ -37,17 +38,23 @@ type HermesLogName = keyof typeof HERMES_LOG_FILES;
 export function readHermesLogTail(
   params: unknown,
   logDirectory = HERMES_LOG_DIR,
+  connectionLogPath = profileLogPath(),
 ): LocalResult {
   const request = normalizeLogRequest(params);
   if (!request) {
     return { ok: false, error: "invalid_log_name" };
   }
 
-  const logPath = join(logDirectory, HERMES_LOG_FILES[request.logName]);
-  if (!existsSync(logPath)) {
+  const requestedLogPath = join(logDirectory, HERMES_LOG_FILES[request.logName]);
+  const logPath = resolveReadableLogPath(
+    request.logName,
+    requestedLogPath,
+    connectionLogPath,
+  );
+  if (!logPath) {
     return {
       ok: true,
-      payload: emptyLogPayload(logPath),
+      payload: emptyLogPayload(requestedLogPath),
     };
   }
 
@@ -90,6 +97,23 @@ export function readHermesLogTail(
       error: `hermes_logs_read_failed: ${errorMessageWithOutput(error)}`,
     };
   }
+}
+
+function resolveReadableLogPath(
+  logName: HermesLogName,
+  requestedLogPath: string,
+  connectionLogPath: string,
+): string | undefined {
+  if (existsSync(requestedLogPath)) {
+    return requestedLogPath;
+  }
+
+  // Windows Hermes 当前不会生成 gateway.log；此时展示当前 profile 的真实连接日志。
+  // 只有固定的 gateway 请求允许回退，远端参数始终不能控制宿主机文件路径。
+  if (logName === "gateway" && existsSync(connectionLogPath)) {
+    return connectionLogPath;
+  }
+  return undefined;
 }
 
 function countLogLines(
