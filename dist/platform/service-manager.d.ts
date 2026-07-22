@@ -1,6 +1,7 @@
 import type { ServicePlatform, ServiceStatus } from "./service-manager-common.js";
 export type { ServicePlatform, ServiceStatus } from "./service-manager-common.js";
 export { buildWindowsDirAclGrants, buildWindowsFileAclGrant, setRestrictiveDirPermissions, setRestrictiveFilePermissions, } from "./service-manager-common.js";
+export declare function macLaunchctlServiceTarget(label: string, uid: number): string;
 export declare function getServicePlatform(): ServicePlatform;
 export declare function installService(profile?: string): boolean;
 export declare function restartService(profile?: string): boolean;

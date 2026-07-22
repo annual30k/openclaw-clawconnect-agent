@@ -104,7 +104,24 @@ function uninstallMacArtifacts(profile) {
     return changed;
 }
 function restartMacService(profile) {
+    const getuid = process.getuid;
+    if (typeof getuid === "function") {
+        const target = macLaunchctlServiceTarget(macLabel(profile), getuid.call(process));
+        try {
+            // `kickstart -k` is one launchd transaction. Unlike unload + load, it
+            // cannot strand the service in a disabled state if the restart command
+            // was launched by a descendant of that service.
+            run(`launchctl kickstart -k "${target}"`, "inherit");
+            return true;
+        }
+        catch {
+            // The job may not be loaded yet; install/load it below.
+        }
+    }
     return installMacService(profile);
+}
+export function macLaunchctlServiceTarget(label, uid) {
+    return `gui/${uid}/${label}`;
 }
 export function getServicePlatform() {
     return detectPlatform();

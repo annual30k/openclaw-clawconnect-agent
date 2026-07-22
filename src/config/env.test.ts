@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   AGENT_ENV_TEMPLATE,
   ensureUserEnvFile,
+  getConfiguredAsrCommand,
   getConfiguredGatewayPort,
   getDefaultRelayServerUrl,
   loadAgentEnv,
@@ -60,6 +61,32 @@ test("getConfiguredGatewayPort accepts only valid TCP ports", () => {
   assert.equal(getConfiguredGatewayPort({ OPENCLAW_GATEWAY_PORT: "0" }), undefined);
   assert.equal(getConfiguredGatewayPort({ OPENCLAW_GATEWAY_PORT: "65536" }), undefined);
   assert.equal(getConfiguredGatewayPort({ OPENCLAW_GATEWAY_PORT: "abc" }), undefined);
+});
+
+test("getConfiguredAsrCommand refreshes file-loaded values without overriding shell values", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-live-asr-env-"));
+  const envPath = join(tempDir, ".env");
+  const fileBackedEnv: Record<string, string | undefined> = {};
+
+  try {
+    await writeFile(envPath, "CLAWCONNECT_ASR_COMMAND=transcribe-old {file}\n", "utf-8");
+    loadAgentEnv({ env: fileBackedEnv, paths: [envPath] });
+    assert.equal(fileBackedEnv.CLAWCONNECT_ASR_COMMAND, "transcribe-old {file}");
+
+    await writeFile(envPath, "CLAWCONNECT_ASR_COMMAND=transcribe-new {file}\n", "utf-8");
+    assert.equal(
+      getConfiguredAsrCommand({ env: fileBackedEnv, paths: [envPath] }),
+      "transcribe-new {file}",
+    );
+
+    const shellEnv = { CLAWCONNECT_ASR_COMMAND: "transcribe-shell {file}" };
+    assert.equal(
+      getConfiguredAsrCommand({ env: shellEnv, paths: [envPath] }),
+      "transcribe-shell {file}",
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("ensureUserEnvFile creates the full commented env template without overwriting", async () => {

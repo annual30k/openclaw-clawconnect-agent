@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { prepareVoiceSendParams, voiceInputSetupMessage } from "./voice-input.js";
+import { getConfiguredAsrCommand } from "../../config/env.js";
 
 test("prepareVoiceSendParams transcribes inline audio and returns chat.send params", async () => {
   const stagingDir = await mkdtemp(join(tmpdir(), "clawconnect-voice-input-test-"));
@@ -130,11 +131,21 @@ test("prepareVoiceSendParams rejects empty transcripts", async () => {
   );
 });
 
-test("voiceInputSetupMessage explains missing ASR skill installation path", () => {
-  const message = voiceInputSetupMessage(new Error("voice_asr_not_configured"));
+test("voiceInputSetupMessage explains missing OpenClaw ASR skill installation path", () => {
+  const message = voiceInputSetupMessage(new Error("voice_asr_not_configured"), "openclaw");
   assert.ok(message?.includes("语音转文字（SenseVoice int8）"));
   assert.ok(message?.includes("CLAWCONNECT_ASR_COMMAND"));
-  assert.ok(message?.includes("OPENCLAW_ASR_COMMAND"));
+  assert.ok(message?.includes("Windows、macOS 还是 Linux"));
+  assert.ok(message?.includes("clawconnect restart-openclaw"));
+});
+
+test("voiceInputSetupMessage keeps Hermes guidance free of OpenClaw naming", () => {
+  const message = voiceInputSetupMessage(new Error("voice_asr_not_configured"), "hermes");
+  assert.ok(message?.includes("CLAWCONNECT_ASR_COMMAND"));
+  assert.ok(message?.includes("无需重启 Hermes"));
+  assert.ok(message?.includes("自动重新读取配置"));
+  assert.doesNotMatch(message ?? "", /openclaw/i);
+  assert.doesNotMatch(message ?? "", /clawconnect (?:restart|stop|reset|pair)|reset-hermes|pair-hermes/i);
 });
 
 test("prepareVoiceSendParams prefers CLAWCONNECT_ASR_COMMAND over legacy ASR command", async () => {
@@ -157,24 +168,14 @@ test("prepareVoiceSendParams prefers CLAWCONNECT_ASR_COMMAND over legacy ASR com
   }
 });
 
-test("prepareVoiceSendParams falls back to OPENCLAW_ASR_COMMAND", async () => {
-  const previousClawConnect = process.env.CLAWCONNECT_ASR_COMMAND;
-  const previousOpenClaw = process.env.OPENCLAW_ASR_COMMAND;
-  delete process.env.CLAWCONNECT_ASR_COMMAND;
-  process.env.OPENCLAW_ASR_COMMAND = "printf openclaw";
-  try {
-    const params = await prepareVoiceSendParams({
-      audio: {
-        fileName: "voice.wav",
-        mimeType: "audio/wav",
-        content: Buffer.from("wav-body", "utf8").toString("base64"),
-      },
-    });
-    assert.equal((params as Record<string, unknown>).message, "openclaw");
-  } finally {
-    restoreEnv("CLAWCONNECT_ASR_COMMAND", previousClawConnect);
-    restoreEnv("OPENCLAW_ASR_COMMAND", previousOpenClaw);
-  }
+test("ASR command resolution falls back to OPENCLAW_ASR_COMMAND", () => {
+  assert.equal(
+    getConfiguredAsrCommand({
+      env: { OPENCLAW_ASR_COMMAND: "printf openclaw" },
+      paths: [],
+    }),
+    "printf openclaw",
+  );
 });
 
 function restoreEnv(name: "CLAWCONNECT_ASR_COMMAND" | "OPENCLAW_ASR_COMMAND", value: string | undefined): void {

@@ -541,7 +541,7 @@ export async function runHermesRelayManagerWithDependencies(
           forgetActiveHermesChatRun(activeChatRuns, acknowledgedChatRun);
         }
         console.error(`[hermes-relay] cmd failed method=${methodForLog || "(unknown)"} id=${requestId ?? "(no-id)"}: ${message}`);
-        const setupMessage = voiceInputSetupMessage(error);
+        const setupMessage = voiceInputSetupMessage(error, "hermes");
         const chatRun = setupMessage ? (acknowledgedChatRun ?? voiceInputRun) : acknowledgedChatRun;
         if (chatRun) {
           const errorPayload = buildMobileAssistantErrorPayload({

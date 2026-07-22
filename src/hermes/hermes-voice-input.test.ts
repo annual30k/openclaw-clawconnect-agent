@@ -3,8 +3,8 @@ import test from "node:test";
 import { prepareHermesVoiceInputCommand } from "./hermes-voice-input.js";
 
 test("Hermes voice input uses the mobile idempotency key as the chat run id", async () => {
-  const originalCommand = process.env.OPENCLAW_ASR_COMMAND;
-  process.env.OPENCLAW_ASR_COMMAND = "printf '你可以做什么？'";
+  const originalCommand = process.env.CLAWCONNECT_ASR_COMMAND;
+  process.env.CLAWCONNECT_ASR_COMMAND = "printf '你可以做什么？'";
   try {
     const prepared = await prepareHermesVoiceInputCommand(
       {
@@ -27,9 +27,9 @@ test("Hermes voice input uses the mobile idempotency key as the chat run id", as
     assert.equal((prepared.params as Record<string, unknown>).message, "你可以做什么？");
   } finally {
     if (originalCommand === undefined) {
-      delete process.env.OPENCLAW_ASR_COMMAND;
+      delete process.env.CLAWCONNECT_ASR_COMMAND;
     } else {
-      process.env.OPENCLAW_ASR_COMMAND = originalCommand;
+      process.env.CLAWCONNECT_ASR_COMMAND = originalCommand;
     }
   }
 });

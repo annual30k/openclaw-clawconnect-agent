@@ -698,7 +698,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.error(`[relay] cmd failed method=${methodForLog ?? "(unknown)"} id=${requestId ?? "(no-id)"}: ${message}`);
-        const setupMessage = voiceInputSetupMessage(err);
+        const setupMessage = voiceInputSetupMessage(err, "openclaw");
         if (setupMessage && voiceInputRun) {
           send({
             type: "event",

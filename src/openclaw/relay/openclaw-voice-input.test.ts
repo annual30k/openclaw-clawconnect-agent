@@ -3,8 +3,8 @@ import test from "node:test";
 import { prepareOpenClawVoiceInputCommand } from "./openclaw-voice-input.js";
 
 test("OpenClaw voice input uses the mobile idempotency key as the chat run id", async () => {
-  const originalCommand = process.env.OPENCLAW_ASR_COMMAND;
-  process.env.OPENCLAW_ASR_COMMAND = "printf '测试语音'";
+  const originalCommand = process.env.CLAWCONNECT_ASR_COMMAND;
+  process.env.CLAWCONNECT_ASR_COMMAND = "printf '测试语音'";
   try {
     const prepared = await prepareOpenClawVoiceInputCommand({
       sessionKey: "main",
@@ -22,7 +22,7 @@ test("OpenClaw voice input uses the mobile idempotency key as the chat run id", 
     assert.equal(prepared.run.runId, "voice-client-run-1");
     assert.equal(prepared.run.sessionKey, "main");
   } finally {
-    if (originalCommand === undefined) delete process.env.OPENCLAW_ASR_COMMAND;
-    else process.env.OPENCLAW_ASR_COMMAND = originalCommand;
+    if (originalCommand === undefined) delete process.env.CLAWCONNECT_ASR_COMMAND;
+    else process.env.CLAWCONNECT_ASR_COMMAND = originalCommand;
   }
 });

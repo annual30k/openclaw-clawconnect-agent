@@ -5,6 +5,7 @@ import { resolveHermesHomeDir, resolveHermesPythonBin, resolveHermesStateDbPath 
 test("Hermes native Windows paths prefer LOCALAPPDATA and Scripts/python.exe", () => {
   const existing = new Set([
     "C:\\Users\\tester\\AppData\\Local/hermes",
+    "C:\\Users\\tester/.hermes",
     "C:\\Users\\tester\\AppData\\Local/hermes/hermes-agent/venv/Scripts/python.exe",
   ]);
   const options = {
@@ -19,6 +20,20 @@ test("Hermes native Windows paths prefer LOCALAPPDATA and Scripts/python.exe", (
     resolveHermesPythonBin(options),
     "C:\\Users\\tester\\AppData\\Local/hermes/hermes-agent/venv/Scripts/python.exe",
   );
+});
+
+test("Hermes native Windows home remains authoritative when a legacy home also exists", () => {
+  const existing = new Set([
+    "C:\\Users\\tester\\AppData\\Local/hermes",
+    "C:\\Users\\tester/.hermes",
+  ]);
+
+  assert.equal(resolveHermesHomeDir({
+    env: { LOCALAPPDATA: "C:\\Users\\tester\\AppData\\Local" },
+    platform: "win32",
+    systemHome: "C:\\Users\\tester",
+    exists: (path: string) => existing.has(path),
+  }), "C:\\Users\\tester\\AppData\\Local/hermes");
 });
 
 test("Hermes explicit home works for non-default and source installations", () => {

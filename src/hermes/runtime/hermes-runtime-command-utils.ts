@@ -1,6 +1,7 @@
 
 import type { LocalResult } from "../../core/command-types.js";
 import { DEFAULT_TIMEOUT_MS, errorMessageWithOutput, runHermes, runHermesAsync } from "./hermes-runtime-process.js";
+import { readHermesLogTail } from "./hermes-runtime-logs.js";
 
 export function runHermesOutput(args: string[], timeoutMs = DEFAULT_TIMEOUT_MS): LocalResult {
   try {
@@ -21,10 +22,5 @@ export async function runHermesOutputAsync(args: string[], timeoutMs = DEFAULT_T
 }
 
 export function runHermesLogs(params: unknown): LocalResult {
-  const record = params && typeof params === "object" && !Array.isArray(params)
-    ? (params as Record<string, unknown>)
-    : {};
-  const logName = typeof record.logName === "string" && record.logName.trim().length > 0 ? record.logName.trim() : "gateway";
-  const limit = typeof record.limit === "number" && Number.isFinite(record.limit) ? Math.max(1, Math.min(2000, Math.floor(record.limit))) : 100;
-  return runHermesOutput(["logs", logName, "-n", String(limit)]);
+  return readHermesLogTail(params);
 }

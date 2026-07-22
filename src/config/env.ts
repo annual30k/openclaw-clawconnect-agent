@@ -49,7 +49,8 @@ CLAWCONNECT_RELAY_SERVER_URL=https://clawlinks.cn
 # Optional: host-side speech-to-text for ClawLink voice messages.
 # Command must print the transcript to stdout. Available placeholders:
 # {file}, {language}, {mimeType}
-# OPENCLAW_ASR_COMMAND=/usr/local/bin/transcribe-audio {file} {language}
+# CLAWCONNECT_ASR_COMMAND=/usr/local/bin/transcribe-audio {file} {language} {mimeType}
+# OPENCLAW_ASR_COMMAND remains supported only as a legacy fallback.
 
 # Optional: override how local maintenance commands find the OpenClaw CLI.
 # OPENCLAW_BIN=/usr/local/bin/openclaw
@@ -70,6 +71,8 @@ CLAWCONNECT_RELAY_SERVER_URL=https://clawlinks.cn
 `;
 
 type EnvMap = Record<string, string | undefined>;
+
+const fileLoadedEnvKeys = new WeakMap<EnvMap, Set<string>>();
 
 export interface LoadEnvOptions {
   cwd?: string;
@@ -92,6 +95,25 @@ export function getConfiguredGatewayPort(env: EnvMap = process.env): number | un
   }
   const port = Number.parseInt(value, 10);
   return port >= 1 && port <= 65_535 ? port : undefined;
+}
+
+/**
+ * Resolve the host ASR command without requiring a ClawConnect restart.
+ *
+ * `loadAgentEnv()` intentionally copies file values into the process environment
+ * once at startup. ASR installation happens from a live mobile chat, so the
+ * installer must be able to update `.clawconnect/.env` without restarting the
+ * very service that is carrying that chat. Values that originated from a file
+ * are therefore refreshed from disk on each voice request, while a real shell
+ * environment value keeps the documented precedence.
+ */
+export function getConfiguredAsrCommand(options: LoadEnvOptions = {}): string | undefined {
+  const cwd = options.cwd ?? process.cwd();
+  const env = options.env ?? process.env;
+  const paths = options.paths ?? defaultEnvPaths(cwd, env);
+
+  return resolveLiveEnvValue("CLAWCONNECT_ASR_COMMAND", env, paths)
+    ?? resolveLiveEnvValue("OPENCLAW_ASR_COMMAND", env, paths);
 }
 
 export function getUserEnvPath(): string {
@@ -120,12 +142,42 @@ export function loadAgentEnv(options: LoadEnvOptions = {}): string[] {
     for (const [key, value] of Object.entries(values)) {
       if (env[key] === undefined) {
         env[key] = value;
+        markFileLoadedEnvKey(env, key);
       }
     }
     loaded.push(path);
   }
 
   return loaded;
+}
+
+function resolveLiveEnvValue(key: string, env: EnvMap, paths: string[]): string | undefined {
+  const environmentValue = normalizeNonEmpty(env[key]);
+  if (environmentValue && !fileLoadedEnvKeys.get(env)?.has(key)) {
+    return environmentValue;
+  }
+
+  for (const path of paths) {
+    if (!existsSync(path)) continue;
+    try {
+      const values = parseEnvFile(readFileSync(path, "utf-8"));
+      if (Object.prototype.hasOwnProperty.call(values, key)) {
+        return normalizeNonEmpty(values[key]);
+      }
+    } catch {
+      // A concurrent installer may be replacing the file. Treat this request as
+      // unconfigured instead of mutating or retaining a stale command.
+      return undefined;
+    }
+  }
+
+  return fileLoadedEnvKeys.get(env)?.has(key) ? undefined : environmentValue;
+}
+
+function markFileLoadedEnvKey(env: EnvMap, key: string): void {
+  const keys = fileLoadedEnvKeys.get(env) ?? new Set<string>();
+  keys.add(key);
+  fileLoadedEnvKeys.set(env, keys);
 }
 
 export function parseEnvFile(raw: string): Record<string, string> {

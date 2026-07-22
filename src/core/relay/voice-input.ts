@@ -5,6 +5,7 @@ import { basename, extname, join } from "node:path";
 import { promisify } from "node:util";
 import { extensionForMimeType } from "./attachment-staging.js";
 import { buildShellCommandInvocation, quoteShellArgument } from "../../platform/process-invocation.js";
+import { getConfiguredAsrCommand } from "../../config/env.js";
 
 const execFile = promisify(execFileCb);
 
@@ -69,7 +70,10 @@ export async function prepareVoiceSendParams(
   return next;
 }
 
-export function voiceInputSetupMessage(error: unknown): string | undefined {
+export function voiceInputSetupMessage(
+  error: unknown,
+  gatewayType: "openclaw" | "hermes",
+): string | undefined {
   const message = error instanceof Error ? error.message : String(error);
   if (!message.includes("voice_asr_not_configured")) {
     return undefined;
@@ -77,14 +81,15 @@ export function voiceInputSetupMessage(error: unknown): string | undefined {
   return [
     "未安装语音输入技能，暂时不能使用语音对话。",
     "安装路径：ClawLink → 技能扩展 → 语音转文字（SenseVoice int8）→ 安装。",
-    "安装完成后会写入 CLAWCONNECT_ASR_COMMAND；旧版 OPENCLAW_ASR_COMMAND 仍兼容。然后重启 ClawConnect 再试。",
+    "安装时会先确认宿主机是 Windows、macOS 还是 Linux，并写入 CLAWCONNECT_ASR_COMMAND。",
+    gatewayType === "hermes"
+      ? "安装完成后无需重启 Hermes；下一条语音会自动重新读取配置。不要在当前聊天中运行重启、停止、重置或重新配对命令。"
+      : "安装完成后运行 clawconnect restart-openclaw，再发送语音重试。",
   ].join("\n");
 }
 
 async function transcribeAudioWithConfiguredCommand(opts: VoiceTranscriptionOptions): Promise<string> {
-  const command =
-    process.env.CLAWCONNECT_ASR_COMMAND?.trim()
-    || process.env.OPENCLAW_ASR_COMMAND?.trim();
+  const command = getConfiguredAsrCommand();
   if (!command) {
     throw new Error("voice_asr_not_configured");
   }

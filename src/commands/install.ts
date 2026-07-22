@@ -49,6 +49,14 @@ export function installCommand(): void {
 }
 
 export function restartCommand(): void {
+  if (isActiveMobileChatProcess()) {
+    console.error(
+      "[clawconnect] Refusing to restart the host service from the active mobile chat process. "
+      + "The ASR configuration reloads automatically; run a service restart only from an independent host terminal.",
+    );
+    process.exitCode = 1;
+    return;
+  }
   console.log(t("install.restarting"));
   const platform = getServicePlatform();
   if (platform === "unsupported") {
@@ -60,6 +68,13 @@ export function restartCommand(): void {
     return;
   }
   console.log(t("install.restartFailed", platformName(platform)));
+}
+
+export function isActiveMobileChatProcess(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(
+    env.CLAWCONNECT_CHAT_SESSION_KEY?.trim()
+    || env.CLAWCONNECT_SOURCE_RUN_ID?.trim(),
+  );
 }
 
 export function uninstallCommand(): void {
