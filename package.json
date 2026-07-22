@@ -1,6 +1,6 @@
 {
   "name": "clawconnect-agent",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "description": "ClawConnect host agent for OpenClaw remote access",
   "license": "MIT",
   "type": "module",
@@ -17,6 +17,7 @@
   },
   "files": [
     "dist/**",
+    "scripts/fix-windows-powershell-shim.mjs",
     ".env.example",
     "README.md",
     "README.zh-CN.md"
@@ -28,6 +29,7 @@
     "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.build.json",
     "postbuild": "node -e \"require('fs').chmodSync('dist/index.js', 0o755)\"",
+    "postinstall": "node scripts/fix-windows-powershell-shim.mjs",
     "sync:slash-commands": "tsx scripts/sync-slash-command-catalog.ts",
     "prepack": "npm run build",
     "test": "node --test --import tsx src/*.test.ts src/commands/*.test.ts src/config/*.test.ts src/core/*.test.ts src/core/**/*.test.ts src/openclaw/*.test.ts src/openclaw/**/*.test.ts src/platform/*.test.ts src/hermes/*.test.ts src/hermes/**/*.test.ts",

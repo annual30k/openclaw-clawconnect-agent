@@ -14,6 +14,8 @@ npm install -g clawconnect-agent
 clawconnect --help
 ```
 
+Windows 会自动保留 npm 的 `clawconnect.cmd` 入口，并移除同目录下会被严格 PowerShell 执行策略优先拦截的 npm `.ps1` 包装器，因此不需要降低系统执行策略。若安装时使用了 `--ignore-scripts`，可在 PowerShell 中改用 `clawconnect.cmd`。
+
 ## 使用方式
 
 ### 1. 配对

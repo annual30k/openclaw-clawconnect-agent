@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "child_process";
+import { execFileSync } from "child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import {
@@ -195,27 +195,33 @@ function reportWindowsQueryTimeout(probe: string): void {
   );
 }
 
-function startWindowsRunner(runnerPath: string): void {
-  const child = spawn(
-    "powershell.exe",
-    [
-      "-NoProfile",
-      "-WindowStyle",
-      "Hidden",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      runnerPath,
-    ],
-    {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-    },
-  );
-  // Avoid an unhandled error event if process creation is blocked by policy.
-  child.once("error", () => undefined);
-  child.unref();
+export function buildWindowsDetachedRunnerStartScript(): string {
+  return [
+    `$runnerArgument = '"' + $env:CLAW_RUNNER_PATH + '"'`,
+    `$process = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $runnerArgument) -PassThru`,
+    `[string]$process.Id`,
+  ].join("; ");
+}
+
+function startWindowsRunner(runnerPath: string): boolean {
+  try {
+    // Node 的 detached spawn 在部分普通用户/远控会话中会无错误返回、但子进程随即消失。
+    // 由 Windows PowerShell 的 Start-Process 创建独立隐藏进程，并要求返回真实 PID 后才算启动成功。
+    const output = execFileSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", buildWindowsDetachedRunnerStartScript()],
+      {
+        stdio: "pipe",
+        env: { ...process.env, CLAW_RUNNER_PATH: runnerPath },
+        timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
+        windowsHide: true,
+      },
+    ).toString().trim();
+    return /^\d+$/.test(output);
+  } catch (error) {
+    console.error("[clawconnect] Failed to start Windows service runner:", error);
+    return false;
+  }
 }
 
 function startScheduledTaskOrRunner(taskName: string, runnerPath: string): void {
@@ -235,7 +241,9 @@ function installWindowsStartupEntry(
     stdio: "pipe",
     windowsHide: true,
   });
-  startWindowsRunner(runnerPath);
+  if (!startWindowsRunner(runnerPath)) {
+    throw new Error("Windows startup entry was created, but its service runner did not start");
+  }
 }
 
 export function writeWindowsServiceRunner(
@@ -496,12 +504,7 @@ export function restartWindowsService(profile?: string): boolean {
   }
 
   if (hasWindowsStartupEntry(taskName)) {
-    try {
-      startWindowsRunner(runnerPath);
-      return true;
-    } catch {
-      return false;
-    }
+    return startWindowsRunner(runnerPath);
   }
 
   try {

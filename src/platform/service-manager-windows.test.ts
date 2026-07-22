@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   buildWindowsPowerShellBootstrap,
+  buildWindowsDetachedRunnerStartScript,
   buildWindowsProcessQueryScript,
   buildWindowsScheduledTaskStateScript,
   buildWindowsServiceProcessCommand,
@@ -71,6 +72,17 @@ test("Windows standard-user fallback installs a profile-specific HKCU startup en
       "/f",
     ],
   );
+});
+
+test("Windows Startup launches the runner through a detached hidden PowerShell process", () => {
+  const script = buildWindowsDetachedRunnerStartScript();
+
+  assert.match(script, /Start-Process -FilePath 'powershell\.exe'/);
+  assert.match(script, /-WindowStyle Hidden/);
+  assert.match(script, /'-ExecutionPolicy', 'Bypass'/);
+  assert.match(script, /\$env:CLAW_RUNNER_PATH/);
+  assert.match(script, /-PassThru/);
+  assert.match(script, /\[string\]\$process\.Id/);
 });
 
 test("Windows service install migrates old UTF-16LE logs before UTF-8 appends", () => {
