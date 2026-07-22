@@ -265,6 +265,8 @@ test("runHermesChat bypasses interactive command approvals for mobile bridge que
     assert.equal(result.output, "fresh reply");
     const args = readFileSync(`${binPath}.args`, "utf8").trim().split(/\n/);
     assert.equal(args[0], "chat");
+    assert.equal(args.includes("--cli"), true);
+    assert.equal(args.includes("--tui"), false);
     assert.equal(args.includes("--quiet"), true);
     assert.equal(args.includes("--source"), true);
     assert.equal(args.includes("pocketclaw"), true);

@@ -342,6 +342,9 @@ async function runHermesChatOnce(params: {
 }): Promise<string> {
   const args = [
     "chat",
+    // Hermes 会按 display.interface 自动切到 TUI；移动端桥接必须强制经典 CLI，
+    // 再由 --quiet 只输出最终回答。Tools 过程仍由 agent.log watcher 独立发布。
+    "--cli",
     "--query",
     params.message,
     "--quiet",

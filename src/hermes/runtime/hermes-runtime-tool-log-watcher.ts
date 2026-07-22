@@ -13,14 +13,22 @@ export function hermesToolState(event: HermesToolLogEvent): ToolState {
   return "streaming_output";
 }
 
-export function createHermesToolLogWatcher(onEvent: (event: HermesToolLogEvent) => void): {
+export function createHermesToolLogWatcher(
+  onEvent: (event: HermesToolLogEvent) => void,
+  options: {
+    logFile?: string;
+    pollIntervalMs?: number;
+  } = {},
+): {
   start: () => void;
   stop: () => void;
 } {
+  const logFile = options.logFile ?? HERMES_AGENT_LOG_FILE;
+  const pollIntervalMs = options.pollIntervalMs ?? 250;
   let offset = 0;
   let timer: NodeJS.Timeout | undefined;
   try {
-    offset = statSync(HERMES_AGENT_LOG_FILE).size;
+    offset = statSync(logFile).size;
   } catch {
     offset = 0;
   }
@@ -28,7 +36,7 @@ export function createHermesToolLogWatcher(onEvent: (event: HermesToolLogEvent) 
   const poll = (): void => {
     let content = "";
     try {
-      const bytes = readFileSync(HERMES_AGENT_LOG_FILE);
+      const bytes = readFileSync(logFile);
       if (bytes.length < offset) {
         offset = 0;
       }
@@ -53,7 +61,7 @@ export function createHermesToolLogWatcher(onEvent: (event: HermesToolLogEvent) 
       if (timer) {
         return;
       }
-      timer = setInterval(poll, 250);
+      timer = setInterval(poll, pollIntervalMs);
       timer.unref?.();
     },
     stop: () => {
