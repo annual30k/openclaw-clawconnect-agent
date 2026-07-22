@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveHermesHomeDir, resolveHermesPythonBin, resolveHermesStateDbPath } from "./hermes-runtime-paths.js";
+import {
+  getHermesBinCandidates,
+  resolveHermesHomeDir,
+  resolveHermesPythonBin,
+  resolveHermesStateDbPath,
+} from "./hermes-runtime-paths.js";
 
 test("Hermes native Windows paths prefer LOCALAPPDATA and Scripts/python.exe", () => {
   const existing = new Set([
@@ -34,6 +39,22 @@ test("Hermes native Windows home remains authoritative when a legacy home also e
     systemHome: "C:\\Users\\tester",
     exists: (path: string) => existing.has(path),
   }), "C:\\Users\\tester\\AppData\\Local/hermes");
+});
+
+test("Hermes native Windows executable candidates prefer hermes.exe over command shims", () => {
+  const options = {
+    env: { LOCALAPPDATA: "C:\\Users\\tester\\AppData\\Local" },
+    platform: "win32" as const,
+    systemHome: "C:\\Users\\tester",
+    exists: (path: string) => path === "C:\\Users\\tester\\AppData\\Local/hermes",
+  };
+
+  assert.deepEqual(getHermesBinCandidates(options).slice(0, 4), [
+    "C:\\Users\\tester\\AppData\\Local/hermes/hermes-agent/venv/Scripts/hermes.exe",
+    "C:\\Users\\tester\\AppData\\Local/hermes/hermes-agent/venv/Scripts/hermes.cmd",
+    "C:\\Users\\tester\\AppData\\Local/hermes/hermes-agent/venv/Scripts/hermes.ps1",
+    "C:\\Users\\tester\\AppData\\Local/hermes/bin/hermes.cmd",
+  ]);
 });
 
 test("Hermes explicit home works for non-default and source installations", () => {

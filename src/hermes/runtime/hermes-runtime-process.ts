@@ -6,7 +6,12 @@ import { delimiter, dirname, join } from "path";
 import { promisify } from "util";
 import { buildExecutableInvocation, type ProcessInvocation } from "../../platform/process-invocation.js";
 import { resolveConfiguredPath } from "../../openclaw/runtime/openclaw-paths.js";
-import { resolveHermesHomeDir, resolveHermesPythonBin } from "./hermes-runtime-paths.js";
+import {
+  getHermesBinCandidates,
+  resolveHermesHomeDir,
+  resolveHermesPythonBin,
+  type HermesPathOptions,
+} from "./hermes-runtime-paths.js";
 
 const execFile = promisify(execFileCb);
 
@@ -66,46 +71,55 @@ export const SUBPROCESS_ENV: NodeJS.ProcessEnv = (() => {
   return env;
 })();
 
-export function resolveHermesBin(): string {
-  const explicit = process.env.HERMES_BIN?.trim();
-  const explicitPath = explicit ? resolveConfiguredPath(explicit) : undefined;
-  if (explicitPath && existsSync(explicitPath)) {
+export interface HermesBinResolutionOptions extends HermesPathOptions {
+  resolveOnPath?: () => string | undefined;
+}
+
+export function resolveHermesBin(options: HermesBinResolutionOptions = {}): string {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const systemHome = options.systemHome ?? homedir();
+  const exists = options.exists ?? existsSync;
+  const explicit = env.HERMES_BIN?.trim();
+  const explicitPath = explicit ? resolveConfiguredPath(explicit, systemHome) : undefined;
+  if (explicitPath && exists(explicitPath)) {
     return explicitPath;
   }
 
-  try {
-    const resolved = IS_WINDOWS
-      ? execFileSync("where.exe", ["hermes"], { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000, windowsHide: true }).toString().trim()
-      : execSync("command -v hermes", { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 }).toString().trim();
-    const first = resolved.split(/\r?\n/)[0]?.trim();
-    if (first) {
-      return first;
+  const candidates = getHermesBinCandidates({ ...options, env, platform, systemHome, exists });
+  if (platform === "win32") {
+    // Windows 原生安装自带可直接传递 argv 的 hermes.exe。必须先于 PATH 中的旧版
+    // hermes.cmd 使用，否则 cmd.exe 会重新解析多行消息并可能破坏 --quiet 等参数。
+    const nativeExecutable = candidates.find((candidate) => candidate.toLowerCase().endsWith(".exe") && exists(candidate));
+    if (nativeExecutable) {
+      return nativeExecutable;
     }
-  } catch {
-    // fall through
   }
 
-  const candidates = IS_WINDOWS
-    ? [
-        join(HERMES_HOME_DIR, "hermes-agent", "venv", "Scripts", "hermes.exe"),
-        join(HERMES_HOME_DIR, "hermes-agent", "venv", "Scripts", "hermes.cmd"),
-        join(HERMES_HOME_DIR, "hermes-agent", "venv", "Scripts", "hermes.ps1"),
-        join(HERMES_HOME_DIR, "bin", "hermes.cmd"),
-        join(HERMES_HOME_DIR, "bin", "hermes.ps1"),
-        join(homedir(), ".local", "bin", "hermes.exe"),
-        join(homedir(), ".local", "bin", "hermes.cmd"),
-      ]
-    : [
-        join(HERMES_HOME_DIR, "hermes-agent", "venv", "bin", "hermes"),
-        join(HERMES_HOME_DIR, "bin", "hermes"),
-        join(homedir(), ".local", "bin", "hermes"),
-      ];
-  const local = candidates.find((candidate) => existsSync(candidate));
+  const fromPath = options.resolveOnPath
+    ? options.resolveOnPath()
+    : resolveHermesBinOnPath(platform);
+  if (fromPath) {
+    return fromPath;
+  }
+
+  const local = candidates.find((candidate) => exists(candidate));
   if (local) {
     return local;
   }
 
   return "hermes";
+}
+
+function resolveHermesBinOnPath(platform: NodeJS.Platform): string | undefined {
+  try {
+    const resolved = platform === "win32"
+      ? execFileSync("where.exe", ["hermes"], { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000, windowsHide: true }).toString().trim()
+      : execSync("command -v hermes", { stdio: "pipe", env: SUBPROCESS_ENV, timeout: 3000 }).toString().trim();
+    return resolved.split(/\r?\n/)[0]?.trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function hermesInvocation(args: string[]): ProcessInvocation {

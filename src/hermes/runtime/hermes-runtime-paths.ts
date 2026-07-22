@@ -10,6 +10,28 @@ export interface HermesPathOptions {
   exists?: (path: string) => boolean;
 }
 
+export function getHermesBinCandidates(options: HermesPathOptions = {}): string[] {
+  const platform = options.platform ?? process.platform;
+  const systemHome = options.systemHome ?? homedir();
+  const hermesHome = resolveHermesHomeDir(options);
+  if (platform === "win32") {
+    return [
+      join(hermesHome, "hermes-agent", "venv", "Scripts", "hermes.exe"),
+      join(hermesHome, "hermes-agent", "venv", "Scripts", "hermes.cmd"),
+      join(hermesHome, "hermes-agent", "venv", "Scripts", "hermes.ps1"),
+      join(hermesHome, "bin", "hermes.cmd"),
+      join(hermesHome, "bin", "hermes.ps1"),
+      join(systemHome, ".local", "bin", "hermes.exe"),
+      join(systemHome, ".local", "bin", "hermes.cmd"),
+    ];
+  }
+  return [
+    join(hermesHome, "hermes-agent", "venv", "bin", "hermes"),
+    join(hermesHome, "bin", "hermes"),
+    join(systemHome, ".local", "bin", "hermes"),
+  ];
+}
+
 export function resolveHermesHomeDir(options: HermesPathOptions = {}): string {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
