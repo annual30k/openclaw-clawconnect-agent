@@ -56,8 +56,6 @@ export { selectHermesSessionForCompletedChat } from "./hermes-runtime-history-co
 export { parseHermesToolLogLine } from "./hermes-runtime-tool-log-watcher.js";
 export { isHermesSlashCommandMessage } from "./hermes-runtime-slash-command.js";
 
-const HERMES_ASSISTANT_DELTA_FLUSH_MS = 120;
-const HERMES_ASSISTANT_DELTA_MAX_BYTES = 4096;
 const HERMES_HISTORY_COMPLETION_GRACE_MS = 2_000;
 const HERMES_HISTORY_COMPLETION_POLL_MS = 1_000;
 const HERMES_API_EMPTY_OUTPUT_HISTORY_COMPLETION_TIMEOUT_MS = 12_000;
@@ -381,9 +379,6 @@ async function runHermesChatStreaming(
   let stderr = "";
   let seq = 0;
   let stdoutLineBuffer = "";
-  let stdoutLineFlushTimer: NodeJS.Timeout | undefined;
-  let pendingAssistantDelta = "";
-  let assistantDeltaFlushTimer: NodeJS.Timeout | undefined;
   let inSecurityReview = false;
   let commandDeniedTimeout = false;
   let commandDeniedTimeoutKillTimer: NodeJS.Timeout | undefined;
@@ -471,75 +466,16 @@ async function runHermesChatStreaming(
     return line;
   };
 
-  const clearAssistantDeltaFlushTimer = (): void => {
-    if (!assistantDeltaFlushTimer) {
-      return;
-    }
-    clearTimeout(assistantDeltaFlushTimer);
-    assistantDeltaFlushTimer = undefined;
-  };
-
-  const clearStdoutLineFlushTimer = (): void => {
-    if (!stdoutLineFlushTimer) {
-      return;
-    }
-    clearTimeout(stdoutLineFlushTimer);
-    stdoutLineFlushTimer = undefined;
-  };
-
-  const flushAssistantDelta = (): void => {
-    clearAssistantDeltaFlushTimer();
-    if (!pendingAssistantDelta) {
-      return;
-    }
-    const delta = pendingAssistantDelta;
-    pendingAssistantDelta = "";
-    const timestampMs = Date.now();
-    try {
-      context.publishEvent?.({
-        type: "event",
-        event: "chat",
-        payload: buildHermesAssistantDeltaPayload({
-          runId,
-          sessionKey,
-          seq: seq += 1,
-          timestampMs,
-          // canonical message.part.delta 是同一 part 的绝对状态；Hermes CLI stdout 这里 flush 的只是增量片段。
-          delta: output,
-        }),
-      });
-    } catch (error) {
-      context.publishEvent?.({
-        type: "event",
-        event: "maintenance_log",
-        payload: {
-          gatewayId: context.gatewayId,
-          requestId: context.requestId,
-          runId,
-          stream: "stderr",
-          seq: seq += 1,
-          ts: Date.now(),
-          text: `Hermes stream publish failed: ${error instanceof Error ? error.message : String(error)}`,
-        },
-      });
-    }
-  };
-
-  const publishAssistantDelta = (text: string): void => {
+  const appendStdout = (text: string): void => {
+    // Hermes CLI stdout is a presentation stream, not a semantic assistant stream.
+    // Some Windows builds emit transient TUI frames (Reasoning boxes, spinners, etc.)
+    // even with --cli --quiet. Buffer it for terminal completion, but never expose it
+    // as message.part.delta. The API path has typed assistant.delta events and remains
+    // the only Hermes path allowed to stream assistant text.
     output += text;
-    pendingAssistantDelta += text;
-    if (Buffer.byteLength(pendingAssistantDelta, "utf8") >= HERMES_ASSISTANT_DELTA_MAX_BYTES) {
-      flushAssistantDelta();
-      return;
-    }
-    if (!assistantDeltaFlushTimer) {
-      assistantDeltaFlushTimer = setTimeout(flushAssistantDelta, HERMES_ASSISTANT_DELTA_FLUSH_MS);
-      assistantDeltaFlushTimer.unref?.();
-    }
   };
 
   const flushStdoutLineBuffer = (): void => {
-    clearStdoutLineFlushTimer();
     if (!stdoutLineBuffer) {
       return;
     }
@@ -548,19 +484,7 @@ async function runHermesChatStreaming(
     if (!clean.trim()) {
       return;
     }
-    publishAssistantDelta(clean);
-  };
-
-  const scheduleStdoutLineFlush = (): void => {
-    if (!stdoutLineBuffer.trim()) {
-      clearStdoutLineFlushTimer();
-      return;
-    }
-    if (stdoutLineFlushTimer) {
-      return;
-    }
-    stdoutLineFlushTimer = setTimeout(flushStdoutLineBuffer, HERMES_ASSISTANT_DELTA_FLUSH_MS);
-    stdoutLineFlushTimer.unref?.();
+    appendStdout(clean);
   };
 
   const publishText = (text: string): void => {
@@ -574,12 +498,10 @@ async function runHermesChatStreaming(
         .join("\n"),
     );
     if (!clean.trim()) {
-      scheduleStdoutLineFlush();
       return;
     }
     const chunk = `${clean}\n`;
-    publishAssistantDelta(chunk);
-    scheduleStdoutLineFlush();
+    appendStdout(chunk);
   };
 
   const publishStderr = (text: string): void => {
@@ -636,8 +558,6 @@ async function runHermesChatStreaming(
       settled = true;
       cleanup();
       clearTimeout(timeout);
-      clearStdoutLineFlushTimer();
-      clearAssistantDeltaFlushTimer();
       toolLogWatcher.stop();
       resolveOutput(value);
     };
@@ -648,8 +568,6 @@ async function runHermesChatStreaming(
       settled = true;
       cleanup();
       clearTimeout(timeout);
-      clearStdoutLineFlushTimer();
-      clearAssistantDeltaFlushTimer();
       toolLogWatcher.stop();
       rejectOutput(error);
     };
@@ -665,9 +583,6 @@ async function runHermesChatStreaming(
     const abortChat = (): void => {
       abortRequested = true;
       stdoutLineBuffer = "";
-      pendingAssistantDelta = "";
-      clearStdoutLineFlushTimer();
-      clearAssistantDeltaFlushTimer();
       child.kill("SIGTERM");
     };
     const checkHistoryCompletion = (): void => {
@@ -681,9 +596,7 @@ async function runHermesChatStreaming(
             return;
           }
           output = detectedOutput;
-          pendingAssistantDelta = "";
           stdoutLineBuffer = "";
-          clearStdoutLineFlushTimer();
           child.kill("SIGTERM");
           setTimeout(() => {
             if (child.exitCode === null && child.signalCode === null) {
@@ -733,7 +646,6 @@ async function runHermesChatStreaming(
           return;
         }
         flushStdoutLineBuffer();
-        flushAssistantDelta();
         if (commandDeniedTimeout) {
           finishReject(new Error(HERMES_COMMAND_DENIED_TIMEOUT_MESSAGE));
           return;
@@ -742,6 +654,20 @@ async function runHermesChatStreaming(
           const reason = stderr.trim() || output.trim() || `hermes chat exited with code ${code}`;
           finishReject(new Error(signal ? `${reason} (${signal})` : reason));
           return;
+        }
+        if (historyCompletion) {
+          try {
+            // Prefer the persisted assistant message over CLI presentation stdout.
+            // Hermes writes the semantic answer before a normal process exit, while
+            // stdout may still contain transient TUI frames on Windows.
+            const persistedOutput = await historyCompletion();
+            if (persistedOutput) {
+              output = persistedOutput;
+            }
+          } catch {
+            // Older/test Hermes installations may not expose readable history.
+            // In that case --cli --quiet stdout remains the compatibility fallback.
+          }
         }
         finishResolve(output);
       })().catch((error) => finishReject(error instanceof Error ? error : new Error(String(error))));

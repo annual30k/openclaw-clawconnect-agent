@@ -47,7 +47,6 @@ import {
   writeAbortPartialHermesBin,
   writeSlowPartialHermesBin,
   waitForFile,
-  waitForHermesDelta,
   writeHistoryCompletingHermesBin,
   writeHermesStateDb,
   writeStateDbHistoryCompletingHermesBin,
@@ -987,7 +986,7 @@ test("runHermesChat drops buffered assistant output when aborted", async () => {
   }
 });
 
-test("runHermesChat publishes assistant output before a newline arrives", async () => {
+test("runHermesChat never publishes unstructured CLI stdout as assistant deltas", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-partial-stream-"));
   const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
   const previousBin = process.env.HERMES_BIN;
@@ -1007,11 +1006,11 @@ test("runHermesChat publishes assistant output before a newline arrives", async 
     );
 
     await waitForFile(join(root, "partial-started"), 1000);
-    await waitForHermesDelta(publishedEvents, "partial", 1000);
     const result = await chatPromise;
 
     assert.match(result.output, /partial reply/);
-    assert.deepEqual(assistantTimelineDeltaTexts(publishedEvents), ["partial ", "partial reply\n"]);
+    assert.deepEqual(assistantTimelineDeltaTexts(publishedEvents), []);
+    assert.equal(JSON.stringify(publishedEvents).includes("partial"), false);
   } finally {
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousBin);
@@ -1167,7 +1166,7 @@ test("runHermesChat serializes concurrent requests for the same Hermes session",
   }
 });
 
-test("runHermesChat strips Hermes resume metadata from streaming events and final output", async () => {
+test("runHermesChat keeps CLI stdout and resume metadata out of streaming events", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-resume-metadata-"));
   const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
   const previousBin = process.env.HERMES_BIN;
@@ -1188,7 +1187,7 @@ test("runHermesChat strips Hermes resume metadata from streaming events and fina
     assert.equal(serializedEvents.includes("Resumed session"), false);
     assert.equal(serializedEvents.includes("NoneType"), false);
     assert.equal(serializedEvents.includes("session_id:"), false);
-    assert.equal(serializedEvents.includes("visible reply"), true);
+    assert.equal(serializedEvents.includes("visible reply"), false);
   } finally {
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousBin);
