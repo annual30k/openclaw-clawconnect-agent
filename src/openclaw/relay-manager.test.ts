@@ -354,7 +354,13 @@ test("relay manager sanitizes legacy OpenClaw chat.history fallback params", asy
         id: msg.id,
         ok: true,
         payload: msg.method === "chat.history"
-          ? { messages: [{ role: "assistant", content: [{ type: "text", text: "legacy" }] }] }
+          ? {
+              messages: [
+                { id: "legacy-user", role: "user", content: [{ type: "text", text: "legacy" }] },
+                { id: "heartbeat-user", role: "user", content: [{ type: "text", text: "[OpenClaw heartbeat poll]" }] },
+                { id: "heartbeat-assistant", role: "assistant", content: [{ type: "text", text: "HEARTBEAT_OK" }] },
+              ],
+            }
           : msg.method === "config.get"
             ? sessionDefaultsPayload()
             : {},
@@ -393,6 +399,8 @@ test("relay manager sanitizes legacy OpenClaw chat.history fallback params", asy
     assert.deepEqual(gatewayHistoryRequests, [{ sessionKey: "agent:main:main", limit: 7 }]);
     const response = relayMessages.find((message) => message.type === "res" && message.id === "history-legacy");
     assert.equal(response?.ok, true);
+    const payload = response?.payload as { messages?: Array<Record<string, unknown>> };
+    assert.deepEqual(payload.messages?.map((message) => message.id), ["legacy-user"]);
   } finally {
     abort.abort();
     gatewaySocket?.close(1000, "test done");

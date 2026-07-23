@@ -28,6 +28,7 @@ import {
 } from "../core/relay/chat-payload.js";
 import {
   extractHistoryOutcome,
+  filterOpenClawHeartbeatHistoryResponse,
   readOpenClawTranscriptChatHistory,
   withTimeout,
   type ChatRunContext,
@@ -331,7 +332,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       if (!gatewayClient) {
         throw new Error("gateway not connected");
       }
-      return gatewayClient.request<HistoryResponse>("chat.history", buildLegacyOpenClawHistoryParams(params, sessionDefaults));
+      const history = await gatewayClient.request<HistoryResponse>(
+        "chat.history",
+        buildLegacyOpenClawHistoryParams(params, sessionDefaults),
+      );
+      return filterOpenClawHeartbeatHistoryResponse(history);
     }
 
     relayWs.on("open", () => {

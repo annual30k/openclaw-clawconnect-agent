@@ -6,9 +6,54 @@ import test from "node:test";
 
 import {
   clearTranscriptHistoryCache,
+  filterOpenClawHeartbeatArtifacts,
   readChatHistoryFromTranscriptFile,
   type HistoryResponse,
 } from "./chat-history.js";
+
+test("transcript history hides completed OpenClaw heartbeat-only turns", async () => {
+  const fixture = await createTranscriptFixture(4, [
+    transcriptMessage("user-1", "user", "hello", "2026-05-28T01:00:00.000Z"),
+    transcriptMessage("assistant-1", "assistant", "hi", "2026-05-28T01:00:01.000Z"),
+    transcriptMessage("heartbeat-user", "user", "[OpenClaw heartbeat poll]", "2026-05-28T01:01:00.000Z"),
+    transcriptMessage("heartbeat-assistant", "assistant", "HEARTBEAT_OK", "2026-05-28T01:01:01.000Z"),
+  ]);
+  try {
+    const page = await readChatHistoryFromTranscriptFile({
+      sessionKey: "agent:main:main",
+      transcriptPath: fixture.path,
+      limit: 20,
+    });
+
+    assert.deepEqual(page.messages?.map((message) => message.id), ["user-1", "assistant-1"]);
+    assert.deepEqual(page.timelineSnapshot?.messages.map((message) => message.messageId), ["user-1", "assistant-1"]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("heartbeat filtering keeps real alerts and similar user text", () => {
+  const messages = [
+    { id: "heartbeat-alert-user", role: "user", content: "[OpenClaw heartbeat poll]" },
+    { id: "heartbeat-alert-assistant", role: "assistant", content: "Disk space is low" },
+    { id: "similar-user", role: "user", content: "[OpenClaw heartbeat poll] please explain" },
+    { id: "similar-assistant", role: "assistant", content: "HEARTBEAT_OK" },
+  ];
+
+  assert.deepEqual(filterOpenClawHeartbeatArtifacts(messages), messages);
+});
+
+test("heartbeat filtering removes silent tool artifacts only after a terminal acknowledgement", () => {
+  const messages = [
+    { id: "heartbeat-user", role: "user", content: "[OpenClaw heartbeat poll]" },
+    { id: "heartbeat-tool-call", role: "assistant", content: [{ type: "toolCall", name: "read" }] },
+    { id: "heartbeat-tool-result", role: "toolResult", content: [{ type: "toolResult", text: "ok" }] },
+    { id: "heartbeat-assistant", role: "assistant", content: [{ type: "text", text: "HEARTBEAT_OK" }] },
+    { id: "next-user", role: "user", content: "hello" },
+  ];
+
+  assert.deepEqual(filterOpenClawHeartbeatArtifacts(messages), [messages[4]]);
+});
 
 test("transcript history provider pages newest and older windows with seq cursors", async () => {
   const fixture = await createTranscriptFixture(260);
@@ -394,6 +439,23 @@ test("transcript history provider recovers invalid and future cursors to newest 
 
 function messageSeqs(response: HistoryResponse): unknown[] {
   return response.messages?.map((message) => message.seq) ?? [];
+}
+
+function transcriptMessage(
+  id: string,
+  role: string,
+  text: string,
+  timestamp: string,
+): Record<string, unknown> {
+  return {
+    type: "message",
+    id,
+    timestamp,
+    message: {
+      role,
+      content: [{ type: "text", text }],
+    },
+  };
 }
 
 async function createTranscriptFixture(

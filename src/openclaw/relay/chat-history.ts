@@ -69,6 +69,8 @@ export type TranscriptHistoryRequest = {
 const DEFAULT_TRANSCRIPT_HISTORY_LIMIT = 100;
 const MAX_TRANSCRIPT_HISTORY_LIMIT = 200;
 const CURSOR_PREFIX = "seq:";
+const OPENCLAW_HEARTBEAT_TRANSCRIPT_PROMPT = "[OpenClaw heartbeat poll]";
+const OPENCLAW_HEARTBEAT_ACK = "HEARTBEAT_OK";
 
 type TranscriptHistoryCacheEntry = {
   size: number;
@@ -201,13 +203,143 @@ async function readIndexedTranscriptMessages(transcriptPath: string): Promise<Hi
     }
   }
   restoreTranscriptTurnLineage(messages);
+  const visibleMessages = filterOpenClawHeartbeatArtifacts(messages);
 
   transcriptHistoryCache.set(transcriptPath, {
     size: stats.size,
     mtimeMs: stats.mtimeMs,
-    messages,
+    messages: visibleMessages,
   });
-  return messages;
+  return visibleMessages;
+}
+
+/**
+ * OpenClaw 会把内部心跳探测写入 transcript。只有精确的保留提示最终得到纯确认回执时，
+ * 才隐藏整段内部记录；若心跳产生真实告警，则保留完整内容供用户查看。
+ */
+export function filterOpenClawHeartbeatArtifacts<T extends HistoryMessage>(messages: T[]): T[] {
+  const visible: T[] = [];
+  let index = 0;
+
+  while (index < messages.length) {
+    if (!isOpenClawHeartbeatPrompt(messages[index])) {
+      visible.push(messages[index]);
+      index += 1;
+      continue;
+    }
+
+    const artifactEnd = resolveHeartbeatArtifactEnd(messages, index);
+    if (artifactEnd === undefined) {
+      visible.push(messages[index]);
+      index += 1;
+      continue;
+    }
+    index = artifactEnd;
+  }
+
+  return visible.length === messages.length ? messages : visible;
+}
+
+export function filterOpenClawHeartbeatHistoryResponse(history: HistoryResponse): HistoryResponse {
+  const messages = history.messages ?? [];
+  const visibleMessages = filterOpenClawHeartbeatArtifacts(messages);
+  const snapshotMessages = history.timelineSnapshot?.messages;
+  const visibleSnapshotMessages = snapshotMessages
+    ? filterOpenClawHeartbeatArtifacts(snapshotMessages)
+    : undefined;
+  if (visibleMessages === messages && visibleSnapshotMessages === snapshotMessages) {
+    return history;
+  }
+  return {
+    ...history,
+    messages: visibleMessages,
+    ...(history.timelineSnapshot && visibleSnapshotMessages
+      ? {
+          timelineSnapshot: {
+            ...history.timelineSnapshot,
+            messages: visibleSnapshotMessages,
+          },
+        }
+      : {}),
+  };
+}
+
+function resolveHeartbeatArtifactEnd(messages: HistoryMessage[], startIndex: number): number | undefined {
+  for (let index = startIndex + 1; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message.role === "user") {
+      return undefined;
+    }
+    if (isOpenClawHeartbeatAcknowledgement(message)) {
+      return index + 1;
+    }
+    if (isHeartbeatToolArtifact(message)) {
+      continue;
+    }
+    if (message.role === "assistant") {
+      return undefined;
+    }
+    if (message.role !== "tool" && message.role !== "toolResult" && message.role !== "tool_result") {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function isOpenClawHeartbeatPrompt(message: HistoryMessage): boolean {
+  if (message.role !== "user") {
+    return false;
+  }
+  const content = resolveTextOnlyHistoryContent(message.content);
+  return !content.hasNonTextContent && content.text.trim() === OPENCLAW_HEARTBEAT_TRANSCRIPT_PROMPT;
+}
+
+function isOpenClawHeartbeatAcknowledgement(message: HistoryMessage): boolean {
+  if (message.role !== "assistant") {
+    return false;
+  }
+  const content = resolveTextOnlyHistoryContent(message.content);
+  return !content.hasNonTextContent && content.text.trim() === OPENCLAW_HEARTBEAT_ACK;
+}
+
+function isHeartbeatToolArtifact(message: HistoryMessage): boolean {
+  if (message.role === "tool" || message.role === "toolResult" || message.role === "tool_result") {
+    return true;
+  }
+  if (message.role !== "assistant" || !Array.isArray(message.content) || message.content.length === 0) {
+    return false;
+  }
+  return message.content.every((block) => {
+    const type = typeof block.type === "string" ? block.type.trim().toLowerCase().replaceAll("_", "") : "";
+    return type === "toolcall" || type === "functioncall" || type === "tooluse";
+  });
+}
+
+function resolveTextOnlyHistoryContent(content: HistoryMessage["content"]): {
+  text: string;
+  hasNonTextContent: boolean;
+} {
+  if (typeof content === "string") {
+    return { text: content, hasNonTextContent: false };
+  }
+  if (!Array.isArray(content)) {
+    return { text: "", hasNonTextContent: content !== undefined };
+  }
+  let text = "";
+  let hasNonTextContent = false;
+  for (const block of content) {
+    const type = typeof block.type === "string" ? block.type.trim().toLowerCase() : "";
+    if (type !== "text" && type !== "input_text" && type !== "output_text") {
+      hasNonTextContent = true;
+      continue;
+    }
+    if (typeof block.text !== "string") {
+      hasNonTextContent = true;
+      continue;
+    }
+    text += block.text;
+  }
+  return { text, hasNonTextContent };
 }
 
 function parseTranscriptHistoryLine(line: string, seq: number): HistoryMessage | null {
