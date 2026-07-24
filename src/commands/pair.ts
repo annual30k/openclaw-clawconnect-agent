@@ -21,11 +21,11 @@ interface PairOptions {
 }
 
 export async function pairCommand(opts: PairOptions): Promise<void> {
-  let gatewayId: string;
-  let relaySecret: string;
-  let accessCode: string;
-  let displayName: string;
-  let relayServerUrl: string;
+  let gatewayId = "";
+  let relaySecret = "";
+  let accessCode = "";
+  let displayName = "";
+  let relayServerUrl = "";
   const gatewayType = normalizeGatewayType(opts.gatewayType);
   const capabilities = gatewayCapabilitiesForType(gatewayType);
 
@@ -38,6 +38,7 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
     requestedRelayServerUrl
   );
 
+  let reRegisterNeeded = false;
   if (existingConfig && canReuseExistingConfig) {
     const config = existingConfig;
     relayServerUrl = requestedRelayServerUrl;
@@ -48,29 +49,31 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
     console.log(t("pair.alreadyRegistered", gatewayId));
 
     const httpBase = toRelayHttpBase(relayServerUrl);
-    const res = await fetch(`${httpBase}/api/relay/accesscode`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ gatewayId, relaySecret }),
-    });
-
-    if (!res.ok) {
-      const body = await res.text();
-      if (res.status === 401) {
-        throw new Error(t(
-          "pair.invalidCredentialsWithCommands",
-          resetCommandForProfile(opts.profile),
-          pairCommandForProfile(opts.profile)
-        ));
-      }
-      throw new Error(t("pair.refreshFailed", String(res.status), body));
+    let res: Response;
+    try {
+      res = await fetch(`${httpBase}/api/relay/accesscode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gatewayId, relaySecret }),
+      });
+    } catch (err) {
+      throw new Error(t("pair.refreshFailed", "network", String(err)));
     }
 
-    const data = (await res.json()) as { accessCode: string };
-    accessCode = data.accessCode;
+    if (res.status === 401) {
+      console.log(`Existing gateway credentials (${gatewayId}) unrecognized by relay server (401); re-registering a new gateway…`);
+      reRegisterNeeded = true;
+    } else if (!res.ok) {
+      const body = await res.text();
+      throw new Error(t("pair.refreshFailed", String(res.status), body));
+    } else {
+      const data = (await res.json()) as { accessCode: string };
+      accessCode = data.accessCode;
+      writeConfig({ ...config, relayServerUrl, displayName, gatewayType: config.gatewayType ?? gatewayType, capabilities: config.capabilities ?? capabilities });
+    }
+  }
 
-    writeConfig({ ...config, relayServerUrl, displayName, gatewayType: config.gatewayType ?? gatewayType, capabilities: config.capabilities ?? capabilities });
-  } else {
+  if (!existingConfig || !canReuseExistingConfig || reRegisterNeeded) {
     if (existingConfig && existingGatewayType !== gatewayType) {
       console.log(`Existing ${existingGatewayType} gateway config found; registering a new ${gatewayType} gateway.`);
     } else if (existingConfig && !sameRelayServer(existingConfig.relayServerUrl, requestedRelayServerUrl)) {

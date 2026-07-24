@@ -10,19 +10,19 @@ import { getServicePlatform } from "../platform/service-manager.js";
 import { toRelayHttpBase } from "../core/relay/file-upload-utils.js";
 import { getDefaultRelayServerUrl } from "../config/env.js";
 import { gatewayCapabilitiesForType, normalizeGatewayType } from "../gateway-profiles.js";
-import { pairCommandForProfile, resetCommandForProfile } from "./profile-hints.js";
 export async function pairCommand(opts) {
-    let gatewayId;
-    let relaySecret;
-    let accessCode;
-    let displayName;
-    let relayServerUrl;
+    let gatewayId = "";
+    let relaySecret = "";
+    let accessCode = "";
+    let displayName = "";
+    let relayServerUrl = "";
     const gatewayType = normalizeGatewayType(opts.gatewayType);
     const capabilities = gatewayCapabilitiesForType(gatewayType);
     const existingConfig = configExists() ? readConfig() : null;
     const existingGatewayType = existingConfig?.gatewayType ?? "openclaw";
     const requestedRelayServerUrl = opts.server ?? getDefaultRelayServerUrl();
     const canReuseExistingConfig = shouldReuseExistingPairing(existingConfig, gatewayType, requestedRelayServerUrl);
+    let reRegisterNeeded = false;
     if (existingConfig && canReuseExistingConfig) {
         const config = existingConfig;
         relayServerUrl = requestedRelayServerUrl;
@@ -31,23 +31,32 @@ export async function pairCommand(opts) {
         displayName = opts.name ? sanitizeDisplayName(opts.name) : config.displayName;
         console.log(t("pair.alreadyRegistered", gatewayId));
         const httpBase = toRelayHttpBase(relayServerUrl);
-        const res = await fetch(`${httpBase}/api/relay/accesscode`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ gatewayId, relaySecret }),
-        });
-        if (!res.ok) {
+        let res;
+        try {
+            res = await fetch(`${httpBase}/api/relay/accesscode`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ gatewayId, relaySecret }),
+            });
+        }
+        catch (err) {
+            throw new Error(t("pair.refreshFailed", "network", String(err)));
+        }
+        if (res.status === 401) {
+            console.log(`Existing gateway credentials (${gatewayId}) unrecognized by relay server (401); re-registering a new gateway…`);
+            reRegisterNeeded = true;
+        }
+        else if (!res.ok) {
             const body = await res.text();
-            if (res.status === 401) {
-                throw new Error(t("pair.invalidCredentialsWithCommands", resetCommandForProfile(opts.profile), pairCommandForProfile(opts.profile)));
-            }
             throw new Error(t("pair.refreshFailed", String(res.status), body));
         }
-        const data = (await res.json());
-        accessCode = data.accessCode;
-        writeConfig({ ...config, relayServerUrl, displayName, gatewayType: config.gatewayType ?? gatewayType, capabilities: config.capabilities ?? capabilities });
+        else {
+            const data = (await res.json());
+            accessCode = data.accessCode;
+            writeConfig({ ...config, relayServerUrl, displayName, gatewayType: config.gatewayType ?? gatewayType, capabilities: config.capabilities ?? capabilities });
+        }
     }
-    else {
+    if (!existingConfig || !canReuseExistingConfig || reRegisterNeeded) {
         if (existingConfig && existingGatewayType !== gatewayType) {
             console.log(`Existing ${existingGatewayType} gateway config found; registering a new ${gatewayType} gateway.`);
         }

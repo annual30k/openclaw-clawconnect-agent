@@ -287,20 +287,23 @@ function refreshWindowsServiceRunner(profile?: string): string {
  * Returns true if any processes were killed.
  */
 export function buildWindowsProcessQueryScript(profile?: string): string {
-  const profileFilter = normalizeProfileName(profile)
-    ? `($_.CommandLine -match ('(?:^|\\s)--profile(?:\\s+|=)' + [regex]::Escape($env:CLAW_PROFILE_NAME) + '(?:\\s|$)'))`
+  const normalizedProfile = normalizeProfileName(profile);
+  const profileFilter = normalizedProfile
+    ? `($_.CommandLine -match ('(?:^|\\s)--profile(?:\\s+|=)' + [regex]::Escape($env:CLAW_PROFILE_NAME) + '(?:\\s|$)') -or $_.CommandLine -match [regex]::Escape($env:CLAW_RUNNER_PATH))`
     : `($_.CommandLine -notmatch '(?:^|\\s)--profile(?:\\s|=)')`;
-  return `Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -OperationTimeoutSec 3 | Where-Object { $_.CommandLine -match [regex]::Escape($env:CLAW_SCRIPT_PATH) -and ${profileFilter} } | Select-Object -ExpandProperty ProcessId`;
+  return `Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -OperationTimeoutSec 3 | Where-Object { ($_.CommandLine -match 'clawconnect' -or $_.CommandLine -match [regex]::Escape($env:CLAW_SCRIPT_PATH) -or $_.CommandLine -match [regex]::Escape($env:CLAW_RUNNER_PATH)) -and ${profileFilter} } | Select-Object -ExpandProperty ProcessId`;
 }
 
 function windowsProcessQueryEnv(
   profile?: string,
   scriptPath = process.argv[1],
 ): NodeJS.ProcessEnv {
+  const normalizedProfile = normalizeProfileName(profile);
   return {
     ...process.env,
     CLAW_SCRIPT_PATH: scriptPath ? resolveServiceEntryPath(scriptPath) : "",
-    CLAW_PROFILE_NAME: normalizeProfileName(profile) ?? "",
+    CLAW_RUNNER_PATH: windowsServiceRunnerPath(normalizedProfile),
+    CLAW_PROFILE_NAME: normalizedProfile ?? "",
   };
 }
 
