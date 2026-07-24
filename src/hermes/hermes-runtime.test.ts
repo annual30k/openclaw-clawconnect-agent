@@ -8,6 +8,7 @@ import {
   buildHermesRuntimeContextHint,
   isDuplicateHermesCronJob,
   isHermesSlashCommandMessage,
+  latestTerminalAssistantReplyFromHermesExport,
   parseHermesToolLogLine,
   parseHermesSkillsList,
   parseHermesSessionUsageSnapshot,
@@ -356,6 +357,89 @@ test("runHermesChatHistory extracts stable mobile turn metadata from Hermes expo
     assert.equal(user?.content[0]?.text, "帮把桌面上的图片发过来");
     assert.equal(assistant?.turnId, "client-run-file-1");
     assert.equal(assistant?.runId, "client-run-file-1");
+  } finally {
+    restoreEnv("HERMES_BIN", previousHermesBin);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChatHistory excludes tool-call assistant interims and keeps the terminal reply", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hermes-history-terminal-assistant-"));
+  const previousHermesBin = process.env.HERMES_BIN;
+  try {
+    const hermesBin = join(dir, "hermes");
+    const exported = {
+      sessionId: "s1",
+      messages: [
+        {
+          id: "history-user-1",
+          role: "user",
+          createdAt: "2026-07-23T10:00:00.000Z",
+          content: [
+            "你帮我看看明天福州的天气返回表格",
+            "",
+            "[ClawConnect mobile turn]",
+            "sourceRunId: mobile-weather-run",
+            "sessionKey: qa-no-cli-stream",
+          ].join("\n"),
+        },
+        {
+          id: "history-assistant-interim",
+          role: "assistant",
+          createdAt: "2026-07-23T10:00:01.000Z",
+          content: "Let me use the browser to fetch the weather data.",
+          finish_reason: "tool_calls",
+          tool_calls: [{ id: "tool-weather-1", type: "function" }],
+        },
+        {
+          id: "history-tool-1",
+          role: "tool",
+          createdAt: "2026-07-23T10:00:02.000Z",
+          content: "weather result",
+        },
+        {
+          id: "history-assistant-final",
+          role: "assistant",
+          createdAt: "2026-07-23T10:00:03.000Z",
+          content: "福州明日天气完整表格",
+          finish_reason: "stop",
+        },
+      ],
+    };
+    writeFileSync(hermesBin, [
+      "#!/usr/bin/env node",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'sessions' && args[1] === 'export') {",
+      `  console.log(${JSON.stringify(JSON.stringify(exported))});`,
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"));
+    chmodSync(hermesBin, 0o755);
+    process.env.HERMES_BIN = hermesBin;
+
+    const result = await runHermesChatHistory({ sessionKey: "qa-no-cli-stream", limit: 10 });
+    assert.equal(result.ok, true);
+    const payload = result.payload as {
+      timelineSnapshot: {
+        messages: Array<{
+          messageId: string;
+          role: string;
+          runId?: string;
+          content: Array<{ text?: string }>;
+        }>;
+      };
+    };
+    const assistantMessages = payload.timelineSnapshot.messages.filter((message) => message.role === "assistant");
+
+    assert.deepEqual(assistantMessages.map((message) => message.messageId), ["history-assistant-final"]);
+    assert.equal(assistantMessages[0]?.runId, "mobile-weather-run");
+    assert.equal(assistantMessages[0]?.content[0]?.text, "福州明日天气完整表格");
+    assert.equal(
+      JSON.stringify(payload.timelineSnapshot).includes("Let me use the browser"),
+      false,
+    );
   } finally {
     restoreEnv("HERMES_BIN", previousHermesBin);
     rmSync(dir, { recursive: true, force: true });
@@ -720,6 +804,81 @@ test("selectHermesSessionForCompletedChat keeps explicit resume binding", () => 
   });
 
   assert.equal(selected?.hermesSessionId, "20260521_080012_48f5ae");
+});
+
+test("Hermes history completion ignores visible tool-call assistants and waits for terminal final", () => {
+  const payload = {
+    output: JSON.stringify({
+      messages: [
+        {
+          id: "user-weather",
+          role: "user",
+          content: "你帮我看看明天福州的天气返回表格",
+        },
+        {
+          id: "assistant-tool-call",
+          role: "assistant",
+          content: "Let me use the browser to fetch the weather data.",
+          finish_reason: "tool_calls",
+          tool_calls: JSON.stringify([{ id: "call-browser" }]),
+        },
+        {
+          id: "tool-weather",
+          role: "tool",
+          content: "weather data",
+        },
+        {
+          id: "assistant-final",
+          role: "assistant",
+          content: "福州明日天气\n\n| 时间 | 天气 |\n|---|---|",
+          finish_reason: "stop",
+          tool_calls: null,
+        },
+      ],
+    }),
+  };
+
+  assert.equal(
+    latestTerminalAssistantReplyFromHermesExport(
+      payload,
+      "你帮我看看明天福州的天气返回表格",
+    ),
+    "福州明日天气\n\n| 时间 | 天气 |\n|---|---|",
+  );
+});
+
+test("Hermes history completion does not resolve while only a tool-call assistant exists", () => {
+  const payload = {
+    output: JSON.stringify({
+      messages: [
+        { role: "user", content: "查天气" },
+        {
+          role: "assistant",
+          content: "Let me check.",
+          finishReason: "tool-calls",
+          toolCalls: [{ id: "call-weather" }],
+        },
+      ],
+    }),
+  };
+
+  assert.equal(
+    latestTerminalAssistantReplyFromHermesExport(payload, "查天气"),
+    undefined,
+  );
+});
+
+test("Hermes history completion keeps compatibility with legacy terminal rows without finish reason", () => {
+  const payload = {
+    output: JSON.stringify({
+      messages: [
+        { role: "user", content: "你好" },
+        { role: "assistant", content: "你好！", tool_calls: "[]" },
+      ],
+    }),
+  };
+
+  assert.equal(latestTerminalAssistantReplyFromHermesExport(payload, "你好"), "你好！");
 });
 
 test("isDuplicateHermesCronJob treats equivalent daily weather jobs as duplicates", () => {

@@ -286,7 +286,9 @@ export function buildToolInvocationUpdatedEvent(params: TimelineTurnBase & {
     ...params,
     role: "tool",
     eventType: "tool.invocation.updated",
-    messageId: messageId("tool", params.turnId),
+    // A turn may contain multiple tool calls. The invocation identity, rather than
+    // the parent turn, is the stable message identity for one tool lifecycle.
+    messageId: messageId("tool", params.toolInvocationId),
     partId: derivePartId({ type: "tool", index: 0 }),
     messageState: ["denied", "success", "failed", "cancelled"].includes(params.toolState)
       ? "completed"

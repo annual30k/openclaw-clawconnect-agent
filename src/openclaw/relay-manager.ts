@@ -31,7 +31,6 @@ import {
   filterOpenClawHeartbeatHistoryResponse,
   readOpenClawTranscriptChatHistory,
   withTimeout,
-  type ChatRunContext,
   type HistoryResponse,
 } from "./relay/chat-history.js";
 import {
@@ -60,6 +59,14 @@ import {
   CHAT_HISTORY_FETCH_TIMEOUT_MS,
   CHAT_HISTORY_FINAL_RETRY_DELAY_MS,
 } from "./relay/relay-manager-history-timing.js";
+import {
+  canonicalizeOpenClawChatSendResult,
+  normalizeOpenClawMobileRunId,
+  openClawChatRunIdentities,
+  resolveExplicitMobileRunIdFromChatPayload,
+  restoreOpenClawProviderRunIdForCommand,
+  type OpenClawChatRunIdentity,
+} from "./relay/chat-run-identity.js";
 import { publishOfficeSnapshot } from "./relay/relay-manager-office-events.js";
 import type {
   OpenClawRelayFromServer,
@@ -86,6 +93,7 @@ import {
 type OpenClawChatCommandExecution = {
   params: unknown;
   result: unknown;
+  identity?: OpenClawChatRunIdentity;
 };
 
 // 保留在连接实例之外，使 Relay WebSocket 断线重连后的同轮重投仍能复用终态结果。
@@ -122,7 +130,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     let sessionDefaults: GatewaySessionDefaults = { ...DEFAULT_GATEWAY_SESSION_DEFAULTS };
     const chatBuffers = new Map<string, string>();
     const chatFallbacks = new Map<string, ReturnType<typeof setTimeout>>();
-    const chatRunContexts = new Map<string, ChatRunContext>();
+    const chatRunContexts = new Map<string, OpenClawChatRunIdentity>();
     const chatSendDedupe = new OpenClawChatSendDedupeCoordinator(() => sessionDefaults);
     const outgoingMediaUploadCache = new Map<string, FileUploadResult>();
     const contextUsageRefreshes = new Map<string, ReturnType<typeof setTimeout>>();
@@ -192,15 +200,15 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       contextUsageRefreshes.set(key, timer);
     };
 
-    const scheduleChatHistoryFallback = (runId: string, context: ChatRunContext, attempt = 0): void => {
-      if (!runId || !context.sessionKey) {
+    const scheduleChatHistoryFallback = (providerRunId: string, context: OpenClawChatRunIdentity, attempt = 0): void => {
+      if (!providerRunId || !context.sessionKey) {
         return;
       }
-      clearChatFallback(runId);
-      chatRunContexts.set(runId, context);
+      clearChatFallback(providerRunId);
+      chatRunContexts.set(providerRunId, context);
       const timer = setTimeout(() => {
         if (!gatewayClient) {
-          chatFallbacks.delete(runId);
+          chatFallbacks.delete(providerRunId);
           return;
         }
         const fetchHistory = () =>
@@ -209,19 +217,19 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           .then(async (history) => {
             const outcome = extractHistoryOutcome(history, context);
             if (!outcome && attempt < CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS) {
-              scheduleChatHistoryFallback(runId, context, attempt + 1);
+              scheduleChatHistoryFallback(providerRunId, context, attempt + 1);
               return;
             }
             if (!outcome) {
-              chatFallbacks.delete(runId);
-              chatRunContexts.delete(runId);
+              chatFallbacks.delete(providerRunId);
+              chatRunContexts.delete(providerRunId);
               return;
             }
-            clearChatFallback(runId);
-            chatRunContexts.delete(runId);
+            clearChatFallback(providerRunId);
+            chatRunContexts.delete(providerRunId);
             if (outcome.kind === "final") {
               const basePayload = buildMobileAssistantFinalPayload({
-                run: { runId, sessionKey: context.sessionKey },
+                run: { runId: context.canonicalRunId, sessionKey: context.sessionKey },
                 text: outcome.text,
                 includeTimelineEvents: true,
               });
@@ -236,7 +244,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             await publishAndSendGatewayEvent(
               "chat",
               buildMobileAssistantErrorPayload({
-                run: { runId, sessionKey: context.sessionKey },
+                run: { runId: context.canonicalRunId, sessionKey: context.sessionKey },
                 errorMessage: outcome.errorMessage,
                 includeTimelineEvents: true,
               }),
@@ -245,16 +253,16 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           })
           .catch((err) => {
             if (attempt < CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS) {
-              scheduleChatHistoryFallback(runId, context, attempt + 1);
+              scheduleChatHistoryFallback(providerRunId, context, attempt + 1);
               return;
             }
-            console.warn(`[relay] chat history fallback failed runId=${runId}: ${String(err)}`);
-            chatFallbacks.delete(runId);
-            chatRunContexts.delete(runId);
+            console.warn(`[relay] chat history fallback failed runId=${providerRunId}: ${String(err)}`);
+            chatFallbacks.delete(providerRunId);
+            chatRunContexts.delete(providerRunId);
           });
       }, attempt === 0 ? CHAT_HISTORY_FALLBACK_INITIAL_DELAY_MS : CHAT_HISTORY_FALLBACK_RETRY_DELAY_MS);
       timer.unref?.();
-      chatFallbacks.set(runId, timer);
+      chatFallbacks.set(providerRunId, timer);
     };
 
     const refreshSessionDefaults = async (): Promise<void> => {
@@ -380,31 +388,45 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           if (event === "chat") {
             const p = normalizedPayload as { sessionKey?: string; runId?: string };
             const state = normalizeChatState(normalizedPayload);
-            const runId = typeof p?.runId === "string" ? p.runId : "";
+            const providerRunId = typeof p?.runId === "string" ? p.runId.trim() : "";
             const sessionKey = typeof p?.sessionKey === "string" && p.sessionKey.trim().length > 0 ? p.sessionKey.trim() : undefined;
-            const runContext = runId ? chatRunContexts.get(runId) : undefined;
+            const explicitCanonicalRunId = resolveExplicitMobileRunIdFromChatPayload(normalizedPayload);
+            let runContext = providerRunId
+              ? chatRunContexts.get(providerRunId) ?? openClawChatRunIdentities.resolve(opts.gatewayId, providerRunId)
+              : undefined;
+            if (!runContext && providerRunId && explicitCanonicalRunId && sessionKey) {
+              runContext = {
+                gatewayId: opts.gatewayId,
+                providerRunId,
+                canonicalRunId: explicitCanonicalRunId,
+                sessionKey,
+              };
+              openClawChatRunIdentities.register(runContext);
+              chatRunContexts.set(providerRunId, runContext);
+            }
+            const canonicalRunId = runContext?.canonicalRunId ?? explicitCanonicalRunId ?? providerRunId;
             const resolvedSessionKey = sessionKey ?? runContext?.sessionKey;
             const currentText = extractChatText(normalizedPayload);
             const role = extractChatRole(normalizedPayload);
             let realtimePayload = normalizedPayload;
 
-            if (runId) {
+            if (providerRunId) {
               if (state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted") {
-                chatSendDedupe.scheduleForRun(runId, 100);
+                chatSendDedupe.scheduleForRun(providerRunId, 100);
               }
               if (role === "assistant" && (state === "delta" || state === "final" || state === "error" || state === "failed" || state === "fail")) {
-                clearChatFallback(runId);
+                clearChatFallback(providerRunId);
               }
               if (state === "delta" || state === "streaming" || state === "in_progress") {
-                const previousText = chatBuffers.get(runId) ?? "";
+                const previousText = chatBuffers.get(providerRunId) ?? "";
                 const bufferedText = appendUniqueSuffix(previousText, currentText);
-                chatBuffers.set(runId, bufferedText);
+                chatBuffers.set(providerRunId, bufferedText);
                 if (role === "assistant" && bufferedText.trim()) {
                   realtimePayload = resolvedSessionKey
                     ? mergeCanonicalChatPayload(
                         normalizedPayload,
                         buildMobileAssistantDeltaPayload({
-                          run: { runId, sessionKey: resolvedSessionKey },
+                          run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
                           seq: resolveChatPayloadSeq(normalizedPayload),
                           timestampMs: resolveChatPayloadTimestamp(normalizedPayload),
                           delta: bufferedText,
@@ -414,12 +436,12 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     : withMessageText(normalizedPayload, bufferedText);
                 }
               } else if (state === "error" || state === "failed" || state === "fail" || state === "aborted") {
-                chatBuffers.delete(runId);
+                chatBuffers.delete(providerRunId);
                 if (role === "assistant" && resolvedSessionKey) {
                   realtimePayload = mergeCanonicalChatPayload(
                     normalizedPayload,
                     buildMobileAssistantErrorPayload({
-                      run: { runId, sessionKey: resolvedSessionKey },
+                      run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
                       errorMessage: extractChatErrorMessage(normalizedPayload),
                       includeTimelineEvents: true,
                     }),
@@ -430,20 +452,20 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
             if (state === "final" && resolvedSessionKey) {
               scheduleContextUsageRefresh(resolvedSessionKey, 450);
-              const bufferedText = runId ? chatBuffers.get(runId) ?? "" : "";
+              const bufferedText = providerRunId ? chatBuffers.get(providerRunId) ?? "" : "";
               const resolvedText = currentText || bufferedText;
-              if (runId) {
-                chatBuffers.delete(runId);
+              if (providerRunId) {
+                chatBuffers.delete(providerRunId);
               }
               if (resolvedText.trim()) {
-                if (runId) {
-                  chatRunContexts.delete(runId);
+                if (providerRunId) {
+                  chatRunContexts.delete(providerRunId);
                 }
-                const outgoingPayload = runId
+                const outgoingPayload = providerRunId
                   ? mergeCanonicalChatPayload(
                       normalizedPayload,
                       buildMobileAssistantFinalPayload({
-                        run: { runId, sessionKey: resolvedSessionKey },
+                        run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
                         text: resolvedText,
                         contentBlocks: nonTextContentBlocks(normalizedPayload),
                         includeTimelineEvents: true,
@@ -466,13 +488,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     const retryHistory = await withTimeout(fetchHistory(), CHAT_HISTORY_FETCH_TIMEOUT_MS, "chat.history retry");
                     outcome = runContext ? extractHistoryOutcome(retryHistory, runContext) : null;
                   }
-                  if (runId && outcome) {
-                    chatRunContexts.delete(runId);
+                  if (providerRunId && outcome) {
+                    chatRunContexts.delete(providerRunId);
                   }
                   if (outcome?.kind === "final") {
-                    const basePayload = runId
+                    const basePayload = providerRunId
                       ? buildMobileAssistantFinalPayload({
-                          run: { runId, sessionKey: resolvedSessionKey },
+                          run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
                           text: outcome.text,
                           contentBlocks: nonTextContentBlocksFromHistory(outcome.message),
                           includeTimelineEvents: true,
@@ -484,11 +506,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     return;
                   }
                   if (outcome?.kind === "error") {
-                    const outgoingPayload = runId
+                    const outgoingPayload = providerRunId
                       ? mergeCanonicalChatPayload(
                           normalizedPayload,
                           buildMobileAssistantErrorPayload({
-                            run: { runId, sessionKey: resolvedSessionKey },
+                            run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
                             errorMessage: outcome.errorMessage,
                             includeTimelineEvents: true,
                           }),
@@ -501,16 +523,16 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice);
                     return;
                   }
-                  if (runId && runContext) {
-                    scheduleChatHistoryFallback(runId, runContext, 0);
+                  if (providerRunId && runContext) {
+                    scheduleChatHistoryFallback(providerRunId, runContext, 0);
                     return;
                   }
                   await publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice);
                 })
                 .catch((err) => {
                   console.error(`[relay] chat.history fetch failed: ${err}`);
-                  if (runId && runContext) {
-                    scheduleChatHistoryFallback(runId, runContext, 0);
+                  if (providerRunId && runContext) {
+                    scheduleChatHistoryFallback(providerRunId, runContext, 0);
                     return;
                   }
                   void publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice);
@@ -518,8 +540,8 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               return;
             }
 
-            if (runId && (state === "error" || state === "failed" || state === "fail" || state === "aborted")) {
-              chatRunContexts.delete(runId);
+            if (providerRunId && (state === "error" || state === "failed" || state === "fail" || state === "aborted")) {
+              chatRunContexts.delete(providerRunId);
               scheduleContextUsageRefresh(p?.sessionKey, 450);
             }
             void publishAndSendGatewayEvent(event, realtimePayload, shouldPublishOffice);
@@ -633,56 +655,98 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             relaySecret: opts.relaySecret,
           })
           : rawCommandParams;
-        const params = canonicalizeRelayParams(commandMethod, preparedParams, sessionDefaults);
+        const providerIdentifiedParams = restoreOpenClawProviderRunIdForCommand(
+          commandMethod,
+          preparedParams,
+          opts.gatewayId,
+          openClawChatRunIdentities,
+        );
+        const params = canonicalizeRelayParams(commandMethod, providerIdentifiedParams, sessionDefaults);
         if (!gatewayClient && commandMethod !== "chat.history") {
           throw new Error("gateway not connected");
         }
+        const paramsRecord = params && typeof params === "object" && !Array.isArray(params)
+          ? params as Record<string, unknown>
+          : undefined;
+        const registerIdentity = (result: unknown): OpenClawChatRunIdentity | undefined => {
+          const resultRecord = result && typeof result === "object" && !Array.isArray(result)
+            ? result as Record<string, unknown>
+            : undefined;
+          const providerRunId =
+            typeof resultRecord?.runId === "string" && resultRecord.runId.trim().length > 0
+              ? resultRecord.runId.trim()
+              : requestId;
+          const canonicalRunId = commandMethod === "chat.send"
+            ? normalizeOpenClawMobileRunId(paramsRecord?.idempotencyKey)
+              ?? normalizeOpenClawMobileRunId(voiceInputRun?.runId)
+              ?? providerRunId
+            : providerRunId;
+          if ((commandMethod !== "chat.send" && commandMethod !== "agent") || !providerRunId || !canonicalRunId) {
+            return undefined;
+          }
+          const identity: OpenClawChatRunIdentity = {
+            gatewayId: opts.gatewayId,
+            providerRunId,
+            canonicalRunId,
+            sessionKey: typeof paramsRecord?.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
+              ? paramsRecord.sessionKey.trim()
+              : sessionDefaults.mainSessionKey,
+            promptText: typeof paramsRecord?.message === "string" && paramsRecord.message.trim().length > 0
+              ? paramsRecord.message.trim()
+              : undefined,
+          };
+          openClawChatRunIdentities.register(identity);
+          chatRunContexts.set(identity.providerRunId, identity);
+          return identity;
+        };
+        let identity: OpenClawChatRunIdentity | undefined;
         const result = commandMethod === "chat.history"
           ? await requestChatHistoryFromClawConnect(params)
-          : await gatewayClient!.request(commandMethod, params);
-        return { params, result };
+          : await gatewayClient!.request(commandMethod, params, {
+              // response 帧内同步登记，保证紧随其后的首个 delta 已能解析 canonical 身份。
+              onResponse: (response) => {
+                identity = registerIdentity(response);
+              },
+            });
+        identity ??= registerIdentity(result);
+        return { params, result, identity };
       };
       const commandExecution = chatSendIdempotencyRequest
         ? openClawChatSendIdempotency.execute(chatSendIdempotencyRequest, executeCommand)
         : { status: "started" as const, promise: executeCommand() };
 
       commandExecution.promise
-        .then(async ({ params, result }) => {
+        .then(async ({ params, result, identity }) => {
+          const paramsRecord =
+            params && typeof params === "object" && !Array.isArray(params)
+              ? (params as Record<string, unknown>)
+              : undefined;
+          const resultRecord = result && typeof result === "object" && !Array.isArray(result)
+            ? (result as Record<string, unknown>)
+            : undefined;
+          const providerRunId =
+            typeof resultRecord?.runId === "string" && resultRecord.runId.trim().length > 0
+              ? resultRecord.runId.trim()
+              : requestId;
+          const canonicalRunId = commandMethod === "chat.send"
+            ? normalizeOpenClawMobileRunId(paramsRecord?.idempotencyKey)
+              ?? normalizeOpenClawMobileRunId(voiceInputRun?.runId)
+              ?? providerRunId
+            : providerRunId;
           if (commandExecution.status === "started") {
-            const paramsRecord =
-              params && typeof params === "object" && !Array.isArray(params)
-                ? (params as Record<string, unknown>)
-                : undefined;
             const chatSendDedupeRequest = commandMethod === "chat.send"
               ? chatSendDedupe.buildRequest(paramsRecord)
               : undefined;
             if ((commandMethod === "chat.send" || commandMethod === "agent") && params && typeof params === "object" && !Array.isArray(params)) {
-              const paramsRecord = params as Record<string, unknown>;
               const sessionKey =
-                typeof paramsRecord.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
+                typeof paramsRecord?.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
                   ? paramsRecord.sessionKey.trim()
                   : sessionDefaults.mainSessionKey;
-              const resultRecord = result && typeof result === "object" && !Array.isArray(result)
-                ? (result as Record<string, unknown>)
-                : undefined;
-              const runId =
-                typeof resultRecord?.runId === "string" && resultRecord.runId.trim().length > 0
-                  ? resultRecord.runId.trim()
-                  : requestId;
-              if (runId) {
-                const promptText =
-                  typeof paramsRecord.message === "string" && paramsRecord.message.trim().length > 0
-                    ? paramsRecord.message.trim()
-                    : undefined;
-                const runContext = {
-                  sessionKey,
-                  requestedAtMs: Date.now(),
-                  promptText,
-                };
-                scheduleChatHistoryFallback(runId, runContext);
+              if (providerRunId && identity) {
+                scheduleChatHistoryFallback(providerRunId, identity);
               }
               if (commandMethod === "chat.send" && chatSendDedupeRequest) {
-                chatSendDedupe.register(chatSendDedupeRequest, runId);
+                chatSendDedupe.register(chatSendDedupeRequest, providerRunId);
               }
               // Let a model switch settle before publishing context usage again.
               // Forced refreshes can replay a stale model snapshot and overwrite the new selection.
@@ -690,7 +754,10 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             }
           }
           if (requestId) {
-            const responsePayload = await relayOutgoingMediaForResponse(commandMethod, result);
+            const externallyIdentifiedResult = commandMethod === "chat.send" && canonicalRunId
+              ? canonicalizeOpenClawChatSendResult(result, canonicalRunId)
+              : result;
+            const responsePayload = await relayOutgoingMediaForResponse(commandMethod, externallyIdentifiedResult);
             send({ type: "res", id: requestId, ok: true, payload: responsePayload });
           }
         })

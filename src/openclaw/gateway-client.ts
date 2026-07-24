@@ -146,7 +146,11 @@ export interface GatewayClientOptions {
 
 export class OpenClawGatewayClient {
   private ws: WebSocket | null = null;
-  private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
+  private pending = new Map<string, {
+    resolve: (v: unknown) => void;
+    reject: (e: unknown) => void;
+    onResponse?: (value: unknown) => void;
+  }>();
   private backoffMs = 1000;
   private stopped = false;
   private connectNonce: string | null = null;
@@ -207,14 +211,22 @@ export class OpenClawGatewayClient {
     this.ws.send(JSON.stringify(frame));
   }
 
-  async request<T = unknown>(method: string, params?: unknown): Promise<T> {
+  async request<T = unknown>(
+    method: string,
+    params?: unknown,
+    options?: { onResponse?: (value: T) => void },
+  ): Promise<T> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error("gateway not connected");
     }
     const id = randomUUID();
     const frame: ReqFrame = { type: "req", id, method, params };
     const p = new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: (v) => resolve(v as T), reject });
+      this.pending.set(id, {
+        resolve: (v) => resolve(v as T),
+        reject,
+        ...(options?.onResponse ? { onResponse: (value) => options.onResponse?.(value as T) } : {}),
+      });
     });
     this.ws.send(JSON.stringify(frame));
     return p;
@@ -326,8 +338,15 @@ export class OpenClawGatewayClient {
       const pending = this.pending.get(res.id);
       if (!pending) return;
       this.pending.delete(res.id);
-      if (res.ok) pending.resolve(res.payload);
-      else pending.reject(new Error(res.error?.message ?? "gateway error"));
+      if (res.ok) {
+        try {
+          // response hook 必须先于 Promise continuation；Gateway 可能紧接 response 帧发送首个事件。
+          pending.onResponse?.(res.payload);
+          pending.resolve(res.payload);
+        } catch (error) {
+          pending.reject(error);
+        }
+      } else pending.reject(new Error(res.error?.message ?? "gateway error"));
       return;
     }
 

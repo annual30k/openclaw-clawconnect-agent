@@ -27,6 +27,7 @@ export type HistoryMessage = {
   parentId?: string;
   turnId?: string;
   runId?: string;
+  messageId?: string;
 };
 
 export type HistoryContentBlock = Record<string, unknown> & {
@@ -51,7 +52,7 @@ export type ChatHistoryOutcome =
 
 export type ChatRunContext = {
   sessionKey: string;
-  requestedAtMs: number;
+  canonicalRunId: string;
   promptText?: string;
 };
 
@@ -386,6 +387,7 @@ function parseTranscriptHistoryLine(line: string, seq: number): HistoryMessage |
  */
 function restoreTranscriptTurnLineage(messages: HistoryMessage[]): void {
   const byId = new Map<string, HistoryMessage>();
+  const lastAssistantByMobileTurn = new Map<string, HistoryMessage>();
   for (const message of messages) {
     const id = cleanHistoryString(message.id);
     if (id) byId.set(id, message);
@@ -402,17 +404,30 @@ function restoreTranscriptTurnLineage(messages: HistoryMessage[]): void {
       const parent = byId.get(parentId);
       if (!parent) break;
       if (parent.role === "user") {
-        const turnId = normalizeTranscriptTurnId(parent.idempotencyKey)
-          ?? cleanHistoryString(parent.clientMessageId)
+        const mobileTurnId = normalizeTranscriptTurnId(parent.idempotencyKey)
+          ?? normalizeTranscriptTurnId(parent.clientMessageId);
+        const turnId = mobileTurnId
           ?? cleanHistoryString(parent.id);
         if (turnId) {
           message.turnId = turnId;
           message.runId = turnId;
         }
+        if (mobileTurnId) {
+          message.idempotencyKey = mobileTurnId;
+          if (message.role === "assistant") {
+            lastAssistantByMobileTurn.set(mobileTurnId, message);
+          }
+        }
         break;
       }
       parentId = cleanHistoryString(parent.parentId);
     }
+  }
+
+  // 一个 OpenClaw turn 可能包含若干工具中间消息；只有最后一个 assistant 输出
+  // 与实时 final 共用 canonical messageId，其他中间消息继续保留 transcript 身份。
+  for (const [turnId, message] of lastAssistantByMobileTurn.entries()) {
+    message.messageId = `assistant-${turnId}`;
   }
 }
 
@@ -821,27 +836,26 @@ function isToolOnlyHistoryBlockType(type: string): boolean {
 }
 
 function findHistoryUserIndex(messages: HistoryMessage[], context: ChatRunContext): number {
-  const normalizedPrompt = context.promptText?.trim();
-  const notBeforeMs = context.requestedAtMs - 1_000;
+  const canonicalRunId = normalizeTranscriptTurnId(context.canonicalRunId);
+  if (!canonicalRunId) {
+    return -1;
+  }
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (message.role !== "user") {
       continue;
     }
-    const timestamp = typeof message.timestamp === "number" ? message.timestamp : Number.NaN;
-    if (Number.isFinite(timestamp) && timestamp < notBeforeMs) {
-      continue;
-    }
-    const text = extractHistoryMessageText(message);
-    if (!normalizedPrompt || historyUserTextMatches(text, normalizedPrompt)) {
+    const stableIds = [
+      message.idempotencyKey,
+      message.clientMessageId,
+      message.turnId,
+      message.runId,
+    ].map(normalizeTranscriptTurnId);
+    if (stableIds.includes(canonicalRunId)) {
       return index;
     }
   }
 
   return -1;
-}
-
-function historyUserTextMatches(text: string, normalizedPrompt: string): boolean {
-  return text === normalizedPrompt || text.endsWith(normalizedPrompt);
 }

@@ -53,6 +53,7 @@ import {
 } from "./hermes-runtime-slash-command.js";
 
 export { selectHermesSessionForCompletedChat } from "./hermes-runtime-history-completion.js";
+export { latestTerminalAssistantReplyFromHermesExport } from "./hermes-runtime-history-completion.js";
 export { parseHermesToolLogLine } from "./hermes-runtime-tool-log-watcher.js";
 export { isHermesSlashCommandMessage } from "./hermes-runtime-slash-command.js";
 

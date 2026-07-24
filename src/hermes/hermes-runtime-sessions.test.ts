@@ -327,6 +327,16 @@ test("runHermesChat uses the Hermes API server stream instead of spawning the CL
         res.write(`data: ${JSON.stringify({ delta: "api " })}\n\n`);
         res.write("event: assistant.delta\n");
         res.write(`data: ${JSON.stringify({ delta: "reply" })}\n\n`);
+        res.write("event: tool.progress\n");
+        res.write(`data: ${JSON.stringify({ tool_name: "_thinking", delta: "private reasoning" })}\n\n`);
+        res.write("event: tool.started\n");
+        res.write(`data: ${JSON.stringify({ tool_call_id: "call-api-weather", tool_name: "weather", preview: "Fuzhou" })}\n\n`);
+        res.write("event: tool.progress\n");
+        res.write(`data: ${JSON.stringify({ tool_call_id: "call-api-weather", tool_name: "weather", delta: "fetching" })}\n\n`);
+        res.write("event: tool.completed\n");
+        res.write(`data: ${JSON.stringify({ tool_call_id: "call-api-weather", tool_name: "weather" })}\n\n`);
+        res.write("event: tool.started\n");
+        res.write(`data: ${JSON.stringify({ tool_name: "legacy_terminal", preview: "cleanup on run terminal" })}\n\n`);
         res.write("event: assistant.completed\n");
         res.write(`data: ${JSON.stringify({ session_id: hermesSessionId, content: "api reply" })}\n\n`);
         res.write("event: run.completed\n");
@@ -383,6 +393,18 @@ test("runHermesChat uses the Hermes API server stream instead of spawning the CL
     assert.equal(apiRequests.some((request) => request.url === `/api/sessions/${hermesSessionId}/chat/stream`), true);
     assert.equal(JSON.stringify(publishedEvents).includes("api "), true);
     assert.deepEqual(assistantTimelineDeltaTexts(publishedEvents), ["api ", "api reply"]);
+    const toolEvents = toolTimelineEvents(publishedEvents);
+    assert.deepEqual(
+      toolEvents.map((event) => [event.toolInvocationId, event.messageId, event.toolState]),
+      [
+        ["call-api-weather", "tool-call-api-weather", "streaming_output"],
+        ["call-api-weather", "tool-call-api-weather", "streaming_output"],
+        ["call-api-weather", "tool-call-api-weather", "success"],
+        ["run-api:hermes-api-tool-1", "tool-run-api:hermes-api-tool-1", "streaming_output"],
+        ["run-api:hermes-api-tool-1", "tool-run-api:hermes-api-tool-1", "success"],
+      ],
+    );
+    assert.equal(JSON.stringify(toolEvents).includes("_thinking"), false);
     const stored = await listStoredHermesSessions();
     assert.equal(stored[0]?.sessionKey, "mobile-main");
     assert.equal(stored[0]?.hermesSessionId, hermesSessionId);
@@ -1005,7 +1027,7 @@ test("runHermesChat never publishes unstructured CLI stdout as assistant deltas"
       },
     );
 
-    await waitForFile(join(root, "partial-started"), 1000);
+    await waitForFile(join(root, "partial-started"), 3000);
     const result = await chatPromise;
 
     assert.match(result.output, /partial reply/);
@@ -1034,6 +1056,22 @@ function assistantTimelineDeltaTexts(events: unknown[]): string[] {
     }
   }
   return texts;
+}
+
+function toolTimelineEvents(events: unknown[]): Array<Record<string, unknown>> {
+  const toolEvents: Array<Record<string, unknown>> = [];
+  for (const event of events) {
+    if (!isRecord(event) || event.type !== "event" || event.event !== "chat" || !isRecord(event.payload)) {
+      continue;
+    }
+    const timelineEvents = Array.isArray(event.payload.timelineEvents) ? event.payload.timelineEvents : [];
+    for (const timelineEvent of timelineEvents) {
+      if (isRecord(timelineEvent) && timelineEvent.eventType === "tool.invocation.updated") {
+        toolEvents.push(timelineEvent);
+      }
+    }
+  }
+  return toolEvents;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

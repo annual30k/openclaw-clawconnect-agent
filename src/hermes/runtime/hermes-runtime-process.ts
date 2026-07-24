@@ -24,6 +24,8 @@ export const HERMES_AGENT_LOG_FILE = join(HERMES_LOG_DIR, "agent.log");
 export const HERMES_MODELS_DEV_CACHE_FILE = join(HERMES_HOME_DIR, "models_dev_cache.json");
 export const DEFAULT_TIMEOUT_MS = 120_000;
 export const CHAT_TIMEOUT_MS = 30 * 60_000;
+const HERMES_EXEC_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+const HERMES_ERROR_OUTPUT_LIMIT_BYTES = 16 * 1024;
 export const HERMES_TYPING_MARKER = "[[clawlink:typing]]";
 export const CLAWCONNECT_MOBILE_BRIDGE_HINT = [
   "[ClawConnect mobile bridge]",
@@ -149,6 +151,8 @@ export async function runHermesAsync(
     encoding: "utf8",
     env,
     timeout: timeoutMs,
+    maxBuffer: HERMES_EXEC_MAX_BUFFER_BYTES,
+    windowsHide: true,
   });
   return stdout;
 }
@@ -216,9 +220,18 @@ export function stripAnsi(text: string): string {
 
 export function errorMessageWithOutput(error: unknown): string {
   const err = error as { stdout?: Buffer | string; stderr?: Buffer | string; message?: string };
-  const stdout = err.stdout?.toString().trim() ?? "";
-  const stderr = err.stderr?.toString().trim() ?? "";
+  const stdout = boundedHermesErrorOutput(err.stdout);
+  const stderr = boundedHermesErrorOutput(err.stderr);
   return [stdout, stderr, err.message].filter(Boolean).join("\n") || String(error);
+}
+
+function boundedHermesErrorOutput(value: Buffer | string | undefined): string {
+  const output = value?.toString().trim() ?? "";
+  if (Buffer.byteLength(output, "utf8") <= HERMES_ERROR_OUTPUT_LIMIT_BYTES) {
+    return output;
+  }
+  const suffix = Buffer.from(output, "utf8").subarray(-HERMES_ERROR_OUTPUT_LIMIT_BYTES).toString("utf8");
+  return `[Hermes output truncated to last ${HERMES_ERROR_OUTPUT_LIMIT_BYTES} bytes]\n${suffix}`;
 }
 
 export function isHermesMissingSessionError(error: unknown): boolean {

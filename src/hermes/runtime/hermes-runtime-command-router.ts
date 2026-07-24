@@ -1,6 +1,6 @@
 
 import type { LocalCommandContext, LocalResult } from "../../core/command-types.js";
-import { runHermesOutput } from "./hermes-runtime-command-utils.js";
+import { runHermesOutput, runHermesOutputAsync } from "./hermes-runtime-command-utils.js";
 import {
   runHermesBackupCreate,
   runHermesBackupDelete,
@@ -47,7 +47,10 @@ export function handleHermesCommand(
     case "chat.history":
       return runHermesChatHistory(params);
     case "hermes.status":
-      return runHermesOutput(["status"]);
+      // Readiness shares this Node event loop with the Relay WebSocket. Keep the
+      // CLI probe asynchronous so a slow Hermes status command cannot starve
+      // heartbeats or unrelated chat commands.
+      return runHermesOutputAsync(["status"], 12_000);
     case "hermes.logs":
       return runHermesLogs(params);
     case "hermes.sessions.list":

@@ -165,10 +165,43 @@ test("builds explicit tool invocation lifecycle events", () => {
 
   assert.equal(event.eventType, "tool.invocation.updated");
   assert.equal(event.role, "tool");
+  assert.equal(event.messageId, "tool-tool_123");
   assert.equal(event.toolInvocationId, "tool_123");
   assert.equal(event.toolState, "pending_approval");
   assert.equal(event.partId, "part-tool-1");
   assert.deepEqual(event.content, [{ type: "tool_call", toolName: "shell", input: "pwd" }]);
+});
+
+test("uses the invocation id as the tool message identity within a multi-tool turn", () => {
+  const firstStarted = buildToolInvocationUpdatedEvent({
+    ...base,
+    turnId: "shared-turn",
+    runId: "shared-run",
+    toolInvocationId: "call-1",
+    toolState: "running",
+    content: [{ type: "tool_call", toolName: "shell", text: "first" }],
+  });
+  const firstCompleted = buildToolInvocationUpdatedEvent({
+    ...base,
+    turnId: "shared-turn",
+    runId: "shared-run",
+    toolInvocationId: "call-1",
+    toolState: "success",
+    content: [{ type: "tool_result", toolName: "shell", text: "done" }],
+  });
+  const secondStarted = buildToolInvocationUpdatedEvent({
+    ...base,
+    turnId: "shared-turn",
+    runId: "shared-run",
+    toolInvocationId: "call-2",
+    toolState: "running",
+    content: [{ type: "tool_call", toolName: "shell", text: "second" }],
+  });
+
+  assert.equal(firstStarted.messageId, "tool-call-1");
+  assert.equal(firstCompleted.messageId, firstStarted.messageId);
+  assert.equal(secondStarted.messageId, "tool-call-2");
+  assert.notEqual(secondStarted.messageId, firstStarted.messageId);
 });
 
 test("builds canonical history snapshot pages", () => {

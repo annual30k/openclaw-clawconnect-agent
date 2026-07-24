@@ -17,6 +17,7 @@ export {
   isHermesSlashCommandMessage,
   parseHermesToolLogLine,
   runHermesChat,
+  latestTerminalAssistantReplyFromHermesExport,
   selectHermesSessionForCompletedChat,
 } from "./runtime/hermes-runtime-chat.js";
 export { runHermesChatHistory } from "./runtime/hermes-runtime-history.js";

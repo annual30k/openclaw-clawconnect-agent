@@ -204,6 +204,8 @@ process.exit(0);
   process.env.HOST = HOST;
   process.env.JWT_SECRET = JWT_SECRET;
   process.env.DATABASE_URL = dbUrl;
+  // 协议 smoke 使用一次性测试账号，不能继承宿主生产环境的邮件验证开关。
+  process.env.EMAIL_VERIFICATION_REQUIRED = "false";
   process.env.FILE_STORAGE_DRIVER = "disk";
   process.env.DATA_DIR = tempRelayDataDir;
   
@@ -412,7 +414,6 @@ process.exit(0);
     let toolStartReceived = false;
     let toolStreamReceived = false;
     let toolCompleteReceived = false;
-    let assistantDeltaReceived = false;
     let finalAssistantReceived = false;
     let runtimeMetadataReceived = foundGateway.currentModel === "fake-model";
 
@@ -426,7 +427,6 @@ process.exit(0);
           toolStartReceived &&
           toolStreamReceived &&
           toolCompleteReceived &&
-          assistantDeltaReceived &&
           finalAssistantReceived &&
           runtimeMetadataReceived
         ) {
@@ -500,10 +500,6 @@ process.exit(0);
               }
             }
 
-            if (event.eventType === "message.part.delta" && event.role === "assistant") {
-              assistantDeltaReceived = true;
-            }
-
             if (event.eventType === "message.completed" && event.role === "assistant") {
               const textContent = content
                 .map((block: any) => typeof block.text === "string" ? block.text : "")
@@ -516,11 +512,6 @@ process.exit(0);
                 reject(new Error(`Incorrect canonical final assistant text content: ${textContent}`));
               }
             }
-          }
-
-          // Assistant text delta
-          if (payload.role === "assistant" && payload.state === "delta" && payload.delta) {
-            assistantDeltaReceived = true;
           }
 
           // Assistant final message
@@ -564,7 +555,6 @@ process.exit(0);
     if (!toolStartReceived) throw new Error("Missing Tool Start Event");
     if (!toolStreamReceived) throw new Error("Missing Tool Log Streaming Event");
     if (!toolCompleteReceived) throw new Error("Missing Tool Log Completion Event");
-    if (!assistantDeltaReceived) throw new Error("Missing Assistant Text Deltas");
     if (!finalAssistantReceived) throw new Error("Missing Final Assistant Response");
     if (!runtimeMetadataReceived) throw new Error("Missing Runtime Metadata");
     

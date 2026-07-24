@@ -118,7 +118,10 @@ export function selectOpenclawBinCandidate(
   const exists = options.exists ?? existsSync;
   const canRun = options.canRun ?? canRunOpenclawBin;
   const explicitBin = options.explicitBin?.trim();
-  if (explicitBin && exists(explicitBin) && canRun(explicitBin)) {
+  // OPENCLAW_BIN 是运维侧的权威选择。高负载下 `--version` 探测可能瞬时超时；
+  // 若因此静默回退到 PATH 中另一套 OpenClaw，会对错误的 runtime 执行 start/restart。
+  // 显式路径只校验存在性，真实执行失败应原样暴露，不能换目标。
+  if (explicitBin && exists(explicitBin)) {
     return explicitBin;
   }
 

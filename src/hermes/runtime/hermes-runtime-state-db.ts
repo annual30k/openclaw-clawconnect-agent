@@ -12,6 +12,16 @@ import { stringValue, toRecord } from "./hermes-runtime-values.js";
 const execFile = promisify(execFileCb);
 const HERMES_STATE_DB_QUERY_TIMEOUT_MS = 5_000;
 const HERMES_STATE_DB_LIST_LIMIT = 200;
+const HERMES_STATE_DB_QUERY_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+
+export type HermesStateDbHistoryPage = {
+  sessionId: string;
+  messages: Array<Record<string, unknown>>;
+  contextUser?: Record<string, unknown>;
+  hasMore: boolean;
+  nextCursor?: string;
+  newestCursor?: string;
+};
 
 const HERMES_STATE_DB_SCRIPT = String.raw`
 import datetime
@@ -105,6 +115,87 @@ try:
                 messages.append(item)
             data["messages"] = messages
             print(json.dumps({"ok": True, "payload": data}, ensure_ascii=False))
+    elif mode == "history_page":
+        session_id = sys.argv[3]
+        limit = max(1, int(sys.argv[4]))
+        cursor = int(sys.argv[5]) if sys.argv[5] else None
+        direction = "newer" if sys.argv[6] == "newer" else "older"
+        session = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if session is None:
+            print(json.dumps({"ok": True, "payload": {"found": False}}, ensure_ascii=False))
+        else:
+            assistant_terminal = """
+              AND (
+                LOWER(COALESCE(role, '')) != 'assistant'
+                OR (
+                  LOWER(REPLACE(REPLACE(COALESCE(finish_reason, ''), '-', '_'), ' ', '_'))
+                    NOT IN ('tool_calls', 'function_call')
+                  AND (
+                    tool_calls IS NULL
+                    OR LOWER(TRIM(tool_calls)) IN ('', '[]', '{}', 'null')
+                  )
+                )
+              )
+            """
+            if direction == "newer":
+                boundary = cursor if cursor is not None else 0
+                query = """
+                    SELECT * FROM messages
+                    WHERE session_id = ?
+                      AND COALESCE(active, 1) != 0
+                      AND id > ?
+                """ + assistant_terminal + " ORDER BY id ASC LIMIT ?"
+            else:
+                boundary = cursor if cursor is not None else 9223372036854775807
+                query = """
+                    SELECT * FROM messages
+                    WHERE session_id = ?
+                      AND COALESCE(active, 1) != 0
+                      AND id < ?
+                """ + assistant_terminal + " ORDER BY id DESC LIMIT ?"
+            selected = conn.execute(query, (session_id, boundary, limit + 1)).fetchall()
+            has_more = len(selected) > limit
+            selected = selected[:limit]
+            if direction == "older":
+                selected.reverse()
+            messages = []
+            for message in selected:
+                item = row_dict(message)
+                item["id"] = str(item.get("id"))
+                item["seq"] = int(message["id"])
+                item["createdAt"] = to_iso(item.get("timestamp"))
+                messages.append(item)
+            first_id = int(selected[0]["id"]) if selected else None
+            last_id = int(selected[-1]["id"]) if selected else None
+            context_user = None
+            if first_id is not None:
+                row = conn.execute("""
+                    SELECT * FROM messages
+                    WHERE session_id = ?
+                      AND COALESCE(active, 1) != 0
+                      AND role = 'user'
+                      AND id < ?
+                    ORDER BY id DESC LIMIT 1
+                """, (session_id, first_id)).fetchone()
+                if row is not None:
+                    context_user = row_dict(row)
+                    context_user["id"] = str(context_user.get("id"))
+                    context_user["seq"] = int(row["id"])
+                    context_user["createdAt"] = to_iso(context_user.get("timestamp"))
+            payload = {
+                "found": True,
+                "sessionId": session_id,
+                "messages": messages,
+                "contextUser": context_user,
+                "hasMore": has_more,
+                "nextCursor": (
+                    f"seq:{first_id}" if has_more and direction == "older" and first_id is not None
+                    else f"seq:{last_id}" if has_more and direction == "newer" and last_id is not None
+                    else None
+                ),
+                "newestCursor": f"seq:{last_id}" if last_id is not None else None,
+            }
+            print(json.dumps({"ok": True, "payload": payload}, ensure_ascii=False))
     else:
         print(json.dumps({"ok": False, "error": "unsupported mode"}, ensure_ascii=False))
 except Exception as exc:
@@ -147,6 +238,44 @@ export async function exportHermesSessionFromStateDb(sessionId: string): Promise
     : undefined;
 }
 
+export async function queryHermesHistoryPageFromStateDb(params: {
+  sessionId: string;
+  limit: number;
+  cursorSeq?: number;
+  direction: "older" | "newer";
+}): Promise<HermesStateDbHistoryPage | null | undefined> {
+  const sessionId = params.sessionId.trim();
+  if (!sessionId) {
+    return null;
+  }
+  const payload = await runHermesStateDbQuery("history_page", [
+    sessionId,
+    String(Math.max(1, Math.floor(params.limit))),
+    params.cursorSeq === undefined ? "" : String(Math.max(0, Math.floor(params.cursorSeq))),
+    params.direction,
+  ]);
+  const record = toRecord(payload);
+  if (record.found === false) {
+    return null;
+  }
+  if (record.found !== true || !Array.isArray(record.messages)) {
+    return undefined;
+  }
+  return {
+    sessionId: stringValue(record.sessionId) ?? sessionId,
+    messages: record.messages.flatMap((value) => {
+      const message = toRecord(value);
+      return Object.keys(message).length > 0 ? [message] : [];
+    }),
+    ...(Object.keys(toRecord(record.contextUser)).length > 0
+      ? { contextUser: toRecord(record.contextUser) }
+      : {}),
+    hasMore: record.hasMore === true,
+    ...(stringValue(record.nextCursor) ? { nextCursor: stringValue(record.nextCursor) } : {}),
+    ...(stringValue(record.newestCursor) ? { newestCursor: stringValue(record.newestCursor) } : {}),
+  };
+}
+
 export function buildEmptyHermesHistoryExport(sessionIdentity: string | undefined): Record<string, unknown> {
   return {
     sessionId: sessionIdentity?.trim() || "main",
@@ -158,7 +287,7 @@ function resolveHermesStateDbPython(): string {
   return resolveHermesPythonBin();
 }
 
-async function runHermesStateDbQuery(mode: "list" | "export", args: string[]): Promise<unknown | undefined> {
+async function runHermesStateDbQuery(mode: "list" | "export" | "history_page", args: string[]): Promise<unknown | undefined> {
   const dbPath = resolveHermesStateDbPath();
   if (!dbPath || !existsSync(dbPath)) {
     return undefined;
@@ -169,6 +298,8 @@ async function runHermesStateDbQuery(mode: "list" | "export", args: string[]): P
       encoding: "utf8",
       env: { ...SUBPROCESS_ENV, ...process.env },
       timeout: HERMES_STATE_DB_QUERY_TIMEOUT_MS,
+      maxBuffer: HERMES_STATE_DB_QUERY_MAX_BUFFER_BYTES,
+      windowsHide: true,
     });
     const parsed = JSON.parse(stdout.trim()) as { ok?: boolean; payload?: unknown };
     return parsed.ok === true ? parsed.payload : undefined;

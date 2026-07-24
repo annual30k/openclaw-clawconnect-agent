@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 
 import { runRelayManager } from "./relay-manager.js";
+import { openClawChatRunIdentities } from "./relay/chat-run-identity.js";
 
 test("relay manager forwards OpenClaw agent tool events to relay", async () => {
   const relayServer = new WebSocketServer({ port: 0 });
@@ -206,6 +207,369 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
     await manager.catch(() => false);
     await closeServer(relayServer);
     await closeServer(gatewayServer);
+  }
+});
+
+test("relay manager keeps mobile chat identity across provider events and transcript history", async () => {
+  openClawChatRunIdentities.clear();
+  const openclawHome = await createEmptyOpenClawHomeFixture();
+  const previousOpenClawHome = process.env.CLAWCONNECT_OPENCLAW_HOME;
+  process.env.CLAWCONNECT_OPENCLAW_HOME = openclawHome.home;
+  const sessionsDir = join(openclawHome.home, "agents", "main", "sessions");
+  const transcriptPath = join(sessionsDir, "session-identity.jsonl");
+  await writeFile(
+    join(sessionsDir, "sessions.json"),
+    `${JSON.stringify({
+      "agent:main:main": {
+        sessionId: "session-identity",
+        sessionFile: "session-identity.jsonl",
+      },
+    })}\n`,
+    "utf8",
+  );
+  await writeFile(transcriptPath, "", "utf8");
+
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  const gatewayAbortParams: Array<Record<string, unknown>> = [];
+  let relaySocket: WebSocket | undefined;
+  let gatewaySocket: WebSocket | undefined;
+
+  relayServer.on("connection", (socket) => {
+    relaySocket = socket;
+    socket.on("message", (raw) => {
+      relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
+    });
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({
+      type: "event",
+      event: "connect.challenge",
+      payload: { nonce: "nonce-stable-identity" },
+    }));
+    socket.on("message", (raw) => {
+      void (async () => {
+        const message = JSON.parse(raw.toString()) as {
+          type?: string;
+          id?: string;
+          method?: string;
+          params?: Record<string, unknown>;
+        };
+        if (message.type !== "req" || !message.id) {
+          return;
+        }
+        if (message.method === "chat.abort") {
+          gatewayAbortParams.push(message.params ?? {});
+          socket.send(JSON.stringify({ type: "res", id: message.id, ok: true, payload: { aborted: true } }));
+          return;
+        }
+        if (message.method !== "chat.send") {
+          socket.send(JSON.stringify({
+            type: "res",
+            id: message.id,
+            ok: true,
+            payload: sessionDefaultsPayload(),
+          }));
+          return;
+        }
+
+        const mobileRunId = String(message.params?.idempotencyKey);
+        await writeFile(transcriptPath, [
+          JSON.stringify({
+            type: "message",
+            id: "transcript-user-stable",
+            parentId: "previous-assistant",
+            message: {
+              role: "user",
+              content: message.params?.message,
+              idempotencyKey: `${mobileRunId}:user`,
+            },
+          }),
+          JSON.stringify({
+            type: "message",
+            id: "transcript-assistant-stable",
+            parentId: "transcript-user-stable",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "canonical answer" }],
+              stopReason: "stop",
+            },
+          }),
+        ].join("\n") + "\n", "utf8");
+        socket.send(JSON.stringify({
+          type: "res",
+          id: message.id,
+          ok: true,
+          payload: { runId: "provider-run-stable", status: "started" },
+        }));
+        setImmediate(() => {
+          socket.send(JSON.stringify({
+            type: "event",
+            event: "chat",
+            payload: {
+              runId: "provider-run-stable",
+              sessionKey: "agent:main:main",
+              state: "delta",
+              role: "assistant",
+              seq: 1,
+              delta: "canonical ",
+            },
+          }));
+          socket.send(JSON.stringify({
+            type: "event",
+            event: "chat",
+            payload: {
+              runId: "provider-run-stable",
+              sessionKey: "agent:main:main",
+              state: "final",
+              role: "assistant",
+              seq: 2,
+              text: "canonical answer",
+            },
+          }));
+        });
+      })();
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-stable-identity",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+
+  try {
+    await waitFor(() => Boolean(relaySocket) && relayMessages.some((message) => message.type === "gateway_connected"), 4_000);
+    relaySocket?.send(JSON.stringify({
+      type: "cmd",
+      id: "send-stable-identity",
+      method: "chat.send",
+      params: {
+        sessionKey: "agent:main:main",
+        message: "stable prompt",
+        idempotencyKey: "mobile-run-stable",
+      },
+    }));
+
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "send-stable-identity"), 4_000);
+    const sendResponse = relayMessages.find((message) => message.type === "res" && message.id === "send-stable-identity");
+    assert.equal((sendResponse?.payload as Record<string, unknown> | undefined)?.runId, "mobile-run-stable");
+    assert.equal(JSON.stringify(sendResponse?.payload).includes("provider-run-stable"), false);
+
+    await waitFor(() => relayMessages.some((message) => {
+      if (message.type !== "event" || message.event !== "chat" || !isRecord(message.payload)) {
+        return false;
+      }
+      return message.payload.state === "final" && extractPayloadText(message.payload) === "canonical answer";
+    }), 4_000);
+    const livePayloads = relayMessages
+      .filter((message) => message.type === "event" && message.event === "chat" && isRecord(message.payload))
+      .map((message) => message.payload as Record<string, unknown>)
+      .filter((payload) => payload.state === "delta" || payload.state === "final");
+    assert.ok(livePayloads.length >= 2);
+    for (const payload of livePayloads) {
+      assert.equal(payload.runId, "mobile-run-stable");
+      for (const event of timelineEvents(payload)) {
+        assert.equal(event.runId, "mobile-run-stable");
+        assert.equal(event.turnId, "mobile-run-stable");
+        if (event.eventType === "message.part.delta" || event.eventType === "message.completed") {
+          assert.equal(event.messageId, "assistant-mobile-run-stable");
+        }
+      }
+    }
+
+    relaySocket?.send(JSON.stringify({
+      type: "cmd",
+      id: "abort-stable-identity",
+      method: "chat.abort",
+      params: {
+        sessionKey: "agent:main:main",
+        runId: "mobile-run-stable",
+      },
+    }));
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "abort-stable-identity"), 4_000);
+    assert.deepEqual(gatewayAbortParams, [{
+      sessionKey: "agent:main:main",
+      runId: "provider-run-stable",
+    }]);
+
+    relaySocket?.send(JSON.stringify({
+      type: "cmd",
+      id: "history-stable-identity",
+      method: "chat.history",
+      params: { sessionKey: "agent:main:main", limit: 10 },
+    }));
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "history-stable-identity"), 4_000);
+    const historyResponse = relayMessages.find((message) => message.type === "res" && message.id === "history-stable-identity");
+    const historyPayload = historyResponse?.payload as {
+      timelineSnapshot?: { messages?: Array<Record<string, unknown>> };
+    } | undefined;
+    const historyAssistant = historyPayload?.timelineSnapshot?.messages?.find((message) => message.role === "assistant");
+    assert.deepEqual({
+      runId: historyAssistant?.runId,
+      turnId: historyAssistant?.turnId,
+      messageId: historyAssistant?.messageId,
+    }, {
+      runId: "mobile-run-stable",
+      turnId: "mobile-run-stable",
+      messageId: "assistant-mobile-run-stable",
+    });
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+    openClawChatRunIdentities.clear();
+    if (previousOpenClawHome === undefined) {
+      delete process.env.CLAWCONNECT_OPENCLAW_HOME;
+    } else {
+      process.env.CLAWCONNECT_OPENCLAW_HOME = previousOpenClawHome;
+    }
+    await openclawHome.cleanup();
+  }
+});
+
+test("relay manager restores provider to mobile identity after Relay WebSocket reconnect", async () => {
+  openClawChatRunIdentities.clear();
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const relayMessages: Array<Record<string, unknown>> = [];
+  const relaySockets: WebSocket[] = [];
+  const gatewaySockets: WebSocket[] = [];
+  let gatewayConnectionCount = 0;
+
+  relayServer.on("connection", (socket) => {
+    relaySockets.push(socket);
+    socket.on("message", (raw) => {
+      relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
+    });
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySockets.push(socket);
+    gatewayConnectionCount += 1;
+    const connectionNumber = gatewayConnectionCount;
+    socket.send(JSON.stringify({
+      type: "event",
+      event: "connect.challenge",
+      payload: { nonce: `nonce-reconnect-${connectionNumber}` },
+    }));
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as {
+        type?: string;
+        id?: string;
+        method?: string;
+      };
+      if (message.type !== "req" || !message.id) {
+        return;
+      }
+      if (message.method === "chat.send") {
+        socket.send(JSON.stringify({
+          type: "res",
+          id: message.id,
+          ok: true,
+          payload: { runId: "provider-run-reconnect" },
+        }));
+        return;
+      }
+      socket.send(JSON.stringify({
+        type: "res",
+        id: message.id,
+        ok: true,
+        payload: sessionDefaultsPayload(),
+      }));
+      if (message.method === "connect" && connectionNumber === 2) {
+        setImmediate(() => {
+          socket.send(JSON.stringify({
+            type: "event",
+            event: "chat",
+            payload: {
+              runId: "provider-run-reconnect",
+              sessionKey: "agent:main:main",
+              state: "final",
+              role: "assistant",
+              text: "reply after reconnect",
+            },
+          }));
+        });
+      }
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const managerOptions = {
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-identity-reconnect",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+  };
+  const firstAbort = new AbortController();
+  const firstManager = runRelayManager({ ...managerOptions, signal: firstAbort.signal });
+  let secondManager: Promise<boolean> | undefined;
+  let secondAbort: AbortController | undefined;
+
+  try {
+    await waitFor(() => relaySockets.length === 1 && relayMessages.some((message) => message.type === "gateway_connected"), 4_000);
+    relaySockets[0]?.send(JSON.stringify({
+      type: "cmd",
+      id: "send-before-reconnect",
+      method: "chat.send",
+      params: {
+        sessionKey: "agent:main:main",
+        message: "keep identity",
+        idempotencyKey: "mobile-run-reconnect",
+      },
+    }));
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "send-before-reconnect"), 4_000);
+    relaySockets[0]?.close(1012, "test reconnect");
+    await firstManager;
+
+    secondAbort = new AbortController();
+    secondManager = runRelayManager({ ...managerOptions, signal: secondAbort.signal });
+    await waitFor(() => relayMessages.some((message) => {
+      if (message.type !== "event" || message.event !== "chat" || !isRecord(message.payload)) {
+        return false;
+      }
+      return message.payload.state === "final" && extractPayloadText(message.payload) === "reply after reconnect";
+    }), 4_000);
+    const reconnectedPayload = relayMessages
+      .filter((message) => message.type === "event" && message.event === "chat" && isRecord(message.payload))
+      .map((message) => message.payload as Record<string, unknown>)
+      .find((payload) => extractPayloadText(payload) === "reply after reconnect");
+    assert.equal(reconnectedPayload?.runId, "mobile-run-reconnect");
+    const completed = timelineEvents(reconnectedPayload ?? {}).find((event) => event.eventType === "message.completed");
+    assert.deepEqual({
+      runId: completed?.runId,
+      turnId: completed?.turnId,
+      messageId: completed?.messageId,
+    }, {
+      runId: "mobile-run-reconnect",
+      turnId: "mobile-run-reconnect",
+      messageId: "assistant-mobile-run-reconnect",
+    });
+  } finally {
+    firstAbort.abort();
+    secondAbort?.abort();
+    for (const socket of gatewaySockets) {
+      socket.close(1000, "test done");
+    }
+    await firstManager.catch(() => false);
+    await secondManager?.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+    openClawChatRunIdentities.clear();
   }
 });
 

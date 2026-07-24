@@ -10,6 +10,13 @@ import {
   exportHermesSessionFromStateDb,
 } from "./hermes-runtime-state-db.js";
 
+const HERMES_HISTORY_CLI_FALLBACK_TIMEOUT_MS = 12_000;
+
+let activeHistoryCliFallback: {
+  key: string;
+  promise: Promise<LocalResult>;
+} | undefined;
+
 export async function runHermesSessionsList(): Promise<LocalResult> {
   try {
     const sessions = await listHermesSessions();
@@ -60,9 +67,11 @@ export async function runHermesSessionExport(params: unknown): Promise<LocalResu
   const output = stringParam(record, "output", "outputPath");
   const requireResolvedSession = record.requireResolvedSession === true;
   if (sessionId) {
-    const stateDbExport = await exportHermesSessionFromStateDb(sessionId);
-    if (stateDbExport) {
-      return { ok: true, payload: { output: JSON.stringify(stateDbExport) } };
+    if (record.skipStateDb !== true) {
+      const stateDbExport = await exportHermesSessionFromStateDb(sessionId);
+      if (stateDbExport) {
+        return { ok: true, payload: { output: JSON.stringify(stateDbExport) } };
+      }
     }
   } else if (requireResolvedSession) {
     return {
@@ -75,7 +84,10 @@ export async function runHermesSessionExport(params: unknown): Promise<LocalResu
   const args = ["sessions", "export", output ?? "-"];
   if (sessionId) args.push("--session-id", sessionId);
   // chat.history 会和 chat.send 共享同一个 relay manager 事件循环；这里必须异步，避免导出历史时饿死实时消息。
-  const result = await runHermesOutputAsync(args, 10 * 60_000);
+  const runExport = (exportArgs: string[]): Promise<LocalResult> => record.historyFallback === true
+    ? runBoundedHermesHistoryCliFallback(exportArgs, sessionId ?? resolved.sessionKey ?? "latest")
+    : runHermesOutputAsync(exportArgs, 10 * 60_000);
+  const result = await runExport(args);
   if (
     !result.ok
     && resolved.fromMappedSessionKey
@@ -92,12 +104,12 @@ export async function runHermesSessionExport(params: unknown): Promise<LocalResu
         },
       };
     }
-    return await runHermesOutputAsync(["sessions", "export", output ?? "-"], 10 * 60_000);
+    return await runExport(["sessions", "export", output ?? "-"]);
   }
   return result;
 }
 
-async function resolveHermesSessionIdFromParams(record: Record<string, unknown>): Promise<{
+export async function resolveHermesSessionIdFromParams(record: Record<string, unknown>): Promise<{
   sessionId?: string;
   sessionKey?: string;
   fromMappedSessionKey: boolean;
@@ -122,4 +134,31 @@ async function resolveHermesSessionIdFromParams(record: Record<string, unknown>)
     sessionKey,
     fromMappedSessionKey: true,
   };
+}
+
+async function runBoundedHermesHistoryCliFallback(args: string[], key: string): Promise<LocalResult> {
+  const normalizedKey = key.trim() || "latest";
+  if (activeHistoryCliFallback) {
+    if (activeHistoryCliFallback.key === normalizedKey) {
+      return await activeHistoryCliFallback.promise;
+    }
+    return { ok: false, error: "hermes_history_export_busy" };
+  }
+
+  const promise = runHermesOutputAsync(args, hermesHistoryCliFallbackTimeoutMs());
+  activeHistoryCliFallback = { key: normalizedKey, promise };
+  try {
+    return await promise;
+  } finally {
+    if (activeHistoryCliFallback?.promise === promise) {
+      activeHistoryCliFallback = undefined;
+    }
+  }
+}
+
+function hermesHistoryCliFallbackTimeoutMs(): number {
+  const configured = Number(process.env.CLAWCONNECT_HERMES_HISTORY_EXPORT_TIMEOUT_MS);
+  return Number.isFinite(configured)
+    ? Math.max(250, Math.min(HERMES_HISTORY_CLI_FALLBACK_TIMEOUT_MS, Math.floor(configured)))
+    : HERMES_HISTORY_CLI_FALLBACK_TIMEOUT_MS;
 }

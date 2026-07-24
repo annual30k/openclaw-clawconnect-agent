@@ -1,4 +1,4 @@
-import { execFile as execFileCb } from "node:child_process";
+import { execFile as execFileCb, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
@@ -13,6 +13,7 @@ import {
   SUBPROCESS_ENV,
 } from "../runtime/hermes-runtime-process.js";
 import { resolveHermesPythonBin, resolveHermesStateDbPath } from "../runtime/hermes-runtime-paths.js";
+import { hermesStateDbMessageId } from "../runtime/hermes-state-db-message-identity.js";
 
 const execFile = promisify(execFileCb);
 
@@ -27,13 +28,16 @@ export type HermesStateDbRealtimeMessageRow = {
   observed: boolean;
   toolName?: string;
   toolCallId?: string;
+  finishReason?: string;
+  toolCalls?: string;
   platformMessageId?: string;
 };
 
 export type HermesStateDbRealtimeOpenTurn = {
   turnId: string;
   runId: string;
-  skipUntilNextUser: boolean;
+  mobileTurn: boolean;
+  sessionKey?: string;
 };
 
 export type HermesStateDbRealtimeCursor = {
@@ -68,7 +72,6 @@ import json
 import sqlite3
 import sys
 
-mode = sys.argv[1]
 db_path = sys.argv[2]
 
 def connect():
@@ -77,14 +80,30 @@ def connect():
     conn.execute("PRAGMA query_only=ON")
     return conn
 
-try:
-    conn = connect()
+def message_payload(row):
+    return {
+        "id": int(row["id"]),
+        "sessionId": row["session_id"],
+        "sessionSource": row["session_source"],
+        "role": row["role"],
+        "content": row["content"],
+        "timestamp": row["timestamp"],
+        "active": bool(row["active"]),
+        "observed": bool(row["observed"]),
+        "toolName": row["tool_name"],
+        "toolCallId": row["tool_call_id"],
+        "finishReason": row["finish_reason"],
+        "toolCalls": row["tool_calls"],
+        "platformMessageId": row["platform_message_id"],
+    }
+
+def query(conn, mode, args):
     if mode == "max":
         row = conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages").fetchone()
-        print(json.dumps({"ok": True, "payload": int(row["max_id"] or 0)}, ensure_ascii=False))
+        return int(row["max_id"] or 0)
     elif mode == "rows":
-        after_id = int(sys.argv[3])
-        limit = int(sys.argv[4])
+        after_id = int(args[0])
+        limit = int(args[1])
         rows = conn.execute("""
             SELECT
               m.id,
@@ -97,6 +116,8 @@ try:
               COALESCE(m.observed, 0) AS observed,
               m.tool_name,
               m.tool_call_id,
+              m.finish_reason,
+              m.tool_calls,
               m.platform_message_id
             FROM messages m
             LEFT JOIN sessions s ON s.id = m.session_id
@@ -104,26 +125,84 @@ try:
             ORDER BY m.id ASC
             LIMIT ?
         """, (after_id, limit)).fetchall()
-        payload = []
-        for row in rows:
-            payload.append({
-                "id": int(row["id"]),
-                "sessionId": row["session_id"],
-                "sessionSource": row["session_source"],
-                "role": row["role"],
-                "content": row["content"],
-                "timestamp": row["timestamp"],
-                "active": bool(row["active"]),
-                "observed": bool(row["observed"]),
-                "toolName": row["tool_name"],
-                "toolCallId": row["tool_call_id"],
-                "platformMessageId": row["platform_message_id"],
-            })
-        print(json.dumps({"ok": True, "payload": payload}, ensure_ascii=False))
-    else:
-        print(json.dumps({"ok": False, "error": "unsupported mode"}, ensure_ascii=False))
-except Exception as exc:
-    print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return [message_payload(row) for row in rows]
+    elif mode == "open_turn_users":
+        up_to_id = int(args[0])
+        rows = conn.execute("""
+            WITH latest_user AS (
+              SELECT session_id, MAX(id) AS message_id
+              FROM messages
+              WHERE id <= ?
+                AND role = 'user'
+                AND COALESCE(active, 1) = 1
+              GROUP BY session_id
+            ),
+            latest_terminal_assistant AS (
+              SELECT m.session_id, MAX(m.id) AS message_id
+              FROM messages m
+              INNER JOIN latest_user latest
+                ON latest.session_id = m.session_id
+              WHERE m.id > latest.message_id
+                AND m.id <= ?
+                AND m.role = 'assistant'
+                AND COALESCE(m.active, 1) = 1
+                AND LOWER(COALESCE(m.finish_reason, '')) NOT IN ('tool_calls', 'function_call')
+                AND (
+                  m.tool_calls IS NULL
+                  OR TRIM(m.tool_calls) IN ('', '[]', '{}', 'null')
+                )
+              GROUP BY m.session_id
+            )
+            SELECT
+              m.id,
+              m.session_id,
+              COALESCE(s.source, '') AS session_source,
+              m.role,
+              COALESCE(m.content, '') AS content,
+              m.timestamp,
+              COALESCE(m.active, 1) AS active,
+              COALESCE(m.observed, 0) AS observed,
+              m.tool_name,
+              m.tool_call_id,
+              m.finish_reason,
+              m.tool_calls,
+              m.platform_message_id
+            FROM messages m
+            INNER JOIN latest_user latest
+              ON latest.session_id = m.session_id
+            LEFT JOIN latest_terminal_assistant terminal
+              ON terminal.session_id = m.session_id
+            LEFT JOIN sessions s ON s.id = m.session_id
+            WHERE (
+                m.id = latest.message_id
+                OR m.id = terminal.message_id
+              )
+              AND COALESCE(m.active, 1) = 1
+            ORDER BY m.id ASC
+        """, (up_to_id, up_to_id)).fetchall()
+        return [message_payload(row) for row in rows]
+    raise ValueError("unsupported mode")
+
+def execute(conn, mode, args):
+    try:
+        return {"ok": True, "payload": query(conn, mode, args)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+conn = connect()
+mode = sys.argv[1]
+if mode == "serve":
+    for line in sys.stdin:
+        request = None
+        try:
+            request = json.loads(line)
+            response = execute(conn, request.get("mode"), request.get("args") or [])
+        except Exception as exc:
+            response = {"ok": False, "error": str(exc)}
+        response["id"] = request.get("id") if isinstance(request, dict) else None
+        print(json.dumps(response, ensure_ascii=False), flush=True)
+else:
+    print(json.dumps(execute(conn, mode, sys.argv[3:]), ensure_ascii=False))
 `;
 
 export type HermesStateDbRealtimeWatcher = {
@@ -158,12 +237,12 @@ export function buildHermesStateDbRealtimePayloads(params: {
         delete cursor.openTurnsBySession[row.sessionId];
         continue;
       }
-      // ClawConnect 自己发起的移动端 turn 已经通过 API/CLI streaming 推送过；
-      // state.db 回写只用于历史，所以后续 assistant/tool 行必须跳过到下一个 user 行。
-      const skipUntilNextUser = isClawConnectMobileTurn(row.content);
-      const turn = buildOpenTurn(row, skipUntilNextUser);
+      // 移动端 user 已由 Relay 接收，不重复回写；但最终 assistant 必须从
+      // state.db 用相同 runId 回补，防止 live 断线或错误的中间完成让刷新丢回答。
+      const mobileTurn = isClawConnectMobileTurn(row.content);
+      const turn = buildOpenTurn(row, mobileTurn);
       cursor.openTurnsBySession[row.sessionId] = turn;
-      if (skipUntilNextUser) {
+      if (mobileTurn) {
         continue;
       }
       payloads.push(buildUserPayload(params.gatewayId, row, turn, visibleText));
@@ -171,7 +250,7 @@ export function buildHermesStateDbRealtimePayloads(params: {
     }
 
     const turn = cursor.openTurnsBySession[row.sessionId] ?? buildOpenTurn(row, false);
-    if (turn.skipUntilNextUser) {
+    if (turn.mobileTurn && !isTerminalHermesStateDbAssistant(row)) {
       continue;
     }
     const visibleText = normalizeHermesStateDbOutputText(row.content);
@@ -215,6 +294,201 @@ export async function queryHermesStateDbRealtimeRows(params: {
   return Array.isArray(payload) ? payload.flatMap(parseHermesStateDbRealtimeMessageRow) : [];
 }
 
+export async function queryHermesStateDbRealtimeOpenTurnRows(params: {
+  dbPath: string;
+  upToMessageId: number;
+  pythonBin?: string;
+}): Promise<HermesStateDbRealtimeMessageRow[]> {
+  if (!existsSync(params.dbPath)) {
+    return [];
+  }
+  const upToMessageId = Math.max(0, Math.floor(params.upToMessageId));
+  const payload = await runHermesStateDbRealtimeQuery(
+    "open_turn_users",
+    params.dbPath,
+    [String(upToMessageId)],
+    params.pythonBin,
+  );
+  return Array.isArray(payload) ? payload.flatMap(parseHermesStateDbRealtimeMessageRow) : [];
+}
+
+export type HermesStateDbRealtimeQueryClient = {
+  queryMaxMessageId: () => Promise<number>;
+  queryRows: (params: { afterMessageId: number; limit?: number }) => Promise<HermesStateDbRealtimeMessageRow[]>;
+  queryOpenTurnRows: (params: { upToMessageId: number }) => Promise<HermesStateDbRealtimeMessageRow[]>;
+  close: () => void;
+  processId: () => number | undefined;
+};
+
+export function createHermesStateDbRealtimeQueryClient(params: {
+  dbPath: string;
+  pythonBin?: string;
+  timeoutMs?: number;
+}): HermesStateDbRealtimeQueryClient {
+  type PendingQuery = {
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+  };
+
+  let child: ChildProcessWithoutNullStreams | undefined;
+  let stdoutBuffer = "";
+  let stderrTail = "";
+  let nextRequestId = 1;
+  let closed = false;
+  const pending = new Map<number, PendingQuery>();
+  const timeoutMs = Math.max(250, Math.floor(params.timeoutMs ?? HERMES_STATE_DB_REALTIME_QUERY_TIMEOUT_MS));
+
+  const rejectPending = (error: Error): void => {
+    for (const request of pending.values()) {
+      clearTimeout(request.timeout);
+      request.reject(error);
+    }
+    pending.clear();
+  };
+
+  const stopChild = (expectedChild: ChildProcessWithoutNullStreams, error?: Error): void => {
+    if (child === expectedChild) {
+      child = undefined;
+    }
+    if (error) {
+      rejectPending(error);
+    }
+    if (!expectedChild.killed) {
+      expectedChild.kill();
+    }
+  };
+
+  const ensureChild = (): ChildProcessWithoutNullStreams => {
+    if (closed) {
+      throw new Error("Hermes state.db realtime query client is closed");
+    }
+    if (child && !child.killed) {
+      return child;
+    }
+
+    stdoutBuffer = "";
+    stderrTail = "";
+    const started = spawn(
+      params.pythonBin ?? resolveHermesStateDbRealtimePython(),
+      ["-u", "-c", HERMES_STATE_DB_REALTIME_QUERY_SCRIPT, "serve", params.dbPath],
+      {
+        cwd: homedir(),
+        env: { ...SUBPROCESS_ENV, ...process.env },
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      },
+    );
+    child = started;
+    started.stdout.setEncoding("utf8");
+    started.stderr.setEncoding("utf8");
+    started.stdout.on("data", (chunk: string) => {
+      stdoutBuffer += chunk;
+      let newlineIndex = stdoutBuffer.indexOf("\n");
+      while (newlineIndex >= 0) {
+        const line = stdoutBuffer.slice(0, newlineIndex).trim();
+        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+        if (line) {
+          let response: { id?: unknown; ok?: unknown; payload?: unknown; error?: unknown };
+          try {
+            response = JSON.parse(line) as typeof response;
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            stopChild(started, new Error(`Hermes state.db realtime server returned invalid JSON: ${detail}`));
+            return;
+          }
+          const requestId = numberValue(response.id);
+          const request = requestId === undefined ? undefined : pending.get(requestId);
+          if (request) {
+            pending.delete(requestId!);
+            clearTimeout(request.timeout);
+            if (response.ok === true) {
+              request.resolve(response.payload);
+            } else {
+              request.reject(new Error(
+                typeof response.error === "string" ? response.error : "Hermes state.db realtime query failed",
+              ));
+            }
+          }
+        }
+        newlineIndex = stdoutBuffer.indexOf("\n");
+      }
+    });
+    started.stderr.on("data", (chunk: string) => {
+      stderrTail = `${stderrTail}${chunk}`.slice(-8_192);
+    });
+    started.once("error", (error) => {
+      stopChild(started, error);
+    });
+    started.once("exit", (code, signal) => {
+      if (child === started) {
+        child = undefined;
+      }
+      if (pending.size > 0) {
+        const detail = stderrTail.trim();
+        rejectPending(new Error(
+          `Hermes state.db realtime server exited (${signal ?? code ?? "unknown"})${detail ? `: ${detail}` : ""}`,
+        ));
+      }
+    });
+    return started;
+  };
+
+  const query = async (mode: "max" | "rows" | "open_turn_users", args: string[]): Promise<unknown> => {
+    const started = ensureChild();
+    const requestId = nextRequestId++;
+    return await new Promise<unknown>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pending.delete(requestId);
+        const error = new Error(`Hermes state.db realtime ${mode} query timed out after ${timeoutMs}ms`);
+        reject(error);
+        stopChild(started, error);
+      }, timeoutMs);
+      timeout.unref?.();
+      pending.set(requestId, { resolve, reject, timeout });
+      started.stdin.write(`${JSON.stringify({ id: requestId, mode, args })}\n`, (error) => {
+        if (!error) {
+          return;
+        }
+        const request = pending.get(requestId);
+        if (!request) {
+          return;
+        }
+        pending.delete(requestId);
+        clearTimeout(request.timeout);
+        request.reject(error);
+        stopChild(started, error);
+      });
+    });
+  };
+
+  return {
+    queryMaxMessageId: async () => {
+      const payload = await query("max", []);
+      return numberValue(payload) ?? 0;
+    },
+    queryRows: async ({ afterMessageId, limit }) => {
+      const payload = await query("rows", [
+        String(Math.max(0, Math.floor(afterMessageId))),
+        String(Math.max(1, Math.floor(limit ?? HERMES_STATE_DB_REALTIME_DEFAULT_LIMIT))),
+      ]);
+      return Array.isArray(payload) ? payload.flatMap(parseHermesStateDbRealtimeMessageRow) : [];
+    },
+    queryOpenTurnRows: async ({ upToMessageId }) => {
+      const payload = await query("open_turn_users", [String(Math.max(0, Math.floor(upToMessageId)))]);
+      return Array.isArray(payload) ? payload.flatMap(parseHermesStateDbRealtimeMessageRow) : [];
+    },
+    close: () => {
+      closed = true;
+      const activeChild = child;
+      if (activeChild) {
+        stopChild(activeChild, new Error("Hermes state.db realtime query client closed"));
+      }
+    },
+    processId: () => child?.pid,
+  };
+}
+
 export function createHermesStateDbRealtimeWatcher(params: {
   gatewayId: string;
   dbPath: string;
@@ -222,19 +496,32 @@ export function createHermesStateDbRealtimeWatcher(params: {
   pollIntervalMs?: number;
   queryMaxMessageId?: () => Promise<number>;
   queryRows?: (params: { afterMessageId: number }) => Promise<HermesStateDbRealtimeMessageRow[]>;
+  queryOpenTurnRows?: (params: { upToMessageId: number }) => Promise<HermesStateDbRealtimeMessageRow[]>;
+  queryClientFactory?: () => HermesStateDbRealtimeQueryClient;
   onError?: (error: unknown) => void;
 }): HermesStateDbRealtimeWatcher {
   let cursor: HermesStateDbRealtimeCursor = { lastMessageId: 0, openTurnsBySession: {} };
   let timer: NodeJS.Timeout | undefined;
   let running = false;
+  let primed = false;
+  let startGeneration = 0;
+  let queryClient: HermesStateDbRealtimeQueryClient | undefined;
   const pollIntervalMs = Math.max(250, Math.floor(params.pollIntervalMs ?? HERMES_STATE_DB_REALTIME_DEFAULT_POLL_INTERVAL_MS));
+  const ensureQueryClient = (): HermesStateDbRealtimeQueryClient => {
+    queryClient ??= params.queryClientFactory?.()
+      ?? createHermesStateDbRealtimeQueryClient({ dbPath: params.dbPath });
+    return queryClient;
+  };
   const queryMaxMessageId = params.queryMaxMessageId
-    ?? (() => queryHermesStateDbMaxMessageId({ dbPath: params.dbPath }));
+    ?? (() => existsSync(params.dbPath) ? ensureQueryClient().queryMaxMessageId() : Promise.resolve(0));
   const queryRows = params.queryRows
-    ?? ((queryParams: { afterMessageId: number }) => queryHermesStateDbRealtimeRows({
-      dbPath: params.dbPath,
-      afterMessageId: queryParams.afterMessageId,
-    }));
+    ?? ((queryParams: { afterMessageId: number }) => existsSync(params.dbPath)
+      ? ensureQueryClient().queryRows(queryParams)
+      : Promise.resolve([]));
+  const queryOpenTurnRows = params.queryOpenTurnRows
+    ?? ((queryParams: { upToMessageId: number }) => existsSync(params.dbPath)
+      ? ensureQueryClient().queryOpenTurnRows(queryParams)
+      : Promise.resolve([]));
 
   async function withErrorBoundary(operation: () => Promise<void>): Promise<void> {
     try {
@@ -244,55 +531,91 @@ export function createHermesStateDbRealtimeWatcher(params: {
     }
   }
 
-  async function primeCursor(): Promise<void> {
-    await withErrorBoundary(async () => {
+  async function tryPrimeCursor(): Promise<boolean> {
+    try {
       const maxMessageId = await queryMaxMessageId();
+      const openTurnRows = await queryOpenTurnRows({ upToMessageId: maxMessageId });
+      const restored = restoreHermesStateDbRealtimeOpenTurns(
+        params.gatewayId,
+        cursor,
+        openTurnRows,
+      );
       cursor = {
-        ...cursor,
+        ...restored.cursor,
         lastMessageId: Math.max(cursor.lastMessageId, maxMessageId),
       };
-    });
+      for (const payload of restored.payloads) {
+        params.publishPayload(payload);
+      }
+      return true;
+    } catch (error) {
+      params.onError?.(error);
+      return false;
+    }
   }
 
-  async function pollOnce(): Promise<void> {
+  async function primeCursor(): Promise<void> {
+    primed = await tryPrimeCursor();
+  }
+
+  async function pollOnce(expectedStartGeneration?: number): Promise<void> {
     if (running) {
       return;
     }
     running = true;
-    await withErrorBoundary(async () => {
-      const rows = await queryRows({ afterMessageId: cursor.lastMessageId });
-      if (rows.length === 0) {
+    try {
+      if (!primed) {
+        primed = await tryPrimeCursor();
+        if (!primed) {
+          return;
+        }
+      }
+      if (expectedStartGeneration !== undefined && expectedStartGeneration !== startGeneration) {
         return;
       }
-      const result = buildHermesStateDbRealtimePayloads({
-        gatewayId: params.gatewayId,
-        cursor,
-        rows,
+      await withErrorBoundary(async () => {
+        const rows = await queryRows({ afterMessageId: cursor.lastMessageId });
+        if (
+          rows.length === 0
+          || (expectedStartGeneration !== undefined && expectedStartGeneration !== startGeneration)
+        ) {
+          return;
+        }
+        const result = buildHermesStateDbRealtimePayloads({
+          gatewayId: params.gatewayId,
+          cursor,
+          rows,
+        });
+        cursor = result.cursor;
+        for (const payload of result.payloads) {
+          params.publishPayload(payload);
+        }
       });
-      cursor = result.cursor;
-      for (const payload of result.payloads) {
-        params.publishPayload(payload);
-      }
-    });
-    running = false;
+    } finally {
+      running = false;
+    }
   }
 
   function start(): void {
     if (timer) {
       return;
     }
-    void primeCursor().then(() => pollOnce());
+    const generation = ++startGeneration;
+    void pollOnce(generation);
     timer = setInterval(() => {
-      void pollOnce();
+      void pollOnce(generation);
     }, pollIntervalMs);
   }
 
   function stop(): void {
-    if (!timer) {
-      return;
+    startGeneration += 1;
+    if (timer) {
+      clearInterval(timer);
+      timer = undefined;
     }
-    clearInterval(timer);
-    timer = undefined;
+    queryClient?.close();
+    queryClient = undefined;
+    primed = false;
   }
 
   return {
@@ -313,7 +636,7 @@ export function resolveHermesStateDbRealtimePython(): string {
 }
 
 async function runHermesStateDbRealtimeQuery(
-  mode: "max" | "rows",
+  mode: "max" | "rows" | "open_turn_users",
   dbPath: string,
   args: string[],
   pythonBin = resolveHermesStateDbRealtimePython(),
@@ -327,6 +650,7 @@ async function runHermesStateDbRealtimeQuery(
         encoding: "utf8",
         env: { ...SUBPROCESS_ENV, ...process.env },
         timeout: HERMES_STATE_DB_REALTIME_QUERY_TIMEOUT_MS,
+        maxBuffer: 16 * 1024 * 1024,
         windowsHide: true,
       },
     );
@@ -403,6 +727,8 @@ function parseHermesStateDbRealtimeMessageRow(value: unknown): HermesStateDbReal
     observed: booleanValue(record.observed, false),
     ...(stringValue(record.toolName) ? { toolName: stringValue(record.toolName) } : {}),
     ...(stringValue(record.toolCallId) ? { toolCallId: stringValue(record.toolCallId) } : {}),
+    ...(stringValue(record.finishReason) ? { finishReason: stringValue(record.finishReason) } : {}),
+    ...(stringValue(record.toolCalls) ? { toolCalls: stringValue(record.toolCalls) } : {}),
     ...(stringValue(record.platformMessageId) ? { platformMessageId: stringValue(record.platformMessageId) } : {}),
   }];
 }
@@ -463,14 +789,67 @@ function cloneCursor(cursor: HermesStateDbRealtimeCursor): HermesStateDbRealtime
   };
 }
 
-function buildOpenTurn(row: HermesStateDbRealtimeMessageRow, skipUntilNextUser: boolean): HermesStateDbRealtimeOpenTurn {
-  const turnId = row.role === "user"
-    ? `hermes-db-${row.sessionId}-turn-${row.id}`
-    : `hermes-db-${row.sessionId}-orphan-turn-${row.id}`;
+function restoreHermesStateDbRealtimeOpenTurns(
+  gatewayId: string,
+  cursor: HermesStateDbRealtimeCursor,
+  rows: HermesStateDbRealtimeMessageRow[],
+): HermesStateDbRealtimeBuildResult {
+  const restored: HermesStateDbRealtimeCursor = {
+    lastMessageId: cursor.lastMessageId,
+    openTurnsBySession: {},
+  };
+  const latestMobileFinalBySession = new Map<string, {
+    row: HermesStateDbRealtimeMessageRow;
+    turn: HermesStateDbRealtimeOpenTurn;
+  }>();
+  for (const row of [...rows].sort((left, right) => left.id - right.id)) {
+    if (!row.active) {
+      continue;
+    }
+    if (row.role === "user") {
+      const mobileTurn = isClawConnectMobileTurn(row.content);
+      const visibleText = normalizeHermesStateDbUserText(row.content);
+      if (!visibleText && !mobileTurn) {
+        delete restored.openTurnsBySession[row.sessionId];
+        latestMobileFinalBySession.delete(row.sessionId);
+        continue;
+      }
+      restored.openTurnsBySession[row.sessionId] = buildOpenTurn(row, mobileTurn);
+      continue;
+    }
+    const turn = restored.openTurnsBySession[row.sessionId];
+    if (!turn?.mobileTurn || !isTerminalHermesStateDbAssistant(row)) {
+      continue;
+    }
+    const visibleText = normalizeHermesStateDbOutputText(row.content);
+    if (!visibleText) {
+      continue;
+    }
+    latestMobileFinalBySession.set(row.sessionId, { row, turn });
+  }
+  const payloads = [...latestMobileFinalBySession.values()]
+    .sort((left, right) => left.row.id - right.row.id)
+    .map(({ row, turn }) => buildOutputPayload(
+      gatewayId,
+      row,
+      turn,
+      normalizeHermesStateDbOutputText(row.content),
+    ));
+  return { cursor: restored, payloads };
+}
+
+function buildOpenTurn(row: HermesStateDbRealtimeMessageRow, mobileTurn: boolean): HermesStateDbRealtimeOpenTurn {
+  const mobileSourceRunId = row.role === "user" ? clawConnectMobileSourceRunId(row.content) : undefined;
+  const mobileSessionKey = row.role === "user" ? clawConnectMobileSessionKey(row.content) : undefined;
+  const turnId = mobileSourceRunId
+    ?? (row.role === "user"
+      ? `hermes-db-${row.sessionId}-turn-${row.id}`
+      : `hermes-db-${row.sessionId}-orphan-turn-${row.id}`);
   return {
     turnId,
     runId: turnId,
-    skipUntilNextUser,
+    mobileTurn,
+    ...(mobileSessionKey ? { sessionKey: mobileSessionKey } : {}),
   };
 }
 
@@ -482,7 +861,7 @@ function buildUserPayload(
 ): HermesStateDbRealtimePayload {
   const event = buildTimelineEvent({
     gatewayId,
-    sessionKey: hermesStateDbSessionKey(row.sessionId),
+    sessionKey: hermesStateDbTurnSessionKey(row.sessionId, turn),
     row,
     turn,
     eventType: "turn.user.created",
@@ -508,7 +887,7 @@ function buildOutputPayload(
 ): HermesStateDbRealtimePayload {
   const completed = buildTimelineEvent({
     gatewayId,
-    sessionKey: hermesStateDbSessionKey(row.sessionId),
+    sessionKey: hermesStateDbTurnSessionKey(row.sessionId, turn),
     row,
     turn,
     eventType: "message.completed",
@@ -516,6 +895,9 @@ function buildOutputPayload(
     messageState: "completed",
     runState: "active",
     content: [{ type: "text", text }],
+    ...(turn.mobileTurn && row.role === "assistant"
+      ? { messageId: `assistant-${turn.runId}` }
+      : {}),
   });
   const runCompleted = buildTimelineEvent({
     gatewayId,
@@ -552,7 +934,11 @@ function buildTimelineEvent(params: {
   messageId?: string;
   partId?: string;
 }): CanonicalTimelineEvent {
-  const messageId = params.messageId ?? hermesStateDbMessageId(params.row);
+  const messageId = params.messageId ?? hermesStateDbMessageId({
+    sessionId: params.row.sessionId,
+    rowId: params.row.id,
+    role: params.row.role,
+  });
   return parseCanonicalTimelineEvent({
     protocolVersion: 2,
     eventId: `evt-${messageId}-${params.eventType}`,
@@ -581,8 +967,11 @@ function hermesStateDbSessionKey(sessionId: string): string {
   return sessionId.startsWith("hermes:") ? sessionId : `hermes:${sessionId}`;
 }
 
-function hermesStateDbMessageId(row: HermesStateDbRealtimeMessageRow): string {
-  return `hermes-db-${row.sessionId}-message-${row.id}-${row.role}`;
+function hermesStateDbTurnSessionKey(
+  sessionId: string,
+  turn: HermesStateDbRealtimeOpenTurn,
+): string {
+  return turn.sessionKey?.trim() || hermesStateDbSessionKey(sessionId);
 }
 
 function normalizeHermesStateDbUserText(text: string): string {
@@ -613,6 +1002,55 @@ function stripClawConnectMetadata(text: string): string {
 
 function isClawConnectMobileTurn(text: string): boolean {
   return text.includes(CLAWCONNECT_MOBILE_TURN_MARKER);
+}
+
+function clawConnectMobileSourceRunId(text: string): string | undefined {
+  return clawConnectMobileMetadataValue(text, "sourceRunId");
+}
+
+function clawConnectMobileSessionKey(text: string): string | undefined {
+  return clawConnectMobileMetadataValue(text, "sessionKey");
+}
+
+function clawConnectMobileMetadataValue(text: string, key: string): string | undefined {
+  const markerIndex = text.indexOf(CLAWCONNECT_MOBILE_TURN_MARKER);
+  if (markerIndex < 0) {
+    return undefined;
+  }
+  const metadataBlock = text.slice(markerIndex + CLAWCONNECT_MOBILE_TURN_MARKER.length);
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`^\\s*${escapedKey}\\s*:\\s*(.+?)\\s*$`, "im").exec(metadataBlock);
+  return match?.[1]?.trim() || undefined;
+}
+
+function isTerminalHermesStateDbAssistant(row: HermesStateDbRealtimeMessageRow): boolean {
+  if (row.role !== "assistant") {
+    return false;
+  }
+  const finishReason = row.finishReason?.trim().toLowerCase().replace(/[\s-]+/g, "_") ?? "";
+  if (finishReason === "tool_calls" || finishReason === "function_call") {
+    return false;
+  }
+  return !hasHermesStateDbToolCalls(row.toolCalls);
+}
+
+function hasHermesStateDbToolCalls(value: string | undefined): boolean {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed === "[]" || trimmed === "{}" || trimmed === "null") {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed.length > 0;
+    }
+    if (parsed && typeof parsed === "object") {
+      return Object.keys(parsed as Record<string, unknown>).length > 0;
+    }
+    return parsed !== null;
+  } catch {
+    return true;
+  }
 }
 
 function timestampToIso(timestamp: number): string {

@@ -29,7 +29,7 @@ export async function detectHermesHistoryCompletion(params: {
     return undefined;
   }
 
-  return latestAssistantReplyFromHermesExport(exportResult.payload, params.userMessage);
+  return latestTerminalAssistantReplyFromHermesExport(exportResult.payload, params.userMessage);
 }
 
 export function selectHermesSessionForCompletedChat(
@@ -70,7 +70,10 @@ export function selectHermesSessionForCompletedChat(
   return newSessions[0];
 }
 
-function latestAssistantReplyFromHermesExport(payload: unknown, userMessage: string): string | undefined {
+export function latestTerminalAssistantReplyFromHermesExport(
+  payload: unknown,
+  userMessage: string,
+): string | undefined {
   const output = toRecord(payload).output;
   const parsed = parseHermesChatExportOutput(output);
   const record = toRecord(parsed);
@@ -113,12 +116,63 @@ function latestAssistantReplyFromHermesExport(payload: unknown, userMessage: str
     if (normalizeHistoryRoleValue(message.role) !== "assistant") {
       continue;
     }
+    // Hermes 会在调用工具前写入带可见正文的 assistant 行，例如
+    // “Let me use the browser…”。这类行的 finish_reason=tool_calls，
+    // 只是中间步骤，绝不能让移动端提前结束并把它持久化为最终回答。
+    if (!isTerminalHermesAssistantMessage(message)) {
+      continue;
+    }
     const text = sanitizeHermesChatOutput(extractHermesHistoryText(message)).trim();
     if (text) {
       return text;
     }
   }
   return undefined;
+}
+
+export function isTerminalHermesAssistantMessage(message: Record<string, unknown>): boolean {
+  const finishReason = normalizeHistoryFinishReason(
+    message.finish_reason ?? message.finishReason,
+  );
+  if (finishReason === "tool_calls" || finishReason === "function_call") {
+    return false;
+  }
+  if (hasHermesToolCalls(message.tool_calls ?? message.toolCalls)) {
+    return false;
+  }
+  // 新版 Hermes 的最终行通常是 stop/length/content_filter；旧版导出没有
+  // finish_reason，因此在明确没有 tool_calls 时继续兼容。
+  return true;
+}
+
+function normalizeHistoryFinishReason(value: unknown): string {
+  return typeof value === "string"
+    ? value.trim().toLowerCase().replace(/[\s-]+/g, "_")
+    : "";
+}
+
+function hasHermesToolCalls(value: unknown): boolean {
+  if (value === null || value === undefined) {
+    return false;
+  }
+  if (Array.isArray(value)) {
+    return value.length > 0;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === "[]" || trimmed === "{}" || trimmed === "null") {
+      return false;
+    }
+    try {
+      return hasHermesToolCalls(JSON.parse(trimmed) as unknown);
+    } catch {
+      return true;
+    }
+  }
+  if (typeof value === "object") {
+    return Object.keys(value as Record<string, unknown>).length > 0;
+  }
+  return true;
 }
 
 function parseHermesChatExportOutput(value: unknown): unknown {

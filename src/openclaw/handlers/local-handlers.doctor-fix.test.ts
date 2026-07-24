@@ -87,9 +87,8 @@ test("doctor fix command runs the configured OpenClaw binary as a child process"
   assert.equal(payload.output, "fixed");
 
   const logLines = (await readFile(logFile, "utf8")).trim().split("\n");
-  assert.equal(logLines.length, 2);
-  assert.equal(logLines[0], "--version");
-  assert.equal(logLines[1], "doctor --fix --non-interactive --yes");
+  assert.equal(logLines.length, 1);
+  assert.equal(logLines[0], "doctor --fix --non-interactive --yes");
 
   assert.deepEqual(
     events.map(({ event, payload }) => ({

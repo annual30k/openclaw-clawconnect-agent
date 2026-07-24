@@ -363,7 +363,7 @@ test("transcript history provider carries the mobile run id through the parent c
     })), [
       { messageId: "transcript-user-mobile", turnId: "mobile-run-42:user", runId: "mobile-run-42:user" },
       { messageId: "transcript-assistant-tool", turnId: "mobile-run-42", runId: "mobile-run-42" },
-      { messageId: "transcript-assistant-final", turnId: "mobile-run-42", runId: "mobile-run-42" },
+      { messageId: "assistant-mobile-run-42", turnId: "mobile-run-42", runId: "mobile-run-42" },
     ]);
   } finally {
     await fixture.cleanup();

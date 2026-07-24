@@ -3,7 +3,13 @@ import type { LocalResult } from "../../core/command-types.js";
 import { canonicalizeMobileAssistantText } from "../../core/relay/mobile-chat-run-bridge.js";
 import { buildHistorySnapshotPage } from "../../core/relay/timeline-event-builder.js";
 import type { TimelineContentBlock } from "../../core/relay/timeline-event-log.js";
-import { runHermesSessionExport } from "./hermes-runtime-sessions.js";
+import { isTerminalHermesAssistantMessage } from "./hermes-runtime-history-completion.js";
+import {
+  hermesStateDbHistoryMessageId,
+  type HermesStateDbMessageIdentityRole,
+} from "./hermes-state-db-message-identity.js";
+import { resolveHermesSessionIdFromParams, runHermesSessionExport } from "./hermes-runtime-sessions.js";
+import { queryHermesHistoryPageFromStateDb } from "./hermes-runtime-state-db.js";
 import { stringParam, toRecord } from "./hermes-runtime-values.js";
 
 type HermesHistoryMessage = {
@@ -53,11 +59,44 @@ export function clearHermesHistoryCache(): void {
 export async function runHermesChatHistory(params: unknown): Promise<LocalResult> {
   const record = toRecord(params);
   const sessionKey = stringParam(record, "sessionKey", "session_key", "key", "session") ?? "main";
+  const limit = normalizeHistoryLimit(record.limit);
+  const cursorSeq = parseHistoryCursorSeq(record.cursor);
+  const direction = normalizeHistoryDirection(record.direction);
+  const resolved = await resolveHermesSessionIdFromParams(record);
+  if (resolved.sessionId) {
+    const stateDbPage = await queryHermesHistoryPageFromStateDb({
+      sessionId: resolved.sessionId,
+      limit,
+      cursorSeq,
+      direction,
+    });
+    if (stateDbPage) {
+      const messages = normalizeHermesHistoryMessages({
+        sessionId: stateDbPage.sessionId,
+        messages: stateDbPage.messages,
+        contextUser: stateDbPage.contextUser,
+      }, { stateDbSessionId: stateDbPage.sessionId });
+      return buildHermesHistoryResult({
+        sessionKey,
+        sessionId: stateDbPage.sessionId,
+        cursor: typeof record.cursor === "string" ? record.cursor : undefined,
+        page: {
+          messages,
+          hasMore: stateDbPage.hasMore,
+          nextCursor: stateDbPage.nextCursor,
+          newestCursor: stateDbPage.newestCursor,
+        },
+      });
+    }
+  }
+
   const exportResult = await runHermesSessionExport({
     ...record,
     sessionKey,
     output: "-",
     requireResolvedSession: true,
+    skipStateDb: true,
+    historyFallback: true,
   });
   if (!exportResult.ok) {
     return exportResult;
@@ -73,13 +112,28 @@ export async function runHermesChatHistory(params: unknown): Promise<LocalResult
   const parsed = history.parsed;
   const messages = history.messages;
   const page = paginateHermesHistory(messages, {
-    limit: normalizeHistoryLimit(record.limit),
-    cursorSeq: parseHistoryCursorSeq(record.cursor),
-    direction: normalizeHistoryDirection(record.direction),
+    limit,
+    cursorSeq,
+    direction,
   });
 
   const sessionId = stringParam(toRecord(parsed), "sessionId", "session_id", "id")
     ?? stringParam(record, "sessionId", "session_id", "hermesSessionId", "id");
+  return buildHermesHistoryResult({
+    sessionKey,
+    sessionId,
+    cursor: typeof record.cursor === "string" ? record.cursor : undefined,
+    page,
+  });
+}
+
+function buildHermesHistoryResult(params: {
+  sessionKey: string;
+  sessionId?: string;
+  cursor?: string;
+  page: { messages: HermesHistoryMessage[]; hasMore: boolean; nextCursor?: string; newestCursor?: string };
+}): LocalResult {
+  const { sessionKey, sessionId, page } = params;
   const payload = {
     sessionKey,
     ...(sessionId ? { sessionId } : {}),
@@ -91,7 +145,7 @@ export async function runHermesChatHistory(params: unknown): Promise<LocalResult
     timelineSnapshot: buildHistorySnapshotPage({
       gatewayId: "clawconnect",
       sessionKey,
-      cursor: typeof record.cursor === "string" ? record.cursor : null,
+      cursor: params.cursor ?? null,
       hasMore: page.hasMore,
       nextCursor: page.nextCursor ?? null,
       newestCursor: page.newestCursor ?? null,
@@ -179,7 +233,10 @@ function parseHermesHistoryExportOutput(value: unknown): unknown {
   }
 }
 
-function normalizeHermesHistoryMessages(parsed: unknown): HermesHistoryMessage[] {
+function normalizeHermesHistoryMessages(
+  parsed: unknown,
+  options: { stateDbSessionId?: string } = {},
+): HermesHistoryMessage[] {
   const record = toRecord(parsed);
   const rawMessages =
     Array.isArray(record.messages) ? record.messages
@@ -189,13 +246,18 @@ function normalizeHermesHistoryMessages(parsed: unknown): HermesHistoryMessage[]
 
   const sessionId = stringParam(record, "sessionId", "session_id", "id");
   const messages: HermesHistoryMessage[] = [];
-  let activeMobileTurn: ActiveClawConnectMobileTurn | undefined;
+  let activeMobileTurn = activeMobileTurnFromContextUser(record.contextUser);
   rawMessages.forEach((entry, index) => {
     const source = toRecord(entry);
     if (Object.keys(source).length === 0) {
       return;
     }
     const role = normalizeHistoryRole(source.role);
+    // Hermes 在工具调用前也会写入带正文的 assistant 行。只有明确终态的
+    // assistant 才能进入移动端历史，否则刷新会用中间提示覆盖同 run 的最终回答。
+    if (role === "assistant" && !isTerminalHermesAssistantMessage(source)) {
+      return;
+    }
     const rawText = extractHistoryText(source);
     const mobileTurn = role === "user" ? parseClawConnectMobileTurnMetadata(rawText) : {};
     const normalized = normalizeHistoryText(role, rawText);
@@ -203,13 +265,27 @@ function normalizeHermesHistoryMessages(parsed: unknown): HermesHistoryMessage[]
     if (!normalized && content.length === 0) {
       return;
     }
-    const seq = index + 1;
+    const seq = numberParam(source, "seq") ?? index + 1;
     const sourceTurnId = stringParam(source, "turnId", "turn_id") ?? mobileTurn.sourceRunId;
     const sourceRunId = stringParam(source, "runId", "run_id") ?? mobileTurn.sourceRunId;
     const sourceClientMessageId = stringParam(source, "clientMessageId", "client_message_id") ?? mobileTurn.sourceRunId;
     const sourceIdempotencyKey = stringParam(source, "idempotencyKey", "idempotency_key") ?? mobileTurn.sourceRunId;
+    const stateDbRowId = stringParam(source, "id") ?? seq;
+    const mobileRunId = role === "user"
+      ? mobileTurn.sourceRunId
+      : role === "assistant"
+        ? activeMobileTurn?.runId
+        : undefined;
+    const sourceMessageId = options.stateDbSessionId
+      ? hermesStateDbHistoryMessageId({
+        sessionId: options.stateDbSessionId,
+        rowId: stateDbRowId,
+        role: role as HermesStateDbMessageIdentityRole,
+        mobileRunId,
+      })
+      : stringParam(source, "id", "messageId", "message_id") ?? `history-${seq}`;
     const message: HermesHistoryMessage = {
-      id: stringParam(source, "id", "messageId", "message_id") ?? `history-${seq}`,
+      id: sourceMessageId,
       role,
       content,
       ...(sourceTurnId ? { turnId: sourceTurnId } : {}),
@@ -232,6 +308,17 @@ function normalizeHermesHistoryMessages(parsed: unknown): HermesHistoryMessage[]
     }
   });
   return withHermesHistoryFallbackTimestamps(messages, sessionId);
+}
+
+function activeMobileTurnFromContextUser(value: unknown): ActiveClawConnectMobileTurn | undefined {
+  const source = toRecord(value);
+  if (Object.keys(source).length === 0 || normalizeHistoryRole(source.role) !== "user") {
+    return undefined;
+  }
+  const metadata = parseClawConnectMobileTurnMetadata(extractHistoryText(source));
+  return metadata.sourceRunId
+    ? { turnId: metadata.sourceRunId, runId: metadata.sourceRunId }
+    : undefined;
 }
 
 function inheritClawConnectMobileTurn(

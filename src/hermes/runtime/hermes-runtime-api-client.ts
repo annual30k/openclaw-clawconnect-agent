@@ -27,6 +27,20 @@ type SseEvent = {
   data: unknown;
 };
 
+export type HermesApiResolvedToolEvent = {
+  toolCallId: string;
+  toolName: string;
+  phase: HermesToolLogEvent["phase"];
+  preview: string;
+  isError: boolean;
+};
+
+export type HermesApiToolLifecycleTracker = {
+  resolve: (eventName: string, record: Record<string, unknown>) => HermesApiResolvedToolEvent | undefined;
+  finishActive: (phase: "completed" | "failed") => HermesApiResolvedToolEvent[];
+  activeCount: () => number;
+};
+
 export async function tryRunHermesApiChat(params: {
   message: string;
   instructions?: string;
@@ -295,6 +309,23 @@ async function consumeHermesApiChatStream(
   let finalOutput = "";
   let usage: HermesUsageSnapshot | undefined;
   let hermesSessionId = params.sessionId;
+  const toolLifecycle = createHermesApiToolLifecycleTracker(runId);
+
+  const publishToolEvent = (event: HermesApiResolvedToolEvent): void => {
+    publishHermesApiToolEvent(params.context, {
+      gatewayId: params.context.gatewayId,
+      sessionKey: params.sessionKey,
+      runId,
+      seq: seq += 1,
+      event,
+    });
+  };
+
+  const finishActiveTools = (phase: "completed" | "failed"): void => {
+    for (const event of toolLifecycle.finishActive(phase)) {
+      publishToolEvent(event);
+    }
+  };
 
   const handleEvent = (event: SseEvent): void => {
     const record = event.data && typeof event.data === "object" && !Array.isArray(event.data)
@@ -333,6 +364,7 @@ async function consumeHermesApiChatStream(
         return;
       }
       case "run.completed": {
+        finishActiveTools("completed");
         const content = sanitizeHermesChatOutput(stringValue(record.output) ?? "").trim();
         if (content) {
           finalOutput = content;
@@ -344,18 +376,19 @@ async function consumeHermesApiChatStream(
       case "tool.completed":
       case "tool.failed":
       case "tool.progress": {
-        publishHermesApiToolEvent(params.context, {
-          gatewayId: params.context.gatewayId,
-          sessionKey: params.sessionKey,
-          runId,
-          seq: seq += 1,
-          eventName: event.event,
-          record,
-        });
+        const toolEvent = toolLifecycle.resolve(event.event, record);
+        if (toolEvent) {
+          publishToolEvent(toolEvent);
+        }
         return;
       }
       case "error": {
+        finishActiveTools("failed");
         throw new Error(stringValue(record.message) ?? "Hermes API stream error");
+      }
+      case "done": {
+        finishActiveTools("completed");
+        return;
       }
     }
   };
@@ -387,6 +420,7 @@ async function consumeHermesApiChatStream(
       }
     }
   } catch (error) {
+    finishActiveTools("failed");
     if (params.context.abortSignal?.aborted || (error instanceof Error && error.name === "AbortError")) {
       throw new Error("hermes_chat_aborted");
     }
@@ -399,6 +433,7 @@ async function consumeHermesApiChatStream(
     }
   }
 
+  finishActiveTools("completed");
   const output = sanitizeHermesChatOutput(finalOutput || deltaOutput).trim();
   return {
     output,
@@ -414,24 +449,15 @@ function publishHermesApiToolEvent(
     sessionKey: string;
     runId: string;
     seq: number;
-    eventName: string;
-    record: Record<string, unknown>;
+    event: HermesApiResolvedToolEvent;
   },
 ): void {
-  const toolName = stringValue(params.record.tool_name) ?? stringValue(params.record.tool) ?? "hermes";
-  const preview = compactStringArray([
-    stringValue(params.record.preview),
-    stringValue(params.record.delta),
-    stringValue(params.record.text),
-  ]).join("\n");
-  const phase = hermesApiToolPhase(params.eventName);
   const event: HermesToolLogEvent = {
-    toolName,
-    phase,
-    text: preview,
-    isError: phase === "failed",
+    toolName: params.event.toolName,
+    phase: params.event.phase,
+    text: params.event.preview,
+    isError: params.event.isError,
   };
-  const toolCallId = `${params.runId}:hermes-api-tool-${params.seq}`;
   context.publishEvent?.({
     type: "event",
     event: "chat",
@@ -446,9 +472,9 @@ function publishHermesApiToolEvent(
       ts: Date.now(),
       data: {
         phase: event.phase,
-        tool_call_id: toolCallId,
-        tool_name: toolName,
-        text: preview,
+        tool_call_id: params.event.toolCallId,
+        tool_name: event.toolName,
+        text: event.text,
         is_error: event.isError === true,
       },
       timelineEvents: [
@@ -457,20 +483,167 @@ function publishHermesApiToolEvent(
           sessionKey: params.sessionKey,
           turnId: params.runId,
           runId: params.runId,
-          toolInvocationId: toolCallId,
+          toolInvocationId: params.event.toolCallId,
           toolState: hermesToolState(event),
           seq: params.seq,
           turnSeq: params.seq,
           content: [{
             type: event.phase === "completed" || event.phase === "failed" ? "tool_result" : "tool_call",
-            toolName,
-            text: preview,
+            toolName: event.toolName,
+            text: event.text,
             isError: event.isError === true,
           }],
         }),
       ],
     },
   });
+}
+
+export function createHermesApiToolLifecycleTracker(runId: string): HermesApiToolLifecycleTracker {
+  type ActiveTool = { toolCallId: string; toolName: string; preview: string };
+  const activeById = new Map<string, ActiveTool>();
+  const activeIdsByName = new Map<string, string[]>();
+  let invocationCounter = 0;
+
+  const register = (tool: ActiveTool): void => {
+    const existing = activeById.get(tool.toolCallId);
+    activeById.set(tool.toolCallId, tool);
+    if (existing) {
+      return;
+    }
+    const queue = activeIdsByName.get(tool.toolName) ?? [];
+    queue.push(tool.toolCallId);
+    activeIdsByName.set(tool.toolName, queue);
+  };
+
+  const remove = (toolCallId: string): ActiveTool | undefined => {
+    const active = activeById.get(toolCallId);
+    if (!active) {
+      return undefined;
+    }
+    activeById.delete(toolCallId);
+    const queue = activeIdsByName.get(active.toolName)?.filter((id) => id !== toolCallId) ?? [];
+    if (queue.length > 0) {
+      activeIdsByName.set(active.toolName, queue);
+    } else {
+      activeIdsByName.delete(active.toolName);
+    }
+    return active;
+  };
+
+  const firstActiveId = (toolName: string): string | undefined => activeIdsByName.get(toolName)?.[0];
+
+  const resolve = (
+    eventName: string,
+    record: Record<string, unknown>,
+  ): HermesApiResolvedToolEvent | undefined => {
+    const toolName = hermesApiToolName(record);
+    const explicitToolCallId = hermesApiExplicitToolCallId(record);
+    const phase = hermesApiToolPhase(eventName);
+    const recordPreview = hermesApiToolPreview(record);
+
+    // The legacy session API represents `reasoning.available` as `_thinking`.
+    // It is private reasoning metadata, not a user-visible tool lifecycle. Ignore
+    // every phase defensively so a future started/completed pair cannot surface it.
+    if (toolName.trim().toLowerCase() === "_thinking") {
+      return undefined;
+    }
+
+    if (eventName === "tool.started") {
+      const toolCallId = explicitToolCallId ?? `${runId}:hermes-api-tool-${invocationCounter += 1}`;
+      const active = activeById.get(toolCallId);
+      const tool: ActiveTool = {
+        toolCallId,
+        toolName,
+        preview: recordPreview || active?.preview || "",
+      };
+      register(tool);
+      return resolvedHermesApiToolEvent(tool, phase);
+    }
+
+    if (eventName === "tool.progress") {
+      const toolCallId = explicitToolCallId ?? firstActiveId(toolName);
+      if (!toolCallId) {
+        // A progress fragment without explicit identity or a preceding start cannot
+        // be correlated safely. Do not invent a permanently active invocation.
+        return undefined;
+      }
+      const active = activeById.get(toolCallId);
+      const tool: ActiveTool = {
+        toolCallId,
+        toolName: active?.toolName ?? toolName,
+        preview: recordPreview || active?.preview || "",
+      };
+      register(tool);
+      return resolvedHermesApiToolEvent(tool, phase);
+    }
+
+    if (eventName === "tool.completed" || eventName === "tool.failed") {
+      const toolCallId = explicitToolCallId ?? firstActiveId(toolName);
+      if (!toolCallId) {
+        return undefined;
+      }
+      const active = remove(toolCallId);
+      const tool: ActiveTool = {
+        toolCallId,
+        toolName: active?.toolName ?? toolName,
+        preview: recordPreview || active?.preview || "",
+      };
+      return resolvedHermesApiToolEvent(tool, phase);
+    }
+
+    return undefined;
+  };
+
+  return {
+    resolve,
+    finishActive: (phase) => {
+      const terminalPhase: HermesToolLogEvent["phase"] = phase;
+      const active = [...activeById.values()];
+      activeById.clear();
+      activeIdsByName.clear();
+      return active.map((tool) => resolvedHermesApiToolEvent(tool, terminalPhase));
+    },
+    activeCount: () => activeById.size,
+  };
+}
+
+function resolvedHermesApiToolEvent(
+  tool: { toolCallId: string; toolName: string; preview: string },
+  phase: HermesToolLogEvent["phase"],
+): HermesApiResolvedToolEvent {
+  return {
+    ...tool,
+    phase,
+    isError: phase === "failed",
+  };
+}
+
+function hermesApiExplicitToolCallId(record: Record<string, unknown>): string | undefined {
+  const nested = record.tool_call && typeof record.tool_call === "object" && !Array.isArray(record.tool_call)
+    ? record.tool_call as Record<string, unknown>
+    : undefined;
+  return firstNonEmpty(
+    stringValue(record.toolCallId),
+    stringValue(record.tool_call_id),
+    stringValue(record.toolInvocationId),
+    stringValue(record.tool_invocation_id),
+    stringValue(record.callId),
+    stringValue(record.call_id),
+    stringValue(nested?.id),
+  );
+}
+
+function hermesApiToolName(record: Record<string, unknown>): string {
+  return firstNonEmpty(stringValue(record.tool_name), stringValue(record.tool)) ?? "hermes";
+}
+
+function hermesApiToolPreview(record: Record<string, unknown>): string {
+  return compactStringArray([
+    stringValue(record.preview),
+    stringValue(record.delta),
+    stringValue(record.text),
+  ]).join("\n");
 }
 
 function hermesApiToolPhase(eventName: string): HermesToolLogEvent["phase"] {

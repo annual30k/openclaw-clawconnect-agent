@@ -78,6 +78,21 @@ test("selectOpenclawBinCandidate prefers a working explicit binary", () => {
   );
 });
 
+test("selectOpenclawBinCandidate keeps an existing explicit binary when its probe is temporarily unavailable", () => {
+  const exists = (candidate: string) => ["/explicit/openclaw", "/pkg/openclaw.mjs"].includes(candidate);
+  const canRun = (candidate: string) => candidate === "/pkg/openclaw.mjs";
+
+  assert.equal(
+    selectOpenclawBinCandidate({
+      explicitBin: "/explicit/openclaw",
+      packageBin: "/pkg/openclaw.mjs",
+      exists,
+      canRun,
+    }),
+    "/explicit/openclaw",
+  );
+});
+
 test("OpenClaw install directory overrides expand tilde paths", () => {
   const root = join(homedir(), "custom-openclaw");
   assert.deepEqual(openClawInstallDirCandidates("~/custom-openclaw"), [
