@@ -1,4 +1,4 @@
-import { readdirSync, statSync } from "fs";
+import { existsSync, readdirSync, statSync, unlinkSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
@@ -46,6 +46,17 @@ export function profileLogPath(profile: string | undefined = getActiveProfile())
 
 export function profileErrorLogPath(profile: string | undefined = getActiveProfile()): string {
   return join(profileRoot(profile), "clawconnect-error.log");
+}
+
+export function clearProfileLogs(profile: string | undefined = getActiveProfile()): void {
+  const logPath = profileLogPath(profile);
+  const errorLogPath = profileErrorLogPath(profile);
+  try {
+    if (existsSync(logPath)) unlinkSync(logPath);
+  } catch { /* ignore */ }
+  try {
+    if (existsSync(errorLogPath)) unlinkSync(errorLogPath);
+  } catch { /* ignore */ }
 }
 
 export function listProfileNames(): string[] {

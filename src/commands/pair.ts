@@ -10,6 +10,7 @@ import { getServicePlatform } from "../platform/service-manager.js";
 import { toRelayHttpBase } from "../core/relay/file-upload-utils.js";
 import { getDefaultRelayServerUrl } from "../config/env.js";
 import { gatewayCapabilitiesForType, normalizeGatewayType } from "../gateway-profiles.js";
+import { clearProfileLogs } from "../config/profile.js";
 import { pairCommandForProfile, resetCommandForProfile } from "./profile-hints.js";
 
 interface PairOptions {
@@ -111,6 +112,7 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
     accessCode = data.accessCode;
 
     writeConfig({ relayServerUrl, gatewayId, relaySecret, displayName, gatewayType, capabilities });
+    clearProfileLogs(opts.profile);
 
     console.log(t("pair.registered", gatewayId));
   }

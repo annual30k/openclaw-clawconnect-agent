@@ -10,7 +10,7 @@ import {
   stopService,
   uninstallService,
 } from "../platform/service-manager.js";
-import { getActiveProfile, profileConfigPath, profileDisplayName } from "../config/profile.js";
+import { clearProfileLogs, getActiveProfile, profileConfigPath, profileDisplayName } from "../config/profile.js";
 import { pairCommandForProfile } from "./profile-hints.js";
 
 export function isInstalled(): boolean {
@@ -124,6 +124,8 @@ export function resetCommand(): void {
   } else {
     console.log(t("install.noConfig"));
   }
+
+  clearProfileLogs();
 
   console.log(t("install.resetCompleteWithCommand", pairCommandForProfile(getActiveProfile())));
 }

@@ -141,6 +141,7 @@ function readTailLines(path, maxLines) {
 }
 function parseRelayHealth(lines, gatewayType) {
     const connectedIndex = findLastIndex(lines, (line) => line.includes("Relay connected.")
+        || line.includes("Connected to relay server (gatewayId=")
         || (gatewayType === "hermes" && line.includes("Connected to relay server (hermes gatewayId=")));
     const disconnectedIndex = findLastIndex(lines, (line) => line.includes("Relay disconnected.") ||
         line.includes("Relay connection closed:") ||

@@ -153,6 +153,7 @@ function parseRelayHealth(lines: string[], gatewayType: GatewayType): HealthStat
     lines,
     (line) =>
       line.includes("Relay connected.")
+      || line.includes("Connected to relay server (gatewayId=")
       || (gatewayType === "hermes" && line.includes("Connected to relay server (hermes gatewayId=")),
   );
   const disconnectedIndex = findLastIndex(
