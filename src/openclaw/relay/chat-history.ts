@@ -278,6 +278,12 @@ function resolveHeartbeatArtifactEnd(messages: HistoryMessage[], startIndex: num
       continue;
     }
     if (message.role === "assistant") {
+      const content = resolveTextOnlyHistoryContent(message.content);
+      // Empty assistant placeholder text is ignored while waiting for terminal ack
+      if (!content.text.trim()) {
+        continue;
+      }
+      // Non-empty assistant text that is NOT HEARTBEAT_OK is a real heartbeat alert -> do not filter
       return undefined;
     }
     if (message.role !== "tool" && message.role !== "toolResult" && message.role !== "tool_result") {
@@ -292,7 +298,11 @@ function isOpenClawHeartbeatPrompt(message: HistoryMessage): boolean {
     return false;
   }
   const content = resolveTextOnlyHistoryContent(message.content);
-  return !content.hasNonTextContent && content.text.trim() === OPENCLAW_HEARTBEAT_TRANSCRIPT_PROMPT;
+  if (content.hasNonTextContent) {
+    return false;
+  }
+  const text = content.text.replace(/\r/g, "").trim();
+  return text === "[OpenClaw heartbeat poll]" || text === "OpenClaw heartbeat poll";
 }
 
 function isOpenClawHeartbeatAcknowledgement(message: HistoryMessage): boolean {
@@ -300,7 +310,11 @@ function isOpenClawHeartbeatAcknowledgement(message: HistoryMessage): boolean {
     return false;
   }
   const content = resolveTextOnlyHistoryContent(message.content);
-  return !content.hasNonTextContent && content.text.trim() === OPENCLAW_HEARTBEAT_ACK;
+  if (content.hasNonTextContent) {
+    return false;
+  }
+  const text = content.text.replace(/\r/g, "").trim();
+  return text === "HEARTBEAT_OK" || text === "HEARTBEAT OK";
 }
 
 function isHeartbeatToolArtifact(message: HistoryMessage): boolean {

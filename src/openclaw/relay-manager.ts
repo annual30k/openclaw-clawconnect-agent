@@ -408,6 +408,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             const resolvedSessionKey = sessionKey ?? runContext?.sessionKey;
             const currentText = extractChatText(normalizedPayload);
             const role = extractChatRole(normalizedPayload);
+            if (isOpenClawHeartbeatText(currentText) || (runContext?.promptText && isOpenClawHeartbeatText(runContext.promptText))) {
+              if (providerRunId && (state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted")) {
+                chatBuffers.delete(providerRunId);
+                chatRunContexts.delete(providerRunId);
+              }
+              return;
+            }
             let realtimePayload = normalizedPayload;
 
             if (providerRunId) {
@@ -806,6 +813,23 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       contextUsageRefreshes.clear();
       resolve(shouldRetryRelayClose(code, opts.signal));
     });
+
+    function isOpenClawHeartbeatText(text?: string): boolean {
+      if (!text) return false;
+      const trimmed = text.replace(/\r/g, "").trim();
+      const lower = trimmed.toLowerCase();
+      const upper = trimmed.toUpperCase();
+      return (
+        lower === "[openclaw heartbeat poll]" ||
+        lower === "openclaw heartbeat poll" ||
+        lower.startsWith("[openclaw heartbeat poll]") ||
+        lower.startsWith("openclaw heartbeat poll") ||
+        upper === "HEARTBEAT_OK" ||
+        upper === "HEARTBEAT OK" ||
+        upper.startsWith("HEARTBEAT_OK") ||
+        upper.startsWith("HEARTBEAT OK")
+      );
+    }
 
     relayWs.on("error", (err) => {
       console.error("Relay WebSocket error:", err.message);

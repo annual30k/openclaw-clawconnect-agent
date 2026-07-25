@@ -43,6 +43,29 @@ test("heartbeat filtering keeps real alerts and similar user text", () => {
   assert.deepEqual(filterOpenClawHeartbeatArtifacts(messages), messages);
 });
 
+test("heartbeat filtering removes multi-step heartbeats with intermediate assistant thoughts and tool calls", () => {
+  const messages = [
+    { id: "heartbeat-user", role: "user", content: "[OpenClaw heartbeat poll]" },
+    { id: "heartbeat-assistant-thinking", role: "assistant", content: "" },
+    { id: "heartbeat-tool-call", role: "assistant", content: [{ type: "toolCall", name: "read" }] },
+    { id: "heartbeat-tool-result", role: "toolResult", content: [{ type: "toolResult", text: "ok" }] },
+    { id: "heartbeat-assistant-ack", role: "assistant", content: "HEARTBEAT_OK" },
+    { id: "real-user", role: "user", content: "Hello OpenClaw" },
+  ];
+
+  assert.deepEqual(filterOpenClawHeartbeatArtifacts(messages), [messages[5]]);
+});
+
+test("heartbeat filtering removes standalone heartbeat prompts and ACKs", () => {
+  const messages = [
+    { id: "standalone-prompt", role: "user", content: "[OpenClaw heartbeat poll]" },
+    { id: "standalone-ack", role: "assistant", content: "HEARTBEAT_OK" },
+    { id: "real-user", role: "user", content: "How are you?" },
+  ];
+
+  assert.deepEqual(filterOpenClawHeartbeatArtifacts(messages), [messages[2]]);
+});
+
 test("heartbeat filtering removes silent tool artifacts only after a terminal acknowledgement", () => {
   const messages = [
     { id: "heartbeat-user", role: "user", content: "[OpenClaw heartbeat poll]" },
