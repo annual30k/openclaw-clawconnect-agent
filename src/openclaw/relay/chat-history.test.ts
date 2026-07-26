@@ -186,6 +186,15 @@ test("transcript history provider preserves OpenClaw tool content blocks", async
       content: "/Users/qiuqiquan/Desktop/openClaw",
       text: "/Users/qiuqiquan/Desktop/openClaw",
     }]);
+    assert.deepEqual(page.timelineSnapshot?.messages[1]?.content, [{
+      type: "toolresult",
+      id: "call-1",
+      name: "bash",
+      content: "/Users/qiuqiquan/Desktop/openClaw",
+      text: "/Users/qiuqiquan/Desktop/openClaw",
+      toolCallId: "call-1",
+    }]);
+    assert.match(page.timelineSnapshot?.messages[1]?.content[0]?.toolCallId as string, /^call-1$/);
   } finally {
     await fixture.cleanup();
   }

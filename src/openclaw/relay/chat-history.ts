@@ -146,6 +146,14 @@ export async function readChatHistoryFromTranscriptFile(
           ?? messageId
           ?? `history-${request.sessionKey}-${seq}-${role}`;
         const content = normalizeTimelineContentBlocks(message.content);
+        const toolCallId = role === "tool"
+          ? historyString(message, "toolCallId", "tool_call_id")
+          : undefined;
+        const canonicalContent = toolCallId
+          ? content.map((block) => historyString(block, "toolCallId", "tool_call_id")
+            ? block
+            : { ...block, toolCallId })
+          : content;
         return {
           turnId,
           runId: historyString(message, "runId", "run_id") ?? turnId,
@@ -154,12 +162,14 @@ export async function readChatHistoryFromTranscriptFile(
           messageState: normalizeTimelineMessageState(message),
           createdAt: normalizeTimelineCreatedAt(message) ?? fallbackTimelineCreatedAt(page.messages, index),
           partId: historyString(message, "partId", "part_id") ?? "part-text-1",
-          content,
+          content: canonicalContent,
           seq,
           turnSeq: historyNumber(message, "turnSeq", "turn_seq") ?? seq,
           ...(clientMessageId ? { clientMessageId } : {}),
           ...(idempotencyKey ? { idempotencyKey } : {}),
-          ...(extractAttachmentIds(content).length > 0 ? { attachmentIds: extractAttachmentIds(content) } : {}),
+          ...(extractAttachmentIds(canonicalContent).length > 0
+            ? { attachmentIds: extractAttachmentIds(canonicalContent) }
+            : {}),
         };
       }),
       attachments: [],
