@@ -133,6 +133,7 @@ export async function readChatHistoryFromTranscriptFile(
       nextCursor: page.nextCursor ?? null,
       newestCursor: page.newestCursor ?? null,
       orderPolicy: "transcript",
+      ...(request.sessionId ? { sourceOrderScope: request.sessionId } : {}),
       messages: page.messages.map((message, index) => {
         const seq = messageSeq(message) ?? index + 1;
         const role = normalizeTimelineRole(message.role);

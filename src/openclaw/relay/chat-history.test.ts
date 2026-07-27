@@ -257,6 +257,10 @@ test("transcript history provider returns a canonical timeline snapshot page", a
     assert.equal(snapshot?.cursor, null);
     assert.equal(snapshot?.hasMore, false);
     assert.equal(snapshot?.newestCursor, "seq:2");
+    assert.deepEqual(page.timelineSnapshot?.extensions, {
+      orderPolicy: "transcript",
+      sourceOrderScope: "session-1",
+    });
     assert.deepEqual(snapshot?.messages.map((message) => ({
       messageId: message.messageId,
       role: message.role,
@@ -397,6 +401,141 @@ test("transcript history provider carries the mobile run id through the parent c
       { messageId: "transcript-assistant-tool", turnId: "mobile-run-42", runId: "mobile-run-42" },
       { messageId: "assistant-mobile-run-42", turnId: "mobile-run-42", runId: "mobile-run-42" },
     ]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("transcript history provider preserves every visible and tool row in a folded mobile run", async () => {
+  const runId = "mobile-folded-run";
+  const lines: Array<Record<string, unknown>> = [
+    {
+      type: "message",
+      id: "folded-user",
+      timestamp: "2026-07-27T02:22:00.000Z",
+      message: { role: "user", content: "把桌面的蜘蛛侠图片发过来", idempotencyKey: `${runId}:user` },
+    },
+    {
+      type: "message",
+      id: "folded-assistant-image-call",
+      parentId: "folded-user",
+      timestamp: "2026-07-27T02:22:01.000Z",
+      message: { role: "assistant", content: [{ type: "toolCall", id: "call-image", name: "image" }] },
+    },
+    {
+      type: "message",
+      id: "folded-tool-image-result",
+      parentId: "folded-assistant-image-call",
+      timestamp: "2026-07-27T02:22:02.000Z",
+      message: {
+        role: "toolResult",
+        toolCallId: "call-image",
+        toolName: "image",
+        content: [{ type: "toolResult", id: "call-image", name: "image", text: "标准证件照分析" }],
+      },
+    },
+    {
+      type: "message",
+      id: "folded-assistant-analysis",
+      parentId: "folded-tool-image-result",
+      timestamp: "2026-07-27T02:22:03.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "这是一张标准证件照。关于蜘蛛侠图片，我来找找：" },
+          { type: "toolCall", id: "call-find-1", name: "exec" },
+        ],
+      },
+    },
+    {
+      type: "message",
+      id: "folded-tool-find-failed",
+      parentId: "folded-assistant-analysis",
+      timestamp: "2026-07-27T02:22:04.000Z",
+      message: {
+        role: "toolResult",
+        toolCallId: "call-find-1",
+        toolName: "exec",
+        content: [{ type: "toolResult", id: "call-find-1", name: "exec", text: "not found" }],
+      },
+    },
+    {
+      type: "message",
+      id: "folded-assistant-find-call",
+      parentId: "folded-tool-find-failed",
+      timestamp: "2026-07-27T02:22:05.000Z",
+      message: { role: "assistant", content: [{ type: "toolCall", id: "call-find-2", name: "exec" }] },
+    },
+    {
+      type: "message",
+      id: "folded-tool-find-result",
+      parentId: "folded-assistant-find-call",
+      timestamp: "2026-07-27T02:22:06.000Z",
+      message: {
+        role: "toolResult",
+        toolCallId: "call-find-2",
+        toolName: "exec",
+        content: [{ type: "toolResult", id: "call-find-2", name: "exec", text: "spiderman.jpg" }],
+      },
+    },
+    {
+      type: "message",
+      id: "folded-assistant-found",
+      parentId: "folded-tool-find-result",
+      timestamp: "2026-07-27T02:22:07.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "找到了！现在发到 iPhone：" },
+          { type: "toolCall", id: "call-send", name: "send_file" },
+        ],
+      },
+    },
+    {
+      type: "message",
+      id: "folded-tool-send-result",
+      parentId: "folded-assistant-found",
+      timestamp: "2026-07-27T02:22:08.000Z",
+      message: {
+        role: "toolResult",
+        toolCallId: "call-send",
+        toolName: "send_file",
+        content: [{ type: "toolResult", id: "call-send", name: "send_file", text: "sent" }],
+      },
+    },
+    {
+      type: "message",
+      id: "folded-assistant-final",
+      parentId: "folded-tool-send-result",
+      timestamp: "2026-07-27T02:22:09.000Z",
+      message: { role: "assistant", content: "搞定！spiderman.jpg 已经发到你 iPhone 上了" },
+    },
+  ];
+  const fixture = await createTranscriptFixture(lines.length, lines);
+  try {
+    const page = await readChatHistoryFromTranscriptFile({
+      sessionKey: "agent:main:main",
+      transcriptPath: fixture.path,
+      limit: 20,
+    });
+    const messages = page.timelineSnapshot?.messages ?? [];
+
+    assert.deepEqual(messages.map((message) => message.messageId), [
+      "folded-user",
+      "folded-assistant-image-call",
+      "folded-tool-image-result",
+      "folded-assistant-analysis",
+      "folded-tool-find-failed",
+      "folded-assistant-find-call",
+      "folded-tool-find-result",
+      "folded-assistant-found",
+      "folded-tool-send-result",
+      `assistant-${runId}`,
+    ]);
+    assert.deepEqual(
+      messages.slice(1).map((message) => [message.turnId, message.runId]),
+      Array.from({ length: 9 }, () => [runId, runId]),
+    );
   } finally {
     await fixture.cleanup();
   }
