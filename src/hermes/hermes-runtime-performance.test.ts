@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { buildTurnUserCreatedEvent } from "../core/relay/timeline-event-builder.js";
 import { handleHermesCommand, runHermesChatHistory } from "./hermes-runtime.js";
 import {
   buildHermesStateDbRealtimePayloads,
@@ -81,6 +82,15 @@ conn.close()
         [400, "assistant-large-mobile-run"],
       ],
     );
+    const relayMobileEcho = buildTurnUserCreatedEvent({
+      gatewayId: "gw-hermes",
+      sessionKey: `hermes:${sessionId}`,
+      idempotencyKey: "large-mobile-run",
+      runId: "large-mobile-run",
+      text: "mobile prompt",
+    });
+    assert.equal(relayMobileEcho.messageId, "user-large-mobile-run");
+    assert.equal(newestPayload.messages.at(-2)?.id, relayMobileEcho.messageId);
     assert.deepEqual(
       newestPayload.timelineSnapshot?.messages.slice(-4).map((message) => [message.seq, message.messageId]),
       newestPayload.messages.slice(-4).map((message) => [message.seq, message.id]),
@@ -111,6 +121,12 @@ conn.close()
       `hermes-db-${sessionId}-message-398-assistant`,
       "assistant-large-mobile-run",
     ]);
+    assert.equal(
+      realtime.payloads.some((payload) => payload.timelineEvents.some((timelineEvent) => (
+        timelineEvent.role === "user" && timelineEvent.runId === "large-mobile-run"
+      ))),
+      false,
+    );
     assert.deepEqual(
       newestPayload.messages.filter((message) => [397, 398, 400].includes(message.seq)).map((message) => message.id),
       realtimeCompletedMessageIds,
