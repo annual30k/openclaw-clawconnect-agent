@@ -439,6 +439,202 @@ test("relay manager keeps mobile chat identity across provider events and transc
   }
 });
 
+test("relay manager does not complete an OpenClaw run for a thinking plus toolCall preamble", async () => {
+  openClawChatRunIdentities.clear();
+  const openclawHome = await createEmptyOpenClawHomeFixture();
+  const previousOpenClawHome = process.env.CLAWCONNECT_OPENCLAW_HOME;
+  process.env.CLAWCONNECT_OPENCLAW_HOME = openclawHome.home;
+  const sessionsDir = join(openclawHome.home, "agents", "main", "sessions");
+  const transcriptPath = join(sessionsDir, "session-tool-preamble.jsonl");
+  await writeFile(
+    join(sessionsDir, "sessions.json"),
+    `${JSON.stringify({
+      "agent:main:main": {
+        sessionId: "session-tool-preamble",
+        sessionFile: "session-tool-preamble.jsonl",
+      },
+    })}\n`,
+    "utf8",
+  );
+
+  const mobileRunId = "mobile-run-tool-preamble";
+  const providerRunId = "provider-run-tool-preamble";
+  const writeTranscript = async (includeFinalAnswer: boolean): Promise<void> => {
+    const rows = [
+      {
+        type: "message",
+        id: "tool-preamble-user",
+        parentId: "previous-assistant",
+        message: {
+          role: "user",
+          content: "wait for the tool",
+          idempotencyKey: `${mobileRunId}:user`,
+        },
+      },
+      {
+        type: "message",
+        id: "tool-preamble-assistant",
+        parentId: "tool-preamble-user",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "I should run the tool before replying." },
+            {
+              type: "toolCall",
+              id: "tool-wait",
+              name: "exec",
+              arguments: { command: "wait" },
+            },
+          ],
+        },
+      },
+    ];
+    if (includeFinalAnswer) {
+      rows.push({
+        type: "message",
+        id: "tool-preamble-final",
+        parentId: "tool-preamble-assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "tool finished" }],
+        },
+      });
+    }
+    await writeFile(transcriptPath, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "utf8");
+  };
+  await writeTranscript(false);
+
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let relaySocket: WebSocket | undefined;
+  let gatewaySocket: WebSocket | undefined;
+
+  relayServer.on("connection", (socket) => {
+    relaySocket = socket;
+    socket.on("message", (raw) => {
+      relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
+    });
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({
+      type: "event",
+      event: "connect.challenge",
+      payload: { nonce: "nonce-tool-preamble" },
+    }));
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as {
+        type?: string;
+        id?: string;
+        method?: string;
+      };
+      if (message.type !== "req" || !message.id) {
+        return;
+      }
+      if (message.method === "chat.send") {
+        socket.send(JSON.stringify({
+          type: "res",
+          id: message.id,
+          ok: true,
+          payload: { runId: providerRunId, status: "started" },
+        }));
+        setImmediate(() => {
+          socket.send(JSON.stringify({
+            type: "event",
+            event: "chat",
+            payload: {
+              runId: providerRunId,
+              sessionKey: "agent:main:main",
+              state: "final",
+              role: "assistant",
+              text: "",
+            },
+          }));
+        });
+        return;
+      }
+      socket.send(JSON.stringify({
+        type: "res",
+        id: message.id,
+        ok: true,
+        payload: sessionDefaultsPayload(),
+      }));
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-tool-preamble",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+
+  const terminalEvents = (): Array<Record<string, unknown>> => relayMessages.flatMap((message) => {
+    if (message.type !== "event" || message.event !== "chat" || !isRecord(message.payload)) {
+      return [];
+    }
+    return timelineEvents(message.payload).filter((event) => (
+      event.runId === mobileRunId && event.eventType === "run.completed"
+    ));
+  });
+
+  try {
+    await waitFor(() => Boolean(relaySocket) && relayMessages.some((message) => message.type === "gateway_connected"), 4_000);
+    relaySocket?.send(JSON.stringify({
+      type: "cmd",
+      id: "send-tool-preamble",
+      method: "chat.send",
+      params: {
+        sessionKey: "agent:main:main",
+        message: "wait for the tool",
+        idempotencyKey: mobileRunId,
+      },
+    }));
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "send-tool-preamble"), 4_000);
+
+    // Wait beyond the immediate history read and its retry. The tool preamble must not
+    // be projected as a terminal assistant reply while the actual tool is still running.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.deepEqual(terminalEvents(), []);
+
+    await writeTranscript(true);
+    gatewaySocket?.send(JSON.stringify({
+      type: "event",
+      event: "chat",
+      payload: {
+        runId: providerRunId,
+        sessionKey: "agent:main:main",
+        state: "final",
+        role: "assistant",
+        text: "tool finished",
+      },
+    }));
+    await waitFor(() => terminalEvents().length === 1, 4_000);
+    await new Promise((resolve) => setTimeout(resolve, 1_350));
+    assert.equal(terminalEvents().length, 1);
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+    openClawChatRunIdentities.clear();
+    if (previousOpenClawHome === undefined) {
+      delete process.env.CLAWCONNECT_OPENCLAW_HOME;
+    } else {
+      process.env.CLAWCONNECT_OPENCLAW_HOME = previousOpenClawHome;
+    }
+    await openclawHome.cleanup();
+  }
+});
+
 test("relay manager restores provider to mobile identity after Relay WebSocket reconnect", async () => {
   openClawChatRunIdentities.clear();
   const relayServer = new WebSocketServer({ port: 0 });

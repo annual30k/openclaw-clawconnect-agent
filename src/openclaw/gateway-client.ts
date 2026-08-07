@@ -123,6 +123,19 @@ interface EvtFrame {
 
 const MIN_PROTOCOL_VERSION = 3;
 const MAX_PROTOCOL_VERSION = 4;
+const DEFAULT_CLIENT_ID = "openclaw-control-ui";
+const DEFAULT_CLIENT_MODE = "webchat";
+
+export function gatewayWebSocketOrigin(url: string): string {
+  const parsed = new URL(url);
+  if (parsed.protocol === "ws:") parsed.protocol = "http:";
+  else if (parsed.protocol === "wss:") parsed.protocol = "https:";
+  else throw new Error(`unsupported gateway websocket protocol: ${parsed.protocol}`);
+  parsed.pathname = "/";
+  parsed.search = "";
+  parsed.hash = "";
+  return parsed.origin;
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -168,7 +181,14 @@ export class OpenClawGatewayClient {
 
   start(): void {
     if (this.stopped) return;
-    this.ws = new WebSocket(this.resolveUrl(), { maxPayload: 25 * 1024 * 1024 });
+    const url = this.resolveUrl();
+    const clientId = this.opts.clientId ?? DEFAULT_CLIENT_ID;
+    this.ws = new WebSocket(url, {
+      maxPayload: 25 * 1024 * 1024,
+      // OpenClaw 会校验 Control UI 的 Gateway 来源；必须从 ws(s) 地址确定性派生，
+      // 不能通过放宽 gateway.controlUi.allowedOrigins 绕过安全边界。
+      ...(clientId === DEFAULT_CLIENT_ID ? { origin: gatewayWebSocketOrigin(url) } : {}),
+    });
 
     this.ws.on("open", () => {
       this.connectNonce = null;
@@ -251,8 +271,10 @@ export class OpenClawGatewayClient {
       "operator.approvals",
       "operator.pairing",
     ];
-    const clientId = this.opts.clientId ?? "openclaw-macos";
-    const clientMode = this.opts.clientMode ?? "ui";
+    // chat.send 属于操作界面行为。其他 client id 会被 OpenClaw 当作外部发送者，
+    // 并给模型提示词添加 Sender 不可信信封，使普通 ClawConnect 消息被误判为注入。
+    const clientId = this.opts.clientId ?? DEFAULT_CLIENT_ID;
+    const clientMode = this.opts.clientMode ?? DEFAULT_CLIENT_MODE;
     const caps = this.opts.caps ?? ["tool-events"];
     const signedAtMs = Date.now();
     const nonce = this.connectNonce ?? undefined;

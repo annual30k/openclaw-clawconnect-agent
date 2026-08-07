@@ -207,6 +207,42 @@ test("history helper does not treat tool-only assistant blocks as final content"
   assert.equal(extractHistoryOutcome(history, context), null);
 });
 
+test("history helper does not terminate a run for OpenClaw thinking plus toolCall preamble", () => {
+  const context = {
+    sessionKey: "agent:main:main",
+    canonicalRunId: "turn-thinking-tool",
+    promptText: "wait before replying",
+  };
+  const history: HistoryResponse = {
+    messages: [
+      {
+        role: "user",
+        idempotencyKey: "turn-thinking-tool:user",
+        timestamp: 1_100,
+        content: [{ type: "text", text: "wait before replying" }],
+      },
+      {
+        role: "assistant",
+        timestamp: 1_150,
+        content: [
+          {
+            type: "thinking",
+            thinking: "I should call the waiting tool before answering.",
+          },
+          {
+            type: "toolCall",
+            id: "tool-wait-1",
+            name: "exec",
+            arguments: { command: "sleep 60" },
+          },
+        ],
+      },
+    ],
+  };
+
+  assert.equal(extractHistoryOutcome(history, context), null);
+});
+
 test("history helper matches OpenClaw string user content", () => {
   const context = {
     sessionKey: "session_1",

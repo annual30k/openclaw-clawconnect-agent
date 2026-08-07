@@ -851,13 +851,23 @@ function hasHistoryMessageContent(message: HistoryMessage | undefined): boolean 
 }
 
 function isToolOnlyHistoryBlockType(type: string): boolean {
-  return type === "tool_call"
-    || type === "tool_use"
-    || type === "tool_result"
-    || type === "function_call"
-    || type === "function_result"
-    || type === "computer_call"
-    || type === "computer_call_output";
+  // OpenClaw 在工具轮开始时会先落一条 thinking + toolCall 的 assistant 行。
+  // thinking/reasoning 属于内部推理，不是用户可见终答；若把它当成内容，移动端会
+  // 在工具仍运行时收到 run.completed，并提前发送队列中的下一条消息。
+  // OpenClaw 的不同网关版本会同时出现 tool_call 与 toolCall 两种拼法；
+  // 在调用方转小写后，后者会变成 toolcall，因此这里统一去掉分隔符再判断。
+  const normalizedType = type.replace(/[\s_-]+/g, "");
+  return normalizedType === "thinking"
+    || normalizedType === "reasoning"
+    || normalizedType === "reasoningcontent"
+    || normalizedType === "analysis"
+    || normalizedType === "toolcall"
+    || normalizedType === "tooluse"
+    || normalizedType === "toolresult"
+    || normalizedType === "functioncall"
+    || normalizedType === "functionresult"
+    || normalizedType === "computercall"
+    || normalizedType === "computercalloutput";
 }
 
 function findHistoryUserIndex(messages: HistoryMessage[], context: ChatRunContext): number {

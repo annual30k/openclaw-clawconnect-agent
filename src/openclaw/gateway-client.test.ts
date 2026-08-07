@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { WebSocketServer } from "ws";
-import { OpenClawGatewayClient } from "./gateway-client.js";
+import { gatewayWebSocketOrigin, OpenClawGatewayClient } from "./gateway-client.js";
+
+test("gatewayWebSocketOrigin maps secure and insecure Gateway URLs", () => {
+  assert.equal(gatewayWebSocketOrigin("ws://localhost:18789/path?token=hidden"), "http://localhost:18789");
+  assert.equal(gatewayWebSocketOrigin("wss://gateway.example.test/socket"), "https://gateway.example.test");
+});
 
 test("gateway client rejects pending requests when the gateway socket closes", async () => {
   const server = new WebSocketServer({ port: 0 });
@@ -71,20 +76,30 @@ test("gateway client resolves the websocket URL before each reconnect", async ()
   }
 });
 
-test("gateway client advertises a protocol range for older and newer OpenClaw gateways", async () => {
+test("gateway client advertises the trusted Control UI identity and protocol range", async () => {
   const server = new WebSocketServer({ port: 0 });
   const address = server.address();
   assert.ok(address && typeof address === "object");
 
-  let connectParams: { minProtocol?: number; maxProtocol?: number } | undefined;
+  let connectParams: {
+    minProtocol?: number;
+    maxProtocol?: number;
+    client?: { id?: string; mode?: string; displayName?: string };
+  } | undefined;
+  let requestOrigin: string | undefined;
   let connected = false;
-  server.on("connection", (socket) => {
+  server.on("connection", (socket, request) => {
+    requestOrigin = request.headers.origin;
     socket.on("message", (raw) => {
       const msg = JSON.parse(raw.toString()) as {
         type?: string;
         id?: string;
         method?: string;
-        params?: { minProtocol?: number; maxProtocol?: number };
+        params?: {
+          minProtocol?: number;
+          maxProtocol?: number;
+          client?: { id?: string; mode?: string; displayName?: string };
+        };
       };
       if (msg.type === "req" && msg.method === "connect" && msg.id) {
         connectParams = msg.params;
@@ -107,6 +122,10 @@ test("gateway client advertises a protocol range for older and newer OpenClaw ga
 
     assert.equal(connectParams?.minProtocol, 3);
     assert.equal(connectParams?.maxProtocol, 4);
+    assert.equal(connectParams?.client?.id, "openclaw-control-ui");
+    assert.equal(connectParams?.client?.mode, "webchat");
+    assert.equal(connectParams?.client?.displayName, "ClawConnect Agent");
+    assert.equal(requestOrigin, `http://127.0.0.1:${address.port}`);
   } finally {
     client.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
