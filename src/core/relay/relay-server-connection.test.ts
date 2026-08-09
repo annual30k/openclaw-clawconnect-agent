@@ -28,8 +28,40 @@ test("sendRelayJson only sends when socket is open", () => {
     send: (value: string) => sent.push(value),
   } as unknown as WebSocket;
 
-  sendRelayJson(ws, { type: "heartbeat" });
+  const result = sendRelayJson(ws, { type: "heartbeat" });
   assert.deepEqual(sent, ['{"type":"heartbeat"}']);
+  assert.equal(result.status, "sent");
+  assert.equal(result.aboveHighWaterMark, false);
+  assert.equal(result.byteLength, Buffer.byteLength('{"type":"heartbeat"}'));
+});
+
+test("sendRelayJson reports backpressure but still sends the frame", () => {
+  const sent: string[] = [];
+  const ws = {
+    readyState: WebSocket.OPEN,
+    bufferedAmount: 99,
+    send: (value: string) => sent.push(value),
+  } as unknown as WebSocket;
+
+  const result = sendRelayJson(ws, { type: "res", ok: true }, 100);
+
+  assert.equal(result.status, "sent");
+  assert.equal(result.aboveHighWaterMark, true);
+  assert.ok(result.projectedBufferedAmount > 100);
+  assert.deepEqual(sent, ['{"type":"res","ok":true}']);
+});
+
+test("sendRelayJson reports a closed socket instead of pretending to send", () => {
+  const ws = {
+    readyState: WebSocket.CLOSED,
+    bufferedAmount: 0,
+    send: () => assert.fail("closed socket must not call send"),
+  } as unknown as WebSocket;
+
+  const result = sendRelayJson(ws, { type: "heartbeat" });
+
+  assert.equal(result.status, "socket_not_open");
+  assert.equal(result.byteLength, 0);
 });
 
 test("bindRelayAbortSignal closes with shutdown code on abort", () => {

@@ -392,7 +392,7 @@ test("runHermesChat uses the Hermes API server stream instead of spawning the CL
     assert.equal(apiRequests.some((request) => request.url === "/api/sessions"), true);
     assert.equal(apiRequests.some((request) => request.url === `/api/sessions/${hermesSessionId}/chat/stream`), true);
     assert.equal(JSON.stringify(publishedEvents).includes("api "), true);
-    assert.deepEqual(assistantTimelineDeltaTexts(publishedEvents), ["api ", "api reply"]);
+    assert.deepEqual(assistantTimelineDeltaTexts(publishedEvents), ["api reply"]);
     const toolEvents = toolTimelineEvents(publishedEvents);
     assert.deepEqual(
       toolEvents.map((event) => [event.toolInvocationId, event.messageId, event.toolState]),
@@ -404,6 +404,14 @@ test("runHermesChat uses the Hermes API server stream instead of spawning the CL
         ["run-api:hermes-api-tool-1", "tool-run-api:hermes-api-tool-1", "success"],
       ],
     );
+    const firstAssistantDeltaIndex = publishedEvents.findIndex((event) => (
+      JSON.stringify(event).includes('"eventType":"message.part.delta"')
+    ));
+    const firstToolEventIndex = publishedEvents.findIndex((event) => (
+      JSON.stringify(event).includes('"eventType":"tool.invocation.updated"')
+    ));
+    assert.ok(firstAssistantDeltaIndex >= 0);
+    assert.ok(firstToolEventIndex > firstAssistantDeltaIndex);
     assert.equal(JSON.stringify(toolEvents).includes("_thinking"), false);
     const stored = await listStoredHermesSessions();
     assert.equal(stored[0]?.sessionKey, "mobile-main");

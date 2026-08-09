@@ -42,6 +42,10 @@ import {
   buildMobileAssistantFinalPayload,
 } from "../core/relay/mobile-chat-run-bridge.js";
 import {
+  LatestSnapshotCoalescer,
+  buildAssistantStreamSnapshotKey,
+} from "../core/relay/assistant-stream-coalescer.js";
+import {
   buildChatSendIdempotencyRequest,
   ChatSendIdempotencyGuard,
 } from "../core/relay/chat-send-idempotency.js";
@@ -94,6 +98,13 @@ type OpenClawChatCommandExecution = {
   params: unknown;
   result: unknown;
   identity?: OpenClawChatRunIdentity;
+};
+
+type OpenClawAssistantSnapshot = {
+  eventName: string;
+  payload: unknown;
+  publishOffice: boolean;
+  userMessage?: string;
 };
 
 // 保留在连接实例之外，使 Relay WebSocket 断线重连后的同轮重投仍能复用终态结果。
@@ -307,6 +318,69 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       send({ type: "event", event: eventName, payload: outgoingPayload });
     }
 
+    const assistantSnapshots = new LatestSnapshotCoalescer<string, OpenClawAssistantSnapshot>({
+      emit: (_key, snapshot) => publishAndSendGatewayEvent(
+        snapshot.eventName,
+        snapshot.payload,
+        snapshot.publishOffice,
+        snapshot.userMessage,
+      ),
+      onError: (error, key) => {
+        console.warn(`[relay] assistant snapshot publish failed key=${key}: ${String(error)}`);
+      },
+    });
+
+    const assistantSnapshotKey = (runId: string | undefined, sessionKey: string | undefined): string | undefined => {
+      if (!runId?.trim() || !sessionKey?.trim()) {
+        return undefined;
+      }
+      return buildAssistantStreamSnapshotKey({
+        sessionKey,
+        runId,
+        messageId: `assistant-${runId}`,
+      });
+    };
+
+    const runAfterAssistantSnapshot = (
+      key: string | undefined,
+      close: boolean,
+      operation: () => void | Promise<void>,
+    ): void => {
+      let result: void | Promise<void>;
+      try {
+        result = key
+          ? close
+            ? assistantSnapshots.closeAfterFlush(key, operation)
+            : assistantSnapshots.flushThen(key, operation)
+          : operation();
+      } catch (error) {
+        console.warn(`[relay] ordered gateway event publish failed: ${String(error)}`);
+        return;
+      }
+      void Promise.resolve(result).catch((error) => {
+        console.warn(`[relay] ordered gateway event publish failed: ${String(error)}`);
+      });
+    };
+
+    const snapshotKeyForGatewayPayload = (payload: unknown): string | undefined => {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        return undefined;
+      }
+      const record = payload as Record<string, unknown>;
+      const providerRunId = typeof record.runId === "string" && record.runId.trim()
+        ? record.runId.trim()
+        : undefined;
+      const explicitCanonicalRunId = resolveExplicitMobileRunIdFromChatPayload(payload);
+      const runContext = providerRunId
+        ? chatRunContexts.get(providerRunId) ?? openClawChatRunIdentities.resolve(opts.gatewayId, providerRunId)
+        : undefined;
+      const runId = runContext?.canonicalRunId ?? explicitCanonicalRunId ?? providerRunId;
+      const sessionKey = typeof record.sessionKey === "string" && record.sessionKey.trim()
+        ? record.sessionKey.trim()
+        : runContext?.sessionKey;
+      return assistantSnapshotKey(runId, sessionKey);
+    };
+
     async function relayOutgoingMediaForResponse(method: string, payload: unknown): Promise<unknown> {
       if (method !== "chat.history") {
         return payload;
@@ -408,10 +482,14 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             const resolvedSessionKey = sessionKey ?? runContext?.sessionKey;
             const currentText = extractChatText(normalizedPayload);
             const role = extractChatRole(normalizedPayload);
+            const runSnapshotKey = assistantSnapshotKey(canonicalRunId, resolvedSessionKey);
             if (isOpenClawHeartbeatText(currentText) || (runContext?.promptText && isOpenClawHeartbeatText(runContext.promptText))) {
               if (providerRunId && (state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted")) {
                 chatBuffers.delete(providerRunId);
                 chatRunContexts.delete(providerRunId);
+              }
+              if (runSnapshotKey) {
+                assistantSnapshots.clear(runSnapshotKey);
               }
               return;
             }
@@ -457,6 +535,21 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               }
             }
 
+            if (
+              runSnapshotKey &&
+              role === "assistant" &&
+              (state === "delta" || state === "streaming" || state === "in_progress") &&
+              extractChatText(realtimePayload).trim()
+            ) {
+              assistantSnapshots.schedule(runSnapshotKey, {
+                eventName: event,
+                payload: realtimePayload,
+                publishOffice: shouldPublishOffice,
+                userMessage: runContext?.promptText,
+              });
+              return;
+            }
+
             if (state === "final" && resolvedSessionKey) {
               scheduleContextUsageRefresh(resolvedSessionKey, 450);
               const bufferedText = providerRunId ? chatBuffers.get(providerRunId) ?? "" : "";
@@ -480,13 +573,19 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                       }),
                     )
                   : withMessageText(normalizedPayload, resolvedText);
-                void publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
+                runAfterAssistantSnapshot(runSnapshotKey, true, () => (
+                  publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText)
+                ));
                 return;
               }
 
               const fetchHistory = () =>
                 requestChatHistoryFromClawConnect({ sessionKey: resolvedSessionKey, limit: 10 });
-              withTimeout(fetchHistory(), CHAT_HISTORY_FETCH_TIMEOUT_MS, "chat.history")
+              const publishHistoryTerminal = () => withTimeout(
+                fetchHistory(),
+                CHAT_HISTORY_FETCH_TIMEOUT_MS,
+                "chat.history",
+              )
                 .then(async (history) => {
                   let outcome = runContext ? extractHistoryOutcome(history, runContext) : null;
                   // Retry once if OpenClaw has emitted final before the transcript is committed.
@@ -544,6 +643,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                   }
                   void publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice);
                 });
+              runAfterAssistantSnapshot(runSnapshotKey, true, publishHistoryTerminal);
               return;
             }
 
@@ -551,10 +651,15 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               chatRunContexts.delete(providerRunId);
               scheduleContextUsageRefresh(p?.sessionKey, 450);
             }
-            void publishAndSendGatewayEvent(event, realtimePayload, shouldPublishOffice);
+            const isTerminal = state === "error" || state === "failed" || state === "fail" || state === "aborted";
+            runAfterAssistantSnapshot(runSnapshotKey, isTerminal, () => (
+              publishAndSendGatewayEvent(event, realtimePayload, shouldPublishOffice)
+            ));
             return;
           }
-          void publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice);
+          runAfterAssistantSnapshot(snapshotKeyForGatewayPayload(normalizedPayload), false, () => (
+            publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice)
+          ));
         },
       });
 
@@ -811,6 +916,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         clearTimeout(timer);
       }
       contextUsageRefreshes.clear();
+      assistantSnapshots.dispose();
       resolve(shouldRetryRelayClose(code, opts.signal));
     });
 

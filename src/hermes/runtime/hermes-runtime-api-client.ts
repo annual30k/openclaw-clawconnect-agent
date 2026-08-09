@@ -1,5 +1,9 @@
 import { TextDecoder } from "util";
 import type { LocalCommandContext } from "../../core/command-types.js";
+import {
+  LatestSnapshotCoalescer,
+  buildAssistantStreamSnapshotKey,
+} from "../../core/relay/assistant-stream-coalescer.js";
 import { buildMobileAssistantDeltaPayload } from "../../core/relay/mobile-chat-run-bridge.js";
 import { buildToolInvocationUpdatedEvent } from "../../core/relay/timeline-event-builder.js";
 import { rememberHermesSession } from "../hermes-session-store.js";
@@ -310,24 +314,47 @@ async function consumeHermesApiChatStream(
   let usage: HermesUsageSnapshot | undefined;
   let hermesSessionId = params.sessionId;
   const toolLifecycle = createHermesApiToolLifecycleTracker(runId);
+  const assistantSnapshotKey = buildAssistantStreamSnapshotKey({
+    sessionKey: params.sessionKey,
+    runId,
+    messageId: `assistant-${runId}`,
+  });
+  const assistantSnapshots = new LatestSnapshotCoalescer<string, { text: string; timestampMs: number }>({
+    emit: (_key, snapshot) => {
+      params.context.publishEvent?.({
+        type: "event",
+        event: "chat",
+        payload: buildMobileAssistantDeltaPayload({
+          run: { runId, sessionKey: params.sessionKey },
+          seq: seq += 1,
+          timestampMs: snapshot.timestampMs,
+          // Wire payload remains an absolute snapshot for current clients.
+          delta: snapshot.text,
+          includeTimelineEvents: true,
+        }),
+      });
+    },
+  });
 
-  const publishToolEvent = (event: HermesApiResolvedToolEvent): void => {
-    publishHermesApiToolEvent(params.context, {
-      gatewayId: params.context.gatewayId,
-      sessionKey: params.sessionKey,
-      runId,
-      seq: seq += 1,
-      event,
+  const publishToolEvent = async (event: HermesApiResolvedToolEvent): Promise<void> => {
+    await assistantSnapshots.flushThen(assistantSnapshotKey, () => {
+      publishHermesApiToolEvent(params.context, {
+        gatewayId: params.context.gatewayId,
+        sessionKey: params.sessionKey,
+        runId,
+        seq: seq += 1,
+        event,
+      });
     });
   };
 
-  const finishActiveTools = (phase: "completed" | "failed"): void => {
+  const finishActiveTools = async (phase: "completed" | "failed"): Promise<void> => {
     for (const event of toolLifecycle.finishActive(phase)) {
-      publishToolEvent(event);
+      await publishToolEvent(event);
     }
   };
 
-  const handleEvent = (event: SseEvent): void => {
+  const handleEvent = async (event: SseEvent): Promise<void> => {
     const record = event.data && typeof event.data === "object" && !Array.isArray(event.data)
       ? event.data as Record<string, unknown>
       : {};
@@ -342,21 +369,14 @@ async function consumeHermesApiChatStream(
           return;
         }
         deltaOutput += delta;
-        params.context.publishEvent?.({
-          type: "event",
-          event: "chat",
-          payload: buildMobileAssistantDeltaPayload({
-            run: { runId, sessionKey: params.sessionKey },
-            seq: seq += 1,
-            timestampMs: Date.now(),
-            // canonical message.part.delta 是同一 part 的绝对状态；Hermes API 的 assistant.delta 是增量片段。
-            delta: deltaOutput,
-            includeTimelineEvents: true,
-          }),
+        assistantSnapshots.schedule(assistantSnapshotKey, {
+          text: deltaOutput,
+          timestampMs: Date.now(),
         });
         return;
       }
       case "assistant.completed": {
+        await assistantSnapshots.flush(assistantSnapshotKey);
         const content = sanitizeHermesChatOutput(stringValue(record.content) ?? stringValue(record.text) ?? "").trim();
         if (content) {
           finalOutput = content;
@@ -364,7 +384,8 @@ async function consumeHermesApiChatStream(
         return;
       }
       case "run.completed": {
-        finishActiveTools("completed");
+        await assistantSnapshots.flush(assistantSnapshotKey);
+        await finishActiveTools("completed");
         const content = sanitizeHermesChatOutput(stringValue(record.output) ?? "").trim();
         if (content) {
           finalOutput = content;
@@ -378,16 +399,18 @@ async function consumeHermesApiChatStream(
       case "tool.progress": {
         const toolEvent = toolLifecycle.resolve(event.event, record);
         if (toolEvent) {
-          publishToolEvent(toolEvent);
+          await publishToolEvent(toolEvent);
         }
         return;
       }
       case "error": {
-        finishActiveTools("failed");
+        await assistantSnapshots.flush(assistantSnapshotKey);
+        await finishActiveTools("failed");
         throw new Error(stringValue(record.message) ?? "Hermes API stream error");
       }
       case "done": {
-        finishActiveTools("completed");
+        await assistantSnapshots.flush(assistantSnapshotKey);
+        await finishActiveTools("completed");
         return;
       }
     }
@@ -408,7 +431,7 @@ async function consumeHermesApiChatStream(
       for (const frame of frames.completeFrames) {
         const parsed = parseSseEvent(frame);
         if (parsed) {
-          handleEvent(parsed);
+          await handleEvent(parsed);
         }
       }
     }
@@ -416,11 +439,13 @@ async function consumeHermesApiChatStream(
     if (tail) {
       const parsed = parseSseEvent(tail);
       if (parsed) {
-        handleEvent(parsed);
+        await handleEvent(parsed);
       }
     }
   } catch (error) {
-    finishActiveTools("failed");
+    await assistantSnapshots.flush(assistantSnapshotKey);
+    await finishActiveTools("failed");
+    assistantSnapshots.dispose();
     if (params.context.abortSignal?.aborted || (error instanceof Error && error.name === "AbortError")) {
       throw new Error("hermes_chat_aborted");
     }
@@ -433,7 +458,9 @@ async function consumeHermesApiChatStream(
     }
   }
 
-  finishActiveTools("completed");
+  await assistantSnapshots.flush(assistantSnapshotKey);
+  await finishActiveTools("completed");
+  assistantSnapshots.dispose();
   const output = sanitizeHermesChatOutput(finalOutput || deltaOutput).trim();
   return {
     output,

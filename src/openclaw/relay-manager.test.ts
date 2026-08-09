@@ -191,6 +191,11 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
     assert.equal(deltaEvents[0]?.messageId, "assistant-run-1");
     assert.equal(deltaEvents[0]?.seq, 2);
     assert.deepEqual(deltaEvents[0]?.content, [{ type: "text", text: "hello world" }]);
+    const runChatFrames = relayMessages
+      .filter((message) => message.type === "event" && message.event === "chat" && isRecord(message.payload))
+      .map((message) => message.payload as Record<string, unknown>)
+      .filter((payload) => payload.runId === "run-1");
+    assert.equal(runChatFrames.filter((payload) => payload.state === "delta").length, 1);
 
     await waitFor(() => relayMessages.some((message) => {
       if (message.type !== "event" || message.event !== "chat" || !isRecord(message.payload)) {
@@ -201,6 +206,21 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
         events.some((event) => event.eventType === "message.completed") &&
         events.some((event) => event.eventType === "run.completed");
     }), 4_000);
+    const orderedRunStates = relayMessages
+      .filter((message) => message.type === "event" && message.event === "chat" && isRecord(message.payload))
+      .map((message) => message.payload as Record<string, unknown>)
+      .filter((payload) => payload.runId === "run-1")
+      .map((payload) => payload.state);
+    assert.deepEqual(orderedRunStates, ["delta", "final"]);
+    const writingOfficeFrames = relayMessages.filter((message) => (
+      message.type === "event" &&
+      message.event === "office" &&
+      isRecord(message.payload) &&
+      isRecord(message.payload.office) &&
+      message.payload.office.kind === "writing" &&
+      message.payload.office.detail === "hello world"
+    ));
+    assert.equal(writingOfficeFrames.length, 1);
   } finally {
     abort.abort();
     gatewaySocket?.close(1000, "test done");
