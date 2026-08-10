@@ -124,6 +124,11 @@ clawconnect stop-hermes
 ~/.clawconnect/profiles/hermes/config.json
 ```
 
+终态事件和命令响应会先写入权限受限、按 profile/Relay/gateway 隔离的
+`reliable-outbox-v1/` WAL，再发送到 Relay。未收到 ACK 的条目在 Agent
+崩溃或服务重启后仍会按原始内容重放；`clawconnect reset --profile <name>`
+会清除对应 profile 的可靠投递状态，而 `uninstall` 会保留它。
+
 macOS 后台服务名：
 
 ```text
@@ -222,10 +227,15 @@ clawconnect install
 
 Windows 的不同 profile 使用独立后台启动项（例如 `ClawConnectAgent-openclaw`、`ClawConnectAgent-hermes`）和独立 UTF-8 日志，不会互相覆盖。
 
+Linux 的不同 profile 也完全隔离：systemd 服务名分别类似
+`clawconnect-agent-openclaw.service`、`clawconnect-agent-hermes.service`，
+nohup 的 PID、启动脚本和日志位于各自 profile 目录。
+
 在不支持 `systemd --user` 的 Linux 环境下，会生成一个备用启动脚本：
 
 ```bash
 ~/.clawconnect/clawconnect-start.sh
+~/.clawconnect/profiles/<profile>/clawconnect-start.sh
 ```
 
 你也可以手动执行：

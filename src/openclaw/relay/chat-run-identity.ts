@@ -6,15 +6,30 @@ export type OpenClawChatRunIdentity = ChatRunContext & {
   canonicalRunId: string;
 };
 
+type StoredOpenClawChatRunIdentity = OpenClawChatRunIdentity & {
+  terminal?: boolean;
+  accumulatedText: string;
+};
+
+export const OPENCLAW_CHAT_RUN_IDENTITY_MAX_ENTRIES = 2_048;
+
 /**
  * OpenClaw 的 provider runId 只负责关联 Gateway 事件；移动端幂等键才是跨 Relay
- * 重连仍然有效的对外身份。该注册表位于连接实例之外，并按显式运行身份保留到进程结束，
- * 避免长运行或迟到事件因时间窗口、容量淘汰而退化为 provider 身份。
+ * 重连仍然有效的对外身份。累计正文与身份共用同一进程级、LRU 有界生命周期；新的
+ * provider command response 是运行代际边界，即使 provider 重用了 runId，也不会继承
+ * 上一轮 terminal 状态。
  */
 export class OpenClawChatRunIdentityRegistry {
-  private readonly identitiesByProvider = new Map<string, OpenClawChatRunIdentity>();
+  private readonly identitiesByProvider = new Map<string, StoredOpenClawChatRunIdentity>();
   private readonly providerRunsByCanonical = new Map<string, string>();
 
+  constructor(private readonly maxEntries = OPENCLAW_CHAT_RUN_IDENTITY_MAX_ENTRIES) {
+    if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
+      throw new Error("openclaw_chat_run_identity_limit_invalid");
+    }
+  }
+
+  /** Starts a new authoritative provider run generation. */
   register(identity: OpenClawChatRunIdentity): void {
     const gatewayId = identity.gatewayId.trim();
     const providerRunId = identity.providerRunId.trim();
@@ -22,21 +37,69 @@ export class OpenClawChatRunIdentityRegistry {
     if (!gatewayId || !providerRunId || !canonicalRunId) {
       return;
     }
-    this.identitiesByProvider.set(this.key(gatewayId, providerRunId), {
+    const identityKey = this.key(gatewayId, providerRunId);
+    this.removeCanonicalMapping(this.identitiesByProvider.get(identityKey));
+    this.identitiesByProvider.delete(identityKey);
+    this.identitiesByProvider.set(identityKey, {
       ...identity,
       gatewayId,
       providerRunId,
       canonicalRunId,
+      accumulatedText: "",
     });
     this.providerRunsByCanonical.set(this.key(gatewayId, canonicalRunId), providerRunId);
+    this.prune();
+  }
+
+  /** Registers event-only runs without resetting a generation already in flight. */
+  ensure(identity: OpenClawChatRunIdentity): OpenClawChatRunIdentity | undefined {
+    const existing = this.resolve(identity.gatewayId, identity.providerRunId);
+    if (existing) return existing;
+    this.register(identity);
+    return this.resolve(identity.gatewayId, identity.providerRunId);
   }
 
   resolve(gatewayId: string, providerRunId: string): OpenClawChatRunIdentity | undefined {
-    return this.identitiesByProvider.get(this.key(gatewayId.trim(), providerRunId.trim()));
+    const key = this.key(gatewayId.trim(), providerRunId.trim());
+    const stored = this.touch(key);
+    return stored ? this.publicIdentity(stored) : undefined;
   }
 
   resolveProviderRunId(gatewayId: string, canonicalRunId: string): string | undefined {
     return this.providerRunsByCanonical.get(this.key(gatewayId.trim(), canonicalRunId.trim()));
+  }
+
+  markTerminal(gatewayId: string, providerRunId: string): void {
+    const key = this.key(gatewayId.trim(), providerRunId.trim());
+    const identity = this.touch(key);
+    if (identity) identity.terminal = true;
+  }
+
+  isTerminal(gatewayId: string, providerRunId: string): boolean {
+    return this.touch(this.key(gatewayId.trim(), providerRunId.trim()))?.terminal === true;
+  }
+
+  accumulatedText(gatewayId: string, providerRunId: string): string {
+    return this.touch(this.key(gatewayId.trim(), providerRunId.trim()))?.accumulatedText ?? "";
+  }
+
+  setAccumulatedText(gatewayId: string, providerRunId: string, text: string): void {
+    const identity = this.touch(this.key(gatewayId.trim(), providerRunId.trim()));
+    if (identity) identity.accumulatedText = text;
+  }
+
+  clearTransient(gatewayId: string, providerRunId: string): void {
+    const identity = this.touch(this.key(gatewayId.trim(), providerRunId.trim()));
+    if (!identity) return;
+    identity.accumulatedText = "";
+    identity.promptText = undefined;
+  }
+
+  remove(gatewayId: string, providerRunId: string): void {
+    const key = this.key(gatewayId.trim(), providerRunId.trim());
+    const identity = this.identitiesByProvider.get(key);
+    this.removeCanonicalMapping(identity);
+    this.identitiesByProvider.delete(key);
   }
 
   clear(): void {
@@ -46,6 +109,41 @@ export class OpenClawChatRunIdentityRegistry {
 
   private key(gatewayId: string, providerRunId: string): string {
     return `${gatewayId}\u0000${providerRunId}`;
+  }
+
+  private touch(key: string): StoredOpenClawChatRunIdentity | undefined {
+    const identity = this.identitiesByProvider.get(key);
+    if (!identity) return undefined;
+    this.identitiesByProvider.delete(key);
+    this.identitiesByProvider.set(key, identity);
+    return identity;
+  }
+
+  private prune(): void {
+    while (this.identitiesByProvider.size > this.maxEntries) {
+      const oldestKey = this.identitiesByProvider.keys().next().value as string | undefined;
+      if (!oldestKey) return;
+      const identity = this.identitiesByProvider.get(oldestKey);
+      this.removeCanonicalMapping(identity);
+      this.identitiesByProvider.delete(oldestKey);
+    }
+  }
+
+  private removeCanonicalMapping(identity: StoredOpenClawChatRunIdentity | undefined): void {
+    if (!identity) return;
+    const canonicalKey = this.key(identity.gatewayId, identity.canonicalRunId);
+    if (this.providerRunsByCanonical.get(canonicalKey) === identity.providerRunId) {
+      this.providerRunsByCanonical.delete(canonicalKey);
+    }
+  }
+
+  private publicIdentity(identity: StoredOpenClawChatRunIdentity): OpenClawChatRunIdentity {
+    const {
+      terminal: _terminal,
+      accumulatedText: _accumulatedText,
+      ...publicIdentity
+    } = identity;
+    return publicIdentity;
   }
 }
 

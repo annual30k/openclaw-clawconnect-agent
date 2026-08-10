@@ -117,6 +117,12 @@ Profile config files:
 ~/.clawconnect/profiles/hermes/config.json
 ```
 
+Reliable terminal events and command responses are written to a restricted,
+profile/Relay/gateway-scoped WAL under `reliable-outbox-v1/` before they are
+sent. Unacknowledged entries survive Agent crashes or service restarts and are
+replayed byte-for-byte after reconnect; `clawconnect reset --profile <name>`
+removes the matching profile's delivery state, while `uninstall` preserves it.
+
 macOS launchd service labels:
 
 ```text
@@ -189,10 +195,15 @@ clawconnect install
 
 Windows profiles use isolated background startup entries and UTF-8 logs, for example `ClawConnectAgent-openclaw` and `ClawConnectAgent-hermes`.
 
+Linux profiles are isolated as well: systemd units use names such as
+`clawconnect-agent-openclaw.service` and `clawconnect-agent-hermes.service`,
+and nohup PID/scripts/logs live inside each profile directory.
+
 On Linux hosts without `systemd --user`, `clawconnect install` will generate a fallback launcher at:
 
 ```bash
 ~/.clawconnect/clawconnect-start.sh
+~/.clawconnect/profiles/<profile>/clawconnect-start.sh
 ```
 
 You can start it manually with:

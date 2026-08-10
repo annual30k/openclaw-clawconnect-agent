@@ -66,6 +66,23 @@ export function toRelayHttpBase(relayServerUrl: string): string {
   return `http://${trimmed}`;
 }
 
+export function normalizeRelayServerIdentity(relayServerUrl: string): string {
+  const parsed = new URL(toRelayHttpBase(relayServerUrl));
+  const protocol = parsed.protocol.toLowerCase();
+  const host = normalizeRelayHost(parsed.hostname);
+  const port = parsed.port || (protocol === "https:" ? "443" : "80");
+  const pathname = parsed.pathname.replace(/\/+$/, "");
+  return `${protocol}//${host}:${port}${pathname}`;
+}
+
+function normalizeRelayHost(hostname: string): string {
+  const lower = hostname.toLowerCase();
+  if (lower === "localhost" || lower === "::1" || lower === "[::1]") {
+    return "127.0.0.1";
+  }
+  return lower;
+}
+
 export function inferMimeType(fileName: string): string {
   const lowerName = fileName.trim().toLowerCase();
   const dotIndex = lowerName.lastIndexOf(".");

@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ASSISTANT_STREAM_COMPENSATION_MAX_RETRIES,
+  ASSISTANT_STREAM_COMPENSATION_RETRY_INTERVAL_MS,
   ASSISTANT_STREAM_COALESCE_INTERVAL_MS,
   LatestSnapshotCoalescer,
   buildAssistantStreamSnapshotKey,
@@ -37,7 +39,7 @@ test("latest snapshot coalescer merges a burst and keeps the latest absolute pay
   const emitted: string[] = [];
   const key = buildAssistantStreamSnapshotKey({ sessionKey: "main", runId: "run-1" });
   const coalescer = new LatestSnapshotCoalescer<string, string>({
-    emit: (_key, snapshot) => emitted.push(snapshot),
+    emit: (_key, snapshot) => { emitted.push(snapshot); },
     setTimer: timers.setTimer,
     clearTimer: timers.clearTimer,
   });
@@ -74,7 +76,7 @@ test("terminal operation flushes the latest snapshot first and closes its stable
   });
 
   coalescer.schedule(key, "complete answer");
-  await coalescer.closeAfterFlush(key, () => emitted.push("final:complete answer"));
+  await coalescer.closeAfterFlush(key, () => { emitted.push("final:complete answer"); });
 
   assert.deepEqual(emitted, ["delta:complete answer", "final:complete answer"]);
   assert.equal(timers.callbacks.size, 0);
@@ -91,14 +93,138 @@ test("terminal operation still runs when its pending intermediate snapshot fails
     },
     setTimer: timers.setTimer,
     clearTimer: timers.clearTimer,
-    onError: (error) => errors.push(error),
+    onError: (error) => { errors.push(error); },
   });
 
   coalescer.schedule("run-terminal", "partial");
-  await coalescer.closeAfterFlush("run-terminal", () => emitted.push("final"));
+  await coalescer.closeAfterFlush("run-terminal", () => { emitted.push("final"); });
 
   assert.deepEqual(emitted, ["final"]);
   assert.equal(errors.length, 1);
+});
+
+test("slow emit keeps only one in-flight snapshot and the newest pending snapshot", async () => {
+  const timers = createManualTimers();
+  const emitted: string[] = [];
+  let releaseFirst!: () => void;
+  const firstBlocked = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const coalescer = new LatestSnapshotCoalescer<string, string>({
+    emit: async (_key, snapshot) => {
+      emitted.push(snapshot);
+      if (snapshot === "s1") {
+        await firstBlocked;
+      }
+    },
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  });
+
+  coalescer.schedule("run-slow", "s1");
+  timers.fireAll();
+  await Promise.resolve();
+  coalescer.schedule("run-slow", "s2");
+  coalescer.schedule("run-slow", "s3");
+  coalescer.schedule("run-slow", "s4");
+  coalescer.schedule("run-slow", "s5");
+
+  assert.deepEqual(emitted, ["s1"]);
+  assert.equal(coalescer.pendingCount, 1);
+  assert.equal(timers.callbacks.size, 0);
+
+  const terminal = coalescer.closeAfterFlush("run-slow", () => {
+    emitted.push("terminal");
+  });
+  releaseFirst();
+  await terminal;
+
+  assert.deepEqual(emitted, ["s1", "s5", "terminal"]);
+  assert.equal(coalescer.pendingCount, 0);
+});
+
+test("retryable write outcome schedules one bounded compensation for the latest snapshot", async () => {
+  const timers = createManualTimers();
+  const emitted: string[] = [];
+  let attempt = 0;
+  const coalescer = new LatestSnapshotCoalescer<string, string>({
+    emit: (_key, snapshot) => {
+      emitted.push(snapshot);
+      attempt += 1;
+      return attempt === 1 ? { status: "retryable" } : { status: "delivered" };
+    },
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  });
+
+  coalescer.schedule("run-retry", "latest text");
+  timers.fireAll();
+  await settleMicrotasks();
+
+  assert.equal(timers.callbacks.size, 1);
+  assert.equal(
+    [...timers.callbacks.values()][0]?.delayMs,
+    ASSISTANT_STREAM_COMPENSATION_RETRY_INTERVAL_MS,
+  );
+  timers.fireAll();
+  await coalescer.flush("run-retry");
+
+  assert.deepEqual(emitted, ["latest text", "latest text"]);
+  assert.equal(timers.callbacks.size, 0);
+});
+
+test("a newer snapshot replaces failed compensation and returns to coalesce interval", async () => {
+  const timers = createManualTimers();
+  const emitted: string[] = [];
+  const coalescer = new LatestSnapshotCoalescer<string, string>({
+    emit: (_key, snapshot) => {
+      emitted.push(snapshot);
+      return snapshot === "old" ? { status: "retryable" } : { status: "delivered" };
+    },
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  });
+
+  coalescer.schedule("run-latest", "old");
+  timers.fireAll();
+  await settleMicrotasks();
+  assert.equal([...timers.callbacks.values()][0]?.delayMs, ASSISTANT_STREAM_COMPENSATION_RETRY_INTERVAL_MS);
+
+  coalescer.schedule("run-latest", "new");
+  assert.equal(timers.callbacks.size, 1);
+  assert.equal([...timers.callbacks.values()][0]?.delayMs, ASSISTANT_STREAM_COALESCE_INTERVAL_MS);
+  timers.fireAll();
+  await coalescer.flush("run-latest");
+
+  assert.deepEqual(emitted, ["old", "new"]);
+});
+
+test("terminal barrier exhausts bounded latest-snapshot compensation before final", async () => {
+  const timers = createManualTimers();
+  const order: string[] = [];
+  const errors: unknown[] = [];
+  const coalescer = new LatestSnapshotCoalescer<string, string>({
+    emit: (_key, snapshot) => {
+      order.push(`snapshot:${snapshot}`);
+      return { status: "retryable", error: new Error("still backpressured") };
+    },
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    onError: (error) => { errors.push(error); },
+  });
+
+  coalescer.schedule("run-terminal-retry", "complete text");
+  await coalescer.closeAfterFlush("run-terminal-retry", () => {
+    order.push("final");
+  });
+
+  assert.equal(
+    order.filter((entry) => entry.startsWith("snapshot:")).length,
+    ASSISTANT_STREAM_COMPENSATION_MAX_RETRIES + 1,
+  );
+  assert.equal(order.at(-1), "final");
+  assert.equal(errors.length, 1);
+  assert.equal(timers.callbacks.size, 0);
 });
 
 test("different stable run identities never share snapshots", async () => {
@@ -107,7 +233,7 @@ test("different stable run identities never share snapshots", async () => {
   const firstKey = buildAssistantStreamSnapshotKey({ sessionKey: "main", runId: "run-a" });
   const secondKey = buildAssistantStreamSnapshotKey({ sessionKey: "main", runId: "run-b" });
   const coalescer = new LatestSnapshotCoalescer<string, string>({
-    emit: (key, snapshot) => emitted.push([key, snapshot]),
+    emit: (key, snapshot) => { emitted.push([key, snapshot]); },
     setTimer: timers.setTimer,
     clearTimer: timers.clearTimer,
   });
@@ -126,7 +252,7 @@ test("dispose cancels timers and discards unsent snapshots", async () => {
   const timers = createManualTimers();
   const emitted: string[] = [];
   const coalescer = new LatestSnapshotCoalescer<string, string>({
-    emit: (_key, snapshot) => emitted.push(snapshot),
+    emit: (_key, snapshot) => { emitted.push(snapshot); },
     setTimer: timers.setTimer,
     clearTimer: timers.clearTimer,
   });
@@ -142,3 +268,37 @@ test("dispose cancels timers and discards unsent snapshots", async () => {
   assert.deepEqual(emitted, []);
   assert.equal(coalescer.schedule("run-c", "c"), false);
 });
+
+test("a terminal identity can be released after its owner records completion", async () => {
+  const coalescer = new LatestSnapshotCoalescer<string, string>({ emit: () => undefined });
+  await coalescer.closeAfterFlush("run-terminal", () => undefined);
+
+  assert.equal(coalescer.schedule("run-terminal", "late"), false);
+  coalescer.releaseClosed("run-terminal");
+  assert.equal(coalescer.schedule("run-terminal", "owned elsewhere"), true);
+  coalescer.dispose();
+});
+
+test("closed-key tombstones use a bounded LRU while rejecting recent late snapshots", async () => {
+  const coalescer = new LatestSnapshotCoalescer<string, string>({
+    emit: () => undefined,
+    maxClosedKeys: 2,
+  });
+  await coalescer.closeAfterFlush("run-a", () => undefined);
+  await coalescer.closeAfterFlush("run-b", () => undefined);
+
+  assert.equal(coalescer.schedule("run-a", "late-a"), false);
+  await coalescer.closeAfterFlush("run-c", () => undefined);
+
+  // The rejected run-a delta refreshed its tombstone, so run-b is the LRU.
+  assert.equal(coalescer.schedule("run-a", "still-late-a"), false);
+  assert.equal(coalescer.schedule("run-c", "late-c"), false);
+  assert.equal(coalescer.schedule("run-b", "new-generation-b"), true);
+  coalescer.dispose();
+});
+
+async function settleMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}

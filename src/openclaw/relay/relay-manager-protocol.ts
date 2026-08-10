@@ -14,16 +14,29 @@ export type OpenClawRelayToServer =
   | { type: "heartbeat" }
   | { type: "gateway_connected" }
   | { type: "gateway_disconnected"; reason: string }
-  | { type: "event"; event: string; payload: unknown }
-  | { type: "res"; id: string; ok: boolean; payload?: unknown; error?: { message?: string } };
+  | { type: "event"; event: string; payload: unknown; deliveryId?: string }
+  | {
+    type: "res";
+    id: string;
+    ok: boolean;
+    responsePhase?: "accepted" | "terminal";
+    payload?: unknown;
+    error?: { message?: string };
+  };
 
 /** Messages the relay server sends to the OpenClaw relay client. */
-export interface OpenClawRelayFromServer {
-  type: "cmd" | "hello" | "heartbeat";
-  id?: string;
-  method: string;
-  params: unknown;
-}
+export type OpenClawRelayFromServer =
+  | { type: "cmd"; id?: string; method: string; params: unknown }
+  | {
+    type: "hello";
+    role: "relay";
+    gatewayId: string;
+    ok: true;
+    protocolCapabilities?: string[];
+  }
+  | { type: "heartbeat" }
+  | { type: "event_ack"; id: string }
+  | { type: "response_ack"; id: string; responsePhase?: string };
 
 export interface RelayManagerOptions {
   relayServerUrl: string;
@@ -34,6 +47,10 @@ export interface RelayManagerOptions {
   gatewayPassword?: string;
   onConnected?: () => void;
   onDisconnected?: () => void;
+  /** @internal Allows deterministic protocol-negotiation timeout tests. */
+  relayHelloTimeoutMs?: number;
+  /** @internal Isolates durable outbox files in tests. */
+  reliableOutboxStorageDirectory?: string;
   /** Optional abort signal.  When aborted the relay WebSocket is closed
    *  cleanly (code 1001) and the retry loop stops. */
   signal?: AbortSignal;

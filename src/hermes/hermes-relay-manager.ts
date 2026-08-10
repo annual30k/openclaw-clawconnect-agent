@@ -5,9 +5,13 @@ import { uploadFileToRelay, type FileUploadRequest, type FileUploadResult } from
 import {
   bindRelayAbortSignal,
   buildRelayUrl,
+  createRelayWebSocket,
+  disconnectRelaySocketForRecovery,
   parseRelayFrame,
   sendRelayJson,
+  sendRelayJsonWithWriteConfirmation,
   shouldRetryRelayClose,
+  type RelaySendResult,
 } from "../core/relay/relay-server-connection.js";
 import { buildOfficeEventPayload } from "../core/relay/office-payload.js";
 import type { RelaySlashCommandDescriptor } from "../core/relay/slash-command-types.js";
@@ -30,6 +34,13 @@ import {
   deriveAttachmentId,
   derivePartId,
 } from "../core/relay/timeline-event-builder.js";
+import { reliableRelayOutboxForGateway } from "../core/relay/reliable-relay-outbox-registry.js";
+import type { AssistantStreamEmitResult } from "../core/relay/assistant-stream-coalescer.js";
+import {
+  isValidRelayHello,
+  reliableDeliveryModeFromRelayHello,
+  RELAY_HELLO_NEGOTIATION_TIMEOUT_MS,
+} from "../core/relay/reliable-delivery-protocol.js";
 import type { TimelineContentBlock } from "../core/relay/timeline-event-log.js";
 import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
 import { prepareHermesVoiceInputCommand, resolveHermesVoiceInputSessionKey } from "./hermes-voice-input.js";
@@ -72,7 +83,7 @@ type ToServer =
   | { type: "heartbeat" }
   | { type: "gateway_connected" }
   | { type: "gateway_disconnected"; reason: string }
-  | { type: "event"; event: string; payload: unknown }
+  | { type: "event"; event: string; payload: unknown; deliveryId?: string }
   | {
     type: "res";
     id: string;
@@ -83,12 +94,17 @@ type ToServer =
   };
 
 interface FromServer {
-  type: "cmd" | "hello" | "heartbeat" | "event";
+  type: "cmd" | "hello" | "heartbeat" | "event" | "event_ack" | "response_ack";
   id?: string;
   method?: string;
   params?: unknown;
   event?: string;
   payload?: unknown;
+  responsePhase?: string;
+  role?: string;
+  gatewayId?: string;
+  ok?: boolean;
+  protocolCapabilities?: string[];
 };
 
 export type HermesRelayHelloMessage = {
@@ -113,6 +129,10 @@ export interface HermesRelayManagerOptions {
   signal?: AbortSignal;
   onConnected?: () => void;
   onDisconnected?: () => void;
+  /** @internal Allows deterministic protocol-negotiation timeout tests. */
+  relayHelloTimeoutMs?: number;
+  /** @internal Isolates durable outbox files in tests. */
+  reliableOutboxStorageDirectory?: string;
 }
 
 export interface HermesRelayManagerDependencies {
@@ -158,11 +178,20 @@ export async function runHermesRelayManagerWithDependencies(
   const recentMobileFiles = new Map<string, Array<Record<string, unknown>>>();
   const sentArtifacts = new Map<string, number>();
   const activeChatRuns = new Map<string, ActiveHermesChatRun>();
+  const outboxLookup = reliableRelayOutboxForGateway(opts.gatewayId, {
+    storageDirectory: opts.reliableOutboxStorageDirectory,
+    relayIdentity: opts.relayServerUrl,
+  });
+  if (outboxLookup.status === "rejected") {
+    console.error(`[hermes-relay] cannot start reliable delivery: ${outboxLookup.error.message}`);
+    return true;
+  }
+  const deliveryOutbox = outboxLookup.outbox;
 
   return new Promise<boolean>((resolve) => {
     let relayWs: WebSocket;
     try {
-      relayWs = new WebSocket(wsUrl);
+      relayWs = createRelayWebSocket(wsUrl);
     } catch (error) {
       console.error("Failed to create Hermes relay WebSocket:", error);
       resolve(true);
@@ -171,8 +200,47 @@ export async function runHermesRelayManagerWithDependencies(
 
     bindRelayAbortSignal(relayWs, opts.signal);
 
-    const send = (message: ToServer): void => {
-      sendRelayJson(relayWs, message);
+    let relayHelloNegotiated = false;
+    let relayHelloTimer: ReturnType<typeof setTimeout> | undefined;
+
+    let lastBackpressureWarningAt = 0;
+    const queueReliable = (message: ToServer): AssistantStreamEmitResult | undefined => {
+      const enqueue = deliveryOutbox.enqueueIfReliable(message);
+      if (enqueue.status === "not_reliable") return undefined;
+      if (enqueue.status === "accepted") return { status: "delivered" };
+      console.error(`[hermes-relay] reliable frame rejected reason=${enqueue.reason}: ${enqueue.error.message}`);
+      disconnectRelaySocketForRecovery(relayWs, "reliable_outbox_overload");
+      return { status: "retryable", error: enqueue.error };
+    };
+    const reportSendResult = (result: RelaySendResult): void => {
+      if (result.status === "backpressure_skipped" && Date.now() - lastBackpressureWarningAt >= 10_000) {
+        lastBackpressureWarningAt = Date.now();
+        console.warn(`[hermes-relay] stream snapshot skipped under backpressure buffered=${result.bufferedAmount} projected=${result.projectedBufferedAmount}`);
+      } else if (result.status === "backpressure_disconnected") {
+        console.warn(`[hermes-relay] disconnected saturated WebSocket buffered=${result.bufferedAmount} projected=${result.projectedBufferedAmount}`);
+      } else if (result.status === "socket_not_open" || result.status === "send_failed") {
+        console.warn(`[hermes-relay] best-effort frame not sent status=${result.status}`);
+      }
+    };
+    const send = (message: ToServer): AssistantStreamEmitResult => {
+      const reliable = queueReliable(message);
+      if (reliable) return reliable;
+      const result = sendRelayJson(relayWs, message, undefined, (error) => {
+        if (error) console.warn(`[hermes-relay] WebSocket write failed: ${error.message}`);
+      });
+      reportSendResult(result);
+      return result.status === "sent"
+        ? { status: "delivered" }
+        : { status: "retryable", error: result.error ?? new Error(`relay_send_${result.status}`) };
+    };
+    const sendWithWriteConfirmation = async (message: ToServer): Promise<AssistantStreamEmitResult> => {
+      const reliable = queueReliable(message);
+      if (reliable) return reliable;
+      const result = await sendRelayJsonWithWriteConfirmation(relayWs, message);
+      reportSendResult(result);
+      return result.status === "sent"
+        ? { status: "delivered" }
+        : { status: "retryable", error: result.error ?? new Error(`relay_send_${result.status}`) };
     };
     const stateDbRealtimePath = dependencies.resolveStateDbRealtimePath();
     const stateDbRealtimeWatcher = stateDbRealtimePath
@@ -198,6 +266,12 @@ export async function runHermesRelayManagerWithDependencies(
         agentVersion: "hermes",
         capabilities: opts.capabilities ?? [...gatewayCapabilitiesForType("hermes"), "models"],
       }));
+      relayHelloTimer = setTimeout(() => {
+        if (relayHelloNegotiated) return;
+        console.warn("[hermes-relay] Relay hello negotiation timed out; reconnecting without protocol downgrade");
+        disconnectRelaySocketForRecovery(relayWs, "relay_hello_timeout");
+      }, opts.relayHelloTimeoutMs ?? RELAY_HELLO_NEGOTIATION_TIMEOUT_MS);
+      relayHelloTimer.unref?.();
       send({ type: "gateway_connected" });
       void dependencies.readStatusSnapshot().then((statusSnapshot) => {
         send({
@@ -226,6 +300,7 @@ export async function runHermesRelayManagerWithDependencies(
       let acknowledgedChatRun: { runId: string; sessionKey: string } | undefined;
       let voiceInputRun: { runId: string; sessionKey: string } | undefined;
       let idempotencyClaim: StartedHermesChatClaim | undefined;
+      let modelCompleted = false;
       try {
         const msg = parseRelayFrame<FromServer>(raw);
         if (!msg) {
@@ -237,6 +312,28 @@ export async function runHermesRelayManagerWithDependencies(
           return;
         }
         if (msg.type === "hello") {
+          if (!isValidRelayHello(msg, opts.gatewayId)) {
+            console.warn("[hermes-relay] invalid Relay hello; reconnecting without protocol downgrade");
+            disconnectRelaySocketForRecovery(relayWs, "invalid_relay_hello");
+            return;
+          }
+          if (relayHelloNegotiated) return;
+          relayHelloNegotiated = true;
+          if (relayHelloTimer) {
+            clearTimeout(relayHelloTimer);
+            relayHelloTimer = undefined;
+          }
+          const deliveryMode = reliableDeliveryModeFromRelayHello(msg);
+          deliveryOutbox.attach(relayWs, deliveryMode);
+          console.log(`[hermes-relay] reliable delivery mode=${deliveryMode}`);
+          return;
+        }
+        if (msg.type === "event_ack") {
+          if (msg.id) deliveryOutbox.acknowledge(msg.id);
+          return;
+        }
+        if (msg.type === "response_ack") {
+          if (msg.id) deliveryOutbox.acknowledgeResponse(msg.id, msg.responsePhase);
           return;
         }
         if (msg.type === "event") {
@@ -405,10 +502,12 @@ export async function runHermesRelayManagerWithDependencies(
           gatewayId: opts.gatewayId,
           abortSignal: abortController.signal,
           publishEvent: (event) => {
-            send(event);
+            const confirmation = sendWithWriteConfirmation(event);
             publishHermesOfficeSnapshot(send, event.event, event.payload);
+            return confirmation;
           },
         });
+        modelCompleted = true;
         forgetActiveHermesChatRun(activeChatRuns, run);
         const artifactTimelineEvents: Array<{
           completed: ReturnType<typeof buildHermesArtifactCompletedEvent>;
@@ -502,9 +601,10 @@ export async function runHermesRelayManagerWithDependencies(
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        // Relay 断开时不会再收到当前 requestId 的终态。释放本地 owner 后，重连使用
-        // 同一稳定幂等键才能重新进入模型；普通模型错误和用户中止仍是明确终态。
-        if (acknowledgedChatRun && relayWs.readyState !== WebSocket.OPEN) {
+        // Only an interrupted model run may release its owner. Once the model
+        // completed, its canonical terminal belongs to the cross-connection
+        // outbox and the same idempotency key must never run the model again.
+        if (acknowledgedChatRun && relayWs.readyState !== WebSocket.OPEN && !modelCompleted) {
           idempotencyClaim?.release();
           forgetActiveHermesChatRun(activeChatRuns, acknowledgedChatRun);
           return;
@@ -575,7 +675,12 @@ export async function runHermesRelayManagerWithDependencies(
     relayWs.on("close", (code, reason) => {
       console.log(`Hermes relay connection closed: ${code} ${reason.toString()}`);
       opts.onDisconnected?.();
+      if (relayHelloTimer) {
+        clearTimeout(relayHelloTimer);
+        relayHelloTimer = undefined;
+      }
       stateDbRealtimeWatcher?.stop();
+      deliveryOutbox.detach(relayWs);
       activeChatRuns.forEach((entry) => entry.controller.abort());
       activeChatRuns.clear();
       resolve(shouldRetryRelayClose(code, opts.signal));
@@ -741,7 +846,7 @@ export function shouldPublishHermesOfficeSnapshot(eventName: string | undefined,
   const state = typeof (payload as Record<string, unknown>).state === "string"
     ? ((payload as Record<string, unknown>).state as string).trim().toLowerCase()
     : "";
-  return state !== "delta";
+  return state !== "delta" && state !== "streaming" && state !== "in_progress";
 }
 
 function publishHermesOfficeSnapshot(send: (message: ToServer) => void, eventName: string | undefined, payload: unknown): void {

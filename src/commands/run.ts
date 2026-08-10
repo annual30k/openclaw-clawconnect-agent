@@ -3,6 +3,8 @@ import { getGatewayRuntimeAdapter } from "../runtime-adapters.js";
 import { withReconnect } from "../core/relay/reconnect.js";
 import { t } from "../i18n/index.js";
 import { createInterface } from "readline";
+import type { Interface } from "readline";
+import { disposeReliableRelayOutboxes } from "../core/relay/reliable-relay-outbox-registry.js";
 
 export async function runCommand(): Promise<void> {
   const config = readConfig();
@@ -22,8 +24,9 @@ export async function runCommand(): Promise<void> {
 
   // On Windows, taskkill without /F sends WM_CLOSE.  A readline interface
   // installs a console control handler that translates this into SIGTERM.
+  let rl: Interface | undefined;
   if (process.platform === "win32") {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl = createInterface({ input: process.stdin, output: process.stdout });
     rl.on("SIGTERM", onSignal);
     rl.on("close", onSignal);
   }
@@ -38,19 +41,29 @@ export async function runCommand(): Promise<void> {
     console.log(t("run.gatewayUrl", gatewayUrl));
   }
 
-  await withReconnect(
-    () => runtimeAdapter.start({
-      config,
-      gatewayUrl: () => readGatewayUrl(),
-      gatewayAuth,
-      signal: shutdown.signal,
-      onConnected: () => console.log(t("run.connected")),
-      onDisconnected: () => console.log(t("run.disconnected")),
-    }),
-    {
-      onRetry: (attempt, delayMs) => {
-        console.log(t("run.retry", String(attempt), String(delayMs)));
+  try {
+    await withReconnect(
+      () => runtimeAdapter.start({
+        config,
+        gatewayUrl: () => readGatewayUrl(),
+        gatewayAuth,
+        signal: shutdown.signal,
+        onConnected: () => console.log(t("run.connected")),
+        onDisconnected: () => console.log(t("run.disconnected")),
+      }),
+      {
+        signal: shutdown.signal,
+        onRetry: (attempt, delayMs) => {
+          console.log(t("run.retry", String(attempt), String(delayMs)));
+        },
       },
-    }
-  );
+    );
+  } finally {
+    process.removeListener("SIGTERM", onSignal);
+    process.removeListener("SIGINT", onSignal);
+    rl?.removeListener("SIGTERM", onSignal);
+    rl?.removeListener("close", onSignal);
+    rl?.close();
+    disposeReliableRelayOutboxes();
+  }
 }

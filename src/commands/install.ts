@@ -12,6 +12,7 @@ import {
 } from "../platform/service-manager.js";
 import { clearProfileLogs, getActiveProfile, profileConfigPath, profileDisplayName } from "../config/profile.js";
 import { pairCommandForProfile } from "./profile-hints.js";
+import { clearReliableRelayOutboxStorage } from "../core/relay/reliable-relay-outbox-store.js";
 
 export function isInstalled(): boolean {
   return getServiceStatus().installed;
@@ -126,6 +127,11 @@ export function resetCommand(): void {
   }
 
   clearProfileLogs();
+  try {
+    clearReliableRelayOutboxStorage(getActiveProfile());
+  } catch (err) {
+    console.error("[clawconnect] Failed to clear reliable delivery state:", err);
+  }
 
   console.log(t("install.resetCompleteWithCommand", pairCommandForProfile(getActiveProfile())));
 }

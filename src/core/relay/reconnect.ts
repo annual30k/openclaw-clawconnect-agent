@@ -2,6 +2,7 @@ export interface ReconnectOptions {
   initialDelayMs?: number;
   maxDelayMs?: number;
   onRetry?: (attempt: number, delayMs: number) => void;
+  signal?: AbortSignal;
 }
 
 /**
@@ -22,16 +23,30 @@ export async function withReconnect(
   let delay = initialDelay;
 
   while (true) {
+    if (opts.signal?.aborted) break;
     const shouldRetry = await connect();
-    if (!shouldRetry) break;
+    if (!shouldRetry || opts.signal?.aborted) break;
 
     attempt++;
     opts.onRetry?.(attempt, delay);
-    await sleep(delay);
+    if (!await sleep(delay, opts.signal)) break;
     delay = Math.min(delay * 2, maxDelay);
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    timer.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 }

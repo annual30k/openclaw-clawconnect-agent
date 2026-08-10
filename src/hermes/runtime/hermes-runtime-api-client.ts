@@ -319,9 +319,13 @@ async function consumeHermesApiChatStream(
     runId,
     messageId: `assistant-${runId}`,
   });
-  const assistantSnapshots = new LatestSnapshotCoalescer<string, { text: string; timestampMs: number }>({
+  const assistantSnapshots = new LatestSnapshotCoalescer<string, {
+    text: string;
+    timestampMs: number;
+    envelope?: { type: "event"; event: string; payload: unknown };
+  }>({
     emit: (_key, snapshot) => {
-      params.context.publishEvent?.({
+      snapshot.envelope ??= {
         type: "event",
         event: "chat",
         payload: buildMobileAssistantDeltaPayload({
@@ -332,7 +336,8 @@ async function consumeHermesApiChatStream(
           delta: snapshot.text,
           includeTimelineEvents: true,
         }),
-      });
+      };
+      return params.context.publishEvent?.(snapshot.envelope);
     },
   });
 

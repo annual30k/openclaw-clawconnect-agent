@@ -7,7 +7,7 @@ import { t } from "../i18n/index.js";
 import { execSync } from "child_process";
 import { hostname } from "os";
 import { getServicePlatform } from "../platform/service-manager.js";
-import { toRelayHttpBase } from "../core/relay/file-upload-utils.js";
+import { normalizeRelayServerIdentity, toRelayHttpBase } from "../core/relay/file-upload-utils.js";
 import { getDefaultRelayServerUrl } from "../config/env.js";
 import { gatewayCapabilitiesForType, normalizeGatewayType } from "../gateway-profiles.js";
 import { clearProfileLogs } from "../config/profile.js";
@@ -155,22 +155,7 @@ export function shouldReuseExistingPairing(
     && sameRelayServer(config.relayServerUrl, requestedRelayServerUrl);
 }
 
-export function normalizeRelayServerIdentity(relayServerUrl: string): string {
-  const parsed = new URL(toRelayHttpBase(relayServerUrl));
-  const protocol = parsed.protocol.toLowerCase();
-  const host = normalizeRelayHost(parsed.hostname);
-  const port = parsed.port || (protocol === "https:" ? "443" : "80");
-  const pathname = parsed.pathname.replace(/\/+$/, "");
-  return `${protocol}//${host}:${port}${pathname}`;
-}
-
-function normalizeRelayHost(hostname: string): string {
-  const lower = hostname.toLowerCase();
-  if (lower === "localhost" || lower === "::1" || lower === "[::1]") {
-    return "127.0.0.1";
-  }
-  return lower;
-}
+export { normalizeRelayServerIdentity } from "../core/relay/file-upload-utils.js";
 
 function backupExistingConfig(): string | undefined {
   const configPath = getConfigPath();

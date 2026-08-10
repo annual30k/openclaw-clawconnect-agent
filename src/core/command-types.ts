@@ -6,7 +6,7 @@ export type LocalCommandEventPublisher = (event: {
   type: "event";
   event: string;
   payload: unknown;
-}) => void;
+}) => void | AssistantStreamEmitResult | Promise<void | AssistantStreamEmitResult>;
 
 export type LocalCommandContext = {
   requestId?: string;
@@ -14,3 +14,4 @@ export type LocalCommandContext = {
   publishEvent?: LocalCommandEventPublisher;
   abortSignal?: AbortSignal;
 };
+import type { AssistantStreamEmitResult } from "./relay/assistant-stream-coalescer.js";

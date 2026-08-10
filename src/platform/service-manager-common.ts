@@ -6,6 +6,7 @@ import {
   profileErrorLogPath,
   profileLogPath,
   profileRoot,
+  normalizeProfileName,
 } from "../config/profile.js";
 
 export type ServicePlatform = "macos" | "linux" | "windows" | "unsupported";
@@ -30,6 +31,23 @@ export const LINUX_SYSTEMD_USER_DIR = join(homedir(), ".config", "systemd", "use
 export const LINUX_SERVICE_PATH = join(LINUX_SYSTEMD_USER_DIR, LINUX_SERVICE_NAME);
 export const LINUX_NOHUP_PID_PATH = join(LOG_DIR, "clawconnect.pid");
 export const LINUX_NOHUP_START_SCRIPT_PATH = join(LOG_DIR, "clawconnect-start.sh");
+
+export function getLinuxServiceName(profile?: string): string {
+  const normalized = normalizeProfileName(profile);
+  return normalized ? `clawconnect-agent-${normalized}.service` : LINUX_SERVICE_NAME;
+}
+
+export function getLinuxServicePath(profile?: string): string {
+  return join(LINUX_SYSTEMD_USER_DIR, getLinuxServiceName(profile));
+}
+
+export function getLinuxNohupPidPath(profile?: string): string {
+  return join(profileRoot(profile), "clawconnect.pid");
+}
+
+export function getLinuxNohupStartScriptPath(profile?: string): string {
+  return join(profileRoot(profile), "clawconnect-start.sh");
+}
 
 export function detectPlatform(): ServicePlatform {
   if (process.platform === "darwin") return "macos";

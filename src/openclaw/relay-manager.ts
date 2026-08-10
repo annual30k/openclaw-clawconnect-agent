@@ -3,9 +3,13 @@ import { OpenClawGatewayClient } from "./gateway-client.js";
 import {
   bindRelayAbortSignal,
   buildRelayUrl,
+  createRelayWebSocket,
+  disconnectRelaySocketForRecovery,
   parseRelayFrame,
   sendRelayJson,
+  sendRelayJsonWithWriteConfirmation,
   shouldRetryRelayClose,
+  type RelaySendResult,
 } from "../core/relay/relay-server-connection.js";
 import { handleLocalCommand } from "./handlers/local-handlers.js";
 import { handleProviderCommand } from "./handlers/provider-handlers.js";
@@ -44,7 +48,14 @@ import {
 import {
   LatestSnapshotCoalescer,
   buildAssistantStreamSnapshotKey,
+  type AssistantStreamEmitResult,
 } from "../core/relay/assistant-stream-coalescer.js";
+import { reliableRelayOutboxForGateway } from "../core/relay/reliable-relay-outbox-registry.js";
+import {
+  isValidRelayHello,
+  reliableDeliveryModeFromRelayHello,
+  RELAY_HELLO_NEGOTIATION_TIMEOUT_MS,
+} from "../core/relay/reliable-delivery-protocol.js";
 import {
   buildChatSendIdempotencyRequest,
   ChatSendIdempotencyGuard,
@@ -124,11 +135,20 @@ const openClawChatSendIdempotency = new ChatSendIdempotencyGuard<OpenClawChatCom
  */
 export async function runRelayManager(opts: RelayManagerOptions): Promise<boolean> {
   const wsUrl = buildRelayUrl(opts.relayServerUrl, opts.gatewayId, opts.relaySecret);
+  const outboxLookup = reliableRelayOutboxForGateway(opts.gatewayId, {
+    storageDirectory: opts.reliableOutboxStorageDirectory,
+    relayIdentity: opts.relayServerUrl,
+  });
+  if (outboxLookup.status === "rejected") {
+    console.error(`[relay] cannot start reliable delivery: ${outboxLookup.error.message}`);
+    return true;
+  }
+  const deliveryOutbox = outboxLookup.outbox;
 
   return new Promise<boolean>((resolve) => {
     let relayWs: WebSocket;
     try {
-      relayWs = new WebSocket(wsUrl);
+      relayWs = createRelayWebSocket(wsUrl);
     } catch (err) {
       console.error("Failed to create relay WebSocket:", err);
       resolve(true);
@@ -139,13 +159,14 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
     let gatewayClient: OpenClawGatewayClient | null = null;
     let sessionDefaults: GatewaySessionDefaults = { ...DEFAULT_GATEWAY_SESSION_DEFAULTS };
-    const chatBuffers = new Map<string, string>();
     const chatFallbacks = new Map<string, ReturnType<typeof setTimeout>>();
     const chatRunContexts = new Map<string, OpenClawChatRunIdentity>();
     const chatSendDedupe = new OpenClawChatSendDedupeCoordinator(() => sessionDefaults);
     const outgoingMediaUploadCache = new Map<string, FileUploadResult>();
     const contextUsageRefreshes = new Map<string, ReturnType<typeof setTimeout>>();
     const contextUsageFingerprints = new Map<string, string>();
+    let relayHelloNegotiated = false;
+    let relayHelloTimer: ReturnType<typeof setTimeout> | undefined;
 
     const clearChatFallback = (runId: string): void => {
       const timer = chatFallbacks.get(runId);
@@ -234,11 +255,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             if (!outcome) {
               chatFallbacks.delete(providerRunId);
               chatRunContexts.delete(providerRunId);
+              openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
               return;
             }
             clearChatFallback(providerRunId);
             chatRunContexts.delete(providerRunId);
             if (outcome.kind === "final") {
+              openClawChatRunIdentities.markTerminal(opts.gatewayId, providerRunId);
               const basePayload = buildMobileAssistantFinalPayload({
                 run: { runId: context.canonicalRunId, sessionKey: context.sessionKey },
                 text: outcome.text,
@@ -250,8 +273,10 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 true,
                 context.promptText,
               );
+              openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
               return;
             }
+            openClawChatRunIdentities.markTerminal(opts.gatewayId, providerRunId);
             await publishAndSendGatewayEvent(
               "chat",
               buildMobileAssistantErrorPayload({
@@ -261,6 +286,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               }),
               true,
             );
+            openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
           })
           .catch((err) => {
             if (attempt < CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS) {
@@ -270,6 +296,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             console.warn(`[relay] chat history fallback failed runId=${providerRunId}: ${String(err)}`);
             chatFallbacks.delete(providerRunId);
             chatRunContexts.delete(providerRunId);
+            openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
           });
       }, attempt === 0 ? CHAT_HISTORY_FALLBACK_INITIAL_DELAY_MS : CHAT_HISTORY_FALLBACK_RETRY_DELAY_MS);
       timer.unref?.();
@@ -292,8 +319,49 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       }
     };
 
-    function send(msg: OpenClawRelayToServer): void {
-      sendRelayJson(relayWs, msg);
+    let lastBackpressureWarningAt = 0;
+    function queueReliable(msg: OpenClawRelayToServer): AssistantStreamEmitResult | undefined {
+      const enqueue = deliveryOutbox.enqueueIfReliable(msg);
+      if (enqueue.status === "not_reliable") return undefined;
+      if (enqueue.status === "accepted") return { status: "delivered" };
+      console.error(`[relay] reliable frame rejected reason=${enqueue.reason}: ${enqueue.error.message}`);
+      disconnectRelaySocketForRecovery(relayWs, "reliable_outbox_overload");
+      return { status: "retryable", error: enqueue.error };
+    }
+
+    function reportSendResult(result: RelaySendResult): void {
+      if (result.status === "backpressure_skipped" && Date.now() - lastBackpressureWarningAt >= 10_000) {
+        lastBackpressureWarningAt = Date.now();
+        console.warn(`[relay] stream snapshot skipped under backpressure buffered=${result.bufferedAmount} projected=${result.projectedBufferedAmount}`);
+      } else if (result.status === "backpressure_disconnected") {
+        console.warn(`[relay] disconnected saturated WebSocket buffered=${result.bufferedAmount} projected=${result.projectedBufferedAmount}`);
+      } else if (result.status === "socket_not_open" || result.status === "send_failed") {
+        console.warn(`[relay] best-effort frame not sent status=${result.status}`);
+      }
+    }
+
+    function send(msg: OpenClawRelayToServer): AssistantStreamEmitResult {
+      const reliable = queueReliable(msg);
+      if (reliable) return reliable;
+      const result = sendRelayJson(relayWs, msg, undefined, (error) => {
+        if (error) console.warn(`[relay] WebSocket write failed: ${error.message}`);
+      });
+      reportSendResult(result);
+      return result.status === "sent"
+        ? { status: "delivered" }
+        : { status: "retryable", error: result.error ?? new Error(`relay_send_${result.status}`) };
+    }
+
+    async function sendWithWriteConfirmation(
+      msg: OpenClawRelayToServer,
+    ): Promise<AssistantStreamEmitResult> {
+      const reliable = queueReliable(msg);
+      if (reliable) return reliable;
+      const result = await sendRelayJsonWithWriteConfirmation(relayWs, msg);
+      reportSendResult(result);
+      return result.status === "sent"
+        ? { status: "delivered" }
+        : { status: "retryable", error: result.error ?? new Error(`relay_send_${result.status}`) };
     }
 
     async function publishAndSendGatewayEvent(
@@ -301,30 +369,66 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       payload: unknown,
       publishOffice: boolean,
       userMessage?: string,
-    ): Promise<void> {
-      const outgoingPayload = eventName === "chat"
-        ? await relayOutgoingMediaInPayload(payload, {
+    ): Promise<void>;
+    async function publishAndSendGatewayEvent(
+      eventName: string,
+      payload: unknown,
+      publishOffice: boolean,
+      userMessage: string | undefined,
+      confirmWrite: true,
+    ): Promise<AssistantStreamEmitResult>;
+    async function publishAndSendGatewayEvent(
+      eventName: string,
+      payload: unknown,
+      publishOffice: boolean,
+      userMessage?: string,
+      confirmWrite = false,
+    ): Promise<void | AssistantStreamEmitResult> {
+      let outgoingPayload = payload;
+      if (eventName === "chat") {
+        try {
+          outgoingPayload = await relayOutgoingMediaInPayload(payload, {
             relayServerUrl: opts.relayServerUrl,
             relaySecret: opts.relaySecret,
             gatewayId: opts.gatewayId,
             senderDisplayName: "OpenClaw",
             cache: outgoingMediaUploadCache,
             userMessage,
-          })
-        : payload;
+          });
+        } catch (error) {
+          if (!hasCanonicalTerminalTimeline(payload)) throw error;
+          // The answer is already complete. Attachment enrichment must not keep
+          // the canonical terminal outside the ACK-backed outbox during a Relay
+          // disconnect; replay the original terminal and let history/file flows
+          // reconcile any media separately.
+          console.warn(`[relay] terminal media enrichment failed; sending canonical terminal without enrichment: ${String(error)}`);
+          outgoingPayload = payload;
+        }
+      }
       if (publishOffice) {
         publishOfficeSnapshot(send, eventName, outgoingPayload);
       }
-      send({ type: "event", event: eventName, payload: outgoingPayload });
+      const message: OpenClawRelayToServer = {
+        type: "event",
+        event: eventName,
+        payload: outgoingPayload,
+      };
+      if (confirmWrite) return sendWithWriteConfirmation(message);
+      send(message);
     }
 
     const assistantSnapshots = new LatestSnapshotCoalescer<string, OpenClawAssistantSnapshot>({
-      emit: (_key, snapshot) => publishAndSendGatewayEvent(
-        snapshot.eventName,
-        snapshot.payload,
-        snapshot.publishOffice,
-        snapshot.userMessage,
-      ),
+      emit: (_key, snapshot) => {
+        const publishOffice = snapshot.publishOffice;
+        snapshot.publishOffice = false;
+        return publishAndSendGatewayEvent(
+          snapshot.eventName,
+          snapshot.payload,
+          publishOffice,
+          snapshot.userMessage,
+          true,
+        );
+      },
       onError: (error, key) => {
         console.warn(`[relay] assistant snapshot publish failed key=${key}: ${String(error)}`);
       },
@@ -345,6 +449,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       key: string | undefined,
       close: boolean,
       operation: () => void | Promise<void>,
+      releaseClosed = false,
     ): void => {
       let result: void | Promise<void>;
       try {
@@ -357,9 +462,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         console.warn(`[relay] ordered gateway event publish failed: ${String(error)}`);
         return;
       }
-      void Promise.resolve(result).catch((error) => {
-        console.warn(`[relay] ordered gateway event publish failed: ${String(error)}`);
-      });
+      void Promise.resolve(result)
+        .catch((error) => {
+          console.warn(`[relay] ordered gateway event publish failed: ${String(error)}`);
+        })
+        .finally(() => {
+          if (key && close && releaseClosed) assistantSnapshots.releaseClosed(key);
+        });
     };
 
     const snapshotKeyForGatewayPayload = (payload: unknown): string | undefined => {
@@ -431,6 +540,12 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           capabilities: gatewayCapabilitiesForType("openclaw"),
         }),
       );
+      relayHelloTimer = setTimeout(() => {
+        if (relayHelloNegotiated) return;
+        console.warn("[relay] Relay hello negotiation timed out; reconnecting without protocol downgrade");
+        disconnectRelaySocketForRecovery(relayWs, "relay_hello_timeout");
+      }, opts.relayHelloTimeoutMs ?? RELAY_HELLO_NEGOTIATION_TIMEOUT_MS);
+      relayHelloTimer.unref?.();
 
       // Start the persistent gateway connection as soon as we're connected
       // to the relay server. Its lifetime is tied to this relay session.
@@ -463,20 +578,28 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             const p = normalizedPayload as { sessionKey?: string; runId?: string };
             const state = normalizeChatState(normalizedPayload);
             const providerRunId = typeof p?.runId === "string" ? p.runId.trim() : "";
+            const isStreamingState = state === "delta" || state === "streaming" || state === "in_progress";
+            const isTerminalState = state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted";
             const sessionKey = typeof p?.sessionKey === "string" && p.sessionKey.trim().length > 0 ? p.sessionKey.trim() : undefined;
             const explicitCanonicalRunId = resolveExplicitMobileRunIdFromChatPayload(normalizedPayload);
             let runContext = providerRunId
               ? chatRunContexts.get(providerRunId) ?? openClawChatRunIdentities.resolve(opts.gatewayId, providerRunId)
               : undefined;
-            if (!runContext && providerRunId && explicitCanonicalRunId && sessionKey) {
+            if (!runContext && providerRunId && sessionKey) {
               runContext = {
                 gatewayId: opts.gatewayId,
                 providerRunId,
-                canonicalRunId: explicitCanonicalRunId,
+                canonicalRunId: explicitCanonicalRunId ?? providerRunId,
                 sessionKey,
               };
-              openClawChatRunIdentities.register(runContext);
+              openClawChatRunIdentities.ensure(runContext);
               chatRunContexts.set(providerRunId, runContext);
+            }
+            if (providerRunId && isStreamingState && openClawChatRunIdentities.isTerminal(opts.gatewayId, providerRunId)) {
+              return;
+            }
+            if (providerRunId && isTerminalState) {
+              openClawChatRunIdentities.markTerminal(opts.gatewayId, providerRunId);
             }
             const canonicalRunId = runContext?.canonicalRunId ?? explicitCanonicalRunId ?? providerRunId;
             const resolvedSessionKey = sessionKey ?? runContext?.sessionKey;
@@ -485,7 +608,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             const runSnapshotKey = assistantSnapshotKey(canonicalRunId, resolvedSessionKey);
             if (isOpenClawHeartbeatText(currentText) || (runContext?.promptText && isOpenClawHeartbeatText(runContext.promptText))) {
               if (providerRunId && (state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted")) {
-                chatBuffers.delete(providerRunId);
+                openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
                 chatRunContexts.delete(providerRunId);
               }
               if (runSnapshotKey) {
@@ -503,9 +626,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 clearChatFallback(providerRunId);
               }
               if (state === "delta" || state === "streaming" || state === "in_progress") {
-                const previousText = chatBuffers.get(providerRunId) ?? "";
+                const previousText = openClawChatRunIdentities.accumulatedText(opts.gatewayId, providerRunId);
                 const bufferedText = appendUniqueSuffix(previousText, currentText);
-                chatBuffers.set(providerRunId, bufferedText);
+                openClawChatRunIdentities.setAccumulatedText(opts.gatewayId, providerRunId, bufferedText);
                 if (role === "assistant" && bufferedText.trim()) {
                   realtimePayload = resolvedSessionKey
                     ? mergeCanonicalChatPayload(
@@ -521,7 +644,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     : withMessageText(normalizedPayload, bufferedText);
                 }
               } else if (state === "error" || state === "failed" || state === "fail" || state === "aborted") {
-                chatBuffers.delete(providerRunId);
                 if (role === "assistant" && resolvedSessionKey) {
                   realtimePayload = mergeCanonicalChatPayload(
                     normalizedPayload,
@@ -552,15 +674,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
             if (state === "final" && resolvedSessionKey) {
               scheduleContextUsageRefresh(resolvedSessionKey, 450);
-              const bufferedText = providerRunId ? chatBuffers.get(providerRunId) ?? "" : "";
-              const resolvedText = currentText || bufferedText;
-              if (providerRunId) {
-                chatBuffers.delete(providerRunId);
-              }
+              const bufferedText = providerRunId
+                ? openClawChatRunIdentities.accumulatedText(opts.gatewayId, providerRunId)
+                : "";
+              const resolvedText = appendUniqueSuffix(bufferedText, currentText);
               if (resolvedText.trim()) {
-                if (providerRunId) {
-                  chatRunContexts.delete(providerRunId);
-                }
                 const outgoingPayload = providerRunId
                   ? mergeCanonicalChatPayload(
                       normalizedPayload,
@@ -573,9 +691,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                       }),
                     )
                   : withMessageText(normalizedPayload, resolvedText);
-                runAfterAssistantSnapshot(runSnapshotKey, true, () => (
-                  publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText)
-                ));
+                runAfterAssistantSnapshot(runSnapshotKey, true, async () => {
+                  await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
+                  if (providerRunId) {
+                    openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
+                    chatRunContexts.delete(providerRunId);
+                  }
+                }, Boolean(providerRunId));
                 return;
               }
 
@@ -609,6 +731,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                       : normalizedPayload;
                     const outgoingPayload = buildFinalPayloadFromHistoryOutcome(basePayload, outcome);
                     await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
+                    if (providerRunId) openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
                     return;
                   }
                   if (outcome?.kind === "error") {
@@ -627,6 +750,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                           errorMessage: outcome.errorMessage,
                         };
                     await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice);
+                    if (providerRunId) openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
                     return;
                   }
                   if (providerRunId && runContext) {
@@ -643,7 +767,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                   }
                   void publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice);
                 });
-              runAfterAssistantSnapshot(runSnapshotKey, true, publishHistoryTerminal);
+              runAfterAssistantSnapshot(runSnapshotKey, true, publishHistoryTerminal, Boolean(providerRunId));
               return;
             }
 
@@ -652,9 +776,12 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               scheduleContextUsageRefresh(p?.sessionKey, 450);
             }
             const isTerminal = state === "error" || state === "failed" || state === "fail" || state === "aborted";
-            runAfterAssistantSnapshot(runSnapshotKey, isTerminal, () => (
-              publishAndSendGatewayEvent(event, realtimePayload, shouldPublishOffice)
-            ));
+            runAfterAssistantSnapshot(runSnapshotKey, isTerminal, async () => {
+              await publishAndSendGatewayEvent(event, realtimePayload, shouldPublishOffice);
+              if (providerRunId && isTerminal) {
+                openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
+              }
+            }, Boolean(providerRunId && isTerminal));
             return;
           }
           runAfterAssistantSnapshot(snapshotKeyForGatewayPayload(normalizedPayload), false, () => (
@@ -682,6 +809,30 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       }
 
       if (msg.type === "hello") {
+        if (!isValidRelayHello(msg, opts.gatewayId)) {
+          console.warn("[relay] invalid Relay hello; reconnecting without protocol downgrade");
+          disconnectRelaySocketForRecovery(relayWs, "invalid_relay_hello");
+          return;
+        }
+        if (relayHelloNegotiated) return;
+        relayHelloNegotiated = true;
+        if (relayHelloTimer) {
+          clearTimeout(relayHelloTimer);
+          relayHelloTimer = undefined;
+        }
+        const deliveryMode = reliableDeliveryModeFromRelayHello(msg);
+        deliveryOutbox.attach(relayWs, deliveryMode);
+        console.log(`[relay] reliable delivery mode=${deliveryMode}`);
+        return;
+      }
+
+      if (msg.type === "event_ack") {
+        deliveryOutbox.acknowledge(msg.id);
+        return;
+      }
+
+      if (msg.type === "response_ack") {
+        deliveryOutbox.acknowledgeResponse(msg.id, msg.responsePhase);
         return;
       }
 
@@ -916,7 +1067,12 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         clearTimeout(timer);
       }
       contextUsageRefreshes.clear();
+      if (relayHelloTimer) {
+        clearTimeout(relayHelloTimer);
+        relayHelloTimer = undefined;
+      }
       assistantSnapshots.dispose();
+      deliveryOutbox.detach(relayWs);
       resolve(shouldRetryRelayClose(code, opts.signal));
     });
 
@@ -935,6 +1091,19 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         upper.startsWith("HEARTBEAT_OK") ||
         upper.startsWith("HEARTBEAT OK")
       );
+    }
+
+    function hasCanonicalTerminalTimeline(payload: unknown): boolean {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+      const record = payload as Record<string, unknown>;
+      const state = typeof record.state === "string" ? record.state.trim().toLowerCase() : "";
+      if (!["final", "error", "failed", "fail", "aborted"].includes(state)) return false;
+      return Array.isArray(record.timelineEvents) && record.timelineEvents.some((event) => {
+        if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+        const eventType = (event as Record<string, unknown>).eventType;
+        return typeof eventType === "string"
+          && ["message.completed", "run.completed", "run.failed", "run.aborted"].includes(eventType);
+      });
     }
 
     relayWs.on("error", (err) => {

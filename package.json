@@ -23,7 +23,7 @@
     "README.zh-CN.md"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=18.19.0"
   },
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
@@ -32,7 +32,8 @@
     "postinstall": "node scripts/fix-windows-powershell-shim.mjs",
     "sync:slash-commands": "tsx scripts/sync-slash-command-catalog.ts",
     "prepack": "npm run build",
-    "test": "node --test --test-concurrency=1 --import tsx src/*.test.ts src/commands/*.test.ts src/config/*.test.ts src/core/*.test.ts src/core/**/*.test.ts src/openclaw/*.test.ts src/openclaw/**/*.test.ts src/platform/*.test.ts src/hermes/*.test.ts src/hermes/**/*.test.ts",
+    "test": "node scripts/run-tests.mjs",
+    "test:windows": "node scripts/run-tests.mjs",
     "test:e2e": "tsx scripts/e2e-protocol-smoke.ts",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js"

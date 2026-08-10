@@ -6,6 +6,10 @@ import test from "node:test";
 import {
   buildWindowsDirAclGrants,
   buildWindowsFileAclGrant,
+  getLinuxNohupPidPath,
+  getLinuxNohupStartScriptPath,
+  getLinuxServiceName,
+  getLinuxServicePath,
   getProgramArgs,
   resolveServiceEntryPath,
 } from "./service-manager-common.js";
@@ -48,4 +52,14 @@ test("Windows directory ACL grants apply modify access to the directory and chil
 test("getProgramArgs includes profile for multi-instance services", () => {
   const args = getProgramArgs("hermes");
   assert.deepEqual(args.slice(-3), ["run", "--profile", "hermes"]);
+});
+
+test("Linux service artifacts are isolated by profile", () => {
+  assert.equal(getLinuxServiceName(), "clawconnect-agent.service");
+  assert.equal(getLinuxServiceName("openclaw"), "clawconnect-agent-openclaw.service");
+  assert.equal(getLinuxServiceName("Hermes Agent"), "clawconnect-agent-hermes-agent.service");
+  assert.notEqual(getLinuxServicePath("openclaw"), getLinuxServicePath("hermes"));
+  assert.notEqual(getLinuxNohupPidPath("openclaw"), getLinuxNohupPidPath("hermes"));
+  assert.notEqual(getLinuxNohupStartScriptPath("openclaw"), getLinuxNohupStartScriptPath("hermes"));
+  assert.match(getLinuxNohupPidPath("hermes"), /profiles[/\\]hermes[/\\]clawconnect\.pid$/);
 });

@@ -1,12 +1,60 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import test, { after, afterEach } from "node:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 
-import { runRelayManager } from "./relay-manager.js";
+import { runRelayManager as runRelayManagerImplementation } from "./relay-manager.js";
+import type { RelayManagerOptions } from "./relay/relay-manager-protocol.js";
 import { openClawChatRunIdentities } from "./relay/chat-run-identity.js";
+import { clearReliableRelayOutboxesForTests } from "../core/relay/reliable-relay-outbox-registry.js";
+
+const reliableOutboxStorageDirectory = mkdtempSync(join(tmpdir(), "clawconnect-openclaw-manager-test-"));
+
+afterEach(() => {
+  clearReliableRelayOutboxesForTests();
+  rmSync(reliableOutboxStorageDirectory, { recursive: true, force: true });
+  mkdirSync(reliableOutboxStorageDirectory, { recursive: true });
+});
+
+after(() => rmSync(reliableOutboxStorageDirectory, { recursive: true, force: true }));
+
+function runRelayManager(opts: RelayManagerOptions): Promise<boolean> {
+  return runRelayManagerImplementation({ ...opts, reliableOutboxStorageDirectory });
+}
+
+test("relay manager reconnects on missing Relay hello instead of silently selecting legacy mode", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  let relayClose: { code: number; reason: string } | undefined;
+
+  relayServer.on("connection", (socket) => {
+    socket.on("close", (code, reason) => {
+      relayClose = { code, reason: reason.toString() };
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+
+  const retry = await runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-hello-timeout",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    relayHelloTimeoutMs: 25,
+  });
+
+  await waitFor(() => relayClose !== undefined);
+  assert.equal(retry, true);
+  assert.deepEqual(relayClose, { code: 1013, reason: "relay_hello_timeout" });
+  await closeServer(relayServer);
+  await closeServer(gatewayServer);
+});
 
 test("relay manager forwards OpenClaw agent tool events to relay", async () => {
   const relayServer = new WebSocketServer({ port: 0 });
@@ -16,6 +64,7 @@ test("relay manager forwards OpenClaw agent tool events to relay", async () => {
   let gatewaySocket: WebSocket | undefined;
 
   relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-test");
     socket.on("message", (raw) => {
       relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
     });
@@ -96,6 +145,7 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
   let gatewaySocket: WebSocket | undefined;
 
   relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-test");
     socket.on("message", (raw) => {
       relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
     });
@@ -259,6 +309,7 @@ test("relay manager keeps mobile chat identity across provider events and transc
 
   relayServer.on("connection", (socket) => {
     relaySocket = socket;
+    sendRelayHello(socket, "gw-stable-identity");
     socket.on("message", (raw) => {
       relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
     });
@@ -533,6 +584,7 @@ test("relay manager does not complete an OpenClaw run for a thinking plus toolCa
 
   relayServer.on("connection", (socket) => {
     relaySocket = socket;
+    sendRelayHello(socket, "gw-tool-preamble");
     socket.on("message", (raw) => {
       relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
     });
@@ -655,7 +707,7 @@ test("relay manager does not complete an OpenClaw run for a thinking plus toolCa
   }
 });
 
-test("relay manager restores provider to mobile identity after Relay WebSocket reconnect", async () => {
+test("relay manager restores identity and cumulative assistant text after Relay WebSocket reconnect", async () => {
   openClawChatRunIdentities.clear();
   const relayServer = new WebSocketServer({ port: 0 });
   const gatewayServer = new WebSocketServer({ port: 0 });
@@ -666,6 +718,7 @@ test("relay manager restores provider to mobile identity after Relay WebSocket r
 
   relayServer.on("connection", (socket) => {
     relaySockets.push(socket);
+    sendRelayHello(socket, "gw-identity-reconnect", true);
     socket.on("message", (raw) => {
       relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
     });
@@ -695,6 +748,22 @@ test("relay manager restores provider to mobile identity after Relay WebSocket r
           ok: true,
           payload: { runId: "provider-run-reconnect" },
         }));
+        if (connectionNumber === 1) {
+          setImmediate(() => {
+            socket.send(JSON.stringify({
+              type: "event",
+              event: "chat",
+              payload: {
+                runId: "provider-run-reconnect",
+                sessionKey: "agent:main:main",
+                state: "delta",
+                role: "assistant",
+                text: "hello ",
+                seq: 1,
+              },
+            }));
+          });
+        }
         return;
       }
       socket.send(JSON.stringify({
@@ -713,7 +782,7 @@ test("relay manager restores provider to mobile identity after Relay WebSocket r
               sessionKey: "agent:main:main",
               state: "final",
               role: "assistant",
-              text: "reply after reconnect",
+              text: "world",
             },
           }));
         });
@@ -748,7 +817,10 @@ test("relay manager restores provider to mobile identity after Relay WebSocket r
         idempotencyKey: "mobile-run-reconnect",
       },
     }));
-    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "send-before-reconnect"), 4_000);
+    await waitFor(() => relayMessages.some((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload)
+      && message.payload.state === "delta" && extractPayloadText(message.payload) === "hello "
+    )), 4_000);
     relaySockets[0]?.close(1012, "test reconnect");
     await firstManager;
 
@@ -758,12 +830,15 @@ test("relay manager restores provider to mobile identity after Relay WebSocket r
       if (message.type !== "event" || message.event !== "chat" || !isRecord(message.payload)) {
         return false;
       }
-      return message.payload.state === "final" && extractPayloadText(message.payload) === "reply after reconnect";
+      return message.payload.state === "final" && extractPayloadText(message.payload) === "hello world";
     }), 4_000);
-    const reconnectedPayload = relayMessages
-      .filter((message) => message.type === "event" && message.event === "chat" && isRecord(message.payload))
-      .map((message) => message.payload as Record<string, unknown>)
-      .find((payload) => extractPayloadText(payload) === "reply after reconnect");
+    const reconnectedMessage = relayMessages.find((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload)
+      && extractPayloadText(message.payload) === "hello world"
+    ));
+    assert.match(String(reconnectedMessage?.deliveryId), /^delivery_[a-f0-9]{32}$/);
+    relaySockets.at(-1)?.send(JSON.stringify({ type: "event_ack", id: reconnectedMessage?.deliveryId }));
+    const reconnectedPayload = reconnectedMessage?.payload as Record<string, unknown> | undefined;
     assert.equal(reconnectedPayload?.runId, "mobile-run-reconnect");
     const completed = timelineEvents(reconnectedPayload ?? {}).find((event) => event.eventType === "message.completed");
     assert.deepEqual({
@@ -804,6 +879,7 @@ test("relay manager answers chat.history cursor pages from OpenClaw transcripts 
 
   relayServer.on("connection", (socket) => {
     relaySocket = socket;
+    sendRelayHello(socket, "gw-test");
     socket.on("message", (raw) => {
       relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
     });
@@ -904,6 +980,7 @@ test("relay manager sanitizes legacy OpenClaw chat.history fallback params", asy
 
   relayServer.on("connection", (socket) => {
     relaySocket = socket;
+    sendRelayHello(socket, "gw-test");
     socket.on("message", (raw) => {
       relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
     });
@@ -1024,6 +1101,7 @@ test("relay manager removes duplicate OpenClaw prompt mirrors before serving tra
 
   relayServer.on("connection", (socket) => {
     relaySocket = socket;
+    sendRelayHello(socket, "gw-test");
     socket.on("message", (raw) => {
       relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
     });
@@ -1180,6 +1258,7 @@ test("relay manager reuses one OpenClaw model request for concurrent and termina
 
   relayServer.on("connection", (socket) => {
     relaySocket = socket;
+    sendRelayHello(socket, "gw-openclaw-idempotency-test");
     socket.on("message", (raw) => {
       relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
     });
@@ -1300,7 +1379,15 @@ function extractPayloadText(payload: Record<string, unknown>): string {
   const message = isRecord(payload.message) ? payload.message : undefined;
   const content = Array.isArray(message?.content) ? message.content : [];
   const textBlock = content.find((block): block is Record<string, unknown> => isRecord(block) && block.type === "text");
-  return typeof textBlock?.text === "string" ? textBlock.text : "";
+  if (typeof textBlock?.text === "string") return textBlock.text;
+  for (const event of timelineEvents(payload)) {
+    const eventContent = Array.isArray(event.content) ? event.content : [];
+    const eventText = eventContent.find((block): block is Record<string, unknown> => (
+      isRecord(block) && block.type === "text" && typeof block.text === "string"
+    ));
+    if (typeof eventText?.text === "string") return eventText.text;
+  }
+  return "";
 }
 
 function timelineEvents(payload: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -1334,6 +1421,16 @@ async function closeServer(server: WebSocketServer): Promise<void> {
       }
     });
   });
+}
+
+function sendRelayHello(socket: WebSocket, gatewayId: string, acknowledged = false): void {
+  socket.send(JSON.stringify({
+    type: "hello",
+    role: "relay",
+    gatewayId,
+    ok: true,
+    ...(acknowledged ? { protocolCapabilities: ["reliable_delivery_ack_v1"] } : {}),
+  }));
 }
 
 function sessionDefaultsPayload(): Record<string, unknown> {

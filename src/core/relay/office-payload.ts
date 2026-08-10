@@ -30,6 +30,11 @@ export interface OfficeStreamPayload {
   };
 }
 
+export const OFFICE_DETAIL_MAX_CODE_POINTS = 240;
+const OFFICE_DETAIL_SEGMENTER = typeof Intl.Segmenter === "function"
+  ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+  : undefined;
+
 export function buildOfficeEventPayload(
   eventName: string,
   payload: unknown,
@@ -69,7 +74,7 @@ export function buildOfficeEventPayload(
 
   const kind = resolveKind(eventName, phase, role, toolName);
   const title = resolveTitle(kind);
-  const detail = resolveDetail(kind, {
+  const detail = truncateOfficeDetail(resolveDetail(kind, {
     eventName,
     text,
     currentModel,
@@ -79,7 +84,7 @@ export function buildOfficeEventPayload(
     phase,
     office,
     record,
-  });
+  }));
   const progress = resolveProgress(kind, phase);
 
   return {
@@ -92,13 +97,50 @@ export function buildOfficeEventPayload(
       title,
       detail,
       ...(phase ? { phase } : {}),
-      ...(text ? { text } : {}),
       ...(toolName ? { toolName } : {}),
       ...(toolCallId ? { toolCallId } : {}),
       ...(progress !== undefined ? { progress } : {}),
       updatedAt: nowIso(),
     },
   };
+}
+
+function truncateOfficeDetail(value: string): string {
+  if (OFFICE_DETAIL_SEGMENTER) {
+    let codePointCount = 0;
+    let safeEnd = 0;
+    for (const segment of OFFICE_DETAIL_SEGMENTER.segment(value)) {
+      codePointCount += countCodePoints(segment.segment);
+      if (codePointCount <= OFFICE_DETAIL_MAX_CODE_POINTS - 1) {
+        safeEnd = segment.index + segment.segment.length;
+      }
+      if (codePointCount > OFFICE_DETAIL_MAX_CODE_POINTS) {
+        return `${value.slice(0, safeEnd)}…`;
+      }
+    }
+    return value;
+  }
+
+  // Small-ICU or unusual embedded Node builds may not expose Segmenter. Iterate
+  // lazily by code point so every platform still avoids splitting a surrogate.
+  let codePointCount = 0;
+  let safeEnd = 0;
+  for (const codePoint of value) {
+    codePointCount += 1;
+    if (codePointCount <= OFFICE_DETAIL_MAX_CODE_POINTS - 1) {
+      safeEnd += codePoint.length;
+    }
+    if (codePointCount > OFFICE_DETAIL_MAX_CODE_POINTS) {
+      return `${value.slice(0, safeEnd)}…`;
+    }
+  }
+  return value;
+}
+
+function countCodePoints(value: string): number {
+  let count = 0;
+  for (const _codePoint of value) count += 1;
+  return count;
 }
 
 function resolveKind(

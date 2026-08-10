@@ -9,5 +9,4 @@ interface PairOptions {
 export declare function pairCommand(opts: PairOptions): Promise<void>;
 export declare function sameRelayServer(left: string, right: string): boolean;
 export declare function shouldReuseExistingPairing(config: ClawConnectConfig | null, gatewayType: "openclaw" | "hermes", requestedRelayServerUrl: string): boolean;
-export declare function normalizeRelayServerIdentity(relayServerUrl: string): string;
-export {};
+export { normalizeRelayServerIdentity } from "../core/relay/file-upload-utils.js";

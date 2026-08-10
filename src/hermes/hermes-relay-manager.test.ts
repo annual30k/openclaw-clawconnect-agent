@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, afterEach, test } from "node:test";
 import { WebSocketServer, type WebSocket } from "ws";
 
 import {
@@ -12,11 +15,62 @@ import {
   rememberActiveHermesChatRun,
   resolveHermesChatPreferredRunId,
   resolveHermesAbortRun,
-  runHermesRelayManagerWithDependencies,
+  runHermesRelayManagerWithDependencies as runHermesRelayManagerWithDependenciesImplementation,
   searchHermesSlashCommandCatalog,
   shouldPublishHermesOfficeSnapshot,
   type HermesRelayManagerDependencies,
 } from "./hermes-relay-manager.js";
+import type { HermesRelayManagerOptions } from "./hermes-relay-manager.js";
+import { clearReliableRelayOutboxesForTests } from "../core/relay/reliable-relay-outbox-registry.js";
+
+const reliableOutboxStorageDirectory = mkdtempSync(join(tmpdir(), "clawconnect-hermes-manager-test-"));
+
+afterEach(() => {
+  clearReliableRelayOutboxesForTests();
+  rmSync(reliableOutboxStorageDirectory, { recursive: true, force: true });
+  mkdirSync(reliableOutboxStorageDirectory, { recursive: true });
+});
+
+after(() => rmSync(reliableOutboxStorageDirectory, { recursive: true, force: true }));
+
+function runHermesRelayManagerWithDependencies(
+  opts: HermesRelayManagerOptions,
+  dependencies: HermesRelayManagerDependencies,
+): Promise<boolean> {
+  return runHermesRelayManagerWithDependenciesImplementation({
+    ...opts,
+    reliableOutboxStorageDirectory,
+  }, dependencies);
+}
+
+test("Hermes relay manager reconnects on missing Relay hello instead of silently selecting legacy mode", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  let relayClose: { code: number; reason: string } | undefined;
+
+  relayServer.on("connection", (socket) => {
+    socket.on("close", (code, reason) => {
+      relayClose = { code, reason: reason.toString() };
+    });
+  });
+  const relayAddress = relayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+
+  const retry = await runHermesRelayManagerWithDependencies({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-hermes-hello-timeout",
+    relaySecret: "secret",
+    relayHelloTimeoutMs: 25,
+  }, hermesTestDependencies(async () => ({
+    output: "unused",
+    sessionKey: "main",
+    artifactPaths: [],
+  })));
+
+  await waitForHermesTest(() => relayClose !== undefined);
+  assert.equal(retry, true);
+  assert.deepEqual(relayClose, { code: 1013, reason: "relay_hello_timeout" });
+  await closeHermesTestServer(relayServer);
+});
 
 const imageUpload = {
   filePath: "/tmp/reply.png",
@@ -130,14 +184,17 @@ test("Hermes artifact uploads are linked to the assistant source run", () => {
 });
 
 test("Hermes office snapshots skip high-frequency assistant deltas", () => {
-  assert.equal(
-    shouldPublishHermesOfficeSnapshot("chat", {
-      state: "delta",
-      role: "assistant",
-      delta: "hello",
-    }),
-    false,
-  );
+  for (const state of ["delta", "streaming", "in_progress"]) {
+    assert.equal(
+      shouldPublishHermesOfficeSnapshot("chat", {
+        state,
+        role: "assistant",
+        delta: "hello",
+      }),
+      false,
+      `state=${state}`,
+    );
+  }
 
   assert.equal(
     shouldPublishHermesOfficeSnapshot("chat", {
@@ -330,6 +387,7 @@ test("Hermes relay manager reuses one successful model run for concurrent and te
   }>();
   relayServer.on("connection", (socket) => {
     relaySocket = socket;
+    sendHermesRelayHello(socket, "gw-hermes-idempotency-success");
     socket.on("message", (raw) => {
       relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
     });
@@ -409,6 +467,7 @@ test("Hermes relay manager immediately reuses accepted and publishes one model e
   const modelResult = createHermesTestDeferred<never>();
   relayServer.on("connection", (socket) => {
     relaySocket = socket;
+    sendHermesRelayHello(socket, "gw-hermes-idempotency-error");
     socket.on("message", (raw) => {
       relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
     });
@@ -474,6 +533,86 @@ test("Hermes relay manager immediately reuses accepted and publishes one model e
   }
 });
 
+test("Hermes replays an unacknowledged canonical terminal after reconnect without rerunning the model", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  const relaySockets: WebSocket[] = [];
+  const relayMessages: Array<{ connection: number; message: Record<string, unknown> }> = [];
+  let modelRuns = 0;
+  relayServer.on("connection", (socket) => {
+    relaySockets.push(socket);
+    const connection = relaySockets.length;
+    sendHermesRelayHello(socket, "gw-hermes-terminal-replay", true);
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+      relayMessages.push({ connection, message });
+      if (connection === 2 && message.type === "event" && typeof message.deliveryId === "string") {
+        socket.send(JSON.stringify({ type: "event_ack", id: message.deliveryId }));
+      }
+    });
+  });
+  const relayAddress = relayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  const managerOptions = {
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-hermes-terminal-replay",
+    relaySecret: "secret",
+  };
+  const dependencies = hermesTestDependencies(async () => {
+    modelRuns += 1;
+    return { output: "replay-safe final", sessionKey: "main", artifactPaths: [] };
+  });
+  const command = (id: string) => JSON.stringify({
+    type: "cmd",
+    id,
+    method: "chat.send",
+    params: {
+      sessionKey: "main",
+      message: "run once",
+      idempotencyKey: "hermes-terminal-replay-run",
+    },
+  });
+  const firstAbort = new AbortController();
+  const firstManager = runHermesRelayManagerWithDependencies({
+    ...managerOptions,
+    signal: firstAbort.signal,
+  }, dependencies);
+  let secondManager: Promise<boolean> | undefined;
+  let secondAbort: AbortController | undefined;
+
+  try {
+    await waitForHermesTest(() => relaySockets.length === 1);
+    relaySockets[0]?.send(command("replay-first"));
+    await waitForHermesTest(() => terminalEnvelopeForConnection(relayMessages, 1) !== undefined);
+    const firstTerminal = terminalEnvelopeForConnection(relayMessages, 1)!;
+    assert.match(String(firstTerminal.deliveryId), /^delivery_[a-f0-9]{32}$/);
+
+    relaySockets[0]?.close(1012, "test terminal replay");
+    await firstManager;
+
+    secondAbort = new AbortController();
+    secondManager = runHermesRelayManagerWithDependencies({
+      ...managerOptions,
+      signal: secondAbort.signal,
+    }, dependencies);
+    await waitForHermesTest(() => terminalEnvelopeForConnection(relayMessages, 2) !== undefined);
+    const replayedTerminal = terminalEnvelopeForConnection(relayMessages, 2)!;
+    assert.deepEqual(replayedTerminal, firstTerminal);
+
+    relaySockets[1]?.send(command("replay-retry"));
+    await waitForHermesTest(() => relayMessages.some(({ connection, message }) => (
+      connection === 2 && message.type === "res" && message.id === "replay-retry"
+      && message.responsePhase === "terminal"
+    )));
+    assert.equal(modelRuns, 1);
+  } finally {
+    firstAbort.abort();
+    secondAbort?.abort();
+    await firstManager.catch(() => false);
+    await secondManager?.catch(() => false);
+    await closeHermesTestServer(relayServer);
+  }
+});
+
 function hermesTestDependencies(
   runChat: HermesRelayManagerDependencies["runChat"],
 ): HermesRelayManagerDependencies {
@@ -516,6 +655,18 @@ function terminalHermesChatEvents(
   ));
 }
 
+function terminalEnvelopeForConnection(
+  messages: Array<{ connection: number; message: Record<string, unknown> }>,
+  connection: number,
+): Record<string, unknown> | undefined {
+  return messages.find(({ connection: candidateConnection, message }) => (
+    candidateConnection === connection
+    && message.type === "event"
+    && message.event === "chat"
+    && typeof message.deliveryId === "string"
+  ))?.message;
+}
+
 async function waitForHermesTest(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -531,4 +682,14 @@ async function closeHermesTestServer(server: WebSocketServer): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve());
   });
+}
+
+function sendHermesRelayHello(socket: WebSocket, gatewayId: string, acknowledged = false): void {
+  socket.send(JSON.stringify({
+    type: "hello",
+    role: "relay",
+    gatewayId,
+    ok: true,
+    ...(acknowledged ? { protocolCapabilities: ["reliable_delivery_ack_v1"] } : {}),
+  }));
 }

@@ -9,9 +9,9 @@ import {
   getProfileErrorLogPath,
   getProfileLogPath,
   getProgramArgs,
-  LINUX_NOHUP_PID_PATH,
-  LINUX_NOHUP_START_SCRIPT_PATH,
-  LINUX_SERVICE_PATH,
+  getLinuxNohupPidPath,
+  getLinuxNohupStartScriptPath,
+  getLinuxServicePath,
   run,
   setRestrictiveDirPermissions,
   setRestrictiveFilePermissions,
@@ -167,52 +167,56 @@ export function getServicePlatform(): ServicePlatform {
 }
 
 export function installService(profile?: string): boolean {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
   switch (detectPlatform()) {
     case "macos":
-      return installMacService(profile);
+      return installMacService(resolvedProfile);
     case "linux":
-      return installLinuxService();
+      return installLinuxService(resolvedProfile);
     case "windows":
-      return installWindowsService(profile);
+      return installWindowsService(resolvedProfile);
     default:
       return false;
   }
 }
 
 export function restartService(profile?: string): boolean {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
   switch (detectPlatform()) {
     case "macos":
-      return restartMacService(profile);
+      return restartMacService(resolvedProfile);
     case "linux":
-      return restartLinuxService();
+      return restartLinuxService(resolvedProfile);
     case "windows":
-      return restartWindowsService(profile);
+      return restartWindowsService(resolvedProfile);
     default:
       return false;
   }
 }
 
 export function stopService(profile?: string): boolean {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
   switch (detectPlatform()) {
     case "macos":
-      return uninstallMacArtifacts(profile);
+      return uninstallMacArtifacts(resolvedProfile);
     case "linux":
-      return stopLinuxService();
+      return stopLinuxService(resolvedProfile);
     case "windows":
-      return stopWindowsService(profile);
+      return stopWindowsService(resolvedProfile);
     default:
       return false;
   }
 }
 
 export function uninstallService(profile?: string): boolean {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
   switch (detectPlatform()) {
     case "macos":
-      return uninstallMacArtifacts(profile);
+      return uninstallMacArtifacts(resolvedProfile);
     case "linux":
-      return uninstallLinuxService();
+      return uninstallLinuxService(resolvedProfile);
     case "windows":
-      return uninstallWindowsService(profile);
+      return uninstallWindowsService(resolvedProfile);
     default:
       return false;
   }
@@ -245,7 +249,7 @@ export function getServiceStatus(profile?: string): ServiceStatus {
   }
 
   if (platform === "linux") {
-    return getLinuxServiceStatus();
+    return getLinuxServiceStatus(resolvedProfile);
   }
 
   if (platform === "windows") {
@@ -269,9 +273,9 @@ export function getServicePaths(profile?: string) {
     logPath: getProfileLogPath(resolvedProfile),
     errorLogPath: getProfileErrorLogPath(resolvedProfile),
     macPlistPath: macPlistPath(resolvedProfile),
-    linuxServicePath: LINUX_SERVICE_PATH,
-    linuxNohupPidPath: LINUX_NOHUP_PID_PATH,
-    linuxNohupStartScriptPath: LINUX_NOHUP_START_SCRIPT_PATH,
+    linuxServicePath: getLinuxServicePath(resolvedProfile),
+    linuxNohupPidPath: getLinuxNohupPidPath(resolvedProfile),
+    linuxNohupStartScriptPath: getLinuxNohupStartScriptPath(resolvedProfile),
     windowsServicePath: "",
   };
 }

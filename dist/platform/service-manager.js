@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { detectPlatform, ensureLogDir, getProfileErrorLogPath, getProfileLogPath, getProgramArgs, LINUX_NOHUP_PID_PATH, LINUX_NOHUP_START_SCRIPT_PATH, LINUX_SERVICE_PATH, run, } from "./service-manager-common.js";
+import { detectPlatform, ensureLogDir, getProfileErrorLogPath, getProfileLogPath, getProgramArgs, getLinuxNohupPidPath, getLinuxNohupStartScriptPath, getLinuxServicePath, run, } from "./service-manager-common.js";
 import { getActiveProfile, normalizeProfileName, profileDisplayName } from "../config/profile.js";
 import { getLinuxServiceStatus, installLinuxService, restartLinuxService, stopLinuxService, uninstallLinuxService, } from "./service-manager-linux.js";
 import { getWindowsServiceStatus, installWindowsService, restartWindowsService, stopWindowsService, uninstallWindowsService, } from "./service-manager-windows.js";
@@ -127,49 +127,53 @@ export function getServicePlatform() {
     return detectPlatform();
 }
 export function installService(profile) {
+    const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
     switch (detectPlatform()) {
         case "macos":
-            return installMacService(profile);
+            return installMacService(resolvedProfile);
         case "linux":
-            return installLinuxService();
+            return installLinuxService(resolvedProfile);
         case "windows":
-            return installWindowsService(profile);
+            return installWindowsService(resolvedProfile);
         default:
             return false;
     }
 }
 export function restartService(profile) {
+    const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
     switch (detectPlatform()) {
         case "macos":
-            return restartMacService(profile);
+            return restartMacService(resolvedProfile);
         case "linux":
-            return restartLinuxService();
+            return restartLinuxService(resolvedProfile);
         case "windows":
-            return restartWindowsService(profile);
+            return restartWindowsService(resolvedProfile);
         default:
             return false;
     }
 }
 export function stopService(profile) {
+    const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
     switch (detectPlatform()) {
         case "macos":
-            return uninstallMacArtifacts(profile);
+            return uninstallMacArtifacts(resolvedProfile);
         case "linux":
-            return stopLinuxService();
+            return stopLinuxService(resolvedProfile);
         case "windows":
-            return stopWindowsService(profile);
+            return stopWindowsService(resolvedProfile);
         default:
             return false;
     }
 }
 export function uninstallService(profile) {
+    const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
     switch (detectPlatform()) {
         case "macos":
-            return uninstallMacArtifacts(profile);
+            return uninstallMacArtifacts(resolvedProfile);
         case "linux":
-            return uninstallLinuxService();
+            return uninstallLinuxService(resolvedProfile);
         case "windows":
-            return uninstallWindowsService(profile);
+            return uninstallWindowsService(resolvedProfile);
         default:
             return false;
     }
@@ -200,7 +204,7 @@ export function getServiceStatus(profile) {
         };
     }
     if (platform === "linux") {
-        return getLinuxServiceStatus();
+        return getLinuxServiceStatus(resolvedProfile);
     }
     if (platform === "windows") {
         return getWindowsServiceStatus(resolvedProfile);
@@ -221,9 +225,9 @@ export function getServicePaths(profile) {
         logPath: getProfileLogPath(resolvedProfile),
         errorLogPath: getProfileErrorLogPath(resolvedProfile),
         macPlistPath: macPlistPath(resolvedProfile),
-        linuxServicePath: LINUX_SERVICE_PATH,
-        linuxNohupPidPath: LINUX_NOHUP_PID_PATH,
-        linuxNohupStartScriptPath: LINUX_NOHUP_START_SCRIPT_PATH,
+        linuxServicePath: getLinuxServicePath(resolvedProfile),
+        linuxNohupPidPath: getLinuxNohupPidPath(resolvedProfile),
+        linuxNohupStartScriptPath: getLinuxNohupStartScriptPath(resolvedProfile),
         windowsServicePath: "",
     };
 }
