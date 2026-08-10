@@ -182,6 +182,56 @@ test("Hermes state db realtime suppresses mobile user and tool-call rows but bac
   assert.equal(result.payloads[1]?.timelineEvents[0]?.content[0]?.text, "PC follow-up");
 });
 
+test("Hermes state db realtime quarantines an incomplete mobile turn instead of publishing an orphan reply", () => {
+  const first = buildHermesStateDbRealtimePayloads({
+    gatewayId: "gw-hermes",
+    cursor: { lastMessageId: 49, openTurnsBySession: {} },
+    rows: [
+      message({
+        id: 50,
+        role: "user",
+        sessionSource: "api_server",
+        content: [
+          "mobile prompt",
+          "",
+          "[ClawConnect mobile turn]",
+          "sessionKey: hermes:mobile-session",
+        ].join("\n"),
+      }),
+      message({
+        id: 51,
+        role: "assistant",
+        sessionSource: "api_server",
+        content: "must not become an orphan reply",
+        finishReason: "stop",
+      }),
+    ],
+  });
+
+  assert.deepEqual(first.payloads, []);
+  assert.deepEqual(first.warnings, [{
+    code: "mobile_turn_metadata_incomplete",
+    sessionId: "20260706_164841_883495",
+    rowId: 50,
+    missingFields: ["sourceRunId"],
+  }]);
+  assert.equal(first.cursor.openTurnsBySession["20260706_164841_883495"]?.invalidMobileTurn, true);
+
+  const later = buildHermesStateDbRealtimePayloads({
+    gatewayId: "gw-hermes",
+    cursor: first.cursor,
+    rows: [message({
+      id: 52,
+      role: "assistant",
+      sessionSource: "api_server",
+      content: "later orphan reply",
+      finishReason: "stop",
+    })],
+  });
+  assert.deepEqual(later.payloads, []);
+  assert.deepEqual(later.warnings, []);
+});
+
 test("Hermes state db realtime ignores inactive and already-seen rows", () => {
   const cursor: HermesStateDbRealtimeCursor = { lastMessageId: 30, openTurnsBySession: {} };
   const result = buildHermesStateDbRealtimePayloads({

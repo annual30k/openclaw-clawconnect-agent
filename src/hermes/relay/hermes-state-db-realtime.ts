@@ -38,6 +38,7 @@ export type HermesStateDbRealtimeOpenTurn = {
   runId: string;
   mobileTurn: boolean;
   sessionKey?: string;
+  invalidMobileTurn?: boolean;
 };
 
 export type HermesStateDbRealtimeCursor = {
@@ -56,6 +57,14 @@ export type HermesStateDbRealtimePayload = {
 export type HermesStateDbRealtimeBuildResult = {
   cursor: HermesStateDbRealtimeCursor;
   payloads: HermesStateDbRealtimePayload[];
+  warnings: HermesStateDbRealtimeWarning[];
+};
+
+export type HermesStateDbRealtimeWarning = {
+  code: "mobile_turn_metadata_incomplete";
+  sessionId: string;
+  rowId: number;
+  missingFields: Array<"sourceRunId" | "sessionKey">;
 };
 
 const CLAWCONNECT_MOBILE_TURN_MARKER = "[ClawConnect mobile turn]";
@@ -220,6 +229,7 @@ export function buildHermesStateDbRealtimePayloads(params: {
 }): HermesStateDbRealtimeBuildResult {
   const cursor = cloneCursor(params.cursor);
   const payloads: HermesStateDbRealtimePayload[] = [];
+  const warnings: HermesStateDbRealtimeWarning[] = [];
   const rows = [...params.rows].sort((left, right) => left.id - right.id);
 
   for (const row of rows) {
@@ -242,6 +252,10 @@ export function buildHermesStateDbRealtimePayloads(params: {
       const mobileTurn = isClawConnectMobileTurn(row.content);
       const turn = buildOpenTurn(row, mobileTurn);
       cursor.openTurnsBySession[row.sessionId] = turn;
+      if (turn.invalidMobileTurn) {
+        warnings.push(invalidMobileTurnWarning(row));
+        continue;
+      }
       if (mobileTurn) {
         continue;
       }
@@ -250,6 +264,9 @@ export function buildHermesStateDbRealtimePayloads(params: {
     }
 
     const turn = cursor.openTurnsBySession[row.sessionId] ?? buildOpenTurn(row, false);
+    if (turn.invalidMobileTurn) {
+      continue;
+    }
     if (turn.mobileTurn && !isTerminalHermesStateDbAssistant(row)) {
       continue;
     }
@@ -260,7 +277,7 @@ export function buildHermesStateDbRealtimePayloads(params: {
     payloads.push(buildOutputPayload(params.gatewayId, row, turn, visibleText));
   }
 
-  return { cursor, payloads };
+  return { cursor, payloads, warnings };
 }
 
 export async function queryHermesStateDbMaxMessageId(params: {
@@ -498,6 +515,7 @@ export function createHermesStateDbRealtimeWatcher(params: {
   queryRows?: (params: { afterMessageId: number }) => Promise<HermesStateDbRealtimeMessageRow[]>;
   queryOpenTurnRows?: (params: { upToMessageId: number }) => Promise<HermesStateDbRealtimeMessageRow[]>;
   queryClientFactory?: () => HermesStateDbRealtimeQueryClient;
+  onWarning?: (warning: HermesStateDbRealtimeWarning) => void;
   onError?: (error: unknown) => void;
 }): HermesStateDbRealtimeWatcher {
   let cursor: HermesStateDbRealtimeCursor = { lastMessageId: 0, openTurnsBySession: {} };
@@ -547,6 +565,9 @@ export function createHermesStateDbRealtimeWatcher(params: {
       for (const payload of restored.payloads) {
         params.publishPayload(payload);
       }
+      for (const warning of restored.warnings) {
+        params.onWarning?.(warning);
+      }
       return true;
     } catch (error) {
       params.onError?.(error);
@@ -587,6 +608,9 @@ export function createHermesStateDbRealtimeWatcher(params: {
           rows,
         });
         cursor = result.cursor;
+        for (const warning of result.warnings) {
+          params.onWarning?.(warning);
+        }
         for (const payload of result.payloads) {
           params.publishPayload(payload);
         }
@@ -798,6 +822,7 @@ function restoreHermesStateDbRealtimeOpenTurns(
     lastMessageId: cursor.lastMessageId,
     openTurnsBySession: {},
   };
+  const warnings: HermesStateDbRealtimeWarning[] = [];
   const latestMobileFinalBySession = new Map<string, {
     row: HermesStateDbRealtimeMessageRow;
     turn: HermesStateDbRealtimeOpenTurn;
@@ -814,11 +839,15 @@ function restoreHermesStateDbRealtimeOpenTurns(
         latestMobileFinalBySession.delete(row.sessionId);
         continue;
       }
-      restored.openTurnsBySession[row.sessionId] = buildOpenTurn(row, mobileTurn);
+      const turn = buildOpenTurn(row, mobileTurn);
+      restored.openTurnsBySession[row.sessionId] = turn;
+      if (turn.invalidMobileTurn) {
+        warnings.push(invalidMobileTurnWarning(row));
+      }
       continue;
     }
     const turn = restored.openTurnsBySession[row.sessionId];
-    if (!turn?.mobileTurn || !isTerminalHermesStateDbAssistant(row)) {
+    if (!turn?.mobileTurn || turn.invalidMobileTurn || !isTerminalHermesStateDbAssistant(row)) {
       continue;
     }
     const visibleText = normalizeHermesStateDbOutputText(row.content);
@@ -835,12 +864,13 @@ function restoreHermesStateDbRealtimeOpenTurns(
       turn,
       normalizeHermesStateDbOutputText(row.content),
     ));
-  return { cursor: restored, payloads };
+  return { cursor: restored, payloads, warnings };
 }
 
 function buildOpenTurn(row: HermesStateDbRealtimeMessageRow, mobileTurn: boolean): HermesStateDbRealtimeOpenTurn {
   const mobileSourceRunId = row.role === "user" ? clawConnectMobileSourceRunId(row.content) : undefined;
   const mobileSessionKey = row.role === "user" ? clawConnectMobileSessionKey(row.content) : undefined;
+  const invalidMobileTurn = mobileTurn && (!mobileSourceRunId || !mobileSessionKey);
   const turnId = mobileSourceRunId
     ?? (row.role === "user"
       ? `hermes-db-${row.sessionId}-turn-${row.id}`
@@ -848,8 +878,21 @@ function buildOpenTurn(row: HermesStateDbRealtimeMessageRow, mobileTurn: boolean
   return {
     turnId,
     runId: turnId,
-    mobileTurn,
+    mobileTurn: mobileTurn && !invalidMobileTurn,
     ...(mobileSessionKey ? { sessionKey: mobileSessionKey } : {}),
+    ...(invalidMobileTurn ? { invalidMobileTurn: true } : {}),
+  };
+}
+
+function invalidMobileTurnWarning(row: HermesStateDbRealtimeMessageRow): HermesStateDbRealtimeWarning {
+  const missingFields: HermesStateDbRealtimeWarning["missingFields"] = [];
+  if (!clawConnectMobileSourceRunId(row.content)) missingFields.push("sourceRunId");
+  if (!clawConnectMobileSessionKey(row.content)) missingFields.push("sessionKey");
+  return {
+    code: "mobile_turn_metadata_incomplete",
+    sessionId: row.sessionId,
+    rowId: row.id,
+    missingFields,
   };
 }
 

@@ -251,6 +251,13 @@ export async function runHermesRelayManagerWithDependencies(
           send({ type: "event", event: "chat", payload });
           publishHermesOfficeSnapshot(send, "chat", payload);
         },
+        onWarning: (warning) => {
+          console.warn(
+            `[hermes-relay] state.db realtime row skipped: ${warning.code}`
+            + ` sessionId=${warning.sessionId} rowId=${warning.rowId}`
+            + ` missing=${warning.missingFields.join(",")}`,
+          );
+        },
         onError: (error) => {
           const message = error instanceof Error ? error.message : String(error);
           console.warn(`[hermes-relay] state.db realtime sync failed: ${message}`);
