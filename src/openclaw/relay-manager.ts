@@ -61,7 +61,11 @@ import {
   ChatSendIdempotencyGuard,
 } from "../core/relay/chat-send-idempotency.js";
 import { prepareChatSendParams } from "./relay/chat-send-attachments.js";
-import { relayOutgoingMediaInHistoryResponse, relayOutgoingMediaInPayload } from "./relay/outgoing-media-relay.js";
+import { canonicalizeOpenClawAssistantMediaSidecarPayload } from "./relay/assistant-media-sidecar.js";
+import {
+  relayOutgoingMediaInHistoryResponse,
+  relayOutgoingMediaInPayload,
+} from "./relay/outgoing-media-relay.js";
 import { prepareOpenClawVoiceInputCommand } from "./relay/openclaw-voice-input.js";
 import { voiceInputSetupMessage } from "../core/relay/voice-input.js";
 import type { FileUploadResult } from "../core/relay/file-upload.js";
@@ -572,7 +576,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         },
 
         onEvent: (event, payload) => {
-          const normalizedPayload = event === "chat" ? normalizeChatEventPayload(payload) : payload;
+          const normalizedPayload = event === "chat"
+            ? canonicalizeOpenClawAssistantMediaSidecarPayload(normalizeChatEventPayload(payload))
+            : payload;
           const shouldPublishOffice = event === "chat" || event === "agent" || event === "context_usage";
           if (event === "chat") {
             const p = normalizedPayload as { sessionKey?: string; runId?: string };

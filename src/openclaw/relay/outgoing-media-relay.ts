@@ -5,6 +5,7 @@ import { extname, join, resolve } from "path";
 import { createHash } from "crypto";
 import { uploadFileToRelay, type FileUploadRequest, type FileUploadResult } from "../../core/relay/file-upload.js";
 import { resolveOpenClawStateDir } from "../runtime/openclaw-paths.js";
+import { normalizeOpenClawAssistantMediaSidecars } from "./assistant-media-sidecar.js";
 
 const OUTGOING_MEDIA_RE = /\/api\/chat\/media\/outgoing\/[^/]+\/([^/]+)\/full(?:$|[?#])/;
 const OPENCLAW_MEDIA_CONTROL_PREFIX_RE = /^MEDIA:\s*(?:file:\/\/|~[\\/]|\/|[A-Za-z]:[\\/]|\\\\)/i;
@@ -54,44 +55,74 @@ export async function relayOutgoingMediaInPayload(
   if (!message || typeof message !== "object" || Array.isArray(message)) {
     return payload;
   }
-  const content = (message as Record<string, unknown>).content;
-  if (typeof content === "string") {
-    const sanitizedText = stripOpenClawMediaControlLines(content);
-    return sanitizedText === content
-      ? payload
-      : {
-          ...(payload as Record<string, unknown>),
-          message: {
-            ...(message as Record<string, unknown>),
-            content: sanitizedText,
-          },
-        };
-  }
-  if (!Array.isArray(content)) {
-    return payload;
-  }
+  const payloadRecord = payload as Record<string, unknown>;
+  const sourceRunId = payloadSourceRunId(payloadRecord);
+  const messageContent = await relayOutgoingMediaContent(
+    (message as Record<string, unknown>).content,
+    { ...opts, sourceRunId },
+  );
+  const localArtifactBlocks = await relayLocalArtifactPathsInContent(messageContent.blocks, payloadRecord, opts);
+  const timelineEvents = await relayOutgoingMediaInTimelineEvents(payloadRecord.timelineEvents, opts, sourceRunId);
 
-  let changed = false;
-  const sourceRunId = payloadSourceRunId(payload as Record<string, unknown>);
-  const relayedContent = await Promise.all(content.map(async (block) => {
-    const nextBlock = await relayOutgoingMediaBlock(block, { ...opts, sourceRunId });
-    changed ||= nextBlock !== block;
-    return nextBlock;
-  }));
-  const sanitizedContent = sanitizeOpenClawMediaControlBlocks(relayedContent);
-  changed ||= sanitizedContent.changed;
-  const localArtifactBlocks = await relayLocalArtifactPathsInContent(sanitizedContent.content, payload as Record<string, unknown>, opts);
-
-  if (!changed && localArtifactBlocks.length === 0) {
+  if (!messageContent.changed && localArtifactBlocks.length === 0 && !timelineEvents.changed) {
     return payload;
   }
   return {
-    ...(payload as Record<string, unknown>),
+    ...payloadRecord,
     message: {
       ...(message as Record<string, unknown>),
-      content: [...sanitizedContent.content, ...localArtifactBlocks],
+      content: localArtifactBlocks.length > 0
+        ? [...messageContent.blocks, ...localArtifactBlocks]
+        : messageContent.content,
     },
+    ...(timelineEvents.changed ? { timelineEvents: timelineEvents.events } : {}),
   };
+}
+
+async function relayOutgoingMediaInTimelineEvents(
+  events: unknown,
+  opts: OutgoingMediaRelayOptions,
+  fallbackSourceRunId?: string,
+): Promise<{ events: unknown; changed: boolean }> {
+  if (!Array.isArray(events)) return { events, changed: false };
+  let changed = false;
+  const nextEvents = await Promise.all(events.map(async (event) => {
+    const record = asRecord(event);
+    if (!record || !Array.isArray(record.content)) return event;
+    const sourceRunId = firstString(record.runId, record.turnId, fallbackSourceRunId);
+    const content = await relayOutgoingMediaContent(record.content, { ...opts, sourceRunId });
+    if (!content.changed) return event;
+    changed = true;
+    const { attachmentIds: _staleAttachmentIds, ...eventWithoutAttachmentIds } = record;
+    const attachmentIds = attachmentIdsFromContent(content.content);
+    return {
+      ...eventWithoutAttachmentIds,
+      content: content.content,
+      ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
+    };
+  }));
+  return { events: changed ? nextEvents : events, changed };
+}
+
+async function relayOutgoingMediaContent(
+  content: unknown,
+  opts: OutgoingMediaOptionsWithSourceRun,
+): Promise<{ content: unknown; blocks: unknown[]; changed: boolean }> {
+  if (typeof content === "string") {
+    const sanitized = stripOpenClawMediaControlLines(content);
+    const blocks = sanitized ? [{ type: "text", text: sanitized }] : [];
+    return { content: sanitized, blocks, changed: sanitized !== content };
+  }
+  if (!Array.isArray(content)) return { content, blocks: [], changed: false };
+
+  let changed = false;
+  const relayedContent = (await Promise.all(content.map(async (block) => {
+    const nextBlock = await relayOutgoingMediaBlock(block, opts);
+    changed ||= nextBlock !== block;
+    return nextBlock;
+  }))).filter((block): block is unknown => block !== undefined);
+  const sanitized = sanitizeOpenClawMediaControlBlocks(relayedContent);
+  return { content: sanitized.content, blocks: sanitized.content, changed: changed || sanitized.changed };
 }
 
 export async function relayOutgoingMediaInHistoryResponse(
@@ -108,15 +139,19 @@ export async function relayOutgoingMediaInHistoryResponse(
 
   const responseRecord = response as Record<string, unknown>;
   const responseSessionKey = firstString(responseRecord.sessionKey, responseRecord.sessionId);
-  const messageResult = await relayOutgoingMediaInMessageList(messages, responseSessionKey, opts);
+  const normalizedMessages = normalizeOpenClawAssistantMediaSidecars(messages, responseSessionKey);
+  const messageResult = await relayOutgoingMediaInMessageList(normalizedMessages.messages, responseSessionKey, opts);
   const snapshot = responseRecord.timelineSnapshot;
   const snapshotMessages = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
     ? (snapshot as Record<string, unknown>).messages
     : undefined;
-  const snapshotResult = Array.isArray(snapshotMessages)
-    ? await relayOutgoingMediaInMessageList(snapshotMessages, responseSessionKey, opts)
+  const normalizedSnapshotMessages = Array.isArray(snapshotMessages)
+    ? normalizeOpenClawAssistantMediaSidecars(snapshotMessages, responseSessionKey)
     : undefined;
-  const changed = messageResult.changed || Boolean(snapshotResult?.changed);
+  const snapshotResult = normalizedSnapshotMessages
+    ? await relayOutgoingMediaInMessageList(normalizedSnapshotMessages.messages, responseSessionKey, opts)
+    : undefined;
+  const changed = normalizedMessages.changed || messageResult.changed || Boolean(normalizedSnapshotMessages?.changed) || Boolean(snapshotResult?.changed);
 
   return changed
     ? {
@@ -194,13 +229,17 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
   if (!attachmentId) {
     return block;
   }
+  if (isUploadedMediaBlock(block)) {
+    return block;
+  }
 
   try {
     const record = await readOutgoingMediaRecord(attachmentId, opts.recordsDir);
     const filePath = record.original?.path?.trim();
     const sessionKey = record.sessionKey?.trim();
     if (!filePath || !sessionKey) {
-      return block;
+      console.warn(`[relay] outgoing media record is incomplete attachment=${attachmentId}`);
+      return undefined;
     }
     const cacheKey = await outgoingFileCacheKey({
       gatewayId: opts.gatewayId,
@@ -242,7 +281,7 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
     };
   } catch (error) {
     console.warn(`[relay] failed to publish outgoing media attachment ${attachmentId}: ${String(error)}`);
-    return block;
+    return undefined;
   }
 }
 
@@ -283,6 +322,12 @@ async function readOutgoingMediaRecord(attachmentId: string, recordsDir?: string
 
 function firstString(...values: unknown[]): string | undefined {
   return values.find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 async function relayLocalArtifactPathsInContent(
@@ -348,6 +393,21 @@ function isUploadedMediaBlock(block: unknown): boolean {
   const record = block as Record<string, unknown>;
   const type = typeof record.type === "string" ? record.type.trim().toLowerCase() : "";
   return ["image", "file", "voice", "audio"].includes(type) && typeof record.fileId === "string" && record.fileId.trim().length > 0;
+}
+
+function attachmentIdsFromContent(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  const ids = new Set<string>();
+  for (const block of content) {
+    const record = asRecord(block);
+    for (const attachmentId of [
+      firstString(record?.attachmentId, record?.attachment_id),
+      firstString(record?.fileId, record?.file_id),
+    ]) {
+      if (attachmentId) ids.add(attachmentId);
+    }
+  }
+  return [...ids];
 }
 
 function uploadToContentBlock(upload: FileUploadResult): Record<string, unknown> {

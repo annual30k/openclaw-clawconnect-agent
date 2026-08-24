@@ -11,6 +11,7 @@ import {
   resolveOpenClawSessionTranscript,
   type GatewaySessionDefaults,
 } from "./session-context.js";
+import { normalizeOpenClawAssistantMediaSidecars } from "./assistant-media-sidecar.js";
 
 export type HistoryMessage = {
   [key: string]: unknown;
@@ -108,7 +109,7 @@ export async function readOpenClawTranscriptChatHistory(
 export async function readChatHistoryFromTranscriptFile(
   request: TranscriptHistoryRequest,
 ): Promise<HistoryResponse> {
-  const messages = await readIndexedTranscriptMessages(request.transcriptPath);
+  const messages = await readIndexedTranscriptMessages(request.transcriptPath, request.sessionKey);
   const limit = normalizeHistoryLimit(request.limit);
   const direction = normalizeHistoryDirection(request.direction);
   const cursorSeq = parseHistoryCursorSeq(request.cursor);
@@ -195,7 +196,7 @@ function normalizeTranscriptHistoryParams(
   };
 }
 
-async function readIndexedTranscriptMessages(transcriptPath: string): Promise<HistoryMessage[]> {
+async function readIndexedTranscriptMessages(transcriptPath: string, sessionKey: string): Promise<HistoryMessage[]> {
   const stats = await stat(transcriptPath);
   const cached = transcriptHistoryCache.get(transcriptPath);
   if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
@@ -214,8 +215,13 @@ async function readIndexedTranscriptMessages(transcriptPath: string): Promise<Hi
       messages.push(message);
     }
   }
-  restoreTranscriptTurnLineage(messages);
-  const visibleMessages = filterOpenClawHeartbeatArtifacts(messages);
+  // Fold the automatic assistant-media sidecar before lineage reconstruction.
+  // Lineage deliberately rewrites idempotency keys to mobile turn IDs, while
+  // the raw <run>:assistant-media key and parentId are the authoritative
+  // relationship needed to keep the desktop and mobile projections aligned.
+  const foldedMessages = normalizeOpenClawAssistantMediaSidecars(messages, sessionKey).messages as HistoryMessage[];
+  restoreTranscriptTurnLineage(foldedMessages);
+  const visibleMessages = filterOpenClawHeartbeatArtifacts(foldedMessages);
 
   transcriptHistoryCache.set(transcriptPath, {
     size: stats.size,

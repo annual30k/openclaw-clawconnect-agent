@@ -280,6 +280,91 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
   }
 });
 
+test("relay manager projects an OpenClaw assistant-media sidecar onto the parent canonical message identity", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let gatewaySocket: WebSocket | undefined;
+  const runId = "wx_1787558915948_espv455s";
+
+  relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-sidecar");
+    socket.on("message", (raw) => relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>));
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "nonce-sidecar" } }));
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as { type?: string; id?: string; method?: string };
+      if (message.type !== "req" || !message.id) return;
+      socket.send(JSON.stringify({ type: "res", id: message.id, ok: true, payload: {} }));
+      if (message.method !== "connect") return;
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId,
+          sessionKey: "main",
+          state: "final",
+          role: "assistant",
+          message: { role: "assistant", content: [{ type: "text", text: "桌面只找到一张图片\nMEDIA:/Users/example/Desktop/photo.png" }] },
+        },
+      }));
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId,
+          sessionKey: "main",
+          state: "final",
+          role: "assistant",
+          message: {
+            role: "assistant",
+            idempotencyKey: `${runId}:assistant-media`,
+            content: [
+              { type: "text", text: "桌面只找到一张图片" },
+              { type: "image", url: "/api/chat/media/outgoing/agent%3Amain%3Asession_1/att_missing/full" },
+            ],
+          },
+        },
+      }));
+    });
+  });
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-sidecar",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+  try {
+    await waitFor(() => relayMessages.filter((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload) && message.payload.state === "final"
+    )).length === 2, 4_000);
+    const terminals = relayMessages.filter((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload) && message.payload.state === "final"
+    ));
+    assert.equal(terminals.length, 2);
+    assert.equal(extractPayloadText(terminals[0]!.payload as Record<string, unknown>), "桌面只找到一张图片");
+    assert.equal(extractPayloadText(terminals[1]!.payload as Record<string, unknown>), "桌面只找到一张图片");
+    const completed = terminals.map((terminal) => timelineEvents(terminal.payload as Record<string, unknown>)
+      .find((event) => event.eventType === "message.completed"));
+    assert.deepEqual(completed.map((event) => event?.messageId), [`assistant-${runId}`, `assistant-${runId}`]);
+    assert.deepEqual(completed[1]?.content, [{ type: "text", text: "桌面只找到一张图片" }]);
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+  }
+});
+
 test("relay manager keeps mobile chat identity across provider events and transcript history", async () => {
   openClawChatRunIdentities.clear();
   const openclawHome = await createEmptyOpenClawHomeFixture();

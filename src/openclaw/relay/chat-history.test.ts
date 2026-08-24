@@ -406,6 +406,61 @@ test("transcript history provider carries the mobile run id through the parent c
   }
 });
 
+test("transcript history folds assistant-media into its explicit assistant parent before lineage rewrites keys", async () => {
+  const runId = "wx_1787558915948_espv455s";
+  const fixture = await createTranscriptFixture(3, [
+    {
+      type: "message",
+      id: "user-source",
+      timestamp: "2026-08-24T08:09:20.000Z",
+      message: { role: "user", content: "把桌面图片发来", idempotencyKey: `${runId}:user` },
+    },
+    {
+      type: "message",
+      id: "assistant-parent",
+      parentId: "user-source",
+      timestamp: "2026-08-24T08:09:22.125Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "桌面只找到一张图片\nMEDIA:/Users/example/Desktop/photo.png" }],
+      },
+    },
+    {
+      type: "message",
+      id: "assistant-media-sidecar",
+      parentId: "assistant-parent",
+      timestamp: "2026-08-24T08:09:22.339Z",
+      message: {
+        role: "assistant",
+        idempotencyKey: `${runId}:assistant-media`,
+        content: [
+          { type: "text", text: "桌面只找到一张图片" },
+          { type: "image", url: "/api/chat/media/outgoing/agent%3Amain%3Asession/att_fixture/full" },
+        ],
+      },
+    },
+  ]);
+  try {
+    const page = await readChatHistoryFromTranscriptFile({
+      sessionKey: "agent:main:main",
+      transcriptPath: fixture.path,
+      limit: 20,
+    });
+
+    assert.deepEqual(page.messages?.map((message) => message.id), ["user-source", "assistant-parent"]);
+    assert.equal(page.messages?.[1]?.idempotencyKey, runId);
+    assert.equal(page.messages?.[1]?.messageId, `assistant-${runId}`);
+    assert.deepEqual(page.messages?.[1]?.content, [
+      { type: "text", text: "桌面只找到一张图片\nMEDIA:/Users/example/Desktop/photo.png" },
+      { type: "image", url: "/api/chat/media/outgoing/agent%3Amain%3Asession/att_fixture/full" },
+    ]);
+    assert.equal(page.timelineSnapshot?.messages.length, 2);
+    assert.equal(page.timelineSnapshot?.messages[1]?.messageId, `assistant-${runId}`);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("transcript history provider preserves every visible and tool row in a folded mobile run", async () => {
   const runId = "mobile-folded-run";
   const lines: Array<Record<string, unknown>> = [

@@ -9,6 +9,10 @@ import {
   relayOutgoingMediaInHistoryResponse,
   relayOutgoingMediaInPayload,
 } from "./outgoing-media-relay.js";
+import {
+  isOpenClawAssistantMediaSidecarPayload,
+  normalizeOpenClawAssistantMediaSidecars,
+} from "./assistant-media-sidecar.js";
 
 test("outgoing artifact detection recognizes Windows drive and UNC paths", () => {
   assert.deepEqual(extractDeliverablePathCandidates([
@@ -25,6 +29,7 @@ test("relayOutgoingMediaInPayload uploads OpenClaw outgoing media and rewrites t
   const server = await createFileUploadRelayServer("file_outgoing_payload");
   try {
     const payload = {
+      runId: "assistant-run-outgoing",
       message: {
         runId: "assistant-run-outgoing",
         role: "assistant",
@@ -38,6 +43,19 @@ test("relayOutgoingMediaInPayload uploads OpenClaw outgoing media and rewrites t
           },
         ],
       },
+      timelineEvents: [{
+        eventType: "message.completed",
+        runId: "assistant-run-outgoing",
+        content: [
+          { type: "text", text: "sent image" },
+          {
+            type: "image",
+            url: `/api/chat/media/outgoing/agent%3Amain%3Asession_1/${fixture.attachmentId}/full`,
+            alt: "photo.jpg",
+            mimeType: "image/jpeg",
+          },
+        ],
+      }],
     };
 
     const result = await relayOutgoingMediaInPayload(payload, {
@@ -55,6 +73,9 @@ test("relayOutgoingMediaInPayload uploads OpenClaw outgoing media and rewrites t
     assert.equal(image.sourceRunId, "assistant-run-outgoing");
     assert.equal(image.gatewayId, "gw_test");
     assert.equal(image.sessionKey, "agent:main:session_1");
+    const eventImage = result.timelineEvents[0]?.content[1] as Record<string, unknown>;
+    assert.equal(eventImage.fileId, "file_outgoing_payload");
+    assert.deepEqual(result.timelineEvents[0]?.attachmentIds, [fixture.attachmentId, "file_outgoing_payload"]);
   } finally {
     await server.close();
     await rm(fixture.root, { recursive: true, force: true });
@@ -131,6 +152,127 @@ test("relayOutgoingMediaInHistoryResponse rewrites outgoing media inside chat hi
   } finally {
     await server.close();
     await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("history merges an OpenClaw assistant-media sidecar only through its explicit run identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-sidecar-history-"));
+  const recordsDir = join(root, "missing-records");
+  const attachmentId = "att_missing_sidecar";
+  const outgoingUrl = `/api/chat/media/outgoing/agent%3Amain%3Asession_1/${attachmentId}/full`;
+  const runId = "wx_1787558915948_espv455s";
+  try {
+    const history = {
+      sessionKey: "agent:main:session_1",
+      messages: [
+        {
+          id: "assistant-text",
+          role: "assistant",
+          runId,
+          content: [{ type: "text", text: "桌面只找到一张图片\nMEDIA:/Users/example/Desktop/photo.png" }],
+        },
+        {
+          id: "assistant-media",
+          role: "assistant",
+          idempotencyKey: `${runId}:assistant-media`,
+          content: [
+            { type: "text", text: "桌面只找到一张图片" },
+            { type: "image", url: outgoingUrl },
+          ],
+        },
+      ],
+      timelineSnapshot: {
+        messages: [
+          {
+            messageId: "assistant-text",
+            role: "assistant",
+            runId,
+            content: [{ type: "text", text: "桌面只找到一张图片\nMEDIA:/Users/example/Desktop/photo.png" }],
+          },
+          {
+            messageId: "assistant-media",
+            role: "assistant",
+            idempotencyKey: `${runId}:assistant-media`,
+            content: [
+              { type: "text", text: "桌面只找到一张图片" },
+              { type: "image", url: outgoingUrl, attachmentId },
+            ],
+            attachmentIds: [attachmentId],
+          },
+        ],
+      },
+    };
+
+    const result = await relayOutgoingMediaInHistoryResponse(history, {
+      relayServerUrl: "http://127.0.0.1:1",
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      recordsDir,
+      cache: new Map(),
+    }) as typeof history;
+
+    assert.equal(result.messages.length, 1);
+    assert.deepEqual(result.messages[0]?.content, [{ type: "text", text: "桌面只找到一张图片" }]);
+    assert.equal(result.timelineSnapshot.messages.length, 1);
+    assert.deepEqual(result.timelineSnapshot.messages[0]?.content, [{ type: "text", text: "桌面只找到一张图片" }]);
+    assert.equal("attachmentIds" in result.timelineSnapshot.messages[0]!, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("assistant-media sidecars are never matched by text or a non-identical run", () => {
+  const runId = "run-parent";
+  const sameTextDifferentRun = normalizeOpenClawAssistantMediaSidecars([
+    { role: "assistant", runId: "run-other", content: [{ type: "text", text: "same text" }] },
+    { role: "assistant", idempotencyKey: `${runId}:assistant-media`, content: [{ type: "image", url: "x" }] },
+  ], "agent:main:session_1");
+
+  assert.equal(sameTextDifferentRun.changed, false);
+  assert.equal(sameTextDifferentRun.messages.length, 2);
+  assert.equal(isOpenClawAssistantMediaSidecarPayload({
+    state: "final",
+    message: { role: "assistant", idempotencyKey: `${runId}:assistant-media`, content: [] },
+  }), true);
+  assert.equal(isOpenClawAssistantMediaSidecarPayload({
+    state: "final",
+    message: { role: "assistant", idempotencyKey: runId, content: [] },
+  }), false);
+});
+
+test("payload removes unavailable outgoing media from both message and canonical timeline events", async () => {
+  const root = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-sidecar-payload-"));
+  const recordsDir = join(root, "missing-records");
+  const attachmentId = "att_missing_payload";
+  const outgoingUrl = `/api/chat/media/outgoing/agent%3Amain%3Asession_1/${attachmentId}/full`;
+  try {
+    const payload = {
+      runId: "run-1",
+      sessionKey: "agent:main:session_1",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "图片如下" }, { type: "image", url: outgoingUrl, attachmentId }],
+      },
+      timelineEvents: [{
+        eventType: "message.completed",
+        runId: "run-1",
+        content: [{ type: "text", text: "图片如下" }, { type: "image", url: outgoingUrl, attachmentId }],
+        attachmentIds: [attachmentId],
+      }],
+    };
+    const result = await relayOutgoingMediaInPayload(payload, {
+      relayServerUrl: "http://127.0.0.1:1",
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      recordsDir,
+      cache: new Map(),
+    }) as typeof payload;
+
+    assert.deepEqual(result.message.content, [{ type: "text", text: "图片如下" }]);
+    assert.deepEqual(result.timelineEvents[0]?.content, [{ type: "text", text: "图片如下" }]);
+    assert.equal("attachmentIds" in result.timelineEvents[0]!, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
