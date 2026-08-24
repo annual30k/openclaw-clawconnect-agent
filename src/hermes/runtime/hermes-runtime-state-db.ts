@@ -44,14 +44,17 @@ def to_iso(value):
 def row_dict(row):
     return {key: row[key] for key in row.keys()}
 
-def connect():
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+def connect(writable=False):
+    uri_mode = "rw" if writable else "ro"
+    conn = sqlite3.connect(f"file:{db_path}?mode={uri_mode}", uri=True, timeout=1.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
+    if not writable:
+        conn.execute("PRAGMA query_only=ON")
     return conn
 
+conn = None
 try:
-    conn = connect()
+    conn = connect(writable=(mode == "rewind_after"))
     if mode == "list":
         rows = conn.execute("""
             SELECT
@@ -196,10 +199,97 @@ try:
                 "newestCursor": f"seq:{last_id}" if last_id is not None else None,
             }
             print(json.dumps({"ok": True, "payload": payload}, ensure_ascii=False))
+    elif mode == "active_head":
+        session_id = sys.argv[3]
+        session = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if session is None:
+            print(json.dumps({"ok": True, "payload": {"found": False}}, ensure_ascii=False))
+        else:
+            row = conn.execute("""
+                SELECT MAX(id) AS head_message_id FROM messages
+                WHERE session_id = ? AND COALESCE(active, 1) != 0
+            """, (session_id,)).fetchone()
+            print(json.dumps({
+                "ok": True,
+                "payload": {
+                    "found": True,
+                    "headMessageId": int(row["head_message_id"] or 0),
+                },
+            }, ensure_ascii=False))
+    elif mode == "rewind_after":
+        session_id = sys.argv[3]
+        head_message_id = max(0, int(sys.argv[4]))
+        expected_source_run_id = sys.argv[5]
+        conn.execute("BEGIN IMMEDIATE")
+        session = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if session is None:
+            conn.rollback()
+            print(json.dumps({"ok": True, "payload": {"found": False}}, ensure_ascii=False))
+        else:
+            target = conn.execute("""
+                SELECT id, role, content FROM messages
+                WHERE session_id = ? AND id > ? AND COALESCE(active, 1) != 0
+                ORDER BY id ASC LIMIT 1
+            """, (session_id, head_message_id)).fetchone()
+            if target is None:
+                conn.rollback()
+                print(json.dumps({
+                    "ok": True,
+                    "payload": {"found": True, "rewoundCount": 0},
+                }, ensure_ascii=False))
+            elif target["role"] != "user":
+                conn.rollback()
+                print(json.dumps({"ok": False, "error": "rewind target is not a user message"}, ensure_ascii=False))
+            elif not isinstance(target["content"], str):
+                conn.rollback()
+                print(json.dumps({"ok": False, "error": "rewind target has no text metadata"}, ensure_ascii=False))
+            else:
+                lines = target["content"].splitlines()
+                source_run_id_matches = False
+                for index, line in enumerate(lines):
+                    if line.strip() != "[ClawConnect mobile turn]":
+                        continue
+                    source_run_id = None
+                    for metadata_line in lines[index + 1:]:
+                        stripped = metadata_line.strip()
+                        if not stripped:
+                            break
+                        if stripped.startswith("[") and stripped.endswith("]"):
+                            break
+                        if stripped.startswith("sourceRunId:"):
+                            source_run_id = stripped[len("sourceRunId:"):].strip()
+                            break
+                    if source_run_id == expected_source_run_id:
+                        source_run_id_matches = True
+                        break
+                if not source_run_id_matches:
+                    conn.rollback()
+                    print(json.dumps({"ok": False, "error": "rewind target run id mismatch"}, ensure_ascii=False))
+                else:
+                    cursor = conn.execute("""
+                        UPDATE messages SET active = 0
+                        WHERE session_id = ? AND id >= ? AND COALESCE(active, 1) != 0
+                    """, (session_id, int(target["id"])))
+                    if cursor.rowcount > 0:
+                        conn.execute("""
+                            UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1
+                            WHERE id = ?
+                        """, (session_id,))
+                    conn.commit()
+                    print(json.dumps({
+                        "ok": True,
+                        "payload": {
+                            "found": True,
+                            "rewoundCount": int(cursor.rowcount),
+                        },
+                    }, ensure_ascii=False))
     else:
         print(json.dumps({"ok": False, "error": "unsupported mode"}, ensure_ascii=False))
 except Exception as exc:
     print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+finally:
+    if conn is not None:
+        conn.close()
 `;
 
 export async function listHermesSessionsFromStateDb(): Promise<HermesSessionItem[] | undefined> {
@@ -276,6 +366,42 @@ export async function queryHermesHistoryPageFromStateDb(params: {
   };
 }
 
+/**
+ * Capture an authoritative active-message boundary before resuming a Hermes
+ * CLI session. The row id is stable and lets abort recovery exclude only rows
+ * created by the canceled invocation without comparing message text or time.
+ */
+export async function captureHermesSessionActiveHead(sessionId: string): Promise<number | undefined> {
+  const normalized = sessionId.trim();
+  if (!normalized) {
+    return undefined;
+  }
+  const record = toRecord(await runHermesStateDbQuery("active_head", [normalized]));
+  if (record.found !== true || typeof record.headMessageId !== "number" || !Number.isSafeInteger(record.headMessageId)) {
+    return undefined;
+  }
+  return Math.max(0, record.headMessageId);
+}
+
+/** Soft-rewind rows appended after a previously captured active head. */
+export async function rewindHermesSessionAfterActiveHead(
+  sessionId: string,
+  headMessageId: number,
+  expectedSourceRunId: string,
+): Promise<boolean> {
+  const normalized = sessionId.trim();
+  const normalizedSourceRunId = expectedSourceRunId.trim();
+  if (!normalized || !normalizedSourceRunId || !Number.isSafeInteger(headMessageId) || headMessageId < 0) {
+    return false;
+  }
+  const record = toRecord(await runHermesStateDbQuery("rewind_after", [
+    normalized,
+    String(headMessageId),
+    normalizedSourceRunId,
+  ]));
+  return record.found === true;
+}
+
 export function buildEmptyHermesHistoryExport(sessionIdentity: string | undefined): Record<string, unknown> {
   return {
     sessionId: sessionIdentity?.trim() || "main",
@@ -287,7 +413,10 @@ function resolveHermesStateDbPython(): string {
   return resolveHermesPythonBin();
 }
 
-async function runHermesStateDbQuery(mode: "list" | "export" | "history_page", args: string[]): Promise<unknown | undefined> {
+async function runHermesStateDbQuery(
+  mode: "list" | "export" | "history_page" | "active_head" | "rewind_after",
+  args: string[],
+): Promise<unknown | undefined> {
   const dbPath = resolveHermesStateDbPath();
   if (!dbPath || !existsSync(dbPath)) {
     return undefined;

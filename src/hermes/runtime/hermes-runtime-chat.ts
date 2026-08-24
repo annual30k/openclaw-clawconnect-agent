@@ -40,6 +40,10 @@ import {
   detectHermesHistoryCompletion,
   selectHermesSessionForCompletedChat,
 } from "./hermes-runtime-history-completion.js";
+import {
+  captureHermesSessionActiveHead,
+  rewindHermesSessionAfterActiveHead,
+} from "./hermes-runtime-state-db.js";
 import { tryRunHermesApiChat } from "./hermes-runtime-api-client.js";
 import { resolveHermesPreloadedSkillContext } from "./hermes-runtime-preloaded-skills.js";
 import {
@@ -122,6 +126,7 @@ export async function runHermesChat(
       rawMessage,
       preparedMessage,
       sessionKey,
+      sourceRunId,
       hermesSessionId: record.hermesSessionId,
       context,
       preparationPlan,
@@ -151,6 +156,7 @@ async function runHermesChatPrepared(params: {
   rawMessage: string;
   preparedMessage: PreparedHermesMessage;
   sessionKey: string;
+  sourceRunId: string | undefined;
   hermesSessionId: unknown;
   context: LocalCommandContext;
   preparationPlan: HermesChatPreparationPlan;
@@ -187,6 +193,11 @@ async function runHermesChatPrepared(params: {
       };
     }
   } catch (error) {
+    if (isHermesChatAbortedError(error)) {
+      // API Server owns its cancellation transaction. Retaining the mapping
+      // preserves every previously completed turn for the next request.
+      throw error;
+    }
     if (!mappedResume || !isHermesMissingSessionError(error)) {
       throw error;
     }
@@ -215,6 +226,9 @@ async function runHermesChatPrepared(params: {
     }
   }
   const beforeSessions = await listHermesSessions();
+  let cliActiveHead = resume
+    ? await captureHermesSessionActiveHead(resume)
+    : undefined;
   let rawOutput: string;
   try {
     rawOutput = await runHermesChatOnce({
@@ -231,11 +245,22 @@ async function runHermesChatPrepared(params: {
       }),
     });
   } catch (error) {
+    if (isHermesChatAbortedError(error)) {
+      await recoverHermesCliSessionAfterAbort({
+        sessionKey: params.sessionKey,
+        resume,
+        mappedResume,
+        activeHead: cliActiveHead,
+        sourceRunId: params.sourceRunId,
+      });
+      throw error;
+    }
     if (!mappedResume || !isHermesMissingSessionError(error)) {
       throw error;
     }
     await forgetHermesSession(params.sessionKey, mappedResume);
     resume = undefined;
+    cliActiveHead = undefined;
     rawOutput = await runHermesChatOnce({
       message: params.preparedMessage.cliMessage,
       sessionKey: params.sessionKey,
@@ -268,6 +293,48 @@ async function runHermesChatPrepared(params: {
     artifactPaths: [],
     usage,
   };
+}
+
+function isHermesChatAbortedError(error: unknown): boolean {
+  return error instanceof Error && error.message === "hermes_chat_aborted";
+}
+
+async function recoverHermesCliSessionAfterAbort(params: {
+  sessionKey: string;
+  resume: string | undefined;
+  mappedResume: string | undefined;
+  activeHead: number | undefined;
+  sourceRunId: string | undefined;
+}): Promise<void> {
+  if (!params.resume) {
+    return;
+  }
+  // Hermes CLI writes the new user row before it reacts to SIGTERM. Rewind
+  // only rows beyond the stable pre-run head so completed context remains
+  // resumable and the canceled row cannot be answered on the next request.
+  if (params.activeHead !== undefined && params.sourceRunId) {
+    const recovered = await rewindHermesSessionAfterActiveHead(
+      params.resume,
+      params.activeHead,
+      params.sourceRunId,
+    );
+    if (recovered) {
+      return;
+    }
+  }
+
+  // Old/unavailable state.db schemas cannot provide a safe row boundary. For
+  // an implicit alias, fail closed by dropping only that alias instead of
+  // risking a replay of the canceled prompt. Explicit Hermes session ids are
+  // never silently deleted or remapped.
+  if (params.mappedResume !== params.resume) {
+    return;
+  }
+  try {
+    await forgetHermesSession(params.sessionKey, params.mappedResume);
+  } catch {
+    // Abort delivery must not be replaced by a best-effort recovery failure.
+  }
 }
 
 function requireVisibleHermesOutput(output: string): string {

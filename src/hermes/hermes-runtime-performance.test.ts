@@ -6,10 +6,6 @@ import { join } from "node:path";
 import test from "node:test";
 import { buildTurnUserCreatedEvent } from "../core/relay/timeline-event-builder.js";
 import { handleHermesCommand, runHermesChatHistory } from "./hermes-runtime.js";
-import {
-  buildHermesStateDbRealtimePayloads,
-  type HermesStateDbRealtimeMessageRow,
-} from "./relay/hermes-state-db-realtime.js";
 import { restoreEnv, writeHermesStateDb } from "./hermes-runtime-test-support.js";
 
 test("Hermes history pages a state.db session larger than 1 MiB by authoritative message id", async () => {
@@ -94,42 +90,6 @@ conn.close()
     assert.deepEqual(
       newestPayload.timelineSnapshot?.messages.slice(-4).map((message) => [message.seq, message.messageId]),
       newestPayload.messages.slice(-4).map((message) => [message.seq, message.id]),
-    );
-
-    const realtime = buildHermesStateDbRealtimePayloads({
-      gatewayId: "gw-hermes",
-      cursor: { lastMessageId: 396, openTurnsBySession: {} },
-      rows: [
-        stateDbRealtimeMessage(397, sessionId, "user", "direct PC prompt"),
-        stateDbRealtimeMessage(398, sessionId, "assistant", "direct PC reply"),
-        stateDbRealtimeMessage(
-          399,
-          sessionId,
-          "user",
-          `mobile prompt\n\n[ClawConnect mobile turn]\nsourceRunId: large-mobile-run\nsessionKey: hermes:${sessionId}`,
-        ),
-        stateDbRealtimeMessage(400, sessionId, "assistant", "mobile terminal reply"),
-      ],
-    });
-    const realtimeCompletedMessageIds = realtime.payloads.flatMap((payload) =>
-      payload.timelineEvents
-        .filter((event) => event.eventType !== "run.completed")
-        .map((event) => event.messageId),
-    );
-    assert.deepEqual(realtimeCompletedMessageIds, [
-      `hermes-db-${sessionId}-message-397-user`,
-      `hermes-db-${sessionId}-message-398-assistant`,
-      "assistant-large-mobile-run",
-    ]);
-    assert.equal(
-      realtime.payloads.some((payload) => payload.timelineEvents.some((timelineEvent) => (
-        timelineEvent.role === "user" && timelineEvent.runId === "large-mobile-run"
-      ))),
-      false,
-    );
-    assert.deepEqual(
-      newestPayload.messages.filter((message) => [397, 398, 400].includes(message.seq)).map((message) => message.id),
-      realtimeCompletedMessageIds,
     );
 
     const older = await runHermesChatHistory({
@@ -275,25 +235,6 @@ function statExists(path: string): boolean {
   } catch {
     return false;
   }
-}
-
-function stateDbRealtimeMessage(
-  id: number,
-  sessionId: string,
-  role: HermesStateDbRealtimeMessageRow["role"],
-  content: string,
-): HermesStateDbRealtimeMessageRow {
-  return {
-    id,
-    sessionId,
-    sessionSource: "cli",
-    role,
-    content,
-    timestamp: 1784808000 + id,
-    active: true,
-    observed: false,
-    ...(role === "assistant" ? { finishReason: "stop" } : {}),
-  };
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {

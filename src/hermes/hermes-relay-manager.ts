@@ -61,10 +61,6 @@ import {
   readHermesSlashCommandSearchParams,
   searchHermesSlashCommandCatalog,
 } from "./relay/hermes-slash-command-catalog.js";
-import {
-  createHermesStateDbRealtimeWatcher,
-  resolveHermesStateDbRealtimePath,
-} from "./relay/hermes-state-db-realtime.js";
 
 export {
   collectHermesSlashCommandCatalog,
@@ -89,6 +85,7 @@ type ToServer =
     id: string;
     ok: boolean;
     responsePhase?: "accepted" | "terminal";
+    responseMethod?: "chat.send";
     payload?: unknown;
     error?: { code?: string; message?: string };
   };
@@ -139,16 +136,12 @@ export interface HermesRelayManagerDependencies {
   runChat: typeof runHermesChat;
   readStatusSnapshot: typeof readHermesStatusSnapshotAsync;
   publishUsageSnapshot: typeof publishHermesUsageSnapshot;
-  resolveStateDbRealtimePath: typeof resolveHermesStateDbRealtimePath;
-  createStateDbRealtimeWatcher: typeof createHermesStateDbRealtimeWatcher;
 }
 
 const DEFAULT_HERMES_RELAY_MANAGER_DEPENDENCIES: HermesRelayManagerDependencies = {
   runChat: runHermesChat,
   readStatusSnapshot: readHermesStatusSnapshotAsync,
   publishUsageSnapshot: publishHermesUsageSnapshot,
-  resolveStateDbRealtimePath: resolveHermesStateDbRealtimePath,
-  createStateDbRealtimeWatcher: createHermesStateDbRealtimeWatcher,
 };
 
 export function buildHermesRelayHelloMessage(opts: {
@@ -242,29 +235,9 @@ export async function runHermesRelayManagerWithDependencies(
         ? { status: "delivered" }
         : { status: "retryable", error: result.error ?? new Error(`relay_send_${result.status}`) };
     };
-    const stateDbRealtimePath = dependencies.resolveStateDbRealtimePath();
-    const stateDbRealtimeWatcher = stateDbRealtimePath
-      ? dependencies.createStateDbRealtimeWatcher({
-        gatewayId: opts.gatewayId,
-        dbPath: stateDbRealtimePath,
-        publishPayload: (payload) => {
-          send({ type: "event", event: "chat", payload });
-          publishHermesOfficeSnapshot(send, "chat", payload);
-        },
-        onWarning: (warning) => {
-          console.warn(
-            `[hermes-relay] state.db realtime row skipped: ${warning.code}`
-            + ` sessionId=${warning.sessionId} rowId=${warning.rowId}`
-            + ` missing=${warning.missingFields.join(",")}`,
-          );
-        },
-        onError: (error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          console.warn(`[hermes-relay] state.db realtime sync failed: ${message}`);
-        },
-      })
-      : undefined;
-
+    // Relay 长连接只承载命令和当前运行产生的事件，和 OpenClaw 共用同一传输模型。
+    // state.db 仅可在显式 history/session 请求中按需读取，不能在此处挂轮询或子进程，
+    // 否则数据库压力或失败会扩大为移动端 Relay 的可用性问题。
     relayWs.on("open", () => {
       console.log(`Connected to relay server (hermes gatewayId=${opts.gatewayId})`);
       opts.onConnected?.();
@@ -298,7 +271,6 @@ export async function runHermesRelayManagerWithDependencies(
         });
       });
       void dependencies.publishUsageSnapshot(send);
-      stateDbRealtimeWatcher?.start();
     });
 
     relayWs.on("message", async (raw) => {
@@ -363,19 +335,14 @@ export async function runHermesRelayManagerWithDependencies(
             send({ type: "res", id: requestId, ok: true, payload: abortRun?.run });
           }
           if (abortRun) {
+            const abortedPayload = buildMobileAssistantAbortedPayload({
+              run: abortRun.run,
+              includeTimelineEvents: true,
+            });
             send({
               type: "event",
               event: "chat",
-              payload: {
-                runId: abortRun.run.runId,
-                sessionKey: abortRun.run.sessionKey,
-                state: "aborted",
-                role: "assistant",
-                message: {
-                  role: "assistant",
-                  content: [{ type: "text", text: "" }],
-                },
-              },
+              payload: abortedPayload,
             });
           }
           return;
@@ -455,6 +422,7 @@ export async function runHermesRelayManagerWithDependencies(
                   id: requestId,
                   ok: true,
                   responsePhase: "accepted",
+                  responseMethod: "chat.send",
                   payload: acceptedRun,
                 });
               }
@@ -466,6 +434,7 @@ export async function runHermesRelayManagerWithDependencies(
                     id: requestId,
                     ok: true,
                     responsePhase: "terminal",
+                    responseMethod: "chat.send",
                     payload: acceptedRun,
                   }
                   : {
@@ -473,6 +442,7 @@ export async function runHermesRelayManagerWithDependencies(
                     id: requestId,
                     ok: false,
                     responsePhase: "terminal",
+                    responseMethod: "chat.send",
                     error: { code: "hermes_chat_failed", message: errorMessage(terminal.error) },
                   });
               }
@@ -500,6 +470,7 @@ export async function runHermesRelayManagerWithDependencies(
             id: requestId,
             ok: true,
             responsePhase: "accepted",
+            responseMethod: "chat.send",
             payload: acknowledgedChatRun,
           });
         }
@@ -603,6 +574,7 @@ export async function runHermesRelayManagerWithDependencies(
             id: requestId,
             ok: true,
             responsePhase: "terminal",
+            responseMethod: "chat.send",
             payload: acknowledgedChatRun,
           });
         }
@@ -636,6 +608,7 @@ export async function runHermesRelayManagerWithDependencies(
                 id: requestId,
                 ok: false,
                 responsePhase: "terminal",
+                responseMethod: "chat.send",
                 error: { code: "hermes_chat_aborted", message },
               });
             }
@@ -669,6 +642,7 @@ export async function runHermesRelayManagerWithDependencies(
               id: requestId,
               ok: false,
               responsePhase: "terminal",
+              responseMethod: "chat.send",
               error: { code: "hermes_chat_failed", message: setupMessage ?? message },
             });
           }
@@ -686,7 +660,6 @@ export async function runHermesRelayManagerWithDependencies(
         clearTimeout(relayHelloTimer);
         relayHelloTimer = undefined;
       }
-      stateDbRealtimeWatcher?.stop();
       deliveryOutbox.detach(relayWs);
       activeChatRuns.forEach((entry) => entry.controller.abort());
       activeChatRuns.clear();
@@ -1082,7 +1055,7 @@ function resolveHermesRelaySessionKey(params: unknown): string {
   return resolveHermesVoiceInputSessionKey(params);
 }
 
-function extractFileBlock(payload: unknown): Record<string, unknown> | undefined {
+export function extractFileBlock(payload: unknown): Record<string, unknown> | undefined {
   const record = payload && typeof payload === "object" && !Array.isArray(payload)
     ? (payload as Record<string, unknown>)
     : undefined;
@@ -1095,7 +1068,9 @@ function extractFileBlock(payload: unknown): Record<string, unknown> | undefined
       return false;
     }
     const type = (block as Record<string, unknown>).type;
-    return type === "file" || type === "voice";
+    // Relay represents uploaded photos as `image` blocks. Keep file/voice for
+    // older clients, but do not drop images before Hermes can consume them.
+    return type === "file" || type === "image" || type === "voice";
   });
 }
 

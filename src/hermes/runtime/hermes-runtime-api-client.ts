@@ -9,7 +9,10 @@ import { buildToolInvocationUpdatedEvent } from "../../core/relay/timeline-event
 import { rememberHermesSession } from "../hermes-session-store.js";
 import { buildHermesPreloadedSkillsPrompt } from "./hermes-runtime-preloaded-skills.js";
 import type { HermesChatResult, HermesToolLogEvent, HermesUsageSnapshot } from "./hermes-runtime-types.js";
-import { resolveHermesApiSettings } from "./hermes-runtime-api-settings.js";
+import {
+  resolveHermesApiSettings,
+  resolveHermesRuntimeExecutionMode,
+} from "./hermes-runtime-api-settings.js";
 import { CHAT_TIMEOUT_MS, sanitizeHermesChatOutput } from "./hermes-runtime-process.js";
 import { compactStringArray } from "./hermes-runtime-values.js";
 import { hermesToolState } from "./hermes-runtime-tool-log-watcher.js";
@@ -54,6 +57,12 @@ export async function tryRunHermesApiChat(params: {
   requiredToolsets?: string[];
   context: LocalCommandContext;
 }): Promise<HermesApiChatResult | undefined> {
+  // Hermes 的移动桥接默认转发到宿主机本地 CLI/runtime。API Server 是给
+  // 明确需要 HTTP 会话的外部客户端的兼容入口；不能因为本机恰好启动了
+  // 8642 端口，就把 ClawLink 重新路由到另一套会话执行链。
+  if (resolveHermesRuntimeExecutionMode() !== "api") {
+    return undefined;
+  }
   const config = readHermesApiConfig();
   if (!config) {
     return undefined;
@@ -165,18 +174,26 @@ async function runHermesApiChat(
     return undefined;
   }
   const instructions = combineHermesApiInstructions(params.instructions, preloadedSkillPrompt);
-  const stream = await openHermesApiChatStream(config, {
-    sessionId,
-    sessionKey: params.sessionKey,
-    message: params.message,
-    instructions,
-    abortSignal: params.context.abortSignal,
-  });
-  const parsed = await consumeHermesApiChatStream(stream, {
-    sessionId,
-    sessionKey: params.sessionKey,
-    context: params.context,
-  });
+  let parsed: Awaited<ReturnType<typeof consumeHermesApiChatStream>>;
+  try {
+    const stream = await openHermesApiChatStream(config, {
+      sessionId,
+      sessionKey: params.sessionKey,
+      message: params.message,
+      instructions,
+      abortSignal: params.context.abortSignal,
+    });
+    parsed = await consumeHermesApiChatStream(stream, {
+      sessionId,
+      sessionKey: params.sessionKey,
+      context: params.context,
+    });
+  } catch (error) {
+    if (params.context.abortSignal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+      throw new Error("hermes_chat_aborted");
+    }
+    throw error;
+  }
   await rememberHermesSession(params.sessionKey, {
     sessionKey: params.sessionKey,
     hermesSessionId: parsed.hermesSessionId,

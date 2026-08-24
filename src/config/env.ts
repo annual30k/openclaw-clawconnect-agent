@@ -64,6 +64,9 @@ CLAWCONNECT_RELAY_SERVER_URL=https://clawlinks.cn
 # HERMES_PYTHON=/path/to/python
 # HERMES_SKILLS_DIR=/path/to/hermes-skills
 # CLAWCONNECT_HERMES_STATE_DB=/path/to/state.db
+# Recommended for mobile forwarding: use the host's local Hermes runtime.
+# Set to api only when an external Hermes API Server session is intentional.
+# CLAWCONNECT_HERMES_RUNTIME_MODE=local
 # CLAWCONNECT_HERMES_API_URL=http://127.0.0.1:8642
 # CLAWCONNECT_HERMES_API_KEY=
 # API_SERVER_HOST=127.0.0.1

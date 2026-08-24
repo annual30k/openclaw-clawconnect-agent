@@ -12,6 +12,7 @@ import {
   buildHermesArtifactUploadRequest,
   buildHermesRelayHelloMessage,
   collectHermesSlashCommandCatalog,
+  extractFileBlock,
   rememberActiveHermesChatRun,
   resolveHermesChatPreferredRunId,
   resolveHermesAbortRun,
@@ -116,6 +117,22 @@ test("Hermes image artifact upload is represented as a mobile content block", ()
     sessionKey: "main",
     status: "available",
   });
+});
+
+test("Hermes remembers mobile image uploads for the next chat turn", () => {
+  const imageBlock = extractFileBlock({
+    message: {
+      content: [{
+        type: "image",
+        fileId: "file-mobile-image",
+        fileName: "screen.png",
+        mimeType: "image/png",
+      }],
+    },
+  });
+
+  assert.equal(imageBlock?.type, "image");
+  assert.equal(imageBlock?.fileId, "file-mobile-image");
 });
 
 test("Hermes artifact uploads use independent non-resolving attachment timeline messages", () => {
@@ -225,6 +242,72 @@ test("Hermes abort lookup accepts the mobile idempotency key", () => {
   const resolved = resolveHermesAbortRun({ idempotencyKey: "client-run-1" }, activeRuns);
   assert.equal(resolved?.controller, controller);
   assert.equal(resolved?.run.runId, "server-run-1");
+});
+
+test("Hermes chat.abort publishes only canonical aborted timeline events", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  const relayMessages: Array<Record<string, unknown>> = [];
+  const managerAbort = new AbortController();
+  let relaySocket: WebSocket | undefined;
+  relayServer.on("connection", (socket) => {
+    relaySocket = socket;
+    sendHermesRelayHello(socket, "gw-hermes-abort-canonical");
+    socket.on("message", (raw) => {
+      relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
+    });
+  });
+  const relayAddress = relayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  const manager = runHermesRelayManagerWithDependencies({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-hermes-abort-canonical",
+    relaySecret: "secret",
+    signal: managerAbort.signal,
+  }, hermesTestDependencies(async (_params, context) => (
+    new Promise<never>((_resolve, reject) => {
+      context.abortSignal?.addEventListener("abort", () => reject(new Error("hermes_chat_aborted")), { once: true });
+    })
+  )));
+
+  try {
+    await waitForHermesTest(() => Boolean(relaySocket) && relayMessages.some((message) => message.type === "gateway_connected"));
+    relaySocket?.send(JSON.stringify({
+      type: "cmd",
+      id: "abort-send",
+      method: "chat.send",
+      params: {
+        sessionKey: "main",
+        message: "你可以做什么",
+        idempotencyKey: "abort-run",
+      },
+    }));
+    await waitForHermesTest(() => relayMessages.some((message) => message.type === "res" && message.id === "abort-send"));
+    relaySocket?.send(JSON.stringify({
+      type: "cmd",
+      id: "abort-command",
+      method: "chat.abort",
+      params: { runId: "abort-run" },
+    }));
+    await waitForHermesTest(() => terminalHermesChatEvents(relayMessages, "aborted").length > 0);
+
+    for (const message of terminalHermesChatEvents(relayMessages, "aborted")) {
+      const payload = message.payload as Record<string, unknown>;
+      assert.equal(payload.message, undefined);
+      const events = Array.isArray(payload.timelineEvents) ? payload.timelineEvents : [];
+      assert.equal(events.some((event) => (
+        event && typeof event === "object" && !Array.isArray(event)
+        && (event as Record<string, unknown>).eventType === "message.completed"
+      )), false);
+      assert.equal(events.some((event) => (
+        event && typeof event === "object" && !Array.isArray(event)
+        && (event as Record<string, unknown>).eventType === "run.aborted"
+      )), true);
+    }
+  } finally {
+    managerAbort.abort();
+    await manager.catch(() => false);
+    await closeHermesTestServer(relayServer);
+  }
 });
 
 test("Hermes chat run prefers the mobile idempotency key over relay request id", () => {
@@ -432,6 +515,8 @@ test("Hermes relay manager reuses one successful model run for concurrent and te
     const secondAck = relayMessages.find((message) => message.type === "res" && message.id === "hermes-success-2");
     assert.equal(firstAck?.responsePhase, "accepted");
     assert.equal(secondAck?.responsePhase, "accepted");
+    assert.equal(firstAck?.responseMethod, "chat.send");
+    assert.equal(secondAck?.responseMethod, "chat.send");
     assert.deepEqual(firstAck?.payload, secondAck?.payload);
 
     modelResult.resolve({ output: "只运行一次", sessionKey: "main", artifactPaths: [] });
@@ -439,6 +524,10 @@ test("Hermes relay manager reuses one successful model run for concurrent and te
     await waitForHermesTest(() => ["hermes-success-1", "hermes-success-2"].every((id) => (
       relayMessages.some((message) => message.type === "res" && message.id === id && message.responsePhase === "terminal")
     )));
+    const firstTerminal = relayMessages.find((message) => (
+      message.type === "res" && message.id === "hermes-success-1" && message.responsePhase === "terminal"
+    ));
+    assert.equal(firstTerminal?.responseMethod, "chat.send");
 
     send("hermes-success-terminal");
     await waitForHermesTest(() => relayMessages.some((message) => message.type === "res" && message.id === "hermes-success-terminal"));
@@ -509,6 +598,8 @@ test("Hermes relay manager immediately reuses accepted and publishes one model e
     const secondAck = relayMessages.find((message) => message.type === "res" && message.id === "hermes-error-2");
     assert.equal(firstAck?.responsePhase, "accepted");
     assert.equal(secondAck?.responsePhase, "accepted");
+    assert.equal(firstAck?.responseMethod, "chat.send");
+    assert.equal(secondAck?.responseMethod, "chat.send");
     assert.deepEqual(firstAck?.payload, secondAck?.payload);
     assert.equal(terminalHermesChatEvents(relayMessages, "error").length, 0);
 
@@ -518,6 +609,10 @@ test("Hermes relay manager immediately reuses accepted and publishes one model e
       relayMessages.some((message) => message.type === "res" && message.id === id
         && message.responsePhase === "terminal" && message.ok === false)
     )));
+    const firstTerminal = relayMessages.find((message) => (
+      message.type === "res" && message.id === "hermes-error-1" && message.responsePhase === "terminal"
+    ));
+    assert.equal(firstTerminal?.responseMethod, "chat.send");
 
     send("hermes-error-terminal");
     await waitForHermesTest(() => relayMessages.some((message) => message.type === "res" && message.id === "hermes-error-terminal"));
@@ -620,10 +715,6 @@ function hermesTestDependencies(
     runChat,
     readStatusSnapshot: async () => ({}),
     publishUsageSnapshot: async () => undefined,
-    resolveStateDbRealtimePath: () => undefined,
-    createStateDbRealtimeWatcher: () => {
-      throw new Error("state db watcher is disabled in relay manager tests");
-    },
   };
 }
 

@@ -149,7 +149,8 @@ Supported values:
 - `OPENCLAW_BIN` / `OPENCLAW_PACKAGE_BIN` / `OPENCLAW_INSTALL_DIR` — locate a non-npm or non-PATH OpenClaw CLI/runtime
 - `HERMES_HOME` / `HERMES_BIN` / `HERMES_PYTHON` — override Hermes data, CLI, and Python paths; native Windows auto-detects `%LOCALAPPDATA%\hermes`
 - `HERMES_SKILLS_DIR` / `CLAWCONNECT_HERMES_STATE_DB` — optional explicit Hermes skills and state database paths
-- `CLAWCONNECT_HERMES_API_URL` / `CLAWCONNECT_HERMES_API_KEY` — explicit Hermes API connection; Hermes `API_SERVER_HOST`, `API_SERVER_PORT`, and `API_SERVER_KEY` remain supported
+- `CLAWCONNECT_HERMES_RUNTIME_MODE` — Hermes mobile execution entrance: `local`/`native` (recommended, forwards through the host CLI/runtime) or `api` (explicit HTTP API Server compatibility mode); when omitted, an explicitly configured `CLAWCONNECT_HERMES_API_*` endpoint keeps legacy API behavior
+- `CLAWCONNECT_HERMES_API_URL` / `CLAWCONNECT_HERMES_API_KEY` — explicit Hermes API connection. Without an explicit URL, ClawConnect automatically follows `platforms.api_server.extra` in `$HERMES_HOME/config.yaml`; older `API_SERVER_HOST`, `API_SERVER_PORT`, and `API_SERVER_KEY` settings remain supported as fallbacks. Discovery is configuration-based and does not scan unrelated local ports
 - `CLAWCONNECT_ENV_FILE` — optional explicit env file path. When unset, the agent reads `~/.clawconnect/.env`, then `.env.local`, then `.env`
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD` — Gateway auth fallback
 - `CLAWCONNECT_ASR_COMMAND` — host-side speech-to-text command for ClawLink `chat.voice.send` messages. The agent saves the audio to a temporary file and runs this command; it must print the transcript to stdout. Placeholders: `{file}`, `{language}`, `{mimeType}`

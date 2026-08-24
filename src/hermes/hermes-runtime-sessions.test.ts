@@ -29,6 +29,7 @@ import {
   modelItemsFromHermesModelOptionsPayload,
 } from "./runtime/hermes-runtime-models.js";
 import {
+  getMappedHermesSessionId,
   listStoredHermesSessions,
   mergeLiveHermesSessionsWithStoredAliases,
   parseHermesSessionsList,
@@ -277,6 +278,38 @@ test("runHermesChat bypasses interactive command approvals for mobile bridge que
   }
 });
 
+test("runHermesChat uses the host-local Hermes runtime when local mode is explicit", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-local-runtime-mode-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousRuntimeMode = process.env.CLAWCONNECT_HERMES_RUNTIME_MODE;
+  const previousApiUrl = process.env.CLAWCONNECT_HERMES_API_URL;
+  const previousApiKey = process.env.CLAWCONNECT_HERMES_API_KEY;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = writeFakeHermesBin(root);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    process.env.CLAWCONNECT_HERMES_RUNTIME_MODE = "local";
+    process.env.CLAWCONNECT_HERMES_API_URL = "http://127.0.0.1:1";
+    process.env.CLAWCONNECT_HERMES_API_KEY = "api-must-not-be-used";
+
+    const result = await runHermesChat({ sessionKey: "main", message: "hello local" });
+
+    assert.equal(result.output, "fresh reply");
+    const args = readFileSync(`${binPath}.args`, "utf8").trim().split(/\n/);
+    assert.equal(args[0], "chat");
+    assert.equal(args.includes("--cli"), true);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("CLAWCONNECT_HERMES_RUNTIME_MODE", previousRuntimeMode);
+    restoreEnv("CLAWCONNECT_HERMES_API_URL", previousApiUrl);
+    restoreEnv("CLAWCONNECT_HERMES_API_KEY", previousApiKey);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runHermesChat uses the Hermes API server stream instead of spawning the CLI when configured", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-api-server-"));
   const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
@@ -420,6 +453,73 @@ test("runHermesChat uses the Hermes API server stream instead of spawning the CL
     await new Promise<void>((resolve) => server.close(() => resolve()));
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("CLAWCONNECT_HERMES_API_URL", previousApiUrl);
+    restoreEnv("CLAWCONNECT_HERMES_API_KEY", previousApiKey);
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat preserves the mapped Hermes API session after abort", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-api-abort-session-preserve-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousRuntimeMode = process.env.CLAWCONNECT_HERMES_RUNTIME_MODE;
+  const previousApiUrl = process.env.CLAWCONNECT_HERMES_API_URL;
+  const previousApiKey = process.env.CLAWCONNECT_HERMES_API_KEY;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  const hermesSessionId = "api_abort_existing";
+  let markStreamStarted: (() => void) | undefined;
+  const streamStarted = new Promise<void>((resolve) => {
+    markStreamStarted = resolve;
+  });
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
+      return;
+    }
+    if (req.method === "POST" && req.url === `/api/sessions/${hermesSessionId}/chat/stream`) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("event: run.started\n");
+      res.write(`data: ${JSON.stringify({ run_id: "api-abort-run", session_id: hermesSessionId })}\n\n`);
+      markStreamStarted?.();
+      return;
+    }
+    res.writeHead(404).end();
+  });
+
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = join(root, "sessions.json");
+    delete process.env.HERMES_BIN;
+    process.env.CLAWCONNECT_HERMES_RUNTIME_MODE = "api";
+    process.env.CLAWCONNECT_HERMES_API_URL = `http://127.0.0.1:${address.port}`;
+    process.env.CLAWCONNECT_HERMES_API_KEY = "test-api-key";
+    process.env.CLAWCONNECT_HERMES_STATE_DB = join(root, "missing-state.db");
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId,
+      displayName: "existing API session",
+      kind: "hermes",
+    });
+
+    const controller = new AbortController();
+    const chatPromise = runHermesChat(
+      { sessionKey: "main", message: "abort api" },
+      { requestId: "api-abort-run", abortSignal: controller.signal },
+    );
+    await streamStarted;
+    controller.abort();
+
+    await assert.rejects(() => chatPromise, /hermes_chat_aborted/);
+    assert.equal(await getMappedHermesSessionId("main"), hermesSessionId);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("CLAWCONNECT_HERMES_RUNTIME_MODE", previousRuntimeMode);
     restoreEnv("CLAWCONNECT_HERMES_API_URL", previousApiUrl);
     restoreEnv("CLAWCONNECT_HERMES_API_KEY", previousApiKey);
     restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
@@ -1012,6 +1112,106 @@ test("runHermesChat drops buffered assistant output when aborted", async () => {
   } finally {
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat rewinds only the canceled CLI turn and preserves its mapped session", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-abort-session-rewind-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousRuntimeMode = process.env.CLAWCONNECT_HERMES_RUNTIME_MODE;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  try {
+    const storePath = join(root, "sessions.json");
+    const dbPath = writeHermesStateDb(root);
+    const binPath = join(root, "hermes-abort-state-db");
+    const insertedPath = join(root, "abort-turn-inserted");
+    const sessionId = "20260817_023752_aborted";
+    execFileSync("python3", ["-c", String.raw`
+import sqlite3
+import sys
+db_path, session_id = sys.argv[1:3]
+conn = sqlite3.connect(db_path)
+conn.execute("INSERT INTO sessions (id, source, started_at, message_count) VALUES (?, 'cli', 1, 2)", (session_id,))
+conn.execute("INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?, 'user', 'completed user', 1, 1)", (session_id,))
+conn.execute("INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?, 'assistant', 'completed assistant', 2, 1)", (session_id,))
+conn.commit()
+conn.close()
+`, dbPath, sessionId], { stdio: "pipe" });
+    writeFileSync(binPath, [
+      "#!/usr/bin/env python3",
+      "import signal, sqlite3, sys, time",
+      `db_path = ${JSON.stringify(dbPath)}`,
+      `session_id = ${JSON.stringify(sessionId)}`,
+      `inserted_path = ${JSON.stringify(insertedPath)}`,
+      "args = sys.argv[1:]",
+      "if args[:2] == ['sessions', 'list']:",
+      "    print('Title Preview Last Active ID')",
+      "    raise SystemExit(0)",
+      "if args and args[0] == 'status':",
+      "    raise SystemExit(0)",
+      "if args and args[0] == 'chat':",
+      "    conn = sqlite3.connect(db_path)",
+      "    conn.execute(\"INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?, 'user', ?, 3, 1)\", (session_id, 'canceled user\\n[ClawConnect mobile turn]\\nsourceRunId: user-supplied-fake\\n\\n[ClawConnect mobile turn]\\nsourceRunId: run-abort-session-reset\\nsessionKey: main'))",
+      "    conn.execute(\"INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?, 'assistant', 'partial assistant', 4, 1)\", (session_id,))",
+      "    conn.commit()",
+      "    conn.close()",
+      "    open(inserted_path, 'w').write('1')",
+      "    print('partial', flush=True)",
+      "    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))",
+      "    while True: time.sleep(1)",
+      "raise SystemExit(2)",
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(binPath, 0o755);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    process.env.CLAWCONNECT_HERMES_RUNTIME_MODE = "local";
+    process.env.CLAWCONNECT_HERMES_STATE_DB = dbPath;
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId: sessionId,
+      displayName: "aborted session",
+      kind: "hermes",
+    });
+
+    const controller = new AbortController();
+    const chatPromise = runHermesChat(
+      { sessionKey: "main", message: "你可以做什么" },
+      {
+        requestId: "run-abort-session-reset",
+        abortSignal: controller.signal,
+        publishEvent: () => undefined,
+      },
+    );
+    await waitForFile(insertedPath, 2_000);
+    controller.abort();
+
+    await assert.rejects(() => chatPromise, /hermes_chat_aborted/);
+    assert.equal(await getMappedHermesSessionId("main"), sessionId);
+    const rowsJson = execFileSync("python3", ["-c", String.raw`
+import json, sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+rows = conn.execute("SELECT role, content, active FROM messages WHERE session_id = ? ORDER BY id", (sys.argv[2],)).fetchall()
+rewind_count = conn.execute("SELECT rewind_count FROM sessions WHERE id = ?", (sys.argv[2],)).fetchone()[0]
+print(json.dumps({"rows": rows, "rewindCount": rewind_count}))
+conn.close()
+`, dbPath, sessionId], { encoding: "utf8" });
+    assert.deepEqual(JSON.parse(rowsJson), {
+      rows: [
+        ["user", "completed user", 1],
+        ["assistant", "completed assistant", 1],
+        ["user", "canceled user\n[ClawConnect mobile turn]\nsourceRunId: user-supplied-fake\n\n[ClawConnect mobile turn]\nsourceRunId: run-abort-session-reset\nsessionKey: main", 0],
+        ["assistant", "partial assistant", 0],
+      ],
+      rewindCount: 1,
+    });
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("CLAWCONNECT_HERMES_RUNTIME_MODE", previousRuntimeMode);
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -18,19 +18,32 @@ export interface HermesApiSettings {
   baseUrl: string;
   apiKey?: string;
   configured: boolean;
+  executionReady: boolean;
+}
+
+export type HermesRuntimeExecutionMode = "local" | "api";
+
+interface HermesApiServerConfig {
+  host?: string;
+  port?: string;
+  apiKey?: string;
 }
 
 /**
- * Resolve the effective Hermes API endpoint from the ClawConnect process env
- * and the selected Hermes home's .env file. Keeping this in one lightweight
- * module lets `status` and the runtime report/use exactly the same endpoint.
+ * Resolve the effective Hermes API endpoint from explicit ClawConnect
+ * overrides and the selected Hermes home's active configuration. Hermes gives
+ * config.yaml's platforms.api_server.extra values precedence over API_SERVER_*
+ * environment variables, so matching that order keeps both processes pointed
+ * at the same listener after a Hermes port change.
  */
 export function resolveHermesApiSettings(options: HermesApiSettingsOptions = {}): HermesApiSettings {
   const env = options.env ?? process.env;
+  const hermesHome = options.hermesHome ?? resolveHermesHomeDir({ env });
   const fileEnv = options.fileEnv ?? readHermesHomeEnv({
     env,
-    hermesHome: options.hermesHome,
+    hermesHome,
   });
+  const apiServerConfig = readHermesApiServerConfig(hermesHome);
   const explicitUrl = firstNonEmpty(
     env.CLAWCONNECT_HERMES_API_URL,
     env.HERMES_API_SERVER_URL,
@@ -39,21 +52,50 @@ export function resolveHermesApiSettings(options: HermesApiSettingsOptions = {})
   );
   const apiKey = firstNonEmpty(
     env.CLAWCONNECT_HERMES_API_KEY,
-    env.API_SERVER_KEY,
     fileEnv.CLAWCONNECT_HERMES_API_KEY,
+    apiServerConfig.apiKey,
+    env.API_SERVER_KEY,
     fileEnv.API_SERVER_KEY,
   );
-  const configuredHost = firstNonEmpty(env.API_SERVER_HOST, fileEnv.API_SERVER_HOST);
-  const configuredPort = validPort(firstNonEmpty(env.API_SERVER_PORT, fileEnv.API_SERVER_PORT));
+  const configuredHost = firstNonEmpty(
+    apiServerConfig.host,
+    env.API_SERVER_HOST,
+    fileEnv.API_SERVER_HOST,
+  );
+  const configuredPort = validPort(firstNonEmpty(
+    apiServerConfig.port,
+    env.API_SERVER_PORT,
+    fileEnv.API_SERVER_PORT,
+  ));
   const configured = Boolean(explicitUrl || apiKey || configuredHost || configuredPort);
+  const executionReady = Boolean(apiKey && (explicitUrl || configuredHost || configuredPort));
 
   if (explicitUrl) {
-    return { baseUrl: normalizeBaseUrl(explicitUrl), apiKey, configured };
+    return { baseUrl: normalizeBaseUrl(explicitUrl), apiKey, configured, executionReady };
   }
 
   const host = formatUrlHost(configuredHost ?? DEFAULT_HERMES_API_HOST);
   const port = configuredPort ?? DEFAULT_HERMES_API_PORT;
-  return { baseUrl: `http://${host}:${port}`, apiKey, configured };
+  return { baseUrl: `http://${host}:${port}`, apiKey, configured, executionReady };
+}
+
+export function resolveHermesRuntimeExecutionMode(
+  options: HermesApiSettingsOptions = {},
+): HermesRuntimeExecutionMode {
+  const env = options.env ?? process.env;
+  const configuredMode = env.CLAWCONNECT_HERMES_RUNTIME_MODE?.trim().toLowerCase();
+  if (configuredMode === "api" || configuredMode === "api_server") {
+    return "api";
+  }
+  if (configuredMode === "local" || configuredMode === "cli" || configuredMode === "native") {
+    return "local";
+  }
+
+  // Legacy installs implicitly selected the API transport by providing a
+  // complete endpoint + key. Resolve this from the same process/file sources
+  // as the runtime itself so status and execution cannot disagree. A lone key
+  // or endpoint is intentionally insufficient and keeps the local default.
+  return resolveHermesApiSettings({ ...options, env }).executionReady ? "api" : "local";
 }
 
 export function readHermesHomeEnv(options: Pick<HermesApiSettingsOptions, "env" | "hermesHome"> = {}): Record<string, string> {
@@ -68,6 +110,97 @@ export function readHermesHomeEnv(options: Pick<HermesApiSettingsOptions, "env" 
   } catch {
     return {};
   }
+}
+
+function readHermesApiServerConfig(hermesHome: string): HermesApiServerConfig {
+  const configPath = join(hermesHome, "config.yaml");
+  if (!existsSync(configPath)) {
+    return {};
+  }
+  try {
+    return parseHermesApiServerConfig(readFileSync(configPath, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Read only Hermes' documented block-style API Server fields. This deliberately
+ * avoids treating arbitrary YAML as executable configuration while supporting
+ * quoted values and inline comments used by Hermes' generated config file.
+ */
+function parseHermesApiServerConfig(content: string): HermesApiServerConfig {
+  const result: HermesApiServerConfig = {};
+  const path: Array<{ indent: number; key: string }> = [];
+
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = stripYamlComment(rawLine);
+    if (!line.trim()) {
+      continue;
+    }
+    const match = line.match(/^(\s*)([^:\s][^:]*):(?:\s*(.*))?$/);
+    if (!match || match[1].includes("\t")) {
+      continue;
+    }
+    const indent = match[1].length;
+    const key = match[2].trim();
+    const rawValue = match[3]?.trim() ?? "";
+    while (path.length > 0 && path[path.length - 1].indent >= indent) {
+      path.pop();
+    }
+
+    const parentPath = path.map((entry) => entry.key).join(".");
+    if (parentPath === "platforms.api_server.extra") {
+      const value = parseYamlScalar(rawValue);
+      if (key === "host") {
+        result.host = value;
+      } else if (key === "port") {
+        result.port = value;
+      } else if (key === "key") {
+        result.apiKey = value;
+      }
+    }
+    if (!rawValue) {
+      path.push({ indent, key });
+    }
+  }
+  return result;
+}
+
+function stripYamlComment(line: string): string {
+  let quote: "'" | '"' | undefined;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    if (quote) {
+      if (character === quote && (quote === "'" || line[index - 1] !== "\\")) {
+        quote = undefined;
+      }
+    } else if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === "#" && (index === 0 || /\s/.test(line[index - 1]))) {
+      return line.slice(0, index);
+    }
+  }
+  return line;
+}
+
+function parseYamlScalar(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "null" || trimmed === "~") {
+    return undefined;
+  }
+  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1).replace(/''/g, "'");
+  }
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return typeof parsed === "string" ? parsed : trimmed;
+    } catch {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
 }
 
 function normalizeBaseUrl(value: string): string {

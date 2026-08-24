@@ -155,7 +155,8 @@ $EDITOR ~/.clawconnect/.env
 - `OPENCLAW_BIN` / `OPENCLAW_PACKAGE_BIN` / `OPENCLAW_INSTALL_DIR`：OpenClaw 不在 PATH 或不是 npm 安装时，指定 CLI/JS 入口或安装根目录
 - `HERMES_HOME` / `HERMES_BIN` / `HERMES_PYTHON`：Hermes 数据目录、CLI 与 Python 覆盖；Windows 会先自动探测 `%LOCALAPPDATA%\hermes`
 - `HERMES_SKILLS_DIR` / `CLAWCONNECT_HERMES_STATE_DB`：可选，单独指定 Hermes 技能目录和状态数据库路径
-- `CLAWCONNECT_HERMES_API_URL` / `CLAWCONNECT_HERMES_API_KEY`：Hermes API 完整地址与鉴权；也兼容 Hermes 自己的 `API_SERVER_HOST`、`API_SERVER_PORT`、`API_SERVER_KEY`
+- `CLAWCONNECT_HERMES_RUNTIME_MODE`：Hermes 移动消息的执行入口，推荐 `local`/`native`（转发到宿主机本地 CLI/runtime）；只有明确需要 HTTP API Server 兼容模式时才设为 `api`。未设置且显式配置了 `CLAWCONNECT_HERMES_API_*` 时，为兼容旧部署仍会使用 API
+- `CLAWCONNECT_HERMES_API_URL` / `CLAWCONNECT_HERMES_API_KEY`：Hermes API 完整地址与鉴权。未显式指定地址时，ClawConnect 会自动跟随 `$HERMES_HOME/config.yaml` 中的 `platforms.api_server.extra`；旧版 `API_SERVER_HOST`、`API_SERVER_PORT`、`API_SERVER_KEY` 仍作为回退。探测基于权威配置，不会扫描无关的本机端口
 - `CLAWCONNECT_ENV_FILE`：可选，显式指定 env 文件路径；未设置时会依次读取 `~/.clawconnect/.env`、`.env.local`、`.env`
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD`：Gateway 鉴权兜底值
 - `CLAWCONNECT_ASR_COMMAND`：宿主机语音转文字命令。ClawLink 发送 `chat.voice.send` 后，agent 会把音频保存到临时文件，并执行这个命令；命令必须把识别文本输出到 stdout。可用占位符：`{file}`、`{language}`、`{mimeType}`

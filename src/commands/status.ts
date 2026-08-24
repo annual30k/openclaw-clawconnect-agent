@@ -7,7 +7,10 @@ import { getServiceStatus } from "../platform/service-manager.js";
 import { decodeTextBuffer } from "../platform/text-file-decoder.js";
 import { resolveOpenClawConfigPath, resolveOpenClawStateDir } from "../openclaw/runtime/openclaw-paths.js";
 import { resolveHermesHomeDir } from "../hermes/runtime/hermes-runtime-paths.js";
-import { resolveHermesApiSettings } from "../hermes/runtime/hermes-runtime-api-settings.js";
+import {
+  resolveHermesApiSettings,
+  resolveHermesRuntimeExecutionMode,
+} from "../hermes/runtime/hermes-runtime-api-settings.js";
 
 type HealthState = {
   kind: "ok" | "warn" | "error" | "unknown";
@@ -65,8 +68,13 @@ function statusOne(profile?: string): void {
     }
   } else {
     console.log(`Hermes home: ${resolveHermesHomeDir()}`);
+    const hermesRuntimeMode = resolveHermesRuntimeExecutionMode();
+    const hermesRuntimeLabel = hermesRuntimeMode === "local"
+      ? "host-local CLI/runtime"
+      : "API Server compatibility";
+    console.log(`Hermes runtime: ${hermesRuntimeLabel}`);
     const hermesApi = resolveHermesApiSettings();
-    if (hermesApi.configured) {
+    if (hermesRuntimeMode === "api" && hermesApi.configured) {
       console.log(`Hermes API:  ${hermesApi.baseUrl}`);
     }
   }
