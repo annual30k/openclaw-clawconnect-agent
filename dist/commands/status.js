@@ -8,6 +8,7 @@ import { decodeTextBuffer } from "../platform/text-file-decoder.js";
 import { resolveOpenClawConfigPath, resolveOpenClawStateDir } from "../openclaw/runtime/openclaw-paths.js";
 import { resolveHermesHomeDir } from "../hermes/runtime/hermes-runtime-paths.js";
 import { resolveHermesApiSettings, resolveHermesRuntimeExecutionMode, } from "../hermes/runtime/hermes-runtime-api-settings.js";
+import { CHAT_TIMELINE_DELTA_CAPABILITY, CLAWCONNECT_AGENT_VERSION, buildHermesHostRuntimeMetadata, buildOpenClawHostRuntimeMetadata, } from "../runtime-metadata.js";
 const WINDOWS_LOG_READ_TIMEOUT_MS = 5_000;
 export function statusCommand(opts = {}) {
     if (opts.profile === "all") {
@@ -28,6 +29,7 @@ export function statusCommand(opts = {}) {
 function statusOne(profile) {
     console.log(t("status.title"));
     console.log(`Profile:  ${profileDisplayName(profile)}`);
+    console.log(`ClawConnect Agent: ${CLAWCONNECT_AGENT_VERSION}`);
     let gatewayType = "openclaw";
     if (!configExists(profile)) {
         console.log(t("status.notPaired"));
@@ -47,6 +49,11 @@ function statusOne(profile) {
         }
     }
     if (gatewayType === "openclaw") {
+        const runtimeMetadata = buildOpenClawHostRuntimeMetadata();
+        const liveEvents = runtimeMetadata.capabilities.includes(CHAT_TIMELINE_DELTA_CAPABILITY)
+            ? "text delta + tool lifecycle"
+            : "unavailable";
+        console.log(`Live events: ${liveEvents}`);
         console.log(t("status.gateway", readGatewayUrl()));
         console.log(`OpenClaw state:  ${resolveOpenClawStateDir()}`);
         console.log(`OpenClaw config: ${resolveOpenClawConfigPath()}`);
@@ -60,10 +67,15 @@ function statusOne(profile) {
     else {
         console.log(`Hermes home: ${resolveHermesHomeDir()}`);
         const hermesRuntimeMode = resolveHermesRuntimeExecutionMode();
+        const runtimeMetadata = buildHermesHostRuntimeMetadata(hermesRuntimeMode);
         const hermesRuntimeLabel = hermesRuntimeMode === "local"
             ? "host-local CLI/runtime"
             : "API Server compatibility";
         console.log(`Hermes runtime: ${hermesRuntimeLabel}`);
+        const liveEvents = runtimeMetadata.capabilities.includes(CHAT_TIMELINE_DELTA_CAPABILITY)
+            ? "text delta + tool lifecycle"
+            : "tool lifecycle only; assistant text is terminal-only";
+        console.log(`Live events: ${liveEvents}`);
         const hermesApi = resolveHermesApiSettings();
         if (hermesRuntimeMode === "api" && hermesApi.configured) {
             console.log(`Hermes API:  ${hermesApi.baseUrl}`);

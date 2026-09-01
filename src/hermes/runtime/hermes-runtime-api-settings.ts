@@ -67,8 +67,14 @@ export function resolveHermesApiSettings(options: HermesApiSettingsOptions = {})
     env.API_SERVER_PORT,
     fileEnv.API_SERVER_PORT,
   ));
+  const apiServerEnabled = isTruthy(firstNonEmpty(
+    env.API_SERVER_ENABLED,
+    fileEnv.API_SERVER_ENABLED,
+  ));
   const configured = Boolean(explicitUrl || apiKey || configuredHost || configuredPort);
-  const executionReady = Boolean(apiKey && (explicitUrl || configuredHost || configuredPort));
+  // When Hermes explicitly enables its API Server it uses the documented
+  // 127.0.0.1:8642 defaults even if host/port are absent from .env.
+  const executionReady = Boolean(apiKey && (explicitUrl || configuredHost || configuredPort || apiServerEnabled));
 
   if (explicitUrl) {
     return { baseUrl: normalizeBaseUrl(explicitUrl), apiKey, configured, executionReady };
@@ -215,6 +221,10 @@ function firstNonEmpty(...values: Array<string | undefined>): string | undefined
     }
   }
   return undefined;
+}
+
+function isTruthy(value: string | undefined): boolean {
+  return value === "1" || value?.toLowerCase() === "true" || value?.toLowerCase() === "yes" || value?.toLowerCase() === "on";
 }
 
 function validPort(value: string | undefined): number | undefined {

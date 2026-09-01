@@ -4,6 +4,8 @@ import { getServicePlatform, getServiceStatus, getServicePaths, installService, 
 import { clearProfileLogs, getActiveProfile, profileConfigPath, profileDisplayName } from "../config/profile.js";
 import { pairCommandForProfile } from "./profile-hints.js";
 import { clearReliableRelayOutboxStorage } from "../core/relay/reliable-relay-outbox-store.js";
+import { configExists, readConfig } from "../config/config.js";
+import { ensureHermesApiServer } from "../hermes/runtime/hermes-api-bootstrap.js";
 export function isInstalled() {
     return getServiceStatus().installed;
 }
@@ -13,6 +15,15 @@ export function installCommand() {
         console.log(t("install.unsupported", process.platform));
         console.log(t("install.runForeground"));
         return;
+    }
+    if (configExists() && readConfig().gatewayType === "hermes") {
+        const apiSetup = ensureHermesApiServer();
+        if (apiSetup === "configured") {
+            console.log("Hermes API Server enabled for synchronized text streaming.");
+        }
+        else if (apiSetup === "explicit-local") {
+            console.log("Hermes local CLI mode explicitly selected; assistant text deltas are unavailable.");
+        }
     }
     const started = installService();
     if (started) {

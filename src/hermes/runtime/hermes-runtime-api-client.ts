@@ -57,9 +57,9 @@ export async function tryRunHermesApiChat(params: {
   requiredToolsets?: string[];
   context: LocalCommandContext;
 }): Promise<HermesApiChatResult | undefined> {
-  // Hermes 的移动桥接默认转发到宿主机本地 CLI/runtime。API Server 是给
-  // 明确需要 HTTP 会话的外部客户端的兼容入口；不能因为本机恰好启动了
-  // 8642 端口，就把 ClawLink 重新路由到另一套会话执行链。
+  // Pair/install enables Hermes' API Server by default because this is the
+  // authoritative source of synchronized text deltas. Local mode remains an
+  // explicit terminal-only compatibility path.
   if (resolveHermesRuntimeExecutionMode() !== "api") {
     return undefined;
   }

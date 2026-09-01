@@ -42,8 +42,9 @@ import {
   RELAY_HELLO_NEGOTIATION_TIMEOUT_MS,
 } from "../core/relay/reliable-delivery-protocol.js";
 import type { TimelineContentBlock } from "../core/relay/timeline-event-log.js";
-import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
 import { prepareHermesVoiceInputCommand, resolveHermesVoiceInputSessionKey } from "./hermes-voice-input.js";
+import { resolveHermesRuntimeExecutionMode } from "./runtime/hermes-runtime-api-settings.js";
+import { buildHermesHostRuntimeMetadata } from "../runtime-metadata.js";
 import {
   collectHermesUsageSnapshot,
   handleHermesCommand,
@@ -241,10 +242,19 @@ export async function runHermesRelayManagerWithDependencies(
     relayWs.on("open", () => {
       console.log(`Connected to relay server (hermes gatewayId=${opts.gatewayId})`);
       opts.onConnected?.();
+      const hermesRuntimeMode = resolveHermesRuntimeExecutionMode();
+      const runtimeMetadata = buildHermesHostRuntimeMetadata(
+        hermesRuntimeMode,
+        opts.capabilities,
+      );
+      console.log(
+        `[hermes-relay] ClawConnect Agent ${runtimeMetadata.agentVersion}; `
+        + `runtime=${hermesRuntimeMode}; live events=${hermesRuntimeMode === "api" ? "timeline-delta,tool-lifecycle" : "tool-lifecycle"}`,
+      );
       send(buildHermesRelayHelloMessage({
-        platform: `${process.platform} (Hermes)`,
-        agentVersion: "hermes",
-        capabilities: opts.capabilities ?? [...gatewayCapabilitiesForType("hermes"), "models"],
+        platform: runtimeMetadata.platform,
+        agentVersion: runtimeMetadata.agentVersion,
+        capabilities: runtimeMetadata.capabilities,
       }));
       relayHelloTimer = setTimeout(() => {
         if (relayHelloNegotiated) return;

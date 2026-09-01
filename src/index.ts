@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { createRequire } from "module";
 import { ensureWindowsConsoleUtf8 } from "./platform/service-manager-common.js";
 import { DEFAULT_RELAY_SERVER_URL, ensureUserEnvFile, loadAgentEnv } from "./config/env.js";
 import { pairCommand } from "./commands/pair.js";
@@ -16,9 +15,8 @@ import {
   PAIR_OPENCLAW_HELP_TEXT,
   RESET_PROFILE_HELP_TEXT,
 } from "./commands/profile-hints.js";
+import { CLAWCONNECT_AGENT_VERSION } from "./runtime-metadata.js";
 
-const require = createRequire(import.meta.url);
-const { version } = require("../package.json") as { version: string };
 ensureUserEnvFile();
 loadAgentEnv();
 ensureWindowsConsoleUtf8();
@@ -69,7 +67,7 @@ function runInstallCommand(opts: { profile?: string }): void {
 program
   .name("clawconnect")
   .description("ClawConnect host agent — connects OpenClaw gateway hosts to your relay server")
-  .version(version)
+  .version(CLAWCONNECT_AGENT_VERSION)
   .addHelpText("after", MAIN_HELP_TEXT);
 
 program

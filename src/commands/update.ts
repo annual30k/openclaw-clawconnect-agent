@@ -3,10 +3,33 @@ import { existsSync } from "fs";
 import { dirname, extname, join } from "path";
 import { fileURLToPath } from "url";
 import { t } from "../i18n/index.js";
-import { getServiceStatus, restartService } from "../platform/service-manager.js";
+import { getServiceStatus } from "../platform/service-manager.js";
+import type { ServiceStatus } from "../platform/service-manager.js";
+import { listProfileNames } from "../config/profile.js";
 
 export const CLAWCONNECT_PACKAGE_NAME = "clawconnect-agent";
 export const CLAWCONNECT_COMMAND_NAME = "clawconnect";
+
+export type InstalledServiceProfile = {
+  profile: string;
+  manager: string;
+};
+
+export function installedServiceProfilesForUpdate(
+  profileNames: readonly string[] = listProfileNames(),
+  statusForProfile: (profile?: string) => Pick<ServiceStatus, "installed" | "manager"> = getServiceStatus,
+): InstalledServiceProfile[] {
+  const candidates = profileNames.length > 0 ? profileNames : ["default"];
+  const installed: InstalledServiceProfile[] = [];
+  for (const profile of candidates) {
+    const normalizedProfile = profile === "default" ? undefined : profile;
+    const status = statusForProfile(normalizedProfile);
+    if (status.installed) {
+      installed.push({ profile, manager: status.manager });
+    }
+  }
+  return installed;
+}
 
 export function buildWindowsCommandLine(args: string[]): string {
   return args
@@ -152,7 +175,10 @@ export function getLatestPublishedVersion(): string | null {
 }
 
 export function updateCommand(moduleUrl: string): void {
-  const service = getServiceStatus();
+  // Capture every installed profile before npm replaces the active package.
+  // Named Windows services are independent tasks; checking only the default
+  // profile leaves them running an old absolute dist/index.js after update.
+  const installedServices = installedServiceProfilesForUpdate();
   const activePathBefore = resolveActiveClawconnectPath();
   const activeVersionBefore = activePathBefore ? readCliVersionFromPath(activePathBefore) : null;
   const latestVersion = getLatestPublishedVersion();
@@ -210,24 +236,33 @@ export function updateCommand(moduleUrl: string): void {
 
   console.log(t("update.updated", `${CLAWCONNECT_PACKAGE_NAME}@${activeVersionAfter}`));
 
-  if (service.platform !== "unsupported" && service.installed) {
-    console.log(t("update.reinstallingService"));
-    try {
-      runCommandPath(
-        activePathAfter,
-        ["install"],
-        "inherit",
-        CLAWCONNECT_PACKAGE_NAME,
-        join("dist", "index.js"),
-      );
-      console.log(t("update.serviceReinstalled", service.manager));
-    } catch {
-      console.log(t("update.serviceReinstallFailed", service.manager));
-      if (restartService()) {
-        console.log(t("update.serviceRestarted", service.manager));
-      } else {
-        console.log(t("update.serviceRestartFailed", service.manager));
-        console.log(t("update.manualHint", "clawconnect install"));
+  if (installedServices.length > 0) {
+    for (const service of installedServices) {
+      console.log(t("update.reinstallingService"));
+      try {
+        runCommandPath(
+          activePathAfter,
+          ["install", "--profile", service.profile],
+          "inherit",
+          CLAWCONNECT_PACKAGE_NAME,
+          join("dist", "index.js"),
+        );
+        console.log(t("update.serviceReinstalled", `${service.manager} (${service.profile})`));
+      } catch {
+        console.log(t("update.serviceReinstallFailed", `${service.manager} (${service.profile})`));
+        try {
+          runCommandPath(
+            activePathAfter,
+            ["restart", "--profile", service.profile],
+            "inherit",
+            CLAWCONNECT_PACKAGE_NAME,
+            join("dist", "index.js"),
+          );
+          console.log(t("update.serviceRestarted", `${service.manager} (${service.profile})`));
+        } catch {
+          console.log(t("update.serviceRestartFailed", `${service.manager} (${service.profile})`));
+          console.log(t("update.manualHint", `clawconnect install --profile ${service.profile}`));
+        }
       }
     }
     return;

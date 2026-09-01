@@ -11,6 +11,12 @@ import {
   resolveHermesApiSettings,
   resolveHermesRuntimeExecutionMode,
 } from "../hermes/runtime/hermes-runtime-api-settings.js";
+import {
+  CHAT_TIMELINE_DELTA_CAPABILITY,
+  CLAWCONNECT_AGENT_VERSION,
+  buildHermesHostRuntimeMetadata,
+  buildOpenClawHostRuntimeMetadata,
+} from "../runtime-metadata.js";
 
 type HealthState = {
   kind: "ok" | "warn" | "error" | "unknown";
@@ -38,6 +44,7 @@ export function statusCommand(opts: { profile?: string } = {}): void {
 function statusOne(profile?: string): void {
   console.log(t("status.title"));
   console.log(`Profile:  ${profileDisplayName(profile)}`);
+  console.log(`ClawConnect Agent: ${CLAWCONNECT_AGENT_VERSION}`);
 
   let gatewayType: GatewayType = "openclaw";
   if (!configExists(profile)) {
@@ -57,6 +64,11 @@ function statusOne(profile?: string): void {
   }
 
   if (gatewayType === "openclaw") {
+    const runtimeMetadata = buildOpenClawHostRuntimeMetadata();
+    const liveEvents = runtimeMetadata.capabilities.includes(CHAT_TIMELINE_DELTA_CAPABILITY)
+      ? "text delta + tool lifecycle"
+      : "unavailable";
+    console.log(`Live events: ${liveEvents}`);
     console.log(t("status.gateway", readGatewayUrl()));
     console.log(`OpenClaw state:  ${resolveOpenClawStateDir()}`);
     console.log(`OpenClaw config: ${resolveOpenClawConfigPath()}`);
@@ -69,10 +81,15 @@ function statusOne(profile?: string): void {
   } else {
     console.log(`Hermes home: ${resolveHermesHomeDir()}`);
     const hermesRuntimeMode = resolveHermesRuntimeExecutionMode();
+    const runtimeMetadata = buildHermesHostRuntimeMetadata(hermesRuntimeMode);
     const hermesRuntimeLabel = hermesRuntimeMode === "local"
       ? "host-local CLI/runtime"
       : "API Server compatibility";
     console.log(`Hermes runtime: ${hermesRuntimeLabel}`);
+    const liveEvents = runtimeMetadata.capabilities.includes(CHAT_TIMELINE_DELTA_CAPABILITY)
+      ? "text delta + tool lifecycle"
+      : "tool lifecycle only; assistant text is terminal-only";
+    console.log(`Live events: ${liveEvents}`);
     const hermesApi = resolveHermesApiSettings();
     if (hermesRuntimeMode === "api" && hermesApi.configured) {
       console.log(`Hermes API:  ${hermesApi.baseUrl}`);

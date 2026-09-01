@@ -138,6 +138,23 @@ test("Hermes runtime mode uses the same process and Hermes home settings as API 
   rmSync(hermesHome, { recursive: true, force: true });
 });
 
+test("enabled Hermes API Server uses the documented default endpoint", () => {
+  const hermesHome = mkdtempSync(join(tmpdir(), "clawconnect-hermes-api-default-endpoint-"));
+  const settings = resolveHermesApiSettings({
+    env: {},
+    hermesHome,
+    fileEnv: { API_SERVER_ENABLED: "true", API_SERVER_KEY: "file-key" },
+  });
+  assert.equal(settings.baseUrl, "http://127.0.0.1:8642");
+  assert.equal(settings.executionReady, true);
+  assert.equal(resolveHermesRuntimeExecutionMode({
+    env: {},
+    hermesHome,
+    fileEnv: { API_SERVER_ENABLED: "true", API_SERVER_KEY: "file-key" },
+  }), "api");
+  rmSync(hermesHome, { recursive: true, force: true });
+});
+
 test("Hermes runtime mode does not infer API from partial configuration", () => {
   const hermesHome = mkdtempSync(join(tmpdir(), "clawconnect-hermes-partial-api-mode-"));
   assert.equal(resolveHermesRuntimeExecutionMode({

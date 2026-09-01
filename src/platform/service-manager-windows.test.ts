@@ -13,6 +13,7 @@ import {
   buildWindowsStartupRegistryArgs,
   buildWindowsServiceTaskCommand,
   getWindowsServiceStatus,
+  migrateLegacyWindowsStartup,
   normalizeWindowsServiceLogEncoding,
   WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
   WINDOWS_RUN_KEY,
@@ -104,6 +105,108 @@ test("Windows services and process queries are isolated by ClawConnect profile",
   assert.match(buildWindowsProcessQueryScript("openclaw"), /OperationTimeoutSec 3/);
   assert.match(buildWindowsScheduledTaskStateScript(), /CLAW_TASK_NAME/);
   assert.match(buildWindowsProcessQueryScript(), /-notmatch/);
+});
+
+test("Windows named profiles remove only the exact legacy scheduled task", () => {
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  const execFileSyncImpl = ((command: string, args: readonly string[]) => {
+    calls.push({ command, args });
+    if (command === "reg.exe" && args[0] === "query") {
+      throw new Error("startup entry missing");
+    }
+    return Buffer.from("success");
+  }) as typeof execFileSync;
+  let stoppedLegacyProcesses = 0;
+
+  assert.equal(migrateLegacyWindowsStartup("openclaw", {
+    execFileSyncImpl,
+    defaultProfileConfigured: false,
+    stopLegacyProcess: () => { stoppedLegacyProcesses += 1; },
+  }), true);
+  assert.deepEqual(
+    calls.map((call) => [call.command, ...call.args]),
+    [
+      ["schtasks", "/query", "/tn", "ClawConnectAgent"],
+      ["reg.exe", "query", WINDOWS_RUN_KEY, "/v", "ClawConnectAgent"],
+      ["schtasks", "/end", "/tn", "ClawConnectAgent"],
+      ["schtasks", "/delete", "/tn", "ClawConnectAgent", "/f"],
+    ],
+  );
+  assert.equal(stoppedLegacyProcesses, 1);
+  assert.ok(calls.every((call) => !call.args.includes("ClawConnectAgent-openclaw")));
+});
+
+test("Windows default profile preserves its current unsuffixed scheduled task", () => {
+  const calls: string[] = [];
+  const execFileSyncImpl = ((command: string) => {
+    calls.push(command);
+    return Buffer.from("success");
+  }) as typeof execFileSync;
+
+  assert.equal(migrateLegacyWindowsStartup(undefined, { execFileSyncImpl }), true);
+  assert.deepEqual(calls, []);
+});
+
+test("Windows named profiles preserve the unsuffixed startup owned by a configured default profile", () => {
+  const calls: string[] = [];
+  const execFileSyncImpl = ((command: string) => {
+    calls.push(command);
+    return Buffer.from("success");
+  }) as typeof execFileSync;
+
+  assert.equal(migrateLegacyWindowsStartup("openclaw", {
+    execFileSyncImpl,
+    defaultProfileConfigured: true,
+  }), true);
+  assert.deepEqual(calls, []);
+});
+
+test("Windows named profiles remove an orphaned exact legacy Run entry without a scheduled task", () => {
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  const execFileSyncImpl = ((command: string, args: readonly string[]) => {
+    calls.push({ command, args });
+    if (command === "schtasks" && args[0] === "/query") {
+      throw new Error("scheduled task missing");
+    }
+    return Buffer.from("success");
+  }) as typeof execFileSync;
+
+  assert.equal(migrateLegacyWindowsStartup("hermes", {
+    execFileSyncImpl,
+    defaultProfileConfigured: false,
+    stopLegacyProcess: () => undefined,
+  }), true);
+  assert.deepEqual(
+    calls.map((call) => [call.command, ...call.args]),
+    [
+      ["schtasks", "/query", "/tn", "ClawConnectAgent"],
+      ["reg.exe", "query", WINDOWS_RUN_KEY, "/v", "ClawConnectAgent"],
+      ["reg.exe", "delete", WINDOWS_RUN_KEY, "/v", "ClawConnectAgent", "/f"],
+    ],
+  );
+  assert.ok(calls.every((call) => !call.args.includes("ClawConnectAgent-hermes")));
+});
+
+test("Windows named profile migration fails closed when the legacy task cannot be deleted", () => {
+  const calls: Array<readonly string[]> = [];
+  const execFileSyncImpl = ((command: string, args: readonly string[]) => {
+    calls.push(args);
+    if (command === "reg.exe" && args[0] === "query") {
+      throw new Error("startup entry missing");
+    }
+    if (args[0] === "/delete") {
+      throw new Error("access denied");
+    }
+    return Buffer.from("success");
+  }) as typeof execFileSync;
+
+  assert.equal(migrateLegacyWindowsStartup("hermes", {
+    execFileSyncImpl,
+    defaultProfileConfigured: false,
+    stopLegacyProcess: () => undefined,
+  }), false);
+  assert.deepEqual(calls.at(-1), ["/delete", "/tn", "ClawConnectAgent", "/f"]);
+  assert.ok(calls.every((args) => !args.includes("ClawConnectAgent-hermes")));
 });
 
 test("Windows status trusts a running scheduled task when process command lines are hidden", () => {

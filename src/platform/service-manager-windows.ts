@@ -11,7 +11,7 @@ import {
   setRestrictiveFilePermissions,
 } from "./service-manager-common.js";
 import type { ServiceStatus } from "./service-manager-common.js";
-import { getActiveProfile, normalizeProfileName } from "../config/profile.js";
+import { getActiveProfile, listProfileNames, normalizeProfileName } from "../config/profile.js";
 import { decodeTextBuffer } from "./text-file-decoder.js";
 
 export const TASK_NAME = "ClawConnectAgent";
@@ -98,9 +98,12 @@ export function buildWindowsStartupRegistryArgs(
   ];
 }
 
-function removeWindowsStartupEntry(taskName: string): boolean {
+function removeWindowsStartupEntry(
+  taskName: string,
+  execFileSyncImpl: typeof execFileSync = execFileSync,
+): boolean {
   try {
-    execFileSync("reg.exe", ["delete", WINDOWS_RUN_KEY, "/v", taskName, "/f"], {
+    execFileSyncImpl("reg.exe", ["delete", WINDOWS_RUN_KEY, "/v", taskName, "/f"], {
       stdio: "pipe",
       windowsHide: true,
     });
@@ -148,6 +151,78 @@ function hasWindowsScheduledTask(
     }
     return false;
   }
+}
+
+export function migrateLegacyWindowsStartup(
+  profile?: string,
+  options: Pick<WindowsServiceStatusProbeOptions, "execFileSyncImpl" | "onQueryTimeout"> & {
+    defaultProfileConfigured?: boolean;
+    stopLegacyProcess?: () => void;
+  } = {},
+): boolean {
+  const resolvedProfile = normalizeProfileName(profile);
+  if (!resolvedProfile) {
+    // The unsuffixed task is still the current task for the default profile.
+    return true;
+  }
+  const defaultProfileConfigured = options.defaultProfileConfigured
+    ?? listProfileNames().includes("default");
+  if (defaultProfileConfigured) {
+    // A configured default profile legitimately owns the unsuffixed task and Run value.
+    return true;
+  }
+
+  const execFileSyncImpl = options.execFileSyncImpl ?? execFileSync;
+  const onQueryTimeout = options.onQueryTimeout ?? reportWindowsQueryTimeout;
+  let queryTimedOut = false;
+  const reportQueryTimeout = (probe: string): void => {
+    queryTimedOut = true;
+    onQueryTimeout(probe);
+  };
+  const legacyTaskExists = hasWindowsScheduledTask(
+    TASK_NAME,
+    execFileSyncImpl,
+    reportQueryTimeout,
+  );
+  const legacyStartupExists = hasWindowsStartupEntry(
+    TASK_NAME,
+    execFileSyncImpl,
+    reportQueryTimeout,
+  );
+  if (queryTimedOut) {
+    return false;
+  }
+  if (!legacyTaskExists && !legacyStartupExists) {
+    return true;
+  }
+
+  let migrated = true;
+  if (legacyTaskExists) {
+    try {
+      execFileSyncImpl("schtasks", ["/end", "/tn", TASK_NAME], {
+        stdio: "pipe",
+        windowsHide: true,
+      });
+    } catch {
+      // The legacy task can be installed without currently running.
+    }
+
+    try {
+      execFileSyncImpl("schtasks", ["/delete", "/tn", TASK_NAME, "/f"], {
+        stdio: "pipe",
+        windowsHide: true,
+      });
+    } catch {
+      migrated = false;
+    }
+  }
+
+  if (legacyStartupExists && !removeWindowsStartupEntry(TASK_NAME, execFileSyncImpl)) {
+    migrated = false;
+  }
+
+  (options.stopLegacyProcess ?? (() => { killWindowsProcess(undefined); }))();
+  return migrated;
 }
 
 export function buildWindowsScheduledTaskStateScript(): string {
@@ -371,6 +446,9 @@ export function installWindowsService(profile?: string): boolean {
   const taskName = windowsTaskName(resolvedProfile);
 
   try {
+    if (!migrateLegacyWindowsStartup(resolvedProfile)) {
+      throw new Error(`Unable to remove legacy Windows startup ${TASK_NAME}`);
+    }
     try {
       execFileSync("schtasks", ["/end", "/tn", taskName], { stdio: "pipe" });
     } catch {
@@ -488,6 +566,10 @@ export function uninstallWindowsService(profile?: string): boolean {
 export function restartWindowsService(profile?: string): boolean {
   const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
   const taskName = windowsTaskName(resolvedProfile);
+  if (!migrateLegacyWindowsStartup(resolvedProfile)) {
+    console.error(`[clawconnect] Failed to remove legacy Windows startup ${TASK_NAME}`);
+    return false;
+  }
   // Try to stop the task first
   try {
     execFileSync("schtasks", ["/end", "/tn", taskName], { stdio: "pipe" });

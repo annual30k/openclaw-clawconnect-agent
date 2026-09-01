@@ -69,8 +69,8 @@ import {
 import { prepareOpenClawVoiceInputCommand } from "./relay/openclaw-voice-input.js";
 import { voiceInputSetupMessage } from "../core/relay/voice-input.js";
 import type { FileUploadResult } from "../core/relay/file-upload.js";
-import { gatewayCapabilitiesForType } from "../gateway-profiles.js";
 import { buildRelayHelloMessage } from "./relay/relay-manager-hello.js";
+import { buildOpenClawHostRuntimeMetadata } from "../runtime-metadata.js";
 import {
   CHAT_HISTORY_FALLBACK_INITIAL_DELAY_MS,
   CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS,
@@ -537,11 +537,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     relayWs.on("open", () => {
       console.log(`Connected to relay server (gatewayId=${opts.gatewayId})`);
       opts.onConnected?.();
+      const runtimeMetadata = buildOpenClawHostRuntimeMetadata();
+      console.log(`[relay] ClawConnect Agent ${runtimeMetadata.agentVersion}; live events=timeline-delta,tool-lifecycle`);
       send(
         buildRelayHelloMessage({
-          platform: process.platform,
-          agentVersion: "1.0.0",
-          capabilities: gatewayCapabilitiesForType("openclaw"),
+          platform: runtimeMetadata.platform,
+          agentVersion: runtimeMetadata.agentVersion,
+          capabilities: runtimeMetadata.capabilities,
         }),
       );
       relayHelloTimer = setTimeout(() => {

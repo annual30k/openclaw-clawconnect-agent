@@ -149,7 +149,7 @@ Supported values:
 - `OPENCLAW_BIN` / `OPENCLAW_PACKAGE_BIN` / `OPENCLAW_INSTALL_DIR` — locate a non-npm or non-PATH OpenClaw CLI/runtime
 - `HERMES_HOME` / `HERMES_BIN` / `HERMES_PYTHON` — override Hermes data, CLI, and Python paths; native Windows auto-detects `%LOCALAPPDATA%\hermes`
 - `HERMES_SKILLS_DIR` / `CLAWCONNECT_HERMES_STATE_DB` — optional explicit Hermes skills and state database paths
-- `CLAWCONNECT_HERMES_RUNTIME_MODE` — Hermes mobile execution entrance: `local`/`native` (recommended, forwards through the host CLI/runtime) or `api` (explicit HTTP API Server compatibility mode); when omitted, an explicitly configured `CLAWCONNECT_HERMES_API_*` endpoint keeps legacy API behavior
+- `CLAWCONNECT_HERMES_RUNTIME_MODE` — Hermes mobile execution transport. Hermes pair/install enables the local API Server by default, generates a key when needed, and selects `api` so ClawLink receives host-synchronized assistant text deltas and tool lifecycle events. Set `local`/`native` only as an explicit compatibility fallback; CLI assistant text is terminal-only.
 - `CLAWCONNECT_HERMES_API_URL` / `CLAWCONNECT_HERMES_API_KEY` — explicit Hermes API connection. Without an explicit URL, ClawConnect automatically follows `platforms.api_server.extra` in `$HERMES_HOME/config.yaml`; older `API_SERVER_HOST`, `API_SERVER_PORT`, and `API_SERVER_KEY` settings remain supported as fallbacks. Discovery is configuration-based and does not scan unrelated local ports
 - `CLAWCONNECT_ENV_FILE` — optional explicit env file path. When unset, the agent reads `~/.clawconnect/.env`, then `.env.local`, then `.env`
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD` — Gateway auth fallback
@@ -264,7 +264,7 @@ For custom profiles, use `clawconnect reset --profile <name>`.
 
 ### Update to the Latest Version
 
-Upgrade the globally installed npm package and restart the background service automatically when one is installed:
+Upgrade the globally installed npm package and refresh every currently installed profile background service:
 
 ```bash
 clawconnect update
@@ -272,6 +272,8 @@ clawconnect update
 
 Notes:
 - `update` runs `npm install -g clawconnect-agent@latest` under the hood.
+- Named profiles such as `openclaw` and `hermes` are reinstalled independently so their service runners pick up the new package path.
+- When upgrading from a version that predates named-profile refresh, run `clawconnect install` once after the first update.
 - If you are running from a local source checkout instead of a global npm install, this command upgrades only the global package.
 - If your npm global prefix requires elevated permissions, rerun the printed command with the privileges appropriate for your machine.
 

@@ -5,10 +5,51 @@ import {
   buildSelfUpdateArgs,
   CLAWCONNECT_PACKAGE_NAME,
   deriveWindowsNodeModuleCliEntry,
+  installedServiceProfilesForUpdate,
   isGlobalNpmInstall,
   parseResolvedCommandPath,
   parseVersionOutput,
 } from "./update.js";
+
+test("installedServiceProfilesForUpdate finds all named background services", () => {
+  const probes: Array<string | undefined> = [];
+  const services = installedServiceProfilesForUpdate(
+    ["hermes", "openclaw"],
+    (profile) => {
+      probes.push(profile);
+      return {
+        installed: profile === "hermes" || profile === "openclaw",
+        manager: "Windows Task Scheduler",
+      };
+    },
+  );
+
+  assert.deepEqual(probes, ["hermes", "openclaw"]);
+  assert.deepEqual(services, [
+    { profile: "hermes", manager: "Windows Task Scheduler" },
+    { profile: "openclaw", manager: "Windows Task Scheduler" },
+  ]);
+});
+
+test("installedServiceProfilesForUpdate probes the default service when no profile config exists", () => {
+  const probes: Array<string | undefined> = [];
+  const services = installedServiceProfilesForUpdate([], (profile) => {
+    probes.push(profile);
+    return { installed: true, manager: "launchd" };
+  });
+
+  assert.deepEqual(probes, [undefined]);
+  assert.deepEqual(services, [{ profile: "default", manager: "launchd" }]);
+});
+
+test("installedServiceProfilesForUpdate preserves paired profiles that were intentionally not installed", () => {
+  const services = installedServiceProfilesForUpdate(
+    ["hermes", "openclaw"],
+    (profile) => ({ installed: profile === "openclaw", manager: "Windows Startup" }),
+  );
+
+  assert.deepEqual(services, [{ profile: "openclaw", manager: "Windows Startup" }]);
+});
 
 test("buildSelfUpdateArgs targets the latest published package by default", () => {
   assert.deepEqual(buildSelfUpdateArgs(), [

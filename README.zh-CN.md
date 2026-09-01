@@ -155,7 +155,7 @@ $EDITOR ~/.clawconnect/.env
 - `OPENCLAW_BIN` / `OPENCLAW_PACKAGE_BIN` / `OPENCLAW_INSTALL_DIR`：OpenClaw 不在 PATH 或不是 npm 安装时，指定 CLI/JS 入口或安装根目录
 - `HERMES_HOME` / `HERMES_BIN` / `HERMES_PYTHON`：Hermes 数据目录、CLI 与 Python 覆盖；Windows 会先自动探测 `%LOCALAPPDATA%\hermes`
 - `HERMES_SKILLS_DIR` / `CLAWCONNECT_HERMES_STATE_DB`：可选，单独指定 Hermes 技能目录和状态数据库路径
-- `CLAWCONNECT_HERMES_RUNTIME_MODE`：Hermes 移动消息的执行入口，推荐 `local`/`native`（转发到宿主机本地 CLI/runtime）；只有明确需要 HTTP API Server 兼容模式时才设为 `api`。未设置且显式配置了 `CLAWCONNECT_HERMES_API_*` 时，为兼容旧部署仍会使用 API
+- `CLAWCONNECT_HERMES_RUNTIME_MODE`：Hermes 移动消息的执行通道。Hermes 配对/安装时默认开启本机 API Server，缺少密钥时自动生成，并选择 `api`，让 ClawLink 与宿主机同步接收正文增量和工具生命周期。只有明确需要兼容回退时才设置 `local`/`native`；CLI 助手正文只有终态
 - `CLAWCONNECT_HERMES_API_URL` / `CLAWCONNECT_HERMES_API_KEY`：Hermes API 完整地址与鉴权。未显式指定地址时，ClawConnect 会自动跟随 `$HERMES_HOME/config.yaml` 中的 `platforms.api_server.extra`；旧版 `API_SERVER_HOST`、`API_SERVER_PORT`、`API_SERVER_KEY` 仍作为回退。探测基于权威配置，不会扫描无关的本机端口
 - `CLAWCONNECT_ENV_FILE`：可选，显式指定 env 文件路径；未设置时会依次读取 `~/.clawconnect/.env`、`.env.local`、`.env`
 - `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD`：Gateway 鉴权兜底值
@@ -296,7 +296,7 @@ clawconnect reset-hermes
 
 ### 11. 升级到最新版本
 
-升级全局 npm 安装的包；如果已安装后台服务，会在升级成功后自动重启服务：
+升级全局 npm 安装的包，并逐个刷新当前已经安装的 profile 后台服务：
 
 ```bash
 clawconnect update
@@ -305,6 +305,8 @@ clawconnect update
 说明：
 
 - `update` 底层执行的是 `npm install -g clawconnect-agent@latest`
+- `openclaw`、`hermes` 等命名 profile 会分别重新安装，确保后台 runner 使用新包路径
+- 如果是从尚不支持命名 profile 刷新的旧版本首次升级，升级后需要额外执行一次 `clawconnect install`
 - 如果你当前运行的是本地源码目录，而不是全局 npm 安装，这个命令只会升级全局包
 - 如果你的 npm 全局目录需要更高权限，请按终端提示手动执行对应命令
 
