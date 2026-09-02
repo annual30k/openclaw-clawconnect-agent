@@ -16,6 +16,7 @@ import { handleProviderCommand } from "./handlers/provider-handlers.js";
 import {
   DEFAULT_GATEWAY_SESSION_DEFAULTS,
   buildContextUsageFingerprint,
+  contextUsageSnapshotFromSessionsList,
   readContextUsageSnapshot,
   canonicalizeRelayParams,
   canonicalizeSessionKey,
@@ -31,8 +32,8 @@ import {
   withMessageText,
 } from "../core/relay/chat-payload.js";
 import {
+  canonicalizeOpenClawGatewayHistoryResponse,
   extractHistoryOutcome,
-  filterOpenClawHeartbeatHistoryResponse,
   readOpenClawTranscriptChatHistory,
   withTimeout,
   type HistoryResponse,
@@ -97,7 +98,7 @@ export type { RelayHelloMessage, RelayManagerOptions } from "./relay/relay-manag
 import {
   buildEmptyHistoryPage,
   buildFinalPayloadFromHistoryOutcome,
-  buildLegacyOpenClawHistoryParams,
+  buildOpenClawGatewayHistoryParams,
   extractChatErrorMessage,
   hasHistoryCursor,
   mergeCanonicalChatPayload,
@@ -106,7 +107,6 @@ import {
   nonTextContentBlocksFromHistory,
   resolveChatPayloadSeq,
   resolveChatPayloadTimestamp,
-  shouldUseLegacyOpenClawHistoryFallback,
 } from "./relay/relay-manager-payload-helpers.js";
 
 type OpenClawChatCommandExecution = {
@@ -163,6 +163,8 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
     let gatewayClient: OpenClawGatewayClient | null = null;
     let sessionDefaults: GatewaySessionDefaults = { ...DEFAULT_GATEWAY_SESSION_DEFAULTS };
+    const subscribedSessionMessageKeys = new Set<string>();
+    const pendingSessionMessageSubscriptions = new Map<string, Promise<void>>();
     const chatFallbacks = new Map<string, ReturnType<typeof setTimeout>>();
     const chatRunContexts = new Map<string, OpenClawChatRunIdentity>();
     const chatSendDedupe = new OpenClawChatSendDedupeCoordinator(() => sessionDefaults);
@@ -172,25 +174,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     let relayHelloNegotiated = false;
     let relayHelloTimer: ReturnType<typeof setTimeout> | undefined;
 
-    const clearChatFallback = (runId: string): void => {
-      const timer = chatFallbacks.get(runId);
-      if (timer) {
-        clearTimeout(timer);
-        chatFallbacks.delete(runId);
-      }
-    };
-
-    const publishContextUsageSnapshot = async (sessionKey: string, force = false): Promise<void> => {
-      const normalizedSessionKey = canonicalizeSessionKey(sessionKey, sessionDefaults);
-      if (typeof normalizedSessionKey !== "string" || normalizedSessionKey.trim().length === 0) {
-        return;
-      }
-
-      const snapshot = await readContextUsageSnapshot(normalizedSessionKey.trim(), sessionDefaults);
-      if (!snapshot) {
-        return;
-      }
-
+    const emitContextUsageSnapshot = (snapshot: NonNullable<Awaited<ReturnType<typeof readContextUsageSnapshot>>>, force = false): void => {
       const fingerprint = buildContextUsageFingerprint(snapshot);
       if (!force && contextUsageFingerprints.get(snapshot.sessionKey) === fingerprint) {
         return;
@@ -209,6 +193,42 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           maxInputTokens: snapshot.contextLimit,
         },
       });
+    };
+
+    const clearChatFallback = (runId: string): void => {
+      const timer = chatFallbacks.get(runId);
+      if (timer) {
+        clearTimeout(timer);
+        chatFallbacks.delete(runId);
+      }
+    };
+
+    const publishContextUsageSnapshot = async (sessionKey: string, force = false): Promise<void> => {
+      const normalizedSessionKey = canonicalizeSessionKey(sessionKey, sessionDefaults);
+      if (typeof normalizedSessionKey !== "string" || normalizedSessionKey.trim().length === 0) {
+        return;
+      }
+
+      const requestedSessionKey = normalizedSessionKey.trim();
+      let snapshot = null;
+      if (gatewayClient) {
+        try {
+          const sessions = await gatewayClient.request("sessions.list", {
+            limit: 100,
+            includeGlobal: true,
+            includeUnknown: true,
+          });
+          snapshot = contextUsageSnapshotFromSessionsList(sessions, requestedSessionKey, sessionDefaults);
+        } catch (error) {
+          console.warn(`[relay] failed to read context usage from sessions.list: ${String(error)}`);
+        }
+      }
+      snapshot ??= await readContextUsageSnapshot(requestedSessionKey, sessionDefaults);
+      if (!snapshot) {
+        return;
+      }
+
+      emitContextUsageSnapshot(snapshot, force);
     };
 
     const scheduleContextUsageRefresh = (sessionKey: string | undefined, delayMs = 250, force = false): void => {
@@ -307,6 +327,41 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       chatFallbacks.set(providerRunId, timer);
     };
 
+    const ensureSessionMessagesSubscribed = async (sessionKey: string): Promise<void> => {
+      const normalizedSessionKey = canonicalizeSessionKey(sessionKey, sessionDefaults);
+      if (typeof normalizedSessionKey !== "string" || normalizedSessionKey.trim().length === 0) {
+        throw new Error("cannot subscribe to an empty OpenClaw session key");
+      }
+      const key = normalizedSessionKey.trim();
+      if (subscribedSessionMessageKeys.has(key)) {
+        return;
+      }
+      const pending = pendingSessionMessageSubscriptions.get(key);
+      if (pending) {
+        return pending;
+      }
+      const client = gatewayClient;
+      if (!client) {
+        throw new Error("gateway not connected");
+      }
+
+      const subscription = client.request("sessions.messages.subscribe", { key })
+        .then(() => {
+          // Subscriptions belong to the current Gateway connection. Do not let a
+          // response from a closing connection mark the replacement as ready.
+          if (gatewayClient === client) {
+            subscribedSessionMessageKeys.add(key);
+          }
+        })
+        .finally(() => {
+          if (pendingSessionMessageSubscriptions.get(key) === subscription) {
+            pendingSessionMessageSubscriptions.delete(key);
+          }
+        });
+      pendingSessionMessageSubscriptions.set(key, subscription);
+      return subscription;
+    };
+
     const refreshSessionDefaults = async (): Promise<void> => {
       if (!gatewayClient) {
         return;
@@ -317,7 +372,29 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         if (nextDefaults) {
           sessionDefaults = nextDefaults;
         }
-        scheduleContextUsageRefresh(sessionDefaults.mainSessionKey, 50, true);
+        await ensureSessionMessagesSubscribed(sessionDefaults.mainSessionKey);
+        const sessionsPayload = await gatewayClient.request("sessions.list", {
+          limit: 100,
+          includeGlobal: true,
+          includeUnknown: true,
+        });
+        const sessionRecords = sessionsPayload && typeof sessionsPayload === "object" && !Array.isArray(sessionsPayload)
+          ? (sessionsPayload as { sessions?: unknown }).sessions
+          : undefined;
+        let publishedAny = false;
+        for (const session of Array.isArray(sessionRecords) ? sessionRecords : []) {
+          const sessionKey = session && typeof session === "object" && !Array.isArray(session)
+            ? (session as { key?: unknown }).key
+            : undefined;
+          if (typeof sessionKey !== "string" || !sessionKey.trim()) continue;
+          const snapshot = contextUsageSnapshotFromSessionsList(sessionsPayload, sessionKey, sessionDefaults);
+          if (!snapshot) continue;
+          emitContextUsageSnapshot(snapshot, true);
+          publishedAny = true;
+        }
+        if (!publishedAny) {
+          scheduleContextUsageRefresh(sessionDefaults.mainSessionKey, 50, true);
+        }
       } catch (err) {
         console.warn(`[relay] failed to load session defaults: ${String(err)}`);
       }
@@ -521,17 +598,17 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       if (hasHistoryCursor(params)) {
         return buildEmptyHistoryPage(params, sessionDefaults);
       }
-      if (!shouldUseLegacyOpenClawHistoryFallback(params, sessionDefaults)) {
-        return buildEmptyHistoryPage(params, sessionDefaults);
-      }
       if (!gatewayClient) {
         throw new Error("gateway not connected");
       }
+      const gatewayHistoryParams = buildOpenClawGatewayHistoryParams(params, sessionDefaults);
       const history = await gatewayClient.request<HistoryResponse>(
         "chat.history",
-        buildLegacyOpenClawHistoryParams(params, sessionDefaults),
+        gatewayHistoryParams,
       );
-      return filterOpenClawHeartbeatHistoryResponse(history);
+      return canonicalizeOpenClawGatewayHistoryResponse(history, {
+        sessionKey: String(gatewayHistoryParams.sessionKey),
+      });
     }
 
     relayWs.on("open", () => {
@@ -571,6 +648,8 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
         onDisconnected: (reason) => {
           console.log(`Gateway disconnected: ${reason}`);
+          subscribedSessionMessageKeys.clear();
+          pendingSessionMessageSubscriptions.clear();
           send({ type: "gateway_disconnected", reason });
           publishOfficeSnapshot(send, "gateway_disconnected", {
             reason,
@@ -624,7 +703,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               }
               return;
             }
-            let realtimePayload = normalizedPayload;
+            let realtimePayload = providerRunId && canonicalRunId && canonicalRunId !== providerRunId
+              ? {
+                  ...(normalizedPayload as Record<string, unknown>),
+                  runId: canonicalRunId,
+                  ...(resolvedSessionKey ? { sessionKey: resolvedSessionKey } : {}),
+                }
+              : normalizedPayload;
 
             if (providerRunId) {
               if (state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted") {
@@ -792,6 +877,26 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             }, Boolean(providerRunId && isTerminal));
             return;
           }
+          if (event === "agent") {
+            const p = normalizedPayload as { sessionKey?: string; runId?: string };
+            const providerRunId = typeof p?.runId === "string" ? p.runId.trim() : "";
+            let runContext = providerRunId
+              ? chatRunContexts.get(providerRunId) ?? openClawChatRunIdentities.resolve(opts.gatewayId, providerRunId)
+              : undefined;
+            const canonicalRunId = runContext?.canonicalRunId ?? providerRunId;
+            const resolvedSessionKey = p?.sessionKey ?? runContext?.sessionKey;
+            const mappedPayload = providerRunId && canonicalRunId && canonicalRunId !== providerRunId
+              ? {
+                  ...(normalizedPayload as Record<string, unknown>),
+                  runId: canonicalRunId,
+                  ...(resolvedSessionKey ? { sessionKey: resolvedSessionKey } : {}),
+                }
+              : normalizedPayload;
+            runAfterAssistantSnapshot(snapshotKeyForGatewayPayload(mappedPayload), false, () => (
+              publishAndSendGatewayEvent(event, mappedPayload, shouldPublishOffice)
+            ));
+            return;
+          }
           runAfterAssistantSnapshot(snapshotKeyForGatewayPayload(normalizedPayload), false, () => (
             publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice)
           ));
@@ -939,6 +1044,15 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         const paramsRecord = params && typeof params === "object" && !Array.isArray(params)
           ? params as Record<string, unknown>
           : undefined;
+        if (commandMethod === "chat.send" || commandMethod === "agent") {
+          const commandSessionKey = typeof paramsRecord?.sessionKey === "string" && paramsRecord.sessionKey.trim()
+            ? paramsRecord.sessionKey.trim()
+            : sessionDefaults.mainSessionKey;
+          // OpenClaw 2026.8+ routes non-Control-UI live chat only to explicit
+          // session subscribers. Subscribe before starting the run so its first
+          // thinking/tool/text event cannot win the race with this request.
+          await ensureSessionMessagesSubscribed(commandSessionKey);
+        }
         const registerIdentity = (result: unknown): OpenClawChatRunIdentity | undefined => {
           const resultRecord = result && typeof result === "object" && !Array.isArray(result)
             ? result as Record<string, unknown>

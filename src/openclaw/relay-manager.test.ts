@@ -75,7 +75,7 @@ test("relay manager forwards OpenClaw agent tool events to relay", async () => {
     socket.send(JSON.stringify({
       type: "event",
       event: "connect.challenge",
-      payload: { nonce: "nonce-1" },
+      payload: { nonce: "nonce-1", ts: Date.now() },
     }));
     socket.on("message", (raw) => {
       const msg = JSON.parse(raw.toString()) as {
@@ -137,6 +137,160 @@ test("relay manager forwards OpenClaw agent tool events to relay", async () => {
   }
 });
 
+test("relay manager subscribes before chat.send and streams canonical OpenClaw tool and text events", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  const gatewayMethods: string[] = [];
+  let gatewaySocket: WebSocket | undefined;
+  let relaySocket: WebSocket | undefined;
+  let sessionMessagesSubscribed = false;
+
+  relayServer.on("connection", (socket) => {
+    relaySocket = socket;
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+      relayMessages.push(message);
+    });
+  });
+
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({
+      type: "event",
+      event: "connect.challenge",
+      payload: { nonce: "nonce-agent-tool", ts: Date.now() },
+    }));
+    socket.on("message", (raw) => {
+      const msg = JSON.parse(raw.toString()) as {
+        type?: string;
+        id?: string;
+        method?: string;
+      };
+      if (msg.type !== "req" || !msg.id) {
+        return;
+      }
+      if (msg.method) {
+        gatewayMethods.push(msg.method);
+      }
+      if (msg.method === "connect") {
+        socket.send(JSON.stringify({ type: "res", id: msg.id, ok: true, payload: {} }));
+        return;
+      }
+      if (msg.method === "sessions.messages.subscribe") {
+        sessionMessagesSubscribed = true;
+        socket.send(JSON.stringify({
+          type: "res",
+          id: msg.id,
+          ok: true,
+          payload: { subscribed: true, key: "agent:main:main" },
+        }));
+        return;
+      }
+      if (msg.method === "chat.send") {
+        socket.send(JSON.stringify({
+          type: "res",
+          id: msg.id,
+          ok: true,
+          payload: { runId: "openclaw-run-456" },
+        }));
+        if (!sessionMessagesSubscribed) {
+          return;
+        }
+        socket.send(JSON.stringify({
+          type: "event",
+          event: "agent",
+          payload: {
+            runId: "openclaw-run-456",
+            sessionKey: "main",
+            stream: "tool",
+            data: {
+              phase: "start",
+              toolCallId: "tool-weather-1",
+              name: "weather",
+            },
+          },
+        }));
+        socket.send(JSON.stringify({
+          type: "event",
+          event: "chat",
+          payload: {
+            runId: "openclaw-run-456",
+            sessionKey: "main",
+            state: "delta",
+            role: "assistant",
+            seq: 1,
+            delta: "天气查询中",
+          },
+        }));
+        return;
+      }
+      socket.send(JSON.stringify({
+        type: "res",
+        id: msg.id,
+        ok: true,
+        payload: msg.method === "config.get" ? sessionDefaultsPayload() : {},
+      }));
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-test",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+
+  try {
+    await waitFor(() => Boolean(relaySocket) && relayMessages.some((m) => m.type === "gateway_connected"), 4_000);
+    relaySocket?.send(JSON.stringify({
+      type: "cmd",
+      id: "send-tool-1",
+      method: "chat.send",
+      params: {
+        sessionKey: "main",
+        message: "查天气",
+        idempotencyKey: "wx-run-weather-canonical",
+      },
+    }));
+
+    await waitFor(() => relayMessages.some((message) => {
+      return message.type === "event" &&
+        message.event === "agent" &&
+        isRecord(message.payload) &&
+        message.payload.runId === "wx-run-weather-canonical" &&
+        isRecord(message.payload.data) &&
+        message.payload.data.toolCallId === "tool-weather-1" &&
+        message.payload.data.name === "weather";
+    }), 4_000);
+    await waitFor(() => relayMessages.some((message) => (
+      message.type === "event" &&
+      message.event === "chat" &&
+      isRecord(message.payload) &&
+      message.payload.runId === "wx-run-weather-canonical" &&
+      message.payload.state === "delta" &&
+      extractPayloadText(message.payload) === "天气查询中"
+    )), 4_000);
+    assert.ok(
+      gatewayMethods.indexOf("sessions.messages.subscribe") < gatewayMethods.indexOf("chat.send"),
+      "the session must be subscribed before chat.send starts the run",
+    );
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+  }
+});
+
 test("relay manager publishes OpenClaw chat deltas as accumulated assistant text", async () => {
   const relayServer = new WebSocketServer({ port: 0 });
   const gatewayServer = new WebSocketServer({ port: 0 });
@@ -156,7 +310,7 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
     socket.send(JSON.stringify({
       type: "event",
       event: "connect.challenge",
-      payload: { nonce: "nonce-1" },
+      payload: { nonce: "nonce-1", ts: Date.now() },
     }));
     socket.on("message", (raw) => {
       const msg = JSON.parse(raw.toString()) as {
@@ -294,7 +448,7 @@ test("relay manager projects an OpenClaw assistant-media sidecar onto the parent
   });
   gatewayServer.on("connection", (socket) => {
     gatewaySocket = socket;
-    socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "nonce-sidecar" } }));
+    socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "nonce-sidecar", ts: Date.now() } }));
     socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString()) as { type?: string; id?: string; method?: string };
       if (message.type !== "req" || !message.id) return;
@@ -404,7 +558,7 @@ test("relay manager keeps mobile chat identity across provider events and transc
     socket.send(JSON.stringify({
       type: "event",
       event: "connect.challenge",
-      payload: { nonce: "nonce-stable-identity" },
+      payload: { nonce: "nonce-stable-identity", ts: Date.now() },
     }));
     socket.on("message", (raw) => {
       void (async () => {
@@ -679,7 +833,7 @@ test("relay manager does not complete an OpenClaw run for a thinking plus toolCa
     socket.send(JSON.stringify({
       type: "event",
       event: "connect.challenge",
-      payload: { nonce: "nonce-tool-preamble" },
+      payload: { nonce: "nonce-tool-preamble", ts: Date.now() },
     }));
     socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString()) as {
@@ -815,7 +969,7 @@ test("relay manager restores identity and cumulative assistant text after Relay 
     socket.send(JSON.stringify({
       type: "event",
       event: "connect.challenge",
-      payload: { nonce: `nonce-reconnect-${connectionNumber}` },
+      payload: { nonce: `nonce-reconnect-${connectionNumber}`, ts: Date.now() },
     }));
     socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString()) as {
@@ -975,7 +1129,7 @@ test("relay manager answers chat.history cursor pages from OpenClaw transcripts 
     socket.send(JSON.stringify({
       type: "event",
       event: "connect.challenge",
-      payload: { nonce: "nonce-1" },
+      payload: { nonce: "nonce-1", ts: Date.now() },
     }));
     socket.on("message", (raw) => {
       const msg = JSON.parse(raw.toString()) as {
@@ -1050,7 +1204,7 @@ test("relay manager answers chat.history cursor pages from OpenClaw transcripts 
   }
 });
 
-test("relay manager sanitizes legacy OpenClaw chat.history fallback params", async () => {
+test("relay manager queries and canonicalizes non-main OpenClaw v4 history", async () => {
   const openclawHome = await createEmptyOpenClawHomeFixture();
   const previousOpenClawHome = process.env.CLAWCONNECT_OPENCLAW_HOME;
   process.env.CLAWCONNECT_OPENCLAW_HOME = openclawHome.home;
@@ -1076,7 +1230,7 @@ test("relay manager sanitizes legacy OpenClaw chat.history fallback params", asy
     socket.send(JSON.stringify({
       type: "event",
       event: "connect.challenge",
-      payload: { nonce: "nonce-1" },
+      payload: { nonce: "nonce-1", ts: Date.now() },
     }));
     socket.on("message", (raw) => {
       const msg = JSON.parse(raw.toString()) as {
@@ -1097,8 +1251,20 @@ test("relay manager sanitizes legacy OpenClaw chat.history fallback params", asy
         ok: true,
         payload: msg.method === "chat.history"
           ? {
+              sessionKey: "mobile-session-c6ae",
+              sessionId: "provider-session-c6ae",
               messages: [
-                { id: "legacy-user", role: "user", content: [{ type: "text", text: "legacy" }] },
+                {
+                  role: "user",
+                  content: "non-main prompt",
+                  idempotencyKey: "non-main-run:user",
+                  __openclaw: { id: "provider-user", runId: "non-main-run", seq: 41 },
+                },
+                {
+                  role: "assistant",
+                  content: [{ type: "text", text: "non-main reply" }],
+                  __openclaw: { id: "provider-assistant", runId: "non-main-run", seq: 42 },
+                },
                 { id: "heartbeat-user", role: "user", content: [{ type: "text", text: "[OpenClaw heartbeat poll]" }] },
                 { id: "heartbeat-assistant", role: "assistant", content: [{ type: "text", text: "HEARTBEAT_OK" }] },
               ],
@@ -1127,22 +1293,29 @@ test("relay manager sanitizes legacy OpenClaw chat.history fallback params", asy
     await waitFor(() => Boolean(relaySocket) && relayMessages.some((message) => message.type === "gateway_connected"), 4_000);
     relaySocket?.send(JSON.stringify({
       type: "cmd",
-      id: "history-legacy",
+      id: "history-non-main",
       method: "chat.history",
       params: {
-        sessionKey: "agent:main:main",
+        sessionKey: "mobile-session-c6ae",
         limit: 7,
         cursor: "",
         direction: "older",
       },
     }));
 
-    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "history-legacy"), 4_000);
-    assert.deepEqual(gatewayHistoryRequests, [{ sessionKey: "agent:main:main", limit: 7 }]);
-    const response = relayMessages.find((message) => message.type === "res" && message.id === "history-legacy");
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "history-non-main"), 4_000);
+    assert.deepEqual(gatewayHistoryRequests, [{ sessionKey: "mobile-session-c6ae", limit: 7 }]);
+    const response = relayMessages.find((message) => message.type === "res" && message.id === "history-non-main");
     assert.equal(response?.ok, true);
-    const payload = response?.payload as { messages?: Array<Record<string, unknown>> };
-    assert.deepEqual(payload.messages?.map((message) => message.id), ["legacy-user"]);
+    const payload = response?.payload as {
+      messages?: Array<Record<string, unknown>>;
+      timelineSnapshot?: { messages?: Array<Record<string, unknown>> };
+    };
+    assert.deepEqual(payload.messages?.map((message) => message.role), ["user", "assistant"]);
+    assert.deepEqual(payload.timelineSnapshot?.messages?.map((message) => message.messageId), [
+      "user-non-main-run",
+      "assistant-non-main-run",
+    ]);
   } finally {
     abort.abort();
     gatewaySocket?.close(1000, "test done");
@@ -1197,7 +1370,7 @@ test("relay manager removes duplicate OpenClaw prompt mirrors before serving tra
     socket.send(JSON.stringify({
       type: "event",
       event: "connect.challenge",
-      payload: { nonce: "nonce-1" },
+      payload: { nonce: "nonce-1", ts: Date.now() },
     }));
     socket.on("message", (raw) => {
       void (async () => {
@@ -1265,7 +1438,7 @@ test("relay manager removes duplicate OpenClaw prompt mirrors before serving tra
           type: "res",
           id: "unknown",
           ok: false,
-          error: { message: String(error) },
+          error: { code: "TEST_ERROR", message: String(error) },
         }));
       });
     });
@@ -1353,7 +1526,7 @@ test("relay manager reuses one OpenClaw model request for concurrent and termina
     socket.send(JSON.stringify({
       type: "event",
       event: "connect.challenge",
-      payload: { nonce: "nonce-idempotency" },
+      payload: { nonce: "nonce-idempotency", ts: Date.now() },
     }));
     socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString()) as {
@@ -1373,7 +1546,7 @@ test("relay manager reuses one OpenClaw model request for concurrent and termina
               type: "res",
               id: message.id,
               ok: false,
-              error: { message: "provider_unavailable" },
+              error: { code: "PROVIDER_UNAVAILABLE", message: "provider_unavailable" },
             }));
             return;
           }

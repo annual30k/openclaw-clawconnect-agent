@@ -11,22 +11,9 @@ import type {
   HistoryResponse,
 } from "./chat-history.js";
 
-export function shouldUseLegacyOpenClawHistoryFallback(
-  params: unknown,
-  sessionDefaults: GatewaySessionDefaults,
-): boolean {
-  const record = asRecord(params) ?? {};
-  const rawSessionKey =
-    typeof record.sessionKey === "string" && record.sessionKey.trim().length > 0
-      ? record.sessionKey.trim()
-      : sessionDefaults.mainSessionKey;
-  const normalized = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
-  return typeof normalized === "string" && normalized === sessionDefaults.mainSessionKey;
-}
-
-// legacy OpenClaw 只可靠暴露主会话历史。非主会话不能回退到 legacy 参数，
-// 否则会把其他会话的历史映射到当前移动端 session。
-export function buildLegacyOpenClawHistoryParams(
+// OpenClaw v4 chat.history is session-scoped. Preserve every non-main key
+// verbatim while continuing to collapse the documented aliases of main.
+export function buildOpenClawGatewayHistoryParams(
   params: unknown,
   sessionDefaults: GatewaySessionDefaults,
 ): Record<string, unknown> {

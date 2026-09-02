@@ -365,9 +365,11 @@ test("runHermesChatHistory extracts stable mobile turn metadata from Hermes expo
 
 test("runHermesChatHistory excludes tool-call assistant interims and keeps the terminal reply", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hermes-history-terminal-assistant-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
   const previousHermesBin = process.env.HERMES_BIN;
   try {
     const hermesBin = join(dir, "hermes");
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = join(dir, "sessions.json");
     const exported = {
       sessionId: "s1",
       messages: [
@@ -418,6 +420,11 @@ test("runHermesChatHistory excludes tool-call assistant interims and keeps the t
     ].join("\n"));
     chmodSync(hermesBin, 0o755);
     process.env.HERMES_BIN = hermesBin;
+    await rememberHermesSession("qa-no-cli-stream", {
+      sessionKey: "qa-no-cli-stream",
+      hermesSessionId: "s1",
+      kind: "hermes",
+    });
 
     const result = await runHermesChatHistory({ sessionKey: "qa-no-cli-stream", limit: 10 });
     assert.equal(result.ok, true);
@@ -441,6 +448,7 @@ test("runHermesChatHistory excludes tool-call assistant interims and keeps the t
       false,
     );
   } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousHermesBin);
     rmSync(dir, { recursive: true, force: true });
   }

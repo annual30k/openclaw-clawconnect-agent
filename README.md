@@ -422,7 +422,7 @@ Tests are colocated with the source as `*.test.ts`. They run with `npm test`, an
 ## Requirements
 
 - macOS, Linux, or Windows 10 / Server 2016+
-- Node.js 18+
+- Node.js 22.19+
 
 ## License
 

@@ -4,6 +4,7 @@ import { buildHistorySnapshotPage } from "../../core/relay/timeline-event-builde
 import type {
   CanonicalTimelineHistorySnapshotPage,
   TimelineContentBlock,
+  TimelineHistoryMessage,
   TimelineMessageState,
   TimelineRole,
 } from "../../core/relay/timeline-event-log.js";
@@ -177,6 +178,156 @@ export async function readChatHistoryFromTranscriptFile(
       attachments: [],
     }),
   };
+}
+
+/**
+ * OpenClaw v4 may serve chat.history from its state database even when the
+ * legacy transcript file is unavailable. The v4 response deliberately keeps
+ * canonical identity under __openclaw, so Relay cannot consume its raw
+ * messages as a timeline snapshot. Project those protocol fields here instead
+ * of asking downstream clients to infer missing user turns from assistant text.
+ */
+export function canonicalizeOpenClawGatewayHistoryResponse(
+  history: HistoryResponse,
+  request: { sessionKey: string; cursor?: string },
+): HistoryResponse {
+  const filtered = filterOpenClawHeartbeatHistoryResponse(history);
+  if (filtered.timelineSnapshot) {
+    return filtered;
+  }
+
+  const sessionKey = cleanHistoryString(filtered.sessionKey) ?? request.sessionKey;
+  const messages = filtered.messages ?? [];
+  const sourceOrderScope = cleanHistoryString(filtered.sessionId)
+    ?? messages.map(openClawTranscriptSource).find((value): value is string => Boolean(value));
+
+  return {
+    ...filtered,
+    sessionKey,
+    timelineSnapshot: buildHistorySnapshotPage({
+      gatewayId: "clawconnect",
+      sessionKey,
+      cursor: request.cursor ?? null,
+      hasMore: Boolean(filtered.hasMore),
+      nextCursor: filtered.nextCursor ?? null,
+      newestCursor: filtered.newestCursor ?? null,
+      orderPolicy: "transcript",
+      ...(sourceOrderScope ? { sourceOrderScope } : {}),
+      messages: canonicalizeOpenClawGatewayHistoryMessages(messages, sessionKey),
+      attachments: [],
+    }),
+  };
+}
+
+function canonicalizeOpenClawGatewayHistoryMessages(
+  messages: HistoryMessage[],
+  sessionKey: string,
+): TimelineHistoryMessage[] {
+  const finalAssistantIndexByRunId = new Map<string, number>();
+  messages.forEach((message, index) => {
+    if (normalizeTimelineRole(message.role) !== "assistant") return;
+    const runId = openClawRunId(message);
+    if (runId) finalAssistantIndexByRunId.set(runId, index);
+  });
+
+  return messages.map((message, index) => {
+    const seq = messageSeq(message) ?? index + 1;
+    const role = normalizeTimelineRole(message.role);
+    const rawIdempotencyKey = historyString(message, "idempotencyKey", "idempotency_key")
+      ?? openClawHistoryString(message, "idempotencyKey", "idempotency_key");
+    const clientMessageId = historyString(message, "clientMessageId", "client_message_id");
+    const normalizedInputId = normalizeTranscriptTurnId(rawIdempotencyKey)
+      ?? normalizeTranscriptTurnId(clientMessageId);
+    const providerMessageId = historyString(message, "messageId", "message_id", "id")
+      ?? openClawHistoryString(message, "id");
+    const runId = historyString(message, "runId", "run_id")
+      ?? openClawRunId(message)
+      ?? normalizedInputId;
+    const turnId = historyString(message, "turnId", "turn_id")
+      ?? runId
+      ?? normalizedInputId
+      ?? providerMessageId
+      ?? `history-${sessionKey}-${seq}-${role}`;
+    const toolCallId = role === "tool"
+      ? historyString(message, "toolCallId", "tool_call_id")
+      : undefined;
+    const content = normalizeTimelineContentBlocks(message.content);
+    const canonicalContent = toolCallId
+      ? content.map((block) => historyString(block, "toolCallId", "tool_call_id")
+        ? block
+        : { ...block, toolCallId })
+      : content;
+    const messageId = gatewayHistoryMessageId({
+      role,
+      turnId,
+      runId,
+      providerMessageId,
+      toolCallId,
+      index,
+      finalAssistantIndexByRunId,
+    });
+
+    return {
+      turnId,
+      runId: runId ?? turnId,
+      messageId,
+      role,
+      messageState: normalizeTimelineMessageState(message),
+      createdAt: normalizeTimelineCreatedAt(message) ?? fallbackTimelineCreatedAt(messages, index),
+      partId: historyString(message, "partId", "part_id") ?? "part-text-1",
+      content: canonicalContent,
+      seq,
+      turnSeq: historyNumber(message, "turnSeq", "turn_seq") ?? seq,
+      ...(clientMessageId ? { clientMessageId } : {}),
+      ...(normalizedInputId ? { idempotencyKey: normalizedInputId } : {}),
+      ...(extractAttachmentIds(canonicalContent).length > 0
+        ? { attachmentIds: extractAttachmentIds(canonicalContent) }
+        : {}),
+    };
+  });
+}
+
+function gatewayHistoryMessageId(input: {
+  role: TimelineRole;
+  turnId: string;
+  runId?: string;
+  providerMessageId?: string;
+  toolCallId?: string;
+  index: number;
+  finalAssistantIndexByRunId: Map<string, number>;
+}): string {
+  if (input.role === "user" && input.runId) {
+    return `user-${input.runId}`;
+  }
+  if (
+    input.role === "assistant"
+    && input.runId
+    && input.finalAssistantIndexByRunId.get(input.runId) === input.index
+  ) {
+    return `assistant-${input.runId}`;
+  }
+  if (input.role === "tool" && input.toolCallId) {
+    return `tool-${input.toolCallId}`;
+  }
+  return input.providerMessageId ?? `${input.role}-${input.turnId}`;
+}
+
+function openClawHistoryMetadata(message: HistoryMessage): Record<string, unknown> | undefined {
+  return isRecord(message.__openclaw) ? message.__openclaw : undefined;
+}
+
+function openClawHistoryString(message: HistoryMessage, ...fields: string[]): string | undefined {
+  const metadata = openClawHistoryMetadata(message);
+  return metadata ? historyString(metadata, ...fields) : undefined;
+}
+
+function openClawRunId(message: HistoryMessage): string | undefined {
+  return openClawHistoryString(message, "runId", "run_id");
+}
+
+function openClawTranscriptSource(message: HistoryMessage): string | undefined {
+  const position = openClawHistoryMetadata(message)?.transcriptPosition;
+  return isRecord(position) ? historyString(position, "source") : undefined;
 }
 
 function normalizeTranscriptHistoryParams(
@@ -571,7 +722,7 @@ function lastMessageSeq(messages: HistoryMessage[]): number | undefined {
 }
 
 function messageSeq(message: HistoryMessage | undefined): number | undefined {
-  const raw = message?.seq;
+  const raw = message?.seq ?? (message ? historyNumber(openClawHistoryMetadata(message) ?? {}, "seq") : undefined);
   return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.round(raw) : undefined;
 }
 

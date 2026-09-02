@@ -5,11 +5,137 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  canonicalizeOpenClawGatewayHistoryResponse,
   clearTranscriptHistoryCache,
   filterOpenClawHeartbeatArtifacts,
   readChatHistoryFromTranscriptFile,
   type HistoryResponse,
 } from "./chat-history.js";
+
+test("OpenClaw v4 gateway history becomes a canonical snapshot with native user turns", () => {
+  const firstRunId = "f7ef5c1e-c3e9-48fd-a2a5-84d4f029bc07";
+  const secondRunId = "b3eae41d-40ee-4a59-b65e-9182a26adf12";
+  const page = canonicalizeOpenClawGatewayHistoryResponse({
+    sessionKey: "main",
+    sessionId: "session-v4",
+    messages: [
+      {
+        role: "user",
+        content: "你好",
+        idempotencyKey: `${firstRunId}:user`,
+        timestamp: 1_788_355_499_910,
+        __openclaw: { id: "provider-user-1", seq: 212 },
+      },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "greet" }, { type: "text", text: "你好 Alex" }],
+        timestamp: 1_788_355_500_183,
+        __openclaw: { id: "provider-assistant-1", seq: 213, runId: firstRunId },
+      },
+      {
+        role: "user",
+        content: "你可以做什么",
+        idempotencyKey: `${secondRunId}:user`,
+        timestamp: 1_788_355_511_481,
+        __openclaw: { id: "provider-user-2", seq: 214 },
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "我可以帮你完成任务" }],
+        timestamp: 1_788_355_511_699,
+        __openclaw: { id: "provider-assistant-2", seq: 215, runId: secondRunId },
+      },
+    ],
+    hasMore: true,
+  }, { sessionKey: "main" });
+
+  assert.deepEqual(page.timelineSnapshot?.messages.map((message) => ({
+    role: message.role,
+    turnId: message.turnId,
+    runId: message.runId,
+    messageId: message.messageId,
+    idempotencyKey: message.idempotencyKey,
+    seq: message.seq,
+  })), [
+    {
+      role: "user",
+      turnId: firstRunId,
+      runId: firstRunId,
+      messageId: `user-${firstRunId}`,
+      idempotencyKey: firstRunId,
+      seq: 212,
+    },
+    {
+      role: "assistant",
+      turnId: firstRunId,
+      runId: firstRunId,
+      messageId: `assistant-${firstRunId}`,
+      idempotencyKey: undefined,
+      seq: 213,
+    },
+    {
+      role: "user",
+      turnId: secondRunId,
+      runId: secondRunId,
+      messageId: `user-${secondRunId}`,
+      idempotencyKey: secondRunId,
+      seq: 214,
+    },
+    {
+      role: "assistant",
+      turnId: secondRunId,
+      runId: secondRunId,
+      messageId: `assistant-${secondRunId}`,
+      idempotencyKey: undefined,
+      seq: 215,
+    },
+  ]);
+  assert.equal(page.timelineSnapshot?.hasMore, true);
+  assert.deepEqual(page.timelineSnapshot?.extensions, {
+    orderPolicy: "transcript",
+    sourceOrderScope: "session-v4",
+  });
+});
+
+test("OpenClaw v4 gateway history keeps tool interims distinct from the final assistant", () => {
+  const runId = "run-tool-1";
+  const page = canonicalizeOpenClawGatewayHistoryResponse({
+    sessionKey: "main",
+    messages: [
+      {
+        role: "user",
+        content: "查天气",
+        idempotencyKey: `${runId}:user`,
+        __openclaw: { id: "provider-user", seq: 10 },
+      },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call-weather", name: "weather" }],
+        __openclaw: { id: "provider-assistant-tool", seq: 11, runId },
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call-weather",
+        content: [{ type: "text", text: "晴" }],
+        __openclaw: { id: "provider-tool-result", seq: 12, runId },
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "今天晴天" }],
+        __openclaw: { id: "provider-assistant-final", seq: 13, runId },
+      },
+    ],
+  }, { sessionKey: "main" });
+
+  assert.deepEqual(page.timelineSnapshot?.messages.map((message) => message.messageId), [
+    `user-${runId}`,
+    "provider-assistant-tool",
+    "tool-call-weather",
+    `assistant-${runId}`,
+  ]);
+  assert.equal(new Set(page.timelineSnapshot?.messages.map((message) => message.messageId)).size, 4);
+  assert.equal(page.timelineSnapshot?.messages[2]?.turnId, runId);
+});
 
 test("transcript history hides completed OpenClaw heartbeat-only turns", async () => {
   const fixture = await createTranscriptFixture(4, [

@@ -19,6 +19,58 @@ export type ContextUsageSnapshot = {
   totalTokens?: number;
 };
 
+/**
+ * OpenClaw 2026.8 stores live session metadata in SQLite instead of the old
+ * sessions.json index. Keep usage collection on the public gateway response
+ * so it remains compatible with both storage backends.
+ */
+export function contextUsageSnapshotFromSessionsList(
+  payload: unknown,
+  sessionKey: string,
+  defaults: GatewaySessionDefaults,
+): ContextUsageSnapshot | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  const record = payload as Record<string, unknown>;
+  const sessions = Array.isArray(record.sessions) ? record.sessions : [];
+  const targetKeys = sessionKeyCandidates(sessionKey, defaults);
+  const session = sessions.find((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const key = typeof (candidate as Record<string, unknown>).key === "string"
+      ? (candidate as Record<string, unknown>).key
+      : "";
+    return [...sessionKeyCandidates(key, defaults)].some((candidateKey) => targetKeys.has(candidateKey));
+  }) as Record<string, unknown> | undefined;
+  if (!session) {
+    return null;
+  }
+
+  const payloadDefaults = record.defaults && typeof record.defaults === "object" && !Array.isArray(record.defaults)
+    ? record.defaults as Record<string, unknown>
+    : {};
+  const budget = session.contextBudgetStatus && typeof session.contextBudgetStatus === "object" && !Array.isArray(session.contextBudgetStatus)
+    ? session.contextBudgetStatus as Record<string, unknown>
+    : {};
+  const contextUsage = firstNonNegativeInteger(
+    session.inputTokens,
+    session.promptTokens,
+    budget.estimatedPromptTokens,
+    session.totalTokens,
+  );
+  const contextLimit = firstPositiveInteger(session.contextTokens, payloadDefaults.contextTokens);
+  const currentModel = firstNonEmptyString(session.model, session.currentModel, payloadDefaults.model);
+  if (contextUsage === undefined && contextLimit === undefined && !currentModel) {
+    return null;
+  }
+  return {
+    sessionKey: canonicalizeSessionKey(sessionKey, defaults) as string,
+    ...(currentModel ? { currentModel } : {}),
+    ...(contextUsage !== undefined ? { contextUsage, promptTokens: contextUsage } : {}),
+    ...(contextLimit !== undefined ? { contextLimit } : {}),
+  };
+}
+
 export function buildContextUsageFingerprint(snapshot: ContextUsageSnapshot): string {
   return JSON.stringify({
     currentModel: snapshot.currentModel ?? null,
@@ -257,6 +309,44 @@ function toNonNegativeInteger(value: unknown): number | undefined {
 function toPositiveInteger(value: unknown): number | undefined {
   const normalized = toNonNegativeInteger(value);
   return typeof normalized === "number" && normalized > 0 ? normalized : undefined;
+}
+
+function firstNonNegativeInteger(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const normalized = toNonNegativeInteger(value);
+    if (normalized !== undefined) return normalized;
+  }
+  return undefined;
+}
+
+function firstPositiveInteger(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const normalized = toPositiveInteger(value);
+    if (normalized !== undefined) return normalized;
+  }
+  return undefined;
+}
+
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function sessionKeyCandidates(rawValue: unknown, defaults: GatewaySessionDefaults): Set<string> {
+  if (typeof rawValue !== "string" || !rawValue.trim()) return new Set();
+  const key = canonicalizeSessionKey(rawValue, defaults);
+  if (typeof key !== "string" || !key.trim()) return new Set();
+  const normalized = key.trim();
+  const result = new Set([normalized]);
+  const qualified = normalized.match(/^agent:[^:]+:(.+)$/)?.[1];
+  if (qualified) {
+    result.add(qualified);
+  } else {
+    result.add(`agent:${defaults.defaultAgentId || "main"}:${normalized}`);
+  }
+  return result;
 }
 
 function resolveAgentIdFromSessionKey(sessionKey: string, defaults: GatewaySessionDefaults): string {

@@ -11,10 +11,35 @@ import {
 import { extractHistoryOutcome, type HistoryResponse } from "./chat-history.js";
 import {
   canonicalizeRelayParams,
+  contextUsageSnapshotFromSessionsList,
   extractGatewaySessionDefaults,
   buildContextUsageFingerprint,
   type GatewaySessionDefaults,
 } from "./session-context.js";
+
+test("session usage resolves an unqualified mobile key from OpenClaw sessions.list", () => {
+  const snapshot = contextUsageSnapshotFromSessionsList(
+    {
+      defaults: { model: "mimo-v2.5-pro", contextTokens: 1_048_576 },
+      sessions: [{
+        key: "agent:main:mobile-mt717jco-egmpibpa",
+        inputTokens: 1_171,
+        contextTokens: 1_048_576,
+        model: "mimo-v2.5-pro",
+      }],
+    },
+    "mobile-mt717jco-egmpibpa",
+    { mainSessionKey: "agent:main:main", mainKey: "main", defaultAgentId: "main" },
+  );
+
+  assert.deepEqual(snapshot, {
+    sessionKey: "mobile-mt717jco-egmpibpa",
+    currentModel: "mimo-v2.5-pro",
+    contextUsage: 1_171,
+    promptTokens: 1_171,
+    contextLimit: 1_048_576,
+  });
+});
 
 test("chat payload helpers normalize event shape and preserve streamed text", () => {
   const normalized = normalizeChatEventPayload({

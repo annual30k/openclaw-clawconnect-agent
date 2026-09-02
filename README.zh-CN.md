@@ -477,7 +477,7 @@ clawconnect-agent/
 ## 前置要求
 
 - macOS、Linux 或 Windows 10 / Server 2016+
-- Node.js `18+`
+- Node.js `22.19+`
 - 本机已安装并可运行 `openclaw`
 - 本机 OpenClaw Gateway 能正常启动
 
