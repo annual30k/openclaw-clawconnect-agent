@@ -1,9 +1,10 @@
 import assert from "assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import test from "node:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "fs/promises";
+import { mkdtemp, mkdir, readFile, rm, unlink, writeFile } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
+import { DatabaseSync } from "node:sqlite";
 import {
   extractDeliverablePathCandidates,
   relayOutgoingMediaInHistoryResponse,
@@ -11,6 +12,7 @@ import {
 } from "./outgoing-media-relay.js";
 import {
   isOpenClawAssistantMediaSidecarPayload,
+  normalizeOpenClawAutomaticMediaReplies,
   normalizeOpenClawAssistantMediaSidecars,
 } from "./assistant-media-sidecar.js";
 
@@ -73,9 +75,46 @@ test("relayOutgoingMediaInPayload uploads OpenClaw outgoing media and rewrites t
     assert.equal(image.sourceRunId, "assistant-run-outgoing");
     assert.equal(image.gatewayId, "gw_test");
     assert.equal(image.sessionKey, "agent:main:session_1");
+    assert.equal(server.initBody()?.timelineDelivery, "embedded");
     const eventImage = result.timelineEvents[0]?.content[1] as Record<string, unknown>;
     assert.equal(eventImage.fileId, "file_outgoing_payload");
     assert.deepEqual(result.timelineEvents[0]?.attachmentIds, [fixture.attachmentId, "file_outgoing_payload"]);
+  } finally {
+    await server.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("relayOutgoingMediaInPayload uploads an OpenClaw SQLite managed outgoing image", async () => {
+  const fixture = await createSqliteOutgoingMediaFixture();
+  const server = await createFileUploadRelayServer("file_outgoing_sqlite");
+  try {
+    const payload = {
+      runId: "assistant-run-sqlite",
+      message: {
+        role: "assistant",
+        content: [{
+          type: "image",
+          url: `/api/chat/media/outgoing/agent%3Amain%3Asession_1/${fixture.attachmentId}/full`,
+        }],
+      },
+    };
+
+    const result = await relayOutgoingMediaInPayload(payload, {
+      relayServerUrl: server.baseUrl,
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      stateDir: fixture.stateDir,
+      cache: new Map(),
+    }) as typeof payload;
+
+    const image = result.message.content[0] as Record<string, unknown>;
+    assert.equal(image.fileId, "file_outgoing_sqlite");
+    assert.equal(image.fileName, "photo.png");
+    assert.equal(image.mimeType, "image/png");
+    assert.equal(image.width, 20);
+    assert.equal(image.height, 10);
+    assert.equal(server.initRequestCount(), 1);
   } finally {
     await server.close();
     await rm(fixture.root, { recursive: true, force: true });
@@ -212,9 +251,21 @@ test("history merges an OpenClaw assistant-media sidecar only through its explic
     }) as typeof history;
 
     assert.equal(result.messages.length, 1);
-    assert.deepEqual(result.messages[0]?.content, [{ type: "text", text: "桌面只找到一张图片" }]);
+    const expectedContent = [
+      { type: "text", text: "桌面只找到一张图片" },
+      {
+        type: "image",
+        attachmentId,
+        fileName: "图片",
+        transferState: "expired",
+        isRemoteExpired: true,
+        attachmentStatusText: "图片文件在桌面端已不可用",
+        uploadStatusText: "图片文件在桌面端已不可用",
+      },
+    ];
+    assert.deepEqual(result.messages[0]?.content, expectedContent);
     assert.equal(result.timelineSnapshot.messages.length, 1);
-    assert.deepEqual(result.timelineSnapshot.messages[0]?.content, [{ type: "text", text: "桌面只找到一张图片" }]);
+    assert.deepEqual(result.timelineSnapshot.messages[0]?.content, expectedContent);
     assert.equal("attachmentIds" in result.timelineSnapshot.messages[0]!, false);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -240,7 +291,124 @@ test("assistant-media sidecars are never matched by text or a non-identical run"
   }), false);
 });
 
-test("payload removes unavailable outgoing media from both message and canonical timeline events", async () => {
+test("automatic message-tool media is folded through its explicit sourceRunId", () => {
+  const sourceRunId = "wx_media_parent";
+  const normalized = normalizeOpenClawAutomaticMediaReplies([
+    {
+      id: "assistant-parent",
+      role: "assistant",
+      sessionKey: "agent:main:session_1",
+      runId: sourceRunId,
+      content: [{ type: "text", text: "三张图片都发过来了" }],
+    },
+    {
+      id: "message-tool-media-1",
+      role: "assistant",
+      sessionKey: "agent:main:session_1",
+      sourceRunId,
+      content: [{ type: "image", url: "/api/chat/media/outgoing/session/att_one/full" }],
+    },
+    {
+      id: "message-tool-media-2",
+      role: "assistant",
+      sessionKey: "agent:main:session_1",
+      sourceRunId,
+      content: [{ type: "image", url: "/api/chat/media/outgoing/session/att_two/full" }],
+    },
+  ], "agent:main:session_1");
+
+  assert.equal(normalized.changed, true);
+  assert.equal(normalized.messages.length, 1);
+  assert.deepEqual((normalized.messages[0] as Record<string, unknown>).content, [
+    { type: "text", text: "三张图片都发过来了" },
+    { type: "image", url: "/api/chat/media/outgoing/session/att_one/full" },
+    { type: "image", url: "/api/chat/media/outgoing/session/att_two/full" },
+  ]);
+});
+
+test("concurrent message-tool media is restored to authoritative tool-call order", () => {
+  const sourceRunId = "wx_media_parent";
+  const normalized = normalizeOpenClawAutomaticMediaReplies([
+    {
+      id: "assistant-tool-calls",
+      role: "assistant",
+      __openclaw: { runId: sourceRunId },
+      content: [
+        { type: "thinking", thinking: "send three files" },
+        { type: "toolCall", id: "call_first", name: "message" },
+        { type: "toolCall", id: "call_second", name: "message" },
+        { type: "toolCall", id: "call_third", name: "message" },
+      ],
+    },
+    {
+      id: "reply-third",
+      role: "assistant",
+      idempotencyKey: `${sourceRunId}:message-tool:delivery-third:call_third`,
+      __openclaw: { runId: sourceRunId },
+      content: [{ type: "image", url: "/api/chat/media/outgoing/session/att_third/full" }],
+    },
+    {
+      id: "reply-first",
+      role: "assistant",
+      idempotencyKey: `${sourceRunId}:message-tool:delivery-first:call_first`,
+      __openclaw: { runId: sourceRunId },
+      content: [{ type: "image", url: "/api/chat/media/outgoing/session/att_first/full" }],
+    },
+    {
+      id: "reply-second",
+      role: "assistant",
+      idempotencyKey: `${sourceRunId}:message-tool:delivery-second:call_second`,
+      __openclaw: { runId: sourceRunId },
+      content: [{ type: "image", url: "/api/chat/media/outgoing/session/att_second/full" }],
+    },
+    {
+      id: "assistant-visible-final",
+      role: "assistant",
+      __openclaw: { runId: sourceRunId },
+      content: [{ type: "text", text: "三张图片再发一遍" }],
+    },
+  ], "agent:main:session_1");
+
+  assert.equal(normalized.changed, true);
+  assert.equal(normalized.messages.length, 2);
+  assert.deepEqual((normalized.messages[1] as Record<string, unknown>).content, [
+    { type: "text", text: "三张图片再发一遍" },
+    { type: "image", url: "/api/chat/media/outgoing/session/att_first/full" },
+    { type: "image", url: "/api/chat/media/outgoing/session/att_second/full" },
+    { type: "image", url: "/api/chat/media/outgoing/session/att_third/full" },
+  ]);
+});
+
+test("automatic message-tool media stays independent without one exact parent run", () => {
+  const normalized = normalizeOpenClawAutomaticMediaReplies([
+    {
+      id: "parent-one",
+      role: "assistant",
+      sessionKey: "agent:main:session_1",
+      runId: "wx_shared_run",
+      content: [{ type: "text", text: "first" }],
+    },
+    {
+      id: "parent-two",
+      role: "assistant",
+      sessionKey: "agent:main:session_1",
+      runId: "wx_shared_run",
+      content: [{ type: "text", text: "second" }],
+    },
+    {
+      id: "message-tool-media",
+      role: "assistant",
+      sessionKey: "agent:main:session_1",
+      sourceRunId: "wx_shared_run",
+      content: [{ type: "image", url: "/api/chat/media/outgoing/session/att/full" }],
+    },
+  ], "agent:main:session_1");
+
+  assert.equal(normalized.changed, false);
+  assert.equal(normalized.messages.length, 3);
+});
+
+test("payload preserves unavailable outgoing media as an explicit placeholder", async () => {
   const root = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-sidecar-payload-"));
   const recordsDir = join(root, "missing-records");
   const attachmentId = "att_missing_payload";
@@ -268,11 +436,58 @@ test("payload removes unavailable outgoing media from both message and canonical
       cache: new Map(),
     }) as typeof payload;
 
-    assert.deepEqual(result.message.content, [{ type: "text", text: "图片如下" }]);
-    assert.deepEqual(result.timelineEvents[0]?.content, [{ type: "text", text: "图片如下" }]);
-    assert.equal("attachmentIds" in result.timelineEvents[0]!, false);
+    const messageAttachment = result.message.content[1] as Record<string, unknown>;
+    const timelineAttachment = result.timelineEvents[0]?.content[1] as Record<string, unknown>;
+    assert.deepEqual(result.message.content[0], { type: "text", text: "图片如下" });
+    assert.equal(messageAttachment.attachmentId, attachmentId);
+    assert.equal(messageAttachment.transferState, "expired");
+    assert.equal(messageAttachment.isRemoteExpired, true);
+    assert.equal(messageAttachment.downloadUrl, undefined);
+    assert.equal(timelineAttachment.attachmentId, attachmentId);
+    assert.equal(timelineAttachment.transferState, "expired");
+    assert.deepEqual(result.timelineEvents[0]?.attachmentIds, [attachmentId]);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("live payload waits for an outgoing-media record that is committed just after its event", async () => {
+  const fixture = await createOutgoingMediaFixture();
+  const server = await createFileUploadRelayServer("file_outgoing_delayed_record");
+  const recordPath = join(fixture.recordsDir, `${fixture.attachmentId}.json`);
+  let restoreTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const recordJson = await readFile(recordPath, "utf8");
+    await unlink(recordPath);
+    restoreTimer = setTimeout(() => {
+      void writeFile(recordPath, recordJson);
+    }, 20);
+
+    const result = await relayOutgoingMediaInPayload({
+      runId: "run-delayed-outgoing-record",
+      sessionKey: "agent:main:session_1",
+      message: {
+        role: "assistant",
+        content: [{
+          type: "image",
+          url: `/api/chat/media/outgoing/agent%3Amain%3Asession_1/${fixture.attachmentId}/full`,
+        }],
+      },
+    }, {
+      relayServerUrl: server.baseUrl,
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      recordsDir: fixture.recordsDir,
+      cache: new Map(),
+      waitForOutgoingMediaRecord: true,
+    }) as { message: { content: Array<Record<string, unknown>> } };
+
+    assert.equal(result.message.content[0]?.fileId, "file_outgoing_delayed_record");
+    assert.equal(result.message.content[0]?.transferState, "available");
+  } finally {
+    if (restoreTimer) clearTimeout(restoreTimer);
+    await server.close();
+    await rm(fixture.root, { recursive: true, force: true });
   }
 });
 
@@ -460,6 +675,7 @@ test("relayOutgoingMediaInPayload uploads assistant local artifact paths when us
     assert.equal(image.downloadUrl, "/api/mobile/files/file_local_artifact");
     assert.equal(image.downloadPath, "/api/mobile/files/file_local_artifact");
     assert.equal(image.sourceRunId, "run-1");
+    assert.equal(server.initBody()?.timelineDelivery, "embedded");
   } finally {
     await server.close();
     await rm(root, { recursive: true, force: true });
@@ -553,6 +769,60 @@ async function createOutgoingMediaFixture() {
     },
   }));
   return { root, recordsDir, attachmentId };
+}
+
+async function createSqliteOutgoingMediaFixture() {
+  const root = await mkdtemp(join(tmpdir(), "clawconnect-outgoing-media-sqlite-"));
+  const stateDir = join(root, "state-dir");
+  const stateDatabaseDir = join(stateDir, "state");
+  const mediaRoot = join(stateDir, "media");
+  const originalsDir = join(mediaRoot, "outgoing", "originals");
+  await mkdir(stateDatabaseDir, { recursive: true });
+  await mkdir(originalsDir, { recursive: true });
+  const attachmentId = "a87e1a99-0fd5-47be-a78d-34c44c2c0964";
+  const mediaId = "f8275042-1ae1-4a94-8737-787e8a52dc47.png";
+  await writeFile(join(originalsDir, mediaId), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  const database = new DatabaseSync(join(stateDatabaseDir, "openclaw.sqlite"));
+  try {
+    database.exec(`
+      CREATE TABLE managed_outgoing_image_records (
+        attachment_id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        alt TEXT,
+        original_media_root TEXT NOT NULL,
+        original_media_id TEXT NOT NULL,
+        original_media_subdir TEXT NOT NULL,
+        original_content_type TEXT,
+        original_width INTEGER,
+        original_height INTEGER,
+        original_size_bytes INTEGER,
+        original_filename TEXT,
+        cleanup_pending INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    database.prepare(`
+      INSERT INTO managed_outgoing_image_records (
+        attachment_id, session_key, alt, original_media_root, original_media_id,
+        original_media_subdir, original_content_type, original_width,
+        original_height, original_size_bytes, original_filename, cleanup_pending
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    `).run(
+      attachmentId,
+      "agent:main:session_1",
+      "photo.png",
+      mediaRoot,
+      mediaId,
+      "outgoing/originals",
+      "image/png",
+      20,
+      10,
+      4,
+      "photo.png",
+    );
+  } finally {
+    database.close();
+  }
+  return { root, stateDir, attachmentId };
 }
 
 async function createFileUploadRelayServer(fileId: string) {

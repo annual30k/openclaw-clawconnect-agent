@@ -12,7 +12,10 @@ import {
   resolveOpenClawSessionTranscript,
   type GatewaySessionDefaults,
 } from "./session-context.js";
-import { normalizeOpenClawAssistantMediaSidecars } from "./assistant-media-sidecar.js";
+import {
+  normalizeOpenClawAssistantMediaSidecars,
+  normalizeOpenClawAutomaticMediaReplies,
+} from "./assistant-media-sidecar.js";
 
 export type HistoryMessage = {
   [key: string]: unknown;
@@ -191,7 +194,13 @@ export function canonicalizeOpenClawGatewayHistoryResponse(
   history: HistoryResponse,
   request: { sessionKey: string; cursor?: string },
 ): HistoryResponse {
-  const filtered = filterOpenClawHeartbeatHistoryResponse(history);
+  const requestedSessionKey = cleanHistoryString(history.sessionKey) ?? request.sessionKey;
+  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(history.messages ?? [], requestedSessionKey);
+  const automaticMediaReplies = normalizeOpenClawAutomaticMediaReplies(explicitSidecars.messages, requestedSessionKey);
+  const normalizedHistory = explicitSidecars.changed || automaticMediaReplies.changed
+    ? { ...history, messages: automaticMediaReplies.messages as HistoryMessage[] }
+    : history;
+  const filtered = filterOpenClawHeartbeatHistoryResponse(normalizedHistory);
   if (filtered.timelineSnapshot) {
     return filtered;
   }
@@ -370,8 +379,9 @@ async function readIndexedTranscriptMessages(transcriptPath: string, sessionKey:
   // Lineage deliberately rewrites idempotency keys to mobile turn IDs, while
   // the raw <run>:assistant-media key and parentId are the authoritative
   // relationship needed to keep the desktop and mobile projections aligned.
-  const foldedMessages = normalizeOpenClawAssistantMediaSidecars(messages, sessionKey).messages as HistoryMessage[];
-  restoreTranscriptTurnLineage(foldedMessages);
+  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(messages, sessionKey).messages as HistoryMessage[];
+  restoreTranscriptTurnLineage(explicitSidecars);
+  const foldedMessages = normalizeOpenClawAutomaticMediaReplies(explicitSidecars, sessionKey).messages as HistoryMessage[];
   const visibleMessages = filterOpenClawHeartbeatArtifacts(foldedMessages);
 
   transcriptHistoryCache.set(transcriptPath, {

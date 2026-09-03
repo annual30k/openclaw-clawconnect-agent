@@ -1,11 +1,15 @@
 import { existsSync } from "fs";
 import { readFile, stat } from "fs/promises";
 import { homedir } from "os";
-import { extname, join, resolve } from "path";
+import { isAbsolute, extname, join, relative, resolve } from "path";
+import { DatabaseSync } from "node:sqlite";
 import { createHash } from "crypto";
 import { uploadFileToRelay, type FileUploadRequest, type FileUploadResult } from "../../core/relay/file-upload.js";
 import { resolveOpenClawStateDir } from "../runtime/openclaw-paths.js";
-import { normalizeOpenClawAssistantMediaSidecars } from "./assistant-media-sidecar.js";
+import {
+  normalizeOpenClawAssistantMediaSidecars,
+  normalizeOpenClawAutomaticMediaReplies,
+} from "./assistant-media-sidecar.js";
 
 const OUTGOING_MEDIA_RE = /\/api\/chat\/media\/outgoing\/[^/]+\/([^/]+)\/full(?:$|[?#])/;
 const OPENCLAW_MEDIA_CONTROL_PREFIX_RE = /^MEDIA:\s*(?:file:\/\/|~[\\/]|\/|[A-Za-z]:[\\/]|\\\\)/i;
@@ -17,8 +21,15 @@ export type OutgoingMediaRelayOptions = {
   gatewayId: string;
   senderDisplayName?: string;
   recordsDir?: string;
+  stateDir?: string;
   cache?: Map<string, FileUploadResult>;
   userMessage?: string;
+  /**
+   * A live gateway event can arrive a few milliseconds before OpenClaw commits
+   * its managed outgoing-media record.  Only that path should briefly wait for
+   * the record instead of publishing an unavailable image placeholder.
+   */
+  waitForOutgoingMediaRecord?: boolean;
 };
 
 type OutgoingMediaOptionsWithSourceRun = OutgoingMediaRelayOptions & {
@@ -139,19 +150,28 @@ export async function relayOutgoingMediaInHistoryResponse(
 
   const responseRecord = response as Record<string, unknown>;
   const responseSessionKey = firstString(responseRecord.sessionKey, responseRecord.sessionId);
-  const normalizedMessages = normalizeOpenClawAssistantMediaSidecars(messages, responseSessionKey);
+  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(messages, responseSessionKey);
+  const normalizedMessages = normalizeOpenClawAutomaticMediaReplies(explicitSidecars.messages, responseSessionKey);
   const messageResult = await relayOutgoingMediaInMessageList(normalizedMessages.messages, responseSessionKey, opts);
   const snapshot = responseRecord.timelineSnapshot;
   const snapshotMessages = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
     ? (snapshot as Record<string, unknown>).messages
     : undefined;
-  const normalizedSnapshotMessages = Array.isArray(snapshotMessages)
+  const explicitSnapshotSidecars = Array.isArray(snapshotMessages)
     ? normalizeOpenClawAssistantMediaSidecars(snapshotMessages, responseSessionKey)
+    : undefined;
+  const normalizedSnapshotMessages = explicitSnapshotSidecars
+    ? normalizeOpenClawAutomaticMediaReplies(explicitSnapshotSidecars.messages, responseSessionKey)
     : undefined;
   const snapshotResult = normalizedSnapshotMessages
     ? await relayOutgoingMediaInMessageList(normalizedSnapshotMessages.messages, responseSessionKey, opts)
     : undefined;
-  const changed = normalizedMessages.changed || messageResult.changed || Boolean(normalizedSnapshotMessages?.changed) || Boolean(snapshotResult?.changed);
+  const changed = explicitSidecars.changed
+    || normalizedMessages.changed
+    || messageResult.changed
+    || Boolean(explicitSnapshotSidecars?.changed)
+    || Boolean(normalizedSnapshotMessages?.changed)
+    || Boolean(snapshotResult?.changed);
 
   return changed
     ? {
@@ -234,7 +254,7 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
   }
 
   try {
-    const record = await readOutgoingMediaRecord(attachmentId, opts.recordsDir);
+    const record = await readOutgoingMediaRecordWhenReady(attachmentId, opts);
     const filePath = record.original?.path?.trim();
     const sessionKey = record.sessionKey?.trim();
     if (!filePath || !sessionKey) {
@@ -256,6 +276,7 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
         filePath,
         senderDisplayName: opts.senderDisplayName,
         sourceRunId: opts.sourceRunId,
+        timelineDelivery: "embedded",
       });
 
     return {
@@ -281,7 +302,27 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
     };
   } catch (error) {
     console.warn(`[relay] failed to publish outgoing media attachment ${attachmentId}: ${String(error)}`);
-    return undefined;
+    // The desktop may clean up an outgoing-media record before the Relay has
+    // uploaded it. Keep a stable, explicit unavailable attachment instead of
+    // deleting the only content of an otherwise valid assistant reply.
+    const {
+      url: _url,
+      openUrl: _openUrl,
+      downloadUrl: _downloadUrl,
+      download_path: _downloadPath,
+      downloadPath: _downloadPathCamel,
+      ...unavailableSource
+    } = source;
+    return {
+      ...unavailableSource,
+      type: typeof source.type === "string" && source.type.trim() ? source.type : "image",
+      attachmentId,
+      fileName: firstString(source.fileName, source.alt, "图片"),
+      transferState: "expired",
+      isRemoteExpired: true,
+      attachmentStatusText: "图片文件在桌面端已不可用",
+      uploadStatusText: "图片文件在桌面端已不可用",
+    };
   }
 }
 
@@ -314,10 +355,124 @@ function payloadSourceRunId(payload: Record<string, unknown>): string | undefine
   );
 }
 
-async function readOutgoingMediaRecord(attachmentId: string, recordsDir?: string): Promise<OutgoingMediaRecord> {
-  const root = recordsDir ?? join(resolveOpenClawStateDir(), "media", "outgoing", "records");
-  const raw = await readFile(join(root, `${attachmentId}.json`), "utf8");
-  return JSON.parse(raw) as OutgoingMediaRecord;
+async function readOutgoingMediaRecord(
+  attachmentId: string,
+  options: Pick<OutgoingMediaRelayOptions, "recordsDir" | "stateDir">,
+): Promise<OutgoingMediaRecord> {
+  const stateDir = options.stateDir ?? resolveOpenClawStateDir();
+  const recordsDir = options.recordsDir ?? join(stateDir, "media", "outgoing", "records");
+  try {
+    const raw = await readFile(join(recordsDir, `${attachmentId}.json`), "utf8");
+    return JSON.parse(raw) as OutgoingMediaRecord;
+  } catch (error) {
+    // A caller that supplies recordsDir is explicitly testing or using the
+    // legacy JSON store; it must not read the host's normal state database.
+    if (options.recordsDir || !isFileNotFoundError(error)) throw error;
+  }
+
+  return readSqliteOutgoingMediaRecord(attachmentId, stateDir);
+}
+
+async function readOutgoingMediaRecordWhenReady(
+  attachmentId: string,
+  options: OutgoingMediaRelayOptions,
+): Promise<OutgoingMediaRecord> {
+  // OpenClaw emits the assistant-media event before its SQLite transaction is
+  // occasionally visible to another process.  Retrying only live event
+  // enrichment avoids making ordinary history reads slower for genuinely
+  // expired media while giving the transaction up to roughly one second to
+  // become observable.
+  const delaysMs = options.waitForOutgoingMediaRecord ? [80, 160, 320, 640] : [];
+  let lastError: unknown;
+  for (const delayMs of [...delaysMs, 0]) {
+    if (delayMs > 0) {
+      await wait(delayMs);
+    }
+    try {
+      return await readOutgoingMediaRecord(attachmentId, options);
+    } catch (error) {
+      lastError = error;
+      if (!isFileNotFoundError(error)) throw error;
+    }
+  }
+  throw lastError;
+}
+
+function wait(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function readSqliteOutgoingMediaRecord(attachmentId: string, stateDir: string): OutgoingMediaRecord {
+  const database = new DatabaseSync(join(stateDir, "state", "openclaw.sqlite"), { readOnly: true });
+  try {
+    const row = database.prepare(`
+      SELECT
+        session_key,
+        alt,
+        original_media_root,
+        original_media_id,
+        original_media_subdir,
+        original_content_type,
+        original_width,
+        original_height,
+        original_size_bytes,
+        original_filename
+      FROM managed_outgoing_image_records
+      WHERE attachment_id = ? AND cleanup_pending = 0
+    `).get(attachmentId) as Record<string, unknown> | undefined;
+    if (!row) {
+      const error = new Error(`OpenClaw outgoing media record was not found: ${attachmentId}`) as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
+    }
+
+    const mediaRoot = requiredRecordString(row, "original_media_root");
+    const mediaId = requiredRecordString(row, "original_media_id");
+    const mediaSubdir = requiredRecordString(row, "original_media_subdir");
+    if (!isAbsolute(mediaRoot) || mediaSubdir !== "outgoing/originals" || mediaId !== mediaId.split(/[\\/]/).pop()) {
+      throw new Error(`OpenClaw outgoing media record is unsafe: ${attachmentId}`);
+    }
+    const originalsDir = resolve(mediaRoot, "outgoing", "originals");
+    const filePath = resolve(mediaRoot, mediaSubdir, mediaId);
+    const relativePath = relative(originalsDir, filePath);
+    if (!relativePath || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+      throw new Error(`OpenClaw outgoing media path is outside the managed originals directory: ${attachmentId}`);
+    }
+
+    return {
+      attachmentId,
+      sessionKey: requiredRecordString(row, "session_key"),
+      alt: optionalRecordString(row.alt),
+      original: {
+        path: filePath,
+        contentType: optionalRecordString(row.original_content_type),
+        width: optionalRecordNumber(row.original_width),
+        height: optionalRecordNumber(row.original_height),
+        sizeBytes: optionalRecordNumber(row.original_size_bytes),
+        filename: optionalRecordString(row.original_filename),
+      },
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function isFileNotFoundError(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+function requiredRecordString(row: Record<string, unknown>, field: string): string {
+  const value = optionalRecordString(row[field]);
+  if (!value) throw new Error(`OpenClaw outgoing media record is missing ${field}`);
+  return value;
+}
+
+function optionalRecordString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function optionalRecordNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function firstString(...values: unknown[]): string | undefined {
@@ -376,6 +531,7 @@ async function relayLocalArtifactPathsInContent(
           filePath,
           senderDisplayName: opts.senderDisplayName,
           sourceRunId: runId,
+          timelineDelivery: "embedded",
         };
       const upload = await cachedUpload(opts, cacheKey, request);
       blocks.push(uploadToContentBlock(upload));

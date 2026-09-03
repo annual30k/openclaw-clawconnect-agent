@@ -272,7 +272,10 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         withTimeout(fetchHistory(), CHAT_HISTORY_FETCH_TIMEOUT_MS, "chat.history fallback")
           .then(async (history) => {
             const outcome = extractHistoryOutcome(history, context);
-            if (!outcome && attempt < CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS) {
+            if (
+              (!outcome || isOpenClawMediaDisplayPlaceholder(outcome.kind === "final" ? outcome.text : ""))
+              && attempt < CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS
+            ) {
               scheduleChatHistoryFallback(providerRunId, context, attempt + 1);
               return;
             }
@@ -475,6 +478,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             senderDisplayName: "OpenClaw",
             cache: outgoingMediaUploadCache,
             userMessage,
+            waitForOutgoingMediaRecord: true,
           });
         } catch (error) {
           if (!hasCanonicalTerminalTimeline(payload)) throw error;
@@ -771,7 +775,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 ? openClawChatRunIdentities.accumulatedText(opts.gatewayId, providerRunId)
                 : "";
               const resolvedText = appendUniqueSuffix(bufferedText, currentText);
-              if (resolvedText.trim()) {
+              if (resolvedText.trim() && !isOpenClawMediaDisplayPlaceholder(resolvedText)) {
                 const outgoingPayload = providerRunId
                   ? mergeCanonicalChatPayload(
                       normalizedPayload,
@@ -804,7 +808,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 .then(async (history) => {
                   let outcome = runContext ? extractHistoryOutcome(history, runContext) : null;
                   // Retry once if OpenClaw has emitted final before the transcript is committed.
-                  if (!outcome) {
+                  if (!outcome || isOpenClawMediaDisplayPlaceholder(outcome.kind === "final" ? outcome.text : "")) {
                     await new Promise((resolve) => setTimeout(resolve, CHAT_HISTORY_FINAL_RETRY_DELAY_MS));
                     const retryHistory = await withTimeout(fetchHistory(), CHAT_HISTORY_FETCH_TIMEOUT_MS, "chat.history retry");
                     outcome = runContext ? extractHistoryOutcome(retryHistory, runContext) : null;
@@ -813,6 +817,10 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     chatRunContexts.delete(providerRunId);
                   }
                   if (outcome?.kind === "final") {
+                    if (isOpenClawMediaDisplayPlaceholder(outcome.text) && providerRunId && runContext) {
+                      scheduleChatHistoryFallback(providerRunId, runContext, 0);
+                      return;
+                    }
                     const basePayload = providerRunId
                       ? buildMobileAssistantFinalPayload({
                           run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
@@ -1213,6 +1221,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         upper.startsWith("HEARTBEAT_OK") ||
         upper.startsWith("HEARTBEAT OK")
       );
+    }
+
+    function isOpenClawMediaDisplayPlaceholder(text?: string): boolean {
+      const normalized = text?.replace(/\r/g, "").trim() ?? "";
+      return /^(?:Media reply could not be displayed\.\s*)+$/i.test(normalized);
     }
 
     function hasCanonicalTerminalTimeline(payload: unknown): boolean {

@@ -509,7 +509,112 @@ test("relay manager projects an OpenClaw assistant-media sidecar onto the parent
     const completed = terminals.map((terminal) => timelineEvents(terminal.payload as Record<string, unknown>)
       .find((event) => event.eventType === "message.completed"));
     assert.deepEqual(completed.map((event) => event?.messageId), [`assistant-${runId}`, `assistant-${runId}`]);
-    assert.deepEqual(completed[1]?.content, [{ type: "text", text: "桌面只找到一张图片" }]);
+    assert.deepEqual(completed[1]?.content?.[0], { type: "text", text: "桌面只找到一张图片" });
+    const attachment = completed[1]?.content?.[1] as Record<string, unknown> | undefined;
+    assert.equal(attachment?.type, "image");
+    assert.equal(attachment?.transferState, "expired");
+    assert.equal(attachment?.isRemoteExpired, true);
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+  }
+});
+
+test("relay manager replaces the OpenClaw media display placeholder with source-run media history", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let gatewaySocket: WebSocket | undefined;
+  const runId = "wx_media_history_parent";
+
+  relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-media-history");
+    socket.on("message", (raw) => relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>));
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "nonce-media-history", ts: Date.now() } }));
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as { type?: string; id?: string; method?: string };
+      if (message.type !== "req" || !message.id) return;
+      const history = message.method === "chat.history"
+        ? {
+            sessionKey: "main",
+            messages: [
+              {
+                id: "user-media-history",
+                role: "user",
+                idempotencyKey: `${runId}:user`,
+                content: [{ type: "text", text: "把图片发过来" }],
+              },
+              {
+                id: "assistant-media-history",
+                role: "assistant",
+                runId,
+                content: [{ type: "text", text: "图片已经发过来" }],
+              },
+              {
+                id: "message-tool-media-history",
+                role: "assistant",
+                sourceRunId: runId,
+                content: [{ type: "image", url: "/api/chat/media/outgoing/agent%3Amain%3Amain/att_history/full" }],
+              },
+            ],
+          }
+        : {};
+      socket.send(JSON.stringify({ type: "res", id: message.id, ok: true, payload: history }));
+      if (message.method !== "connect") return;
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId,
+          sessionKey: "main",
+          state: "final",
+          role: "assistant",
+          message: { role: "assistant", content: [{ type: "text", text: "Media reply could not be displayed." }] },
+        },
+      }));
+    });
+  });
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-media-history",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+  try {
+    await waitFor(() => relayMessages.some((message) => (
+      message.type === "event"
+      && message.event === "chat"
+      && extractPayloadText(message.payload as Record<string, unknown>) === "图片已经发过来"
+    )), 4_000);
+    const final = relayMessages.find((message) => (
+      message.type === "event"
+      && message.event === "chat"
+      && extractPayloadText(message.payload as Record<string, unknown>) === "图片已经发过来"
+    ));
+    assert.ok(final);
+    const completed = timelineEvents(final.payload as Record<string, unknown>)
+      .find((event) => event.eventType === "message.completed");
+    assert.deepEqual(completed?.content?.[0], { type: "text", text: "图片已经发过来" });
+    const attachment = completed?.content?.[1] as Record<string, unknown> | undefined;
+    assert.equal(attachment?.type, "image");
+    assert.equal(attachment?.transferState, "expired");
+    assert.equal(relayMessages.some((message) => (
+      message.type === "event"
+      && message.event === "chat"
+      && extractPayloadText(message.payload as Record<string, unknown>) === "Media reply could not be displayed."
+    )), false);
   } finally {
     abort.abort();
     gatewaySocket?.close(1000, "test done");

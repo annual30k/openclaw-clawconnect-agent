@@ -137,6 +137,65 @@ test("OpenClaw v4 gateway history keeps tool interims distinct from the final as
   assert.equal(page.timelineSnapshot?.messages[2]?.turnId, runId);
 });
 
+test("OpenClaw v4 gateway history folds concurrent media replies in tool-call order", () => {
+  const runId = "wx_media_order";
+  const page = canonicalizeOpenClawGatewayHistoryResponse({
+    sessionKey: "main",
+    messages: [
+      {
+        role: "user",
+        content: "再发一遍图片",
+        idempotencyKey: `${runId}:user`,
+        __openclaw: { id: "provider-user", seq: 20 },
+      },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_first", name: "message" },
+          { type: "toolCall", id: "call_second", name: "message" },
+          { type: "toolCall", id: "call_third", name: "message" },
+        ],
+        __openclaw: { id: "provider-tool-calls", seq: 21, runId },
+      },
+      {
+        role: "assistant",
+        idempotencyKey: `${runId}:message-tool:delivery-third:call_third`,
+        content: [{ type: "image", attachmentId: "att-third" }],
+        __openclaw: { id: "provider-third", seq: 22, runId },
+      },
+      {
+        role: "assistant",
+        idempotencyKey: `${runId}:message-tool:delivery-first:call_first`,
+        content: [{ type: "image", attachmentId: "att-first" }],
+        __openclaw: { id: "provider-first", seq: 23, runId },
+      },
+      {
+        role: "assistant",
+        idempotencyKey: `${runId}:message-tool:delivery-second:call_second`,
+        content: [{ type: "image", attachmentId: "att-second" }],
+        __openclaw: { id: "provider-second", seq: 24, runId },
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "三张图片再发一遍" }],
+        __openclaw: { id: "provider-final", seq: 25, runId },
+      },
+    ],
+  }, { sessionKey: "main" });
+
+  assert.deepEqual(page.timelineSnapshot?.messages.map((message) => message.messageId), [
+    `user-${runId}`,
+    "provider-tool-calls",
+    `assistant-${runId}`,
+  ]);
+  assert.deepEqual(page.timelineSnapshot?.messages[2]?.content, [
+    { type: "text", text: "三张图片再发一遍" },
+    { type: "image", attachmentId: "att-first", transferState: "available" },
+    { type: "image", attachmentId: "att-second", transferState: "available" },
+    { type: "image", attachmentId: "att-third", transferState: "available" },
+  ]);
+});
+
 test("transcript history hides completed OpenClaw heartbeat-only turns", async () => {
   const fixture = await createTranscriptFixture(4, [
     transcriptMessage("user-1", "user", "hello", "2026-05-28T01:00:00.000Z"),

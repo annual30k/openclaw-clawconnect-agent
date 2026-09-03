@@ -20,6 +20,8 @@ export interface FileUploadRequest {
   transcript?: string;
   sourceRunId?: string;
   sourceRole?: "user" | "assistant";
+  /** The uploaded file is part of the chat payload published by this same operation. */
+  timelineDelivery?: "independent" | "embedded";
   idempotencyKey?: string;
 }
 
@@ -173,6 +175,7 @@ export async function uploadFileToRelay(
           transcript: typeof opts.transcript === "string" ? opts.transcript.trim() : undefined,
           sourceRunId: normalizeOptionalText(opts.sourceRunId),
           sourceRole: opts.sourceRole,
+          timelineDelivery: opts.timelineDelivery === "embedded" ? "embedded" : "independent",
           clientCreatedAt,
           idempotencyKey: uploadIdempotencyKey,
         }),
