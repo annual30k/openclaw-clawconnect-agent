@@ -89,6 +89,7 @@ const imageUpload = {
   chunkSize: 1024,
   totalChunks: 2,
   sourceRunId: "run-1",
+  sourceRole: "assistant" as const,
   expiresAt: "2026-06-06T00:00:00.000Z",
   downloadPath: "/api/mobile/files/file-image-1",
   downloadUrl: "http://127.0.0.1:8080/api/mobile/files/file-image-1",
@@ -113,6 +114,7 @@ test("Hermes image artifact upload is represented as a mobile content block", ()
     downloadPath: "/api/mobile/files/file-image-1",
     expiresAt: "2026-06-06T00:00:00.000Z",
     sourceRunId: "run-1",
+    sourceRole: "assistant",
     gatewayId: "gw-1",
     sessionKey: "main",
     status: "available",
@@ -194,6 +196,7 @@ test("Hermes artifact uploads are linked to the assistant source run", () => {
     sessionKey: "main",
     filePath: "/tmp/reply.jpg",
     sourceRunId: "run-voice-1",
+    sourceRole: "assistant",
   });
   assert.equal("json" in request, false);
   assert.equal("gateway" in request, false);

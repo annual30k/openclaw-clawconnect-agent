@@ -258,6 +258,7 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
         relayServerUrl: opts.relayServerUrl, relaySecret: opts.relaySecret,
         gatewayId: opts.gatewayId, sessionKey: opts.sessionKey, filePath,
         sourceRunId: opts.sourceRunId, timelineDelivery: "embedded",
+        sourceRole: "user",
       });
       return { ...uploadToContentBlock(upload), attachmentId, fileName: source.fileName || upload.fileName };
     } catch {
@@ -296,6 +297,7 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
         senderDisplayName: opts.senderDisplayName,
         sourceRunId: opts.sourceRunId,
         timelineDelivery: "embedded",
+        sourceRole: "assistant",
       });
 
     return {
@@ -315,6 +317,7 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
       downloadPath: upload.downloadPath,
       expiresAt: upload.expiresAt,
       sourceRunId: upload.sourceRunId,
+      sourceRole: upload.sourceRole ?? "assistant",
       gatewayId: upload.gatewayId,
       sessionKey: upload.sessionKey,
       transferState: "available",
@@ -556,6 +559,7 @@ async function relayLocalArtifactPathsInContent(
           senderDisplayName: opts.senderDisplayName,
           sourceRunId: runId,
           timelineDelivery: "embedded",
+          sourceRole: "assistant",
         };
       const upload = await cachedUpload(opts, cacheKey, request);
       blocks.push(uploadToContentBlock(upload));
@@ -614,6 +618,7 @@ function uploadToContentBlock(upload: FileUploadResult): Record<string, unknown>
     downloadPath: upload.downloadPath,
     expiresAt: upload.expiresAt,
     sourceRunId: upload.sourceRunId,
+    sourceRole: upload.sourceRole,
     sha256: upload.sha256,
     contentHash: upload.sha256,
     gatewayId: upload.gatewayId,

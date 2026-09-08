@@ -28,6 +28,7 @@ test("managed inbound images are uploaded once across history projections and re
     const result = await relayOutgoingMediaInHistoryResponse({ sessionKey: "agent:health:chat", messages: [message], timelineSnapshot: { messages: [message] } }, options) as any;
     assert.equal(result.messages[0].content[0].fileId, "file_inbound");
     assert.equal(result.timelineSnapshot.messages[0].content[0].fileId, "file_inbound");
+    assert.equal(server.initBody()?.sourceRole, "user");
     const escaped = await relayOutgoingMediaInPayload({ sessionKey: "agent:health:chat", message: { ...message, content: [{ type: "image", url: "media://inbound/../../outside.png" }] } }, options) as any;
     assert.equal(escaped.message.content[0].isRemoteExpired, true);
     assert.equal(escaped.message.content[0].url, undefined);
@@ -94,6 +95,7 @@ test("relayOutgoingMediaInPayload uploads OpenClaw outgoing media and rewrites t
     assert.equal(image.downloadUrl, "/api/mobile/files/file_outgoing_payload");
     assert.equal(image.fileName, "photo.jpg");
     assert.equal(image.sourceRunId, "assistant-run-outgoing");
+    assert.equal(image.sourceRole, "assistant");
     assert.equal(image.gatewayId, "gw_test");
     assert.equal(image.sessionKey, "agent:main:session_1");
     assert.equal(server.initBody()?.timelineDelivery, "embedded");
@@ -841,6 +843,7 @@ test("relayOutgoingMediaInPayload uploads assistant local artifact paths when us
     assert.equal(image.downloadUrl, "/api/mobile/files/file_local_artifact");
     assert.equal(image.downloadPath, "/api/mobile/files/file_local_artifact");
     assert.equal(image.sourceRunId, "run-1");
+    assert.equal(image.sourceRole, "assistant");
     assert.equal(server.initBody()?.timelineDelivery, "embedded");
   } finally {
     await server.close();

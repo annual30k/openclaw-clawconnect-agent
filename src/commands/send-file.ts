@@ -72,6 +72,7 @@ export async function sendFileCommand(
       durationMs: opts.durationMs,
       transcript: opts.transcript,
       sourceRunId,
+      sourceRole: "assistant",
     },
     {
       fetchImpl: deps.fetchImpl,

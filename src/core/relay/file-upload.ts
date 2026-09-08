@@ -46,6 +46,7 @@ export interface FileUploadResult {
   chunkSize: number;
   totalChunks: number;
   sourceRunId?: string;
+  sourceRole?: "user" | "assistant";
   expiresAt: string;
   downloadPath: string;
   downloadUrl: string;
@@ -88,6 +89,7 @@ type FileUploadCompleteResponse = {
     chunkSize: number;
     totalChunks: number;
     sourceRunId?: string;
+    sourceRole?: "user" | "assistant";
   };
 };
 
@@ -251,6 +253,9 @@ export async function uploadFileToRelay(
     chunkSize,
     totalChunks,
     sourceRunId: normalizeOptionalText(payload.sourceRunId) ?? normalizeOptionalText(opts.sourceRunId),
+    sourceRole: payload.sourceRole === "user" || payload.sourceRole === "assistant"
+      ? payload.sourceRole
+      : opts.sourceRole,
     expiresAt: payload.expiresAt,
     downloadPath,
     downloadUrl,

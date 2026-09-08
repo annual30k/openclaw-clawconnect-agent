@@ -701,6 +701,7 @@ export function buildHermesArtifactUploadRequest(params: {
     sessionKey: params.sessionKey,
     filePath: params.artifactPath,
     sourceRunId: params.runId,
+    sourceRole: "assistant",
   };
 }
 
@@ -727,6 +728,7 @@ export function buildHermesArtifactContentBlock(
     downloadPath: upload.downloadPath,
     expiresAt: upload.expiresAt,
     sourceRunId: upload.sourceRunId,
+    sourceRole: "assistant",
     gatewayId: upload.gatewayId,
     sessionKey: upload.sessionKey,
     status: "available",

@@ -51,6 +51,7 @@ test("send-file uploads chunks and finalizes the transfer", async () => {
         assert.equal(initBody.senderDisplayName, "Host Mac");
         assert.equal(initBody.transcript, "这是要展示的转写文本");
         assert.equal(initBody.sourceRunId, "run-voice-1");
+        assert.equal(initBody.sourceRole, "assistant");
         assert.equal(initBody.sha256, expectedSha256);
         assert.equal(typeof initBody.clientCreatedAt, "string");
 
