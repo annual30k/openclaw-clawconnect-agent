@@ -124,6 +124,7 @@ export function modelItemsFromHermesModelOptionsPayload(
   // Hermes picker inventory 在切换后可能滞后；运行时状态和持久化配置代表已接受的选择，必须优先。
   const selectedProvider = current.provider ?? config.provider ?? stringValue(record.provider);
   const selectedModel = current.currentModel ?? config.model ?? stringValue(record.model);
+  const hasQualifiedSelection = Boolean(selectedProvider && selectedModel);
   const items: HermesModelListItem[] = [];
 
   for (const provider of providers) {
@@ -136,7 +137,9 @@ export function modelItemsFromHermesModelOptionsPayload(
     }
     const providerName = stringValue(provider.name) ?? providerId;
     const models = Array.isArray(provider.models) ? provider.models : [];
-    const providerIsSelected = provider.is_current === true || normalizedProviderMatches(providerId, selectedProvider);
+    const providerIsSelected = hasQualifiedSelection
+      ? normalizedProviderMatches(providerId, selectedProvider)
+      : provider.is_current === true;
 
     for (const modelEntry of models) {
       const model = hermesModelEntry(modelEntry);

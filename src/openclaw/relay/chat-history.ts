@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
+import { join } from "node:path";
+import { restoreGatewayHistoryMessages } from "./gateway-history-projection.js";
 import { readFile, stat } from "fs/promises";
 import { buildHistorySnapshotPage } from "../../core/relay/timeline-event-builder.js";
 import type {
@@ -12,6 +15,7 @@ import {
   resolveOpenClawSessionTranscript,
   type GatewaySessionDefaults,
 } from "./session-context.js";
+import { resolveOpenClawStateDir } from "../runtime/openclaw-paths.js";
 import {
   normalizeOpenClawAssistantMediaSidecars,
   normalizeOpenClawAutomaticMediaReplies,
@@ -95,6 +99,14 @@ export async function readOpenClawTranscriptChatHistory(
   defaults: GatewaySessionDefaults,
 ): Promise<HistoryResponse | null> {
   const params = normalizeTranscriptHistoryParams(rawParams, defaults.mainSessionKey);
+  // OpenClaw 2026.8 writes the live conversation into the agent SQLite event
+  // log. Its seq is the same order used by Control UI; falling through to the
+  // gateway projection loses that order for records appended asynchronously
+  // (notably scheduled jobs with images).
+  const sqliteHistory = readOpenClawSqliteChatHistory(params, defaults);
+  if (sqliteHistory) {
+    return sqliteHistory;
+  }
   const transcript = await resolveOpenClawSessionTranscript(params.sessionKey, defaults);
   if (!transcript) {
     return null;
@@ -110,16 +122,76 @@ export async function readOpenClawTranscriptChatHistory(
   });
 }
 
+function readOpenClawSqliteChatHistory(
+  params: ReturnType<typeof normalizeTranscriptHistoryParams>,
+  defaults: GatewaySessionDefaults,
+): HistoryResponse | null {
+  const agentId = params.sessionKey.match(/^agent:([^:]+):/)?.[1] ?? defaults.defaultAgentId ?? "main";
+  const databasePath = join(resolveOpenClawStateDir(), "agents", agentId, "agent", "openclaw-agent.sqlite");
+  let database: DatabaseSync | undefined;
+  try {
+    database = new DatabaseSync(databasePath, { readOnly: true });
+    const session = database.prepare(`
+      SELECT current_session_id
+      FROM session_nodes
+      WHERE session_key = ?
+      LIMIT 1
+    `).get(params.sessionKey) as { current_session_id?: unknown } | undefined;
+    const sessionId = cleanHistoryString(session?.current_session_id);
+    if (!sessionId) return null;
+
+    const rows = database.prepare(`
+      SELECT seq, event_json
+      FROM transcript_events
+      WHERE session_id = ?
+      ORDER BY seq ASC
+    `).all(sessionId) as Array<{ seq?: unknown; event_json?: unknown }>;
+    const messages = rows
+      .map((row) => sqliteTranscriptHistoryMessage(row, sessionId))
+      .filter((message): message is HistoryMessage => Boolean(message));
+    if (messages.length === 0) return null;
+
+    return buildTranscriptHistoryResponse({
+      sessionKey: params.sessionKey,
+      sessionId,
+      messages: prepareTranscriptHistoryMessages(messages, params.sessionKey),
+      limit: params.limit,
+      cursor: params.cursor,
+      direction: params.direction,
+    });
+  } catch {
+    return null;
+  } finally {
+    database?.close();
+  }
+}
+
 export async function readChatHistoryFromTranscriptFile(
   request: TranscriptHistoryRequest,
 ): Promise<HistoryResponse> {
   const messages = await readIndexedTranscriptMessages(request.transcriptPath, request.sessionKey);
-  const limit = normalizeHistoryLimit(request.limit);
-  const direction = normalizeHistoryDirection(request.direction);
+  return buildTranscriptHistoryResponse({
+    sessionKey: request.sessionKey,
+    ...(request.sessionId ? { sessionId: request.sessionId } : {}),
+    messages,
+    limit: normalizeHistoryLimit(request.limit),
+    cursor: normalizeCursor(request.cursor),
+    direction: normalizeHistoryDirection(request.direction),
+  });
+}
+
+function buildTranscriptHistoryResponse(request: {
+  sessionKey: string;
+  sessionId?: string;
+  messages: HistoryMessage[];
+  limit: number;
+  cursor?: string;
+  direction: ChatHistoryDirection;
+}): HistoryResponse {
   const cursorSeq = parseHistoryCursorSeq(request.cursor);
-  const page = paginateHistoryMessages(messages, {
-    limit,
-    direction,
+  const page = paginateHistoryMessages(request.messages, {
+    limit: request.limit,
+    direction: request.direction,
     cursorSeq,
   });
 
@@ -195,9 +267,10 @@ export function canonicalizeOpenClawGatewayHistoryResponse(
   request: { sessionKey: string; cursor?: string },
 ): HistoryResponse {
   const requestedSessionKey = cleanHistoryString(history.sessionKey) ?? request.sessionKey;
-  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(history.messages ?? [], requestedSessionKey);
+  const restored = restoreGatewayHistoryMessages(history.messages ?? []);
+  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(restored, requestedSessionKey);
   const automaticMediaReplies = normalizeOpenClawAutomaticMediaReplies(explicitSidecars.messages, requestedSessionKey);
-  const normalizedHistory = explicitSidecars.changed || automaticMediaReplies.changed
+  const normalizedHistory = restored !== history.messages || explicitSidecars.changed || automaticMediaReplies.changed
     ? { ...history, messages: automaticMediaReplies.messages as HistoryMessage[] }
     : history;
   const filtered = filterOpenClawHeartbeatHistoryResponse(normalizedHistory);
@@ -375,14 +448,7 @@ async function readIndexedTranscriptMessages(transcriptPath: string, sessionKey:
       messages.push(message);
     }
   }
-  // Fold the automatic assistant-media sidecar before lineage reconstruction.
-  // Lineage deliberately rewrites idempotency keys to mobile turn IDs, while
-  // the raw <run>:assistant-media key and parentId are the authoritative
-  // relationship needed to keep the desktop and mobile projections aligned.
-  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(messages, sessionKey).messages as HistoryMessage[];
-  restoreTranscriptTurnLineage(explicitSidecars);
-  const foldedMessages = normalizeOpenClawAutomaticMediaReplies(explicitSidecars, sessionKey).messages as HistoryMessage[];
-  const visibleMessages = filterOpenClawHeartbeatArtifacts(foldedMessages);
+  const visibleMessages = prepareTranscriptHistoryMessages(messages, sessionKey);
 
   transcriptHistoryCache.set(transcriptPath, {
     size: stats.size,
@@ -390,6 +456,53 @@ async function readIndexedTranscriptMessages(transcriptPath: string, sessionKey:
     messages: visibleMessages,
   });
   return visibleMessages;
+}
+
+function sqliteTranscriptHistoryMessage(
+  row: { seq?: unknown; event_json?: unknown },
+  sessionId: string,
+): HistoryMessage | null {
+  const seq = typeof row.seq === "number" && Number.isFinite(row.seq) && row.seq > 0
+    ? Math.round(row.seq)
+    : undefined;
+  if (!seq || typeof row.event_json !== "string") return null;
+
+  let event: unknown;
+  try {
+    event = JSON.parse(row.event_json);
+  } catch {
+    return null;
+  }
+  if (!isRecord(event) || event.type !== "message" || !isRecord(event.message)) return null;
+
+  // `event.id`/`event.parentId` form the transcript's real lineage graph.
+  // Do not replace that graph with a synthetic seq id: assistant events often
+  // lack their own run id and are linked back to the originating user turn
+  // only through those event ids.
+  const sourceMessageId = cleanHistoryString(event.id);
+  const message: HistoryMessage = { ...event.message, seq };
+  if (!cleanHistoryString(message.id)) {
+    message.id = sourceMessageId ?? `sqlite-${sessionId}-${seq}`;
+  }
+  const timestamp = normalizeHistoryTimestamp(message.timestamp ?? event.timestamp);
+  if (timestamp !== undefined) {
+    message.timestamp = timestamp;
+    message.createdAt = cleanHistoryString(message.createdAt) ?? new Date(timestamp).toISOString();
+  }
+  const parentId = cleanHistoryString(event.parentId) ?? cleanHistoryString(message.parentId);
+  if (parentId) message.parentId = parentId;
+  return message;
+}
+
+function prepareTranscriptHistoryMessages(messages: HistoryMessage[], sessionKey: string): HistoryMessage[] {
+  // Fold the automatic assistant-media sidecar before lineage reconstruction.
+  // Lineage deliberately rewrites idempotency keys to mobile turn IDs, while
+  // the raw <run>:assistant-media key and parentId are the authoritative
+  // relationship needed to keep the desktop and mobile projections aligned.
+  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(messages, sessionKey).messages as HistoryMessage[];
+  restoreTranscriptTurnLineage(explicitSidecars);
+  const foldedMessages = normalizeOpenClawAutomaticMediaReplies(explicitSidecars, sessionKey).messages as HistoryMessage[];
+  return filterOpenClawHeartbeatArtifacts(foldedMessages);
 }
 
 /**

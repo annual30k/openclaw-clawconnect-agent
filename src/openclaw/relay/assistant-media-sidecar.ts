@@ -10,6 +10,8 @@ export function normalizeOpenClawAssistantMediaSidecars(
   messages: unknown[],
   fallbackSessionKey?: string,
 ): { messages: unknown[]; changed: boolean } {
+  const materialized = materializeOpenClawDisplayContent(messages);
+  messages = materialized.messages;
   const candidatesByScopeAndRun = new Map<string, Array<{ index: number; message: Record<string, unknown> }>>();
   const messagesById = new Map<string, { index: number; message: Record<string, unknown> }>();
   const sidecars: Array<{ index: number; message: Record<string, unknown>; runId: string; scope: string; parentId?: string }> = [];
@@ -42,7 +44,7 @@ export function normalizeOpenClawAssistantMediaSidecars(
     candidatesByScopeAndRun.set(key, candidates);
   }
 
-  if (sidecars.length === 0) return { messages, changed: false };
+  if (sidecars.length === 0) return { messages, changed: materialized.changed };
 
   const mergedByIndex = new Map<number, Record<string, unknown>>();
   const suppressedIndexes = new Set<number>();
@@ -73,7 +75,7 @@ export function normalizeOpenClawAssistantMediaSidecars(
     processedSidecarKeys.add(sidecarKey);
   }
 
-  if (suppressedIndexes.size === 0) return { messages, changed: false };
+  if (suppressedIndexes.size === 0) return { messages, changed: materialized.changed };
   return {
     messages: messages.flatMap((message, index) => {
       if (suppressedIndexes.has(index)) return [];
@@ -93,6 +95,8 @@ export function normalizeOpenClawAutomaticMediaReplies(
   messages: unknown[],
   fallbackSessionKey?: string,
 ): { messages: unknown[]; changed: boolean } {
+  const materialized = materializeOpenClawDisplayContent(messages);
+  messages = materialized.messages;
   const runs = new Map<string, {
     parents: Array<{ index: number; message: Record<string, unknown> }>;
     toolCallOrder: Map<string, number>;
@@ -146,7 +150,7 @@ export function normalizeOpenClawAutomaticMediaReplies(
     runs.set(key, run);
   }
 
-  if (automaticReplies.length === 0) return { messages, changed: false };
+  if (automaticReplies.length === 0) return { messages, changed: materialized.changed };
 
   const mergedByIndex = new Map<number, Record<string, unknown>>();
   const suppressedIndexes = new Set<number>();
@@ -192,7 +196,7 @@ export function normalizeOpenClawAutomaticMediaReplies(
     mergedByIndex.set(parent.index, currentParent);
   }
 
-  if (suppressedIndexes.size === 0) return { messages, changed: false };
+  if (suppressedIndexes.size === 0) return { messages, changed: materialized.changed };
   return {
     messages: messages.flatMap((message, index) => {
       if (suppressedIndexes.has(index)) return [];
@@ -248,6 +252,79 @@ function mergeAssistantMediaSidecar(
   return sidecarMedia.length === 0
     ? parent
     : { ...parent, content: [...parentContent, ...sidecarMedia] };
+}
+
+/**
+ * OpenClaw's delivery-mirror transcript rows keep media-only output in
+ * `openclawDisplayContent` while leaving protocol `content` empty. The
+ * desktop Control UI renders that display projection directly, but Relay and
+ * mobile clients consume canonical content blocks. Promote only media display
+ * blocks here, before sidecar folding and outgoing-media upload, so the same
+ * transcript event has one portable representation across clients.
+ */
+function materializeOpenClawDisplayContent(
+  messages: unknown[],
+): { messages: unknown[]; changed: boolean } {
+  let changed = false;
+  const nextMessages = messages.map((message) => {
+    const record = asRecord(message);
+    if (!record || record.role !== "assistant" || !Array.isArray(record.openclawDisplayContent)) {
+      return message;
+    }
+
+    const displayMedia = record.openclawDisplayContent.filter(isDisplayMediaBlock);
+    if (displayMedia.length === 0) return message;
+
+    const content = normalizeContentBlocks(record.content);
+    const existingMediaKeys = new Set(
+      mediaContentBlocks(content).map(mediaContentIdentity).filter((key): key is string => Boolean(key)),
+    );
+    const additions = displayMedia.filter((block) => {
+      const key = mediaContentIdentity(block);
+      // Only suppress a display block already represented by protocol content.
+      // Do not update this set while walking displayMedia: two display entries
+      // with the same identity can be intentional repeated sends.
+      return !key || !existingMediaKeys.has(key);
+    });
+    if (additions.length === 0) return message;
+
+    changed = true;
+    return { ...record, content: [...content, ...additions] };
+  });
+  return { messages: changed ? nextMessages : messages, changed };
+}
+
+function isDisplayMediaBlock(block: unknown): block is Record<string, unknown> {
+  const record = asRecord(block);
+  if (!record) return false;
+  const type = firstString(record.type)?.toLowerCase();
+  if (!type || !["image", "file", "audio", "voice", "video"].includes(type)) return false;
+  return Boolean(firstString(
+    record.url,
+    record.openUrl,
+    record.downloadUrl,
+    record.downloadPath,
+    record.download_path,
+    record.artifactId,
+    record.attachmentId,
+    record.fileId,
+  ));
+}
+
+function mediaContentIdentity(block: unknown): string | undefined {
+  const record = asRecord(block);
+  if (!record) return undefined;
+  const value = firstString(
+    record.url,
+    record.openUrl,
+    record.downloadUrl,
+    record.downloadPath,
+    record.download_path,
+    record.artifactId,
+    record.attachmentId,
+    record.fileId,
+  );
+  return value ? `${firstString(record.type)?.toLowerCase() ?? "media"}\u0000${value}` : undefined;
 }
 
 function mediaContentBlocks(content: unknown): unknown[] {

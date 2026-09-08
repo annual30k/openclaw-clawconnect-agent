@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { WebSocketServer } from "ws";
 import { gatewayWebSocketOrigin, OpenClawGatewayClient } from "./gateway-client.js";
+import { CLAWCONNECT_AGENT_VERSION } from "../runtime-metadata.js";
 
 test("gatewayWebSocketOrigin maps secure and insecure Gateway URLs", () => {
   assert.equal(gatewayWebSocketOrigin("ws://localhost:18789/path?token=hidden"), "http://localhost:18789");
@@ -127,7 +128,7 @@ test("gateway client advertises the supported WebChat identity and exact protoco
     assert.equal(connectParams?.client?.id, "webchat-ui");
     assert.equal(connectParams?.client?.mode, "webchat");
     assert.equal(connectParams?.client?.displayName, "ClawConnect Agent");
-    assert.equal(connectParams?.client?.version, "0.2.4");
+    assert.equal(connectParams?.client?.version, CLAWCONNECT_AGENT_VERSION);
     assert.equal(connectParams?.client?.buildId, undefined);
     assert.equal(requestOrigin, `http://127.0.0.1:${address.port}`);
   } finally {

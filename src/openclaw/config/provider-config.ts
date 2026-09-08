@@ -250,7 +250,10 @@ export async function listConfiguredModels(): Promise<ConfiguredModelEntry[]> {
       name: alias,
       contextWindow: modelRecord ? modelContextWindow(modelRecord) : "--",
       tags: modelRecord ? [modelId, ...readStringArray(modelRecord["tags"])] : [modelId],
-      isSelected: false,
+      // The Relay may later replace this with a session-specific selection. It is
+      // still important to expose one provider-qualified fallback when a session
+      // only reports an ambiguous bare model ID.
+      isSelected: fullKey === primaryModel,
       isDefault: fullKey === primaryModel,
     });
   }

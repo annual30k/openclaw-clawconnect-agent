@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,9 +9,11 @@ import {
   canonicalizeOpenClawGatewayHistoryResponse,
   clearTranscriptHistoryCache,
   filterOpenClawHeartbeatArtifacts,
+  readOpenClawTranscriptChatHistory,
   readChatHistoryFromTranscriptFile,
   type HistoryResponse,
 } from "./chat-history.js";
+import { DEFAULT_GATEWAY_SESSION_DEFAULTS } from "./session-context.js";
 
 test("OpenClaw v4 gateway history becomes a canonical snapshot with native user turns", () => {
   const firstRunId = "f7ef5c1e-c3e9-48fd-a2a5-84d4f029bc07";
@@ -194,6 +197,70 @@ test("OpenClaw v4 gateway history folds concurrent media replies in tool-call or
     { type: "image", attachmentId: "att-second", transferState: "available" },
     { type: "image", attachmentId: "att-third", transferState: "available" },
   ]);
+});
+
+test("SQLite transcript history preserves the Control UI sequence for asynchronously appended messages", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "clawconnect-chat-history-sqlite-"));
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  const sessionKey = "agent:health-manager:scheduled-review";
+  const sessionId = "sqlite-history-session";
+  const databasePath = join(stateDir, "agents", "health-manager", "agent", "openclaw-agent.sqlite");
+  await mkdir(join(stateDir, "agents", "health-manager", "agent"), { recursive: true });
+
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec(`
+      CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, current_session_id TEXT NOT NULL);
+      CREATE TABLE transcript_events (session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL);
+    `);
+    database.prepare("INSERT INTO session_nodes (session_key, current_session_id) VALUES (?, ?)")
+      .run(sessionKey, sessionId);
+    const insertEvent = database.prepare(
+      "INSERT INTO transcript_events (session_id, seq, event_json) VALUES (?, ?, ?)",
+    );
+    for (const [seq, id, role, text] of [
+      [14, "lunch-photo", "user", "午餐图片"],
+      [19, "lunch-reply", "assistant", "午餐已记录"],
+      [26, "noon-workout", "user", "中午运动图片"],
+      [31, "workout-reply", "assistant", "中午运动已记录"],
+      [35, "dinner-missing", "assistant", "晚餐还没核实"],
+      [36, "dinner-photo", "user", "晚餐图片"],
+    ] as const) {
+      insertEvent.run(sessionId, seq, JSON.stringify({
+        type: "message",
+        id,
+        timestamp: new Date(Date.UTC(2026, 8, 7, 12, 0, seq)).toISOString(),
+        message: { id, role, content: text },
+      }));
+    }
+  } finally {
+    database.close();
+  }
+
+  try {
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    const page = await readOpenClawTranscriptChatHistory(
+      { sessionKey, limit: 20 },
+      DEFAULT_GATEWAY_SESSION_DEFAULTS,
+    );
+
+    assert.deepEqual(page?.messages?.map((message) => message.id), [
+      "lunch-photo",
+      "lunch-reply",
+      "noon-workout",
+      "workout-reply",
+      "dinner-missing",
+      "dinner-photo",
+    ]);
+    assert.deepEqual(page?.timelineSnapshot?.messages.map((message) => message.seq), [14, 19, 26, 31, 35, 36]);
+  } finally {
+    if (previousStateDir === undefined) {
+      delete process.env.OPENCLAW_STATE_DIR;
+    } else {
+      process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    }
+    await rm(stateDir, { recursive: true, force: true });
+  }
 });
 
 test("transcript history hides completed OpenClaw heartbeat-only turns", async () => {

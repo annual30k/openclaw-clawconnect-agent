@@ -78,6 +78,7 @@ import {
   CHAT_HISTORY_FALLBACK_RETRY_DELAY_MS,
   CHAT_HISTORY_FETCH_TIMEOUT_MS,
   CHAT_HISTORY_FINAL_RETRY_DELAY_MS,
+  CHAT_HISTORY_MEDIA_ENRICHMENT_TIMEOUT_MS,
 } from "./relay/relay-manager-history-timing.js";
 import {
   canonicalizeOpenClawChatSendResult,
@@ -93,6 +94,7 @@ import type {
   OpenClawRelayToServer,
   RelayManagerOptions,
 } from "./relay/relay-manager-protocol.js";
+import { enrichAgentsListWithIdentities } from "./relay/agent-identity-helpers.js";
 export { buildRelayHelloMessage } from "./relay/relay-manager-hello.js";
 export type { RelayHelloMessage, RelayManagerOptions } from "./relay/relay-manager-protocol.js";
 import {
@@ -390,6 +392,10 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             ? (session as { key?: unknown }).key
             : undefined;
           if (typeof sessionKey !== "string" || !sessionKey.trim()) continue;
+          // Cron jobs can target an agent session other than the default one.
+          // Subscribe each known session so their finished replies travel through
+          // the same ClawConnect → Relay realtime path as an interactive chat.
+          await ensureSessionMessagesSubscribed(sessionKey);
           const snapshot = contextUsageSnapshotFromSessionsList(sessionsPayload, sessionKey, sessionDefaults);
           if (!snapshot) continue;
           emitContextUsageSnapshot(snapshot, true);
@@ -776,19 +782,53 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 : "";
               const resolvedText = appendUniqueSuffix(bufferedText, currentText);
               if (resolvedText.trim() && !isOpenClawMediaDisplayPlaceholder(resolvedText)) {
-                const outgoingPayload = providerRunId
-                  ? mergeCanonicalChatPayload(
-                      normalizedPayload,
-                      buildMobileAssistantFinalPayload({
-                        run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
-                        text: resolvedText,
-                        contentBlocks: nonTextContentBlocks(normalizedPayload),
-                        includeTimelineEvents: true,
-                        ...mobileAssistantUsageFromPayload(normalizedPayload),
-                      }),
-                    )
-                  : withMessageText(normalizedPayload, resolvedText);
                 runAfterAssistantSnapshot(runSnapshotKey, true, async () => {
+                  let outgoingPayload: unknown;
+                  const directContentBlocks = nonTextContentBlocks(normalizedPayload);
+                  if (providerRunId && runContext && directContentBlocks.length === 0) {
+                    try {
+                      const history = await withTimeout(
+                        requestChatHistoryFromClawConnect({ sessionKey: resolvedSessionKey, limit: 10 }),
+                        CHAT_HISTORY_MEDIA_ENRICHMENT_TIMEOUT_MS,
+                        "chat.history media enrichment",
+                      );
+                      const outcome = extractHistoryOutcome(history, runContext);
+                      const historyContentBlocks = outcome?.kind === "final"
+                        ? nonTextContentBlocksFromHistory(outcome.message)
+                        : [];
+                      if (outcome?.kind === "final" && historyContentBlocks.length > 0) {
+                        const basePayload = mergeCanonicalChatPayload(
+                          normalizedPayload,
+                          buildMobileAssistantFinalPayload({
+                            run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
+                            text: resolvedText,
+                            contentBlocks: historyContentBlocks,
+                            includeTimelineEvents: true,
+                            ...mobileAssistantUsageFromPayload(normalizedPayload),
+                          }),
+                        );
+                        outgoingPayload = buildFinalPayloadFromHistoryOutcome(basePayload, outcome);
+                      }
+                    } catch (error) {
+                      // Media enrichment is opportunistic. The final text event
+                      // must still reach the client when history is unavailable.
+                      console.warn(`[relay] terminal media history enrichment skipped: ${String(error)}`);
+                    }
+                  }
+                  if (outgoingPayload === undefined) {
+                    outgoingPayload = providerRunId
+                      ? mergeCanonicalChatPayload(
+                          normalizedPayload,
+                          buildMobileAssistantFinalPayload({
+                            run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
+                            text: resolvedText,
+                            contentBlocks: directContentBlocks,
+                            includeTimelineEvents: true,
+                            ...mobileAssistantUsageFromPayload(normalizedPayload),
+                          }),
+                        )
+                      : withMessageText(normalizedPayload, resolvedText);
+                  }
                   await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
                   if (providerRunId) {
                     openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
@@ -1093,7 +1133,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           return identity;
         };
         let identity: OpenClawChatRunIdentity | undefined;
-        const result = commandMethod === "chat.history"
+        let result = commandMethod === "chat.history"
           ? await requestChatHistoryFromClawConnect(params)
           : await gatewayClient!.request(commandMethod, params, {
               // response 帧内同步登记，保证紧随其后的首个 delta 已能解析 canonical 身份。
@@ -1102,6 +1142,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               },
             });
         identity ??= registerIdentity(result);
+        if (commandMethod === "agents.list" && gatewayClient) {
+          result = await enrichAgentsListWithIdentities(result, gatewayClient);
+        }
         return { params, result, identity };
       };
       const commandExecution = chatSendIdempotencyRequest

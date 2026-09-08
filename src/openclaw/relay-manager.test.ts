@@ -434,6 +434,139 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
   }
 });
 
+test("relay manager enriches a text terminal with delivery-mirror images from history", async () => {
+  openClawChatRunIdentities.clear();
+  const openclawHome = await createEmptyOpenClawHomeFixture();
+  const previousOpenClawHome = process.env.CLAWCONNECT_OPENCLAW_HOME;
+  process.env.CLAWCONNECT_OPENCLAW_HOME = openclawHome.home;
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let gatewaySocket: WebSocket | undefined;
+  const runId = "run-live-delivery-mirror";
+
+  relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-live-delivery-mirror");
+    socket.on("message", (raw) => relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>));
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "nonce-live-media", ts: Date.now() } }));
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as { type?: string; id?: string; method?: string };
+      if (message.type !== "req" || !message.id) return;
+      if (message.method === "chat.history") {
+        socket.send(JSON.stringify({
+          type: "res",
+          id: message.id,
+          ok: true,
+          payload: {
+            sessionKey: "main",
+            messages: [
+              {
+                id: "user-live-media",
+                role: "user",
+                idempotencyKey: `${runId}:user`,
+                content: "把图片发过来",
+              },
+              {
+                id: "tool-live-media",
+                role: "assistant",
+                __openclaw: { runId },
+                content: [{ type: "toolCall", id: "call_live_media", name: "message" }],
+              },
+              {
+                id: "delivery-live-media",
+                role: "assistant",
+                idempotencyKey: `${runId}:message-tool:delivery:call_live_media`,
+                __openclaw: { runId },
+                content: [],
+                openclawDisplayContent: [{
+                  type: "image",
+                  url: "/api/chat/media/outgoing/agent%3Amain%3Amain/att_live_media/full",
+                }],
+              },
+              {
+                id: "final-live-media",
+                role: "assistant",
+                runId,
+                content: [{ type: "text", text: "3 张都发过去了 📸" }],
+              },
+            ],
+          },
+        }));
+        return;
+      }
+      socket.send(JSON.stringify({
+        type: "res",
+        id: message.id,
+        ok: true,
+        payload: message.method === "config.get" ? sessionDefaultsPayload() : {},
+      }));
+      if (message.method === "connect") {
+        socket.send(JSON.stringify({
+          type: "event",
+          event: "chat",
+          payload: {
+            runId,
+            sessionKey: "main",
+            state: "final",
+            role: "assistant",
+            message: { role: "assistant", content: [{ type: "text", text: "3 张都发过去了 📸" }] },
+          },
+        }));
+      }
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-live-delivery-mirror",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+  try {
+    await waitFor(() => relayMessages.some((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload)
+      && message.payload.state === "final"
+      && timelineEvents(message.payload).some((event) => event.eventType === "message.completed"
+        && Array.isArray(event.content)
+        && event.content.some((block) => isRecord(block) && block.type === "image"))
+    )), 4_000);
+    const final = relayMessages.find((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload)
+      && message.payload.state === "final"
+    ));
+    assert.ok(final);
+    const completed = timelineEvents(final.payload as Record<string, unknown>)
+      .find((event) => event.eventType === "message.completed");
+    const image = Array.isArray(completed?.content)
+      ? completed.content.find((block): block is Record<string, unknown> => isRecord(block) && block.type === "image")
+      : undefined;
+    assert.equal(image?.transferState, "expired");
+    assert.equal(image?.attachmentId, "att_live_media");
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+    openClawChatRunIdentities.clear();
+    if (previousOpenClawHome === undefined) {
+      delete process.env.CLAWCONNECT_OPENCLAW_HOME;
+    } else {
+      process.env.CLAWCONNECT_OPENCLAW_HOME = previousOpenClawHome;
+    }
+    await openclawHome.cleanup();
+  }
+});
+
 test("relay manager projects an OpenClaw assistant-media sidecar onto the parent canonical message identity", async () => {
   const relayServer = new WebSocketServer({ port: 0 });
   const gatewayServer = new WebSocketServer({ port: 0 });
@@ -1737,6 +1870,127 @@ test("relay manager reuses one OpenClaw model request for concurrent and termina
     await closeServer(gatewayServer);
   }
 });
+
+test("relay manager enriches agents.list response with IDENTITY.md for main agent", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let gatewaySocket: WebSocket | undefined;
+  let relaySocket: WebSocket | undefined;
+
+  relayServer.on("connection", (socket) => {
+    relaySocket = socket;
+    sendRelayHello(socket, "gw-agents-test");
+    socket.on("message", (raw) => {
+      relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
+    });
+  });
+
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({
+      type: "event",
+      event: "connect.challenge",
+      payload: { nonce: "nonce-agents", ts: Date.now() },
+    }));
+    socket.on("message", (raw) => {
+      const msg = JSON.parse(raw.toString()) as { type?: string; id?: string; method?: string; params?: any };
+      if (msg.type === "req" && msg.method === "connect" && msg.id) {
+        socket.send(JSON.stringify({
+          type: "res",
+          id: msg.id,
+          ok: true,
+          payload: { protocol: 4, server: { version: "2026.8.2" } },
+        }));
+      } else if (msg.type === "req" && msg.method === "agents.list" && msg.id) {
+        socket.send(JSON.stringify({
+          type: "res",
+          id: msg.id,
+          ok: true,
+          payload: {
+            defaultId: "main",
+            mainKey: "main",
+            scope: "per-sender",
+            agents: [
+              { id: "main" },
+              { id: "health-manager", identity: { name: "健康管家", emoji: "🩺" } },
+            ],
+          },
+        }));
+      } else if (msg.type === "req" && msg.method === "agents.files.get" && msg.id) {
+        if (msg.params?.agentId === "main" && msg.params?.name === "IDENTITY.md") {
+          socket.send(JSON.stringify({
+            type: "res",
+            id: msg.id,
+            ok: true,
+            payload: {
+              agentId: "main",
+              workspace: "/workspace",
+              file: {
+                name: "IDENTITY.md",
+                path: "/workspace/IDENTITY.md",
+                missing: false,
+                content: "# IDENTITY.md\n\n- **Name:** 贾维斯\n- **Emoji:** 🦞\n",
+              },
+            },
+          }));
+        }
+      }
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-agents-test",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+
+  try {
+    await waitFor(() => Boolean(relaySocket) && relayMessages.some((message) => message.type === "gateway_connected"), 4_000);
+    relaySocket!.send(JSON.stringify({
+      type: "cmd",
+      id: "cmd-agents-1",
+      method: "agents.list",
+      params: {},
+    }));
+
+    await waitFor(() => relayMessages.some((m) => m.type === "res" && m.id === "cmd-agents-1"), 4_000);
+    const res = relayMessages.find((m) => m.type === "res" && m.id === "cmd-agents-1");
+    assert.ok(res);
+    assert.equal(res.ok, true);
+    const payload = res.payload as any;
+    const agents = payload?.agents || [];
+    assert.equal(agents.length, 2);
+    const mainAgent = agents.find((a: any) => a.id === "main");
+    assert.ok(mainAgent);
+    assert.equal(mainAgent.identity?.name, "贾维斯");
+    assert.equal(mainAgent.identity?.emoji, "🦞");
+    assert.equal(mainAgent.displayName, "贾维斯");
+    assert.equal(mainAgent.emoji, "🦞");
+
+    const healthAgent = agents.find((a: any) => a.id === "health-manager");
+    assert.ok(healthAgent);
+    assert.equal(healthAgent.identity?.name, "健康管家");
+    assert.equal(healthAgent.identity?.emoji, "🩺");
+    assert.equal(healthAgent.displayName, "健康管家");
+    assert.equal(healthAgent.emoji, "🩺");
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+  }
+});
+
 
 function extractPayloadText(payload: Record<string, unknown>): string {
   const message = isRecord(payload.message) ? payload.message : undefined;

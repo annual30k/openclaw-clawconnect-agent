@@ -16,6 +16,27 @@ import {
   normalizeOpenClawAssistantMediaSidecars,
 } from "./assistant-media-sidecar.js";
 
+test("managed inbound images are uploaded once across history projections and reject traversal", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "inbound-media-test-"));
+  const server = await createFileUploadRelayServer("file_inbound");
+  try {
+    await mkdir(join(stateDir, "media", "inbound"), { recursive: true });
+    await writeFile(join(stateDir, "media", "inbound", "photo.png"), "image bytes");
+    await writeFile(join(stateDir, "outside.png"), "private");
+    const options = { stateDir, relayServerUrl: server.baseUrl, relaySecret: "secret", gatewayId: "gw_test", cache: new Map() };
+    const message = { role: "user", runId: "user-run", content: [{ type: "image", url: "media://inbound/photo.png" }] };
+    const result = await relayOutgoingMediaInHistoryResponse({ sessionKey: "agent:health:chat", messages: [message], timelineSnapshot: { messages: [message] } }, options) as any;
+    assert.equal(result.messages[0].content[0].fileId, "file_inbound");
+    assert.equal(result.timelineSnapshot.messages[0].content[0].fileId, "file_inbound");
+    const escaped = await relayOutgoingMediaInPayload({ sessionKey: "agent:health:chat", message: { ...message, content: [{ type: "image", url: "media://inbound/../../outside.png" }] } }, options) as any;
+    assert.equal(escaped.message.content[0].isRemoteExpired, true);
+    assert.equal(escaped.message.content[0].url, undefined);
+  } finally {
+    await server.close();
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("outgoing artifact detection recognizes Windows drive and UNC paths", () => {
   assert.deepEqual(extractDeliverablePathCandidates([
     "已生成 C:\\Users\\测试 User\\Desktop\\report.xlsx。",
@@ -188,6 +209,47 @@ test("relayOutgoingMediaInHistoryResponse rewrites outgoing media inside chat hi
     const image = result.messages[0].content[0] as Record<string, unknown>;
     assert.equal(image.fileId, "file_outgoing_history");
     assert.equal(image.downloadPath, "/api/mobile/files/file_outgoing_history");
+  } finally {
+    await server.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("relay history uploads images that only exist in an OpenClaw delivery-mirror projection", async () => {
+  const fixture = await createOutgoingMediaFixture();
+  const server = await createFileUploadRelayServer("file_delivery_mirror_history");
+  const runId = "assistant-delivery-mirror";
+  const outgoingUrl = `/api/chat/media/outgoing/agent%3Amain%3Asession_1/${fixture.attachmentId}/full`;
+  try {
+    const result = await relayOutgoingMediaInHistoryResponse({
+      sessionKey: "agent:main:session_1",
+      messages: [
+        {
+          role: "assistant",
+          __openclaw: { runId },
+          content: [{ type: "toolCall", id: "call_send", name: "message" }],
+        },
+        {
+          role: "assistant",
+          idempotencyKey: `${runId}:message-tool:delivery:call_send`,
+          __openclaw: { runId },
+          content: [],
+          openclawDisplayContent: [{ type: "image", url: outgoingUrl, alt: "photo.jpg" }],
+        },
+      ],
+    }, {
+      relayServerUrl: server.baseUrl,
+      relaySecret: "secret",
+      gatewayId: "gw_test",
+      recordsDir: fixture.recordsDir,
+      cache: new Map(),
+    }) as { messages: Array<{ content: Array<Record<string, unknown>> }> };
+
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages[0]?.content[1]?.type, "image");
+    assert.equal(result.messages[0]?.content[1]?.fileId, "file_delivery_mirror_history");
+    assert.equal(result.messages[0]?.content[1]?.downloadPath, "/api/mobile/files/file_delivery_mirror_history");
+    assert.equal(server.initRequestCount(), 1);
   } finally {
     await server.close();
     await rm(fixture.root, { recursive: true, force: true });
@@ -406,6 +468,110 @@ test("automatic message-tool media stays independent without one exact parent ru
 
   assert.equal(normalized.changed, false);
   assert.equal(normalized.messages.length, 3);
+});
+
+test("delivery-mirror display media is promoted when protocol content is empty", () => {
+  const sourceRunId = "wx_display_mirror_run";
+  const displayUrl = "/api/chat/media/outgoing/agent%3Amain%3Asession_1/att_display/full";
+  const normalized = normalizeOpenClawAutomaticMediaReplies([
+    {
+      id: "assistant-tool-call",
+      role: "assistant",
+      __openclaw: { runId: sourceRunId },
+      content: [{ type: "toolCall", id: "call_display", name: "message" }],
+    },
+    {
+      id: "delivery-mirror-display",
+      role: "assistant",
+      idempotencyKey: `${sourceRunId}:message-tool:delivery-display:call_display`,
+      __openclaw: { runId: sourceRunId },
+      content: [],
+      openclawDisplayContent: [{
+        type: "image",
+        artifactId: "artifact_managed_image_display",
+        url: displayUrl,
+        alt: "photo.png",
+        mimeType: "image/png",
+      }],
+    },
+  ], "agent:main:session_1");
+
+  assert.equal(normalized.changed, true);
+  assert.equal(normalized.messages.length, 1);
+  assert.deepEqual((normalized.messages[0] as Record<string, unknown>).content, [{
+    type: "toolCall",
+    id: "call_display",
+    name: "message",
+  }, {
+    type: "image",
+    artifactId: "artifact_managed_image_display",
+    url: displayUrl,
+    alt: "photo.png",
+    mimeType: "image/png",
+  }]);
+});
+
+test("multiple delivery-mirror display rows remain visible when their run has several tool calls", () => {
+  const sourceRunId = "wx_display_mirror_concurrent";
+  const normalized = normalizeOpenClawAutomaticMediaReplies([
+    {
+      id: "assistant-tool-call-one",
+      role: "assistant",
+      __openclaw: { runId: sourceRunId },
+      content: [{ type: "toolCall", id: "call_one", name: "message" }],
+    },
+    {
+      id: "assistant-tool-call-two",
+      role: "assistant",
+      __openclaw: { runId: sourceRunId },
+      content: [{ type: "toolCall", id: "call_two", name: "message" }],
+    },
+    {
+      id: "delivery-mirror-one",
+      role: "assistant",
+      idempotencyKey: `${sourceRunId}:message-tool:delivery-one:call_one`,
+      __openclaw: { runId: sourceRunId },
+      content: [],
+      openclawDisplayContent: [{ type: "image", url: "/api/chat/media/outgoing/session/att_one/full" }],
+    },
+    {
+      id: "delivery-mirror-two",
+      role: "assistant",
+      idempotencyKey: `${sourceRunId}:message-tool:delivery-two:call_two`,
+      __openclaw: { runId: sourceRunId },
+      content: [],
+      openclawDisplayContent: [{ type: "image", url: "/api/chat/media/outgoing/session/att_two/full" }],
+    },
+  ], "agent:main:session_1");
+
+  assert.equal(normalized.changed, true);
+  assert.equal(normalized.messages.length, 4);
+  assert.deepEqual(
+    normalized.messages.slice(2).map((message) => (message as Record<string, unknown>).content),
+    [
+      [{ type: "image", url: "/api/chat/media/outgoing/session/att_one/full" }],
+      [{ type: "image", url: "/api/chat/media/outgoing/session/att_two/full" }],
+    ],
+  );
+});
+
+test("repeated display entries are preserved when OpenClaw intentionally sends the same media twice", () => {
+  const normalized = normalizeOpenClawAutomaticMediaReplies([
+    {
+      role: "assistant",
+      idempotencyKey: "run-repeat:message-tool:delivery:call_repeat",
+      __openclaw: { runId: "run-repeat" },
+      content: [],
+      openclawDisplayContent: [
+        { type: "image", url: "/api/chat/media/outgoing/session/att_repeat/full" },
+        { type: "image", url: "/api/chat/media/outgoing/session/att_repeat/full" },
+      ],
+    },
+  ], "agent:main:session_1");
+
+  assert.equal(normalized.changed, true);
+  assert.equal(normalized.messages.length, 1);
+  assert.equal((normalized.messages[0] as Record<string, unknown>).content?.length, 2);
 });
 
 test("payload preserves unavailable outgoing media as an explicit placeholder", async () => {

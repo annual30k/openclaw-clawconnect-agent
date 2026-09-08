@@ -1,5 +1,5 @@
 import { existsSync } from "fs";
-import { readFile, stat } from "fs/promises";
+import { readFile, stat, realpath } from "fs/promises";
 import { homedir } from "os";
 import { isAbsolute, extname, join, relative, resolve } from "path";
 import { DatabaseSync } from "node:sqlite";
@@ -34,6 +34,7 @@ export type OutgoingMediaRelayOptions = {
 
 type OutgoingMediaOptionsWithSourceRun = OutgoingMediaRelayOptions & {
   sourceRunId?: string;
+  sessionKey?: string;
 };
 
 type OutgoingMediaRecord = {
@@ -70,7 +71,7 @@ export async function relayOutgoingMediaInPayload(
   const sourceRunId = payloadSourceRunId(payloadRecord);
   const messageContent = await relayOutgoingMediaContent(
     (message as Record<string, unknown>).content,
-    { ...opts, sourceRunId },
+    { ...opts, sourceRunId, sessionKey: firstString(payloadRecord.sessionKey) },
   );
   const localArtifactBlocks = await relayLocalArtifactPathsInContent(messageContent.blocks, payloadRecord, opts);
   const timelineEvents = await relayOutgoingMediaInTimelineEvents(payloadRecord.timelineEvents, opts, sourceRunId);
@@ -245,6 +246,24 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
   }
   const source = block as Record<string, unknown>;
   const url = firstString(source.url, source.openUrl, source.downloadUrl, source.download_path, source.downloadPath);
+  if (url?.startsWith("media://inbound/") && opts.sessionKey && opts.sourceRunId) {
+    const attachmentId = `openclaw-input-${createHash("sha256").update(JSON.stringify([opts.sessionKey, opts.sourceRunId, url])).digest("hex").slice(0, 32)}`;
+    try {
+      const root = await realpath(join(opts.stateDir ?? resolveOpenClawStateDir(), "media", "inbound"));
+      const filePath = await realpath(resolve(root, decodeURIComponent(url.slice("media://inbound/".length))));
+      const pathWithinRoot = relative(root, filePath);
+      if (!pathWithinRoot || pathWithinRoot.startsWith("..") || isAbsolute(pathWithinRoot)) throw new Error("invalid_managed_media_path");
+      const cacheKey = await outgoingFileCacheKey({ gatewayId: opts.gatewayId, sessionKey: opts.sessionKey, identity: attachmentId, filePath, sourceRunId: opts.sourceRunId });
+      const upload = await cachedUpload(opts, cacheKey, {
+        relayServerUrl: opts.relayServerUrl, relaySecret: opts.relaySecret,
+        gatewayId: opts.gatewayId, sessionKey: opts.sessionKey, filePath,
+        sourceRunId: opts.sourceRunId, timelineDelivery: "embedded",
+      });
+      return { ...uploadToContentBlock(upload), attachmentId, fileName: source.fileName || upload.fileName };
+    } catch {
+      return { type: source.type, attachmentId, fileName: source.fileName || "图片", transferState: "expired", isRemoteExpired: true, attachmentStatusText: "图片文件暂不可用" };
+    }
+  }
   const attachmentId = outgoingAttachmentId(url);
   if (!attachmentId) {
     return block;
@@ -339,6 +358,8 @@ function payloadSourceRunId(payload: Record<string, unknown>): string | undefine
   const messageRecord = message && typeof message === "object" && !Array.isArray(message)
     ? message as Record<string, unknown>
     : undefined;
+  const metadata = asRecord(messageRecord?.__openclaw);
+  const inputId = firstString(messageRecord?.idempotencyKey, metadata?.idempotencyKey);
   return firstString(
     payload.sourceRunId,
     payload.source_run_id,
@@ -350,8 +371,11 @@ function payloadSourceRunId(payload: Record<string, unknown>): string | undefine
     messageRecord?.source_run_id,
     messageRecord?.runId,
     messageRecord?.turnId,
+    metadata?.runId,
+    inputId?.replace(/:user$/, ""),
     messageRecord?.messageId,
     messageRecord?.id,
+    metadata?.id,
   );
 }
 

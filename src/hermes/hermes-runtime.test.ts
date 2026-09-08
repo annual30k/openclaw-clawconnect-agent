@@ -1009,6 +1009,35 @@ test("model options prefer current Hermes status when picker context is stale", 
   assert.equal(items.find((item) => item.modelId === "gpt-5.6-luna")?.isSelected, true);
 });
 
+test("model options select one provider-qualified duplicate model", () => {
+  const items = modelItemsFromHermesModelOptionsPayload({
+    provider: "xiaomi-token-plan",
+    model: "mimo-v2.5-pro",
+    providers: [
+      {
+        slug: "xiaomi-token-plan",
+        name: "Xiaomi Token Plan",
+        is_current: true,
+        models: ["mimo-v2.5-pro"],
+      },
+      {
+        slug: "xiaomi",
+        name: "Xiaomi",
+        is_current: true,
+        models: ["mimo-v2.5-pro"],
+      },
+    ],
+  }, {
+    provider: "xiaomi",
+    currentModel: "mimo-v2.5-pro",
+  });
+
+  assert.deepEqual(items.map((item) => [item.providerId, item.isSelected]), [
+    ["xiaomi-token-plan", false],
+    ["xiaomi", true],
+  ]);
+});
+
 test("Hermes model assignment uses the official provider-aware config path", () => {
   const script = hermesModelAssignmentScript("openai-api", "gpt-4o-mini");
 
