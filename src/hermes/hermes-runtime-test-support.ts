@@ -378,7 +378,7 @@ export async function waitForHermesDelta(events: unknown[], expectedText: string
   }
   assert.fail(`Timed out waiting for Hermes delta containing ${expectedText}`);
 }
-export function writeHistoryCompletingHermesBin(root: string): string {
+export function writeHistoryCompletingHermesBin(root: string, sourceRunId?: string): string {
   const binPath = join(root, "hermes-history-completion");
   const readyPath = join(root, "history-ready");
   const payload = JSON.stringify({
@@ -387,7 +387,9 @@ export function writeHistoryCompletingHermesBin(root: string): string {
       {
         id: "user-hi",
         role: "user",
-        content: "Hi",
+        content: sourceRunId
+          ? `Hi\n\n[ClawConnect mobile turn]\nsourceRunId: ${sourceRunId}\nsessionKey: main`
+          : "Hi",
         createdAt: "2026-06-22T02:06:26.000Z",
       },
       {
@@ -429,7 +431,7 @@ export function writeHistoryCompletingHermesBin(root: string): string {
   assert.equal(existsSync(binPath), true);
   return binPath;
 }
-export function writeStaleHistoryHermesBin(root: string): string {
+export function writeStaleHistoryHermesBin(root: string, sourceRunId?: string): string {
   const binPath = join(root, "hermes-stale-history");
   const payload = JSON.stringify({
     sessionId: "20260622_100613_8947a8",
@@ -437,7 +439,9 @@ export function writeStaleHistoryHermesBin(root: string): string {
       {
         id: "user-hi",
         role: "user",
-        content: "Hi",
+        content: sourceRunId
+          ? `Hi\n\n[ClawConnect mobile turn]\nsourceRunId: ${sourceRunId}\nsessionKey: main`
+          : "Hi",
         createdAt: "2026-06-22T02:06:26.000Z",
       },
       {
@@ -474,7 +478,7 @@ export function writeStaleHistoryHermesBin(root: string): string {
   assert.equal(existsSync(binPath), true);
   return binPath;
 }
-export function writeRepeatedUserStaleHistoryHermesBin(root: string): string {
+export function writeRepeatedUserStaleHistoryHermesBin(root: string, sourceRunId?: string): string {
   const binPath = join(root, "hermes-repeated-user-stale-history");
   const payload = JSON.stringify({
     sessionId: "20260622_100613_8947a8",
@@ -494,7 +498,9 @@ export function writeRepeatedUserStaleHistoryHermesBin(root: string): string {
       {
         id: "user-visible",
         role: "user",
-        content: "iOS final visible",
+        content: sourceRunId
+          ? `iOS final visible\n\n[ClawConnect mobile turn]\nsourceRunId: ${sourceRunId}\nsessionKey: main`
+          : "iOS final visible",
         createdAt: "2026-06-22T06:18:04.000Z",
       },
       {

@@ -29,7 +29,7 @@ test("dedupeChatSendUserMirrorTranscriptText removes OpenClaw prompt mirror for 
       timestamp: "2026-06-01T01:44:11.853Z",
       message: {
         role: "user",
-        content: "[Mon 2026-06-01 09:43 GMT+8] 后天福州的天气怎么样返回表格",
+        content: "[Mon 2026-06-01 09:43 GMT+8] 这是不同的展示文本，不是身份凭据",
         timestamp: 1780278251848,
         sourceChannel: "webchat",
         senderId: "openclaw-macos",

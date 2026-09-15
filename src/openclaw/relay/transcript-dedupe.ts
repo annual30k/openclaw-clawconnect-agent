@@ -31,23 +31,19 @@ type ParsedLine = {
   removed?: boolean;
 };
 
-const OPENCLAW_PROMPT_TIMESTAMP_PREFIX =
-  /^\[[A-Z][a-z]{2}\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+GMT[+-]\d{1,2}(?::?\d{2})?\]\s*/;
-
 export function dedupeChatSendUserMirrorTranscriptText(
   transcriptText: string,
   request: ChatSendUserMirrorDedupeRequest,
 ): ChatSendUserMirrorDedupeTextResult {
   const normalizedClientRunId = request.clientRunId.trim();
-  const normalizedMessage = normalizeDedupeText(request.message);
-  if (!normalizedClientRunId || !normalizedMessage) {
+  if (!normalizedClientRunId) {
     return unchangedTextResult(transcriptText);
   }
 
   const hasTrailingNewline = transcriptText.endsWith("\n");
   const body = hasTrailingNewline ? transcriptText.slice(0, -1) : transcriptText;
   const entries = parseTranscriptLines(body.length > 0 ? body.split("\n") : []);
-  const original = entries.find((entry) => isCanonicalMobileUserMessage(entry.parsed, normalizedClientRunId, normalizedMessage));
+  const original = entries.find((entry) => isCanonicalMobileUserMessage(entry.parsed, normalizedClientRunId));
   const originalId = typeof original?.parsed?.id === "string" ? original.parsed.id : undefined;
   if (!originalId) {
     return unchangedTextResult(transcriptText);
@@ -59,7 +55,7 @@ export function dedupeChatSendUserMirrorTranscriptText(
     if (!entry.parsed || entry === original) {
       continue;
     }
-    if (!isDuplicatePromptMirror(entry.parsed, originalId, normalizedMessage, request)) {
+    if (!isDuplicatePromptMirror(entry.parsed, originalId, request)) {
       continue;
     }
     const id = typeof entry.parsed.id === "string" ? entry.parsed.id : undefined;
@@ -155,20 +151,19 @@ function parseTranscriptLines(lines: string[]): ParsedLine[] {
 function isCanonicalMobileUserMessage(
   entry: Record<string, unknown> | undefined,
   clientRunId: string,
-  normalizedMessage: string,
 ): boolean {
   const message = transcriptMessage(entry);
   if (!message || message.role !== "user") {
     return false;
   }
-  return message.idempotencyKey === `${clientRunId}:user` &&
-    normalizeDedupeText(extractMessageText(message.content)) === normalizedMessage;
+  // The idempotency key is the canonical identity. Requiring text equality
+  // would make repeated natural-language prompts indistinguishable.
+  return message.idempotencyKey === `${clientRunId}:user`;
 }
 
 function isDuplicatePromptMirror(
   entry: Record<string, unknown>,
   originalId: string,
-  normalizedMessage: string,
   request: ChatSendUserMirrorDedupeRequest,
 ): boolean {
   if (entry.parentId !== originalId) {
@@ -178,9 +173,7 @@ function isDuplicatePromptMirror(
   if (!message || message.role !== "user") {
     return false;
   }
-  return isOpenClawPromptMirror(message) &&
-    isExpectedClawConnectSender(message, request) &&
-    normalizeDedupeText(extractMessageText(message.content)) === normalizedMessage;
+  return isOpenClawPromptMirror(message) && isExpectedClawConnectSender(message, request);
 }
 
 function transcriptMessage(entry: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
@@ -213,43 +206,13 @@ function isExpectedClawConnectSender(
   const senderId = typeof message.senderId === "string" ? message.senderId.trim() : "";
   const senderName = typeof message.senderName === "string" ? message.senderName.trim() : "";
   const senderUsername = typeof message.senderUsername === "string" ? message.senderUsername.trim() : "";
-  const senderLabel = typeof message.senderLabel === "string" ? message.senderLabel.trim() : "";
   return Boolean(
-    (expectedSenderId && (senderId === expectedSenderId || senderLabel.includes(expectedSenderId))) ||
+    (expectedSenderId && senderId === expectedSenderId) ||
       (expectedSenderName && (
         senderName === expectedSenderName ||
-        senderUsername === expectedSenderName ||
-        senderLabel.includes(expectedSenderName)
+        senderUsername === expectedSenderName
       )),
   );
-}
-
-function extractMessageText(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (!Array.isArray(content)) {
-    return "";
-  }
-  return content
-    .map((block) => {
-      if (typeof block === "string") {
-        return block;
-      }
-      if (!isRecord(block)) {
-        return "";
-      }
-      if (typeof block.text === "string") {
-        return block.text;
-      }
-      return typeof block.content === "string" ? block.content : "";
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
-function normalizeDedupeText(value: string): string {
-  return value.replace(/\r\n/g, "\n").replace(OPENCLAW_PROMPT_TIMESTAMP_PREFIX, "").trim();
 }
 
 function resolveRewiredParentId(parentId: string, removedParentById: Map<string, string | undefined>): string | undefined {

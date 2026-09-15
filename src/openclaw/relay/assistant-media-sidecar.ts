@@ -1,5 +1,20 @@
+import {
+  canonicalizeOpenClawSessionScope,
+  type GatewaySessionDefaults,
+} from "./session-context.js";
+
 const OPENCLAW_ASSISTANT_MEDIA_IDEMPOTENCY_SUFFIX = ":assistant-media";
 const OPENCLAW_MESSAGE_TOOL_IDEMPOTENCY_MARKER = ":message-tool:";
+
+export type OpenClawMessageToolRelation = {
+  sourceRunId: string;
+  toolCallId: string;
+};
+
+export type OpenClawMediaRelationOptions = {
+  projectionVersion?: 3;
+  sessionDefaults?: GatewaySessionDefaults;
+};
 
 /**
  * OpenClaw persists automatic outgoing media as a second assistant record whose
@@ -9,6 +24,7 @@ const OPENCLAW_MESSAGE_TOOL_IDEMPOTENCY_MARKER = ":message-tool:";
 export function normalizeOpenClawAssistantMediaSidecars(
   messages: unknown[],
   fallbackSessionKey?: string,
+  options?: OpenClawMediaRelationOptions,
 ): { messages: unknown[]; changed: boolean } {
   const materialized = materializeOpenClawDisplayContent(messages);
   messages = materialized.messages;
@@ -19,7 +35,7 @@ export function normalizeOpenClawAssistantMediaSidecars(
   for (let index = 0; index < messages.length; index += 1) {
     const message = asRecord(messages[index]);
     if (!message || message.role !== "assistant") continue;
-    const scope = messageSessionScope(message, fallbackSessionKey);
+    const scope = messageSessionScope(message, fallbackSessionKey, options?.sessionDefaults);
     const messageId = firstString(message.id, message.messageId, message.message_id);
     if (messageId && !messagesById.has(messageId)) {
       messagesById.set(messageId, { index, message });
@@ -53,13 +69,15 @@ export function normalizeOpenClawAssistantMediaSidecars(
     const explicitParent = sidecar.parentId ? messagesById.get(sidecar.parentId) : undefined;
     const candidates = explicitParent
       ? [explicitParent]
-      : candidatesByScopeAndRun.get(`${sidecar.scope}\u0000${sidecar.runId}`);
+      : options?.projectionVersion === 3
+        ? undefined
+        : candidatesByScopeAndRun.get(`${sidecar.scope}\u0000${sidecar.runId}`);
     // An ambiguous or incomplete relation is deliberately preserved. We never
     // infer a parent by matching text, time, position, or a "latest" message.
     if (!candidates || candidates.length !== 1) continue;
     const parent = candidates[0]!;
     if (
-      messageSessionScope(parent.message, fallbackSessionKey) !== sidecar.scope ||
+      messageSessionScope(parent.message, fallbackSessionKey, options?.sessionDefaults) !== sidecar.scope ||
       (normalAssistantRunId(parent.message) && normalAssistantRunId(parent.message) !== sidecar.runId)
     ) continue;
     const sidecarKey = `${sidecar.scope}\u0000${sidecar.runId}`;
@@ -94,9 +112,35 @@ export function normalizeOpenClawAssistantMediaSidecars(
 export function normalizeOpenClawAutomaticMediaReplies(
   messages: unknown[],
   fallbackSessionKey?: string,
+  options?: OpenClawMediaRelationOptions,
 ): { messages: unknown[]; changed: boolean } {
   const materialized = materializeOpenClawDisplayContent(messages);
   messages = materialized.messages;
+  // A message-tool delivery is a source row in the transcript, not a media
+  // fragment of the final assistant row. In projection v3 it stays visible
+  // (and gets its own sourceMessageId), but a replay of the same exact tool
+  // call is still projected only once. Distinct tool calls remain distinct,
+  // even when they reference the same file.
+  if (options?.projectionVersion === 3) {
+    const seenRelations = new Set<string>();
+    let changed = materialized.changed;
+    const deduped = messages.filter((message) => {
+      const record = asRecord(message);
+      const relation = record ? extractOpenClawMessageToolRelation(record) : undefined;
+      const scope = record
+        ? messageSessionScope(record, fallbackSessionKey, options.sessionDefaults)
+        : undefined;
+      if (!relation || !scope) return true;
+      const relationKey = `${scope}\u0000${relation.sourceRunId}\u0000${relation.toolCallId}`;
+      if (seenRelations.has(relationKey)) {
+        changed = true;
+        return false;
+      }
+      seenRelations.add(relationKey);
+      return true;
+    });
+    return { messages: changed ? deduped : messages, changed };
+  }
   const runs = new Map<string, {
     parents: Array<{ index: number; message: Record<string, unknown> }>;
     toolCallOrder: Map<string, number>;
@@ -115,7 +159,7 @@ export function normalizeOpenClawAutomaticMediaReplies(
   for (let index = 0; index < messages.length; index += 1) {
     const message = asRecord(messages[index]);
     if (!message || message.role !== "assistant") continue;
-    const scope = messageSessionScope(message, fallbackSessionKey);
+    const scope = messageSessionScope(message, fallbackSessionKey, options?.sessionDefaults);
     if (!scope) continue;
     const relation = automaticMediaReplyRelation(message);
     const media = mediaContentBlocks(message.content);
@@ -169,7 +213,9 @@ export function normalizeOpenClawAutomaticMediaReplies(
     if (!run || !parent) continue;
 
     const uniqueReplies = replies.filter((reply) => {
-      const replayKey = `${key}\u0000${reply.identity}`;
+      const replayKey = reply.toolCallId
+        ? `${key}\u0000tool-call\u0000${reply.toolCallId}`
+        : `${key}\u0000identity\u0000${reply.identity}`;
       if (processedReplies.has(replayKey)) {
         suppressedIndexes.add(reply.index);
         return false;
@@ -230,6 +276,27 @@ export function canonicalizeOpenClawAssistantMediaSidecarPayload(payload: unknow
   if (explicitRunId && explicitRunId !== sidecarRunId) return payload;
   if (explicitRunId) return payload;
   return { ...record, runId: sidecarRunId, turnId: sidecarRunId };
+}
+
+/**
+ * Materialize the media projection on a live chat event as canonical message
+ * content. OpenClaw's delivery mirror can expose the image only through
+ * `openclawDisplayContent`; Control UI renders that field, while Relay clients
+ * consume `message.content`.
+ */
+export function materializeOpenClawDisplayContentPayload(payload: unknown): unknown {
+  const record = asRecord(payload);
+  if (!record) return payload;
+
+  const message = asRecord(record.message);
+  if (message) {
+    const materialized = materializeOpenClawDisplayContent([message]);
+    if (!materialized.changed) return payload;
+    return { ...record, message: materialized.messages[0] };
+  }
+
+  const materialized = materializeOpenClawDisplayContent([record]);
+  return materialized.changed ? materialized.messages[0] : payload;
 }
 
 /** True only for the documented OpenClaw automatic-media sidecar identity. */
@@ -342,8 +409,15 @@ function isTextContentBlock(block: unknown): boolean {
   return type === "text" || type === "input_text" || type === "output_text";
 }
 
-function messageSessionScope(message: Record<string, unknown>, fallbackSessionKey?: string): string | undefined {
-  return firstString(message.sessionKey, message.sessionId, fallbackSessionKey);
+function messageSessionScope(
+  message: Record<string, unknown>,
+  fallbackSessionKey?: string,
+  sessionDefaults?: GatewaySessionDefaults,
+): string | undefined {
+  return canonicalizeOpenClawSessionScope(
+    firstString(message.sessionKey, message.sessionId, fallbackSessionKey),
+    sessionDefaults,
+  );
 }
 
 function normalAssistantRunId(message: Record<string, unknown>): string | undefined {
@@ -372,10 +446,14 @@ function automaticMediaReplySourceRunId(message: Record<string, unknown>): strin
   );
 }
 
-function automaticMediaReplyRelation(
+export function extractOpenClawMessageToolRelation(
   message: Record<string, unknown>,
-): { sourceRunId: string; toolCallId?: string } | undefined {
+): OpenClawMessageToolRelation | undefined {
   const explicitSourceRunId = automaticMediaReplySourceRunId(message);
+  const explicitToolCallId = firstString(message.toolCallId, message.tool_call_id, message.sourceToolCallId, message.source_tool_call_id);
+  if (explicitSourceRunId && explicitToolCallId) {
+    return { sourceRunId: explicitSourceRunId, toolCallId: explicitToolCallId };
+  }
   const idempotencyKey = firstString(
     message.idempotencyKey,
     message.idempotency_key,
@@ -384,7 +462,7 @@ function automaticMediaReplyRelation(
   );
   const markerIndex = idempotencyKey?.indexOf(OPENCLAW_MESSAGE_TOOL_IDEMPOTENCY_MARKER) ?? -1;
   if (!idempotencyKey || markerIndex <= 0) {
-    return explicitSourceRunId ? { sourceRunId: explicitSourceRunId } : undefined;
+    return undefined;
   }
 
   const sourceRunId = idempotencyKey.slice(0, markerIndex).trim();
@@ -394,6 +472,15 @@ function automaticMediaReplyRelation(
     return undefined;
   }
   return { sourceRunId, toolCallId };
+}
+
+function automaticMediaReplyRelation(
+  message: Record<string, unknown>,
+): { sourceRunId: string; toolCallId?: string } | undefined {
+  const relation = extractOpenClawMessageToolRelation(message);
+  if (relation) return relation;
+  const explicitSourceRunId = automaticMediaReplySourceRunId(message);
+  return explicitSourceRunId ? { sourceRunId: explicitSourceRunId } : undefined;
 }
 
 function messageToolCallIds(content: unknown): string[] {

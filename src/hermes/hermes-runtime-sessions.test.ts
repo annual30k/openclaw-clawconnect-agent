@@ -222,7 +222,7 @@ test("Hermes session store serializes concurrent writes into valid JSON", async 
   }
 });
 
-test("runHermesChat forgets stale mapped sessions and retries without resume", async () => {
+test("runHermesChat forgets stale mapped sessions and does not guess a returned session owner", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-stale-resume-"));
   const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
   const previousBin = process.env.HERMES_BIN;
@@ -242,7 +242,7 @@ test("runHermesChat forgets stale mapped sessions and retries without resume", a
 
     assert.equal(result.output, "fresh reply");
     const stored = await listStoredHermesSessions();
-    assert.equal(stored[0]?.hermesSessionId, "20260528_181500_abcd12");
+    assert.equal(stored[0], undefined);
   } finally {
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousBin);
@@ -700,7 +700,7 @@ conn.close()
   }
 });
 
-test("runHermesChat forwards Hermes preloaded skill prompt to the API server", async () => {
+test("runHermesChat keeps file-transfer turns on the buffered CLI path", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-api-skills-"));
   const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
   const previousBin = process.env.HERMES_BIN;
@@ -771,7 +771,8 @@ test("runHermesChat forwards Hermes preloaded skill prompt to the API server", a
       "fi",
       "if [ \"$1\" = \"chat\" ]; then",
       `  printf '%s\\n' "$@" > '${cliCalledPath.replace(/'/g, "'\\''")}'`,
-      "  exit 2",
+      "  printf '%s\\n' '请选择要发送的图片'",
+      "  exit 0",
       "fi",
       "exit 0",
       "",
@@ -796,14 +797,12 @@ test("runHermesChat forwards Hermes preloaded skill prompt to the API server", a
 
     const result = await runHermesChat(
       { sessionKey: "mobile-main", message: "send image file to phone with skill" },
-      { requestId: "run-api-skill", gatewayId: "gw-hermes" },
+      { requestId: "run-api-skill", gatewayId: "gw-hermes", hermesFileTransferCapability: "cli" },
     );
 
-    assert.equal(result.output, "skill api reply");
-    assert.equal(result.usage?.hermesSessionId, hermesSessionId);
-    assert.equal(result.usage?.contextUsage, 4);
-    assert.equal(apiBodies.length, 1);
-    assert.equal(existsSync(cliCalledPath), false);
+    assert.doesNotMatch(result.output, /已发送 \d+ 个文件/);
+    assert.equal(apiBodies.length, 0);
+    assert.equal(existsSync(cliCalledPath), true);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
@@ -911,10 +910,9 @@ test("runHermesChat uses the CLI path for preloaded file-transfer mobile sends w
 
     const result = await runHermesChat(
       { sessionKey: "main", message: "把桌面的微信图片发过来" },
-      { requestId: "run-file-transfer-cli", gatewayId: "gw-hermes" },
+      { requestId: "run-file-transfer-cli", gatewayId: "gw-hermes", hermesFileTransferCapability: "cli" },
     );
-
-    assert.equal(result.output, "发送完成");
+    assert.doesNotMatch(result.output, /已发送 \d+ 个文件/);
     assert.deepEqual(apiChatCalls, []);
     const args = JSON.parse(readFileSync(chatArgsPath, "utf8")) as string[];
     assert.equal(args.includes("--skills"), true);
@@ -1034,10 +1032,9 @@ test("runHermesChat keeps explicit file-transfer mobile sends off the API path w
 
     const result = await runHermesChat(
       { sessionKey: "main", message: "把桌面的蜘蛛侠图片发过来" },
-      { requestId: "run-file-transfer-skills-failed", gatewayId: "gw-hermes" },
+      { requestId: "run-file-transfer-skills-failed", gatewayId: "gw-hermes", hermesFileTransferCapability: "cli" },
     );
-
-    assert.equal(result.output, "发送完成");
+    assert.doesNotMatch(result.output, /已发送 \d+ 个文件/);
     assert.deepEqual(apiChatCalls, []);
     const args = JSON.parse(readFileSync(chatArgsPath, "utf8")) as string[];
     assert.equal(args.includes("--skills"), true);
@@ -1292,7 +1289,7 @@ test("runHermesChat resolves from exported history when Hermes keeps running aft
   const previousBin = process.env.HERMES_BIN;
   try {
     const storePath = join(root, "sessions.json");
-    const binPath = writeHistoryCompletingHermesBin(root);
+    const binPath = writeHistoryCompletingHermesBin(root, "run-history-complete");
     const publishedEvents: unknown[] = [];
     process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
     process.env.HERMES_BIN = binPath;
@@ -1347,7 +1344,7 @@ test("runHermesChat ignores exported history until it contains the current user 
   const previousBin = process.env.HERMES_BIN;
   try {
     const storePath = join(root, "sessions.json");
-    const binPath = writeStaleHistoryHermesBin(root);
+    const binPath = writeStaleHistoryHermesBin(root, "run-history-current-turn");
     process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
     process.env.HERMES_BIN = binPath;
 
@@ -1370,7 +1367,7 @@ test("runHermesChat does not complete from an older repeated user prompt in expo
   const previousBin = process.env.HERMES_BIN;
   try {
     const storePath = join(root, "sessions.json");
-    const binPath = writeRepeatedUserStaleHistoryHermesBin(root);
+    const binPath = writeRepeatedUserStaleHistoryHermesBin(root, "run-history-repeated-user");
     process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
     process.env.HERMES_BIN = binPath;
 

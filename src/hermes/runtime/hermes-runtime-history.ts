@@ -11,6 +11,10 @@ import {
 import { resolveHermesSessionIdFromParams, runHermesSessionExport } from "./hermes-runtime-sessions.js";
 import { queryHermesHistoryPageFromStateDb } from "./hermes-runtime-state-db.js";
 import { stringParam, toRecord } from "./hermes-runtime-values.js";
+import {
+  createProjectionMetadata,
+  hermesSourceOrderScope,
+} from "../../core/relay/timeline-projection-v3.js";
 
 type HermesHistoryMessage = {
   id: string;
@@ -44,6 +48,20 @@ const CLAWCONNECT_MOBILE_TURN_MARKER = "[ClawConnect mobile turn]";
 const HERMES_RUNTIME_CONTEXT_HINT_REGEX =
   /(^|\r?\n)[ \t]*\[Hermes runtime context\][\s\S]*?(?=\r?\n[ \t]*\[ClawConnect mobile bridge\]|\r?\n[ \t]*\[ClawConnect mobile turn\]|$)/gi;
 
+function requireHermesProjectionIdentity(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`Hermes projection v3 identity is missing ${field}`);
+  }
+  return value.trim();
+}
+
+function requireHermesProjectionSequence(value: number | undefined): number {
+  if (!Number.isSafeInteger(value) || (value ?? 0) <= 0) {
+    throw new Error("Hermes projection v3 sourceOrderSeq is missing or invalid");
+  }
+  return value as number;
+}
+
 type HermesHistoryCacheEntry = {
   parsed: unknown;
   sessionId?: string;
@@ -59,6 +77,9 @@ export function clearHermesHistoryCache(): void {
 export async function runHermesChatHistory(params: unknown): Promise<LocalResult> {
   const record = toRecord(params);
   const sessionKey = stringParam(record, "sessionKey", "session_key", "key", "session") ?? "main";
+  const profileId = stringParam(record, "profileId", "profile_id", "profile") ?? "default";
+  const projectionGatewayId = stringParam(record, "projectionGatewayId", "projection_gateway_id");
+  const projectionVersion = record.projectionVersion === 3 ? 3 as const : undefined;
   const limit = normalizeHistoryLimit(record.limit);
   const cursorSeq = parseHistoryCursorSeq(record.cursor);
   const direction = normalizeHistoryDirection(record.direction);
@@ -75,9 +96,15 @@ export async function runHermesChatHistory(params: unknown): Promise<LocalResult
         sessionId: stateDbPage.sessionId,
         messages: stateDbPage.messages,
         contextUser: stateDbPage.contextUser,
-      }, { stateDbSessionId: stateDbPage.sessionId });
+      }, {
+        stateDbSessionId: stateDbPage.sessionId,
+        projectionVersion,
+      });
       return buildHermesHistoryResult({
         sessionKey,
+        profileId,
+        projectionGatewayId,
+        projectionVersion,
         sessionId: stateDbPage.sessionId,
         cursor: typeof record.cursor === "string" ? record.cursor : undefined,
         page: {
@@ -108,6 +135,7 @@ export async function runHermesChatHistory(params: unknown): Promise<LocalResult
     sessionIdentity: stringParam(record, "sessionId", "session_id", "hermesSessionId", "id") ?? sessionKey,
     exportHash,
     exportOutput,
+    projectionVersion,
   });
   const parsed = history.parsed;
   const messages = history.messages;
@@ -121,6 +149,9 @@ export async function runHermesChatHistory(params: unknown): Promise<LocalResult
     ?? stringParam(record, "sessionId", "session_id", "hermesSessionId", "id");
   return buildHermesHistoryResult({
     sessionKey,
+    profileId,
+    projectionGatewayId,
+    projectionVersion,
     sessionId,
     cursor: typeof record.cursor === "string" ? record.cursor : undefined,
     page,
@@ -129,11 +160,24 @@ export async function runHermesChatHistory(params: unknown): Promise<LocalResult
 
 function buildHermesHistoryResult(params: {
   sessionKey: string;
+  profileId?: string;
+  projectionGatewayId?: string;
+  projectionVersion?: 3;
   sessionId?: string;
   cursor?: string;
   page: { messages: HermesHistoryMessage[]; hasMore: boolean; nextCursor?: string; newestCursor?: string };
 }): LocalResult {
   const { sessionKey, sessionId, page } = params;
+  const projectionGatewayId = params.projectionVersion === 3
+    ? requireHermesProjectionIdentity(params.projectionGatewayId, "gatewayId")
+    : "clawconnect";
+  const sourceSessionId = params.projectionVersion === 3
+    ? requireHermesProjectionIdentity(sessionId, "sourceSessionId")
+    : sessionId ?? sessionKey;
+  const sourceOrderScope = hermesSourceOrderScope({
+    profileId: params.profileId,
+    sessionId: sourceSessionId,
+  });
   const payload = {
     sessionKey,
     ...(sessionId ? { sessionId } : {}),
@@ -143,7 +187,7 @@ function buildHermesHistoryResult(params: {
     ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
     ...(page.newestCursor ? { newestCursor: page.newestCursor } : {}),
     timelineSnapshot: buildHistorySnapshotPage({
-      gatewayId: "clawconnect",
+      gatewayId: projectionGatewayId,
       sessionKey,
       cursor: params.cursor ?? null,
       hasMore: page.hasMore,
@@ -151,25 +195,46 @@ function buildHermesHistoryResult(params: {
       newestCursor: page.newestCursor ?? null,
       orderPolicy: "transcript",
       messages: page.messages.map((message) => {
-        const turnId = message.turnId ?? message.idempotencyKey ?? message.clientMessageId ?? `history-${sessionKey}-${message.seq}-${message.role}`;
+        const seq = params.projectionVersion === 3
+          ? requireHermesProjectionSequence(message.seq)
+          : message.seq;
+        const sourceMessageId = params.projectionVersion === 3
+          ? requireHermesProjectionIdentity(message.id, "sourceMessageId")
+          : message.id;
+        const turnId = message.turnId ?? message.idempotencyKey ?? message.clientMessageId ?? `history-${sessionKey}-${seq}-${message.role}`;
         const attachmentIds = extractAttachmentIds(message.content);
+        const projectionMetadata = params.projectionVersion === 3
+          ? createProjectionMetadata({
+              gatewayType: "hermes",
+              gatewayId: projectionGatewayId,
+              producerId: params.profileId ?? "default",
+              sourceSessionId,
+              sourceMessageId,
+              sourceOrderScope,
+              sourceOrderSeq: seq,
+              sourceRole: message.role as "user" | "assistant" | "tool" | "system",
+              timelineDelivery: "independent",
+            })
+          : undefined;
         return {
           turnId,
           runId: message.runId ?? turnId,
-          messageId: message.id,
+          messageId: projectionMetadata?.canonicalMessageId ?? sourceMessageId,
           role: message.role as "user" | "assistant" | "tool" | "system",
           messageState: "completed" as const,
           createdAt: message.createdAt ?? timestampToIso(message.timestamp) ?? new Date().toISOString(),
           partId: message.partId ?? "part-text-1",
           content: message.content,
-          seq: message.seq,
-          turnSeq: message.seq,
+          seq,
+          turnSeq: seq,
           ...(message.clientMessageId ? { clientMessageId: message.clientMessageId } : {}),
           ...(message.idempotencyKey ? { idempotencyKey: message.idempotencyKey } : {}),
           ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
+          ...(projectionMetadata ?? {}),
         };
       }),
       attachments: [],
+      ...(params.projectionVersion === 3 ? { sourceOrderScope } : {}),
     }),
   };
   return { ok: true, payload };
@@ -179,8 +244,9 @@ function readHermesHistoryExportFromCache(params: {
   sessionIdentity: string;
   exportHash: string;
   exportOutput: unknown;
+  projectionVersion?: 3;
 }): HermesHistoryCacheEntry {
-  const primaryKey = hermesHistoryCacheKey(params.sessionIdentity, params.exportHash);
+  const primaryKey = hermesHistoryCacheKey(params.sessionIdentity, params.exportHash, params.projectionVersion === 3);
   const cached = hermesHistoryCache.get(primaryKey);
   if (cached) {
     return cached;
@@ -191,17 +257,17 @@ function readHermesHistoryExportFromCache(params: {
   const entry: HermesHistoryCacheEntry = {
     parsed,
     ...(sessionId ? { sessionId } : {}),
-    messages: normalizeHermesHistoryMessages(parsed),
+    messages: normalizeHermesHistoryMessages(parsed, { projectionVersion: params.projectionVersion }),
   };
   hermesHistoryCache.set(primaryKey, entry);
   if (sessionId && sessionId !== params.sessionIdentity) {
-    hermesHistoryCache.set(hermesHistoryCacheKey(sessionId, params.exportHash), entry);
+    hermesHistoryCache.set(hermesHistoryCacheKey(sessionId, params.exportHash, params.projectionVersion === 3), entry);
   }
   return entry;
 }
 
-function hermesHistoryCacheKey(sessionIdentity: string, exportHash: string): string {
-  return `${sessionIdentity}\u0000${exportHash}`;
+function hermesHistoryCacheKey(sessionIdentity: string, exportHash: string, strictProjectionV3 = false): string {
+  return `${sessionIdentity}\u0000${exportHash}\u0000${strictProjectionV3 ? "v3" : "legacy"}`;
 }
 
 function hashHermesHistoryExportOutput(value: unknown): string {
@@ -235,7 +301,7 @@ function parseHermesHistoryExportOutput(value: unknown): unknown {
 
 function normalizeHermesHistoryMessages(
   parsed: unknown,
-  options: { stateDbSessionId?: string } = {},
+  options: { stateDbSessionId?: string; projectionVersion?: 3 } = {},
 ): HermesHistoryMessage[] {
   const record = toRecord(parsed);
   const rawMessages =
@@ -252,6 +318,12 @@ function normalizeHermesHistoryMessages(
     if (Object.keys(source).length === 0) {
       return;
     }
+    const rawSeq = numberParam(source, "seq");
+    const providerMessageId = stringParam(source, "id", "messageId", "message_id");
+    if (options.projectionVersion === 3) {
+      requireHermesProjectionSequence(rawSeq);
+      requireHermesProjectionIdentity(providerMessageId, "sourceMessageId");
+    }
     const role = normalizeHistoryRole(source.role);
     // Hermes 在工具调用前也会写入带正文的 assistant 行。只有明确终态的
     // assistant 才能进入移动端历史，否则刷新会用中间提示覆盖同 run 的最终回答。
@@ -265,12 +337,14 @@ function normalizeHermesHistoryMessages(
     if (!normalized && content.length === 0) {
       return;
     }
-    const seq = numberParam(source, "seq") ?? index + 1;
+    const seq = options.projectionVersion === 3
+      ? requireHermesProjectionSequence(rawSeq)
+      : rawSeq ?? index + 1;
     const sourceTurnId = stringParam(source, "turnId", "turn_id") ?? mobileTurn.sourceRunId;
     const sourceRunId = stringParam(source, "runId", "run_id") ?? mobileTurn.sourceRunId;
     const sourceClientMessageId = stringParam(source, "clientMessageId", "client_message_id") ?? mobileTurn.sourceRunId;
     const sourceIdempotencyKey = stringParam(source, "idempotencyKey", "idempotency_key") ?? mobileTurn.sourceRunId;
-    const stateDbRowId = stringParam(source, "id") ?? seq;
+    const stateDbRowId = providerMessageId ?? seq.toString();
     const mobileRunId = role === "user"
       ? mobileTurn.sourceRunId
       : role === "assistant"
@@ -283,7 +357,7 @@ function normalizeHermesHistoryMessages(
         role: role as HermesStateDbMessageIdentityRole,
         mobileRunId,
       })
-      : stringParam(source, "id", "messageId", "message_id") ?? `history-${seq}`;
+      : providerMessageId ?? `history-${seq}`;
     const message: HermesHistoryMessage = {
       id: sourceMessageId,
       role,
@@ -479,7 +553,10 @@ function normalizeHistoryText(role: string, text: string): string {
 }
 
 function parseClawConnectMobileTurnMetadata(text: string): ClawConnectMobileTurnMetadata {
-  const markerIndex = text.indexOf(CLAWCONNECT_MOBILE_TURN_MARKER);
+  // The bridge appends this controlled metadata block after the user text;
+  // the final marker is authoritative and prevents prompt text from spoofing
+  // a preceding turn identity.
+  const markerIndex = text.lastIndexOf(CLAWCONNECT_MOBILE_TURN_MARKER);
   if (markerIndex < 0) {
     return {};
   }

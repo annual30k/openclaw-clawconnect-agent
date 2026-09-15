@@ -7,13 +7,21 @@ import { createHash } from "crypto";
 import { uploadFileToRelay, type FileUploadRequest, type FileUploadResult } from "../../core/relay/file-upload.js";
 import { resolveOpenClawStateDir } from "../runtime/openclaw-paths.js";
 import {
+  extractOpenClawMessageToolRelation,
   normalizeOpenClawAssistantMediaSidecars,
   normalizeOpenClawAutomaticMediaReplies,
 } from "./assistant-media-sidecar.js";
+import {
+  canonicalizeOpenClawSessionScope,
+  canonicalizeSessionKey,
+  type GatewaySessionDefaults,
+} from "./session-context.js";
 
 const OUTGOING_MEDIA_RE = /\/api\/chat\/media\/outgoing\/[^/]+\/([^/]+)\/full(?:$|[?#])/;
 const OPENCLAW_MEDIA_CONTROL_PREFIX_RE = /^MEDIA:\s*(?:file:\/\/|~[\\/]|\/|[A-Za-z]:[\\/]|\\\\)/i;
 const OPENCLAW_INPUT_MEDIA_MARKER_RE = /\[media attached:\s+(.+?)\s+\(([^)\r\n]+)\)\s+\|\s+(.+?)\]/g;
+const OPENCLAW_DELIVERY_CONTRACT = "openclaw.message-tool-delivery.v1";
+const OUTGOING_MEDIA_RECORD_WAIT_DELAYS_MS = [80, 160, 320, 640] as const;
 
 export type OutgoingMediaRelayOptions = {
   relayServerUrl: string;
@@ -23,18 +31,27 @@ export type OutgoingMediaRelayOptions = {
   recordsDir?: string;
   stateDir?: string;
   cache?: Map<string, FileUploadResult>;
+  /**
+   * Legacy caller context. Deliberately ignored: attachment publication must
+   * come from typed content blocks or structured OpenClaw delivery metadata,
+   * never from natural-language intent in this field.
+   */
   userMessage?: string;
   /**
    * A live gateway event can arrive a few milliseconds before OpenClaw commits
-   * its managed outgoing-media record.  Only that path should briefly wait for
-   * the record instead of publishing an unavailable image placeholder.
+   * its managed outgoing-media record. Only that file-availability path may
+   * briefly wait for the record; this never delays timeline identity, ordering,
+   * or message projection correctness.
    */
   waitForOutgoingMediaRecord?: boolean;
+  /** Session defaults used to canonicalize OpenClaw relation scopes. */
+  sessionDefaults?: GatewaySessionDefaults;
 };
 
 type OutgoingMediaOptionsWithSourceRun = OutgoingMediaRelayOptions & {
   sourceRunId?: string;
   sessionKey?: string;
+  toolCallId?: string;
 };
 
 type OutgoingMediaRecord = {
@@ -51,6 +68,15 @@ type OutgoingMediaRecord = {
   };
 };
 
+type OpenClawDeliveryReceipt = {
+  contract: typeof OPENCLAW_DELIVERY_CONTRACT;
+  toolName: "message";
+  toolCallId: string;
+  idempotencyKey: string;
+  sourceRunId: string;
+  mediaUrls: string[];
+};
+
 const inFlightUploadsByCache = new WeakMap<
   Map<string, FileUploadResult>,
   Map<string, Promise<FileUploadResult>>
@@ -63,32 +89,325 @@ export async function relayOutgoingMediaInPayload(
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return payload;
   }
-  const message = (payload as Record<string, unknown>).message;
-  if (!message || typeof message !== "object" || Array.isArray(message)) {
-    return payload;
-  }
   const payloadRecord = payload as Record<string, unknown>;
-  const sourceRunId = payloadSourceRunId(payloadRecord);
-  const messageContent = await relayOutgoingMediaContent(
-    (message as Record<string, unknown>).content,
-    { ...opts, sourceRunId, sessionKey: firstString(payloadRecord.sessionKey) },
-  );
-  const localArtifactBlocks = await relayLocalArtifactPathsInContent(messageContent.blocks, payloadRecord, opts);
+  const message = asRecord(payloadRecord.message);
+  const messageRelation = message ? extractOpenClawMessageToolRelation(message) : undefined;
+  const sourceRunId = messageRelation?.sourceRunId ?? payloadSourceRunId(payloadRecord);
+  let nextMessage: Record<string, unknown> | undefined;
+  let messageChanged = false;
+  let deliveryBlocks: Record<string, unknown>[] = [];
+  if (message) {
+    const messageContent = await relayOutgoingMediaContent(
+      message.content,
+      {
+        ...opts,
+        sourceRunId,
+        sessionKey: canonicalRelationSessionKey(
+          firstString(message.sessionKey, message.sessionId, payloadRecord.sessionKey),
+          opts,
+        ),
+        ...(messageRelation?.toolCallId ? { toolCallId: messageRelation.toolCallId } : {}),
+      },
+    );
+    deliveryBlocks = await relayOpenClawDeliveryMedia(message, payloadRecord, opts, sourceRunId);
+    const appendedMessage = appendUniqueContentBlocks(
+      messageContent.blocks,
+      deliveryBlocks,
+    );
+    const nextMessageContent = appendedMessage.changed ? appendedMessage.blocks : messageContent.content;
+    messageChanged = messageContent.changed || appendedMessage.changed;
+    if (messageChanged) {
+      nextMessage = {
+        ...message,
+        content: nextMessageContent,
+      };
+    }
+  }
   const timelineEvents = await relayOutgoingMediaInTimelineEvents(payloadRecord.timelineEvents, opts, sourceRunId);
+  const deliveryTimelineEvents = relayOpenClawDeliveryMediaInTimelineEvents(
+    timelineEvents.events,
+    deliveryBlocks,
+    sourceRunId,
+    opts.sessionDefaults,
+  );
 
-  if (!messageContent.changed && localArtifactBlocks.length === 0 && !timelineEvents.changed) {
+  if (
+    !messageChanged
+    && !timelineEvents.changed
+    && !deliveryTimelineEvents.changed
+  ) {
     return payload;
   }
   return {
     ...payloadRecord,
-    message: {
-      ...(message as Record<string, unknown>),
-      content: localArtifactBlocks.length > 0
-        ? [...messageContent.blocks, ...localArtifactBlocks]
-        : messageContent.content,
-    },
-    ...(timelineEvents.changed ? { timelineEvents: timelineEvents.events } : {}),
+    ...(nextMessage ? { message: nextMessage } : {}),
+    ...(timelineEvents.changed || deliveryTimelineEvents.changed
+      ? { timelineEvents: deliveryTimelineEvents.events }
+      : {}),
   };
+}
+
+async function relayOpenClawDeliveryMedia(
+  message: Record<string, unknown>,
+  payload: Record<string, unknown>,
+  opts: OutgoingMediaRelayOptions,
+  sourceRunId?: string,
+): Promise<Record<string, unknown>[]> {
+  // `mediaUrls` is a typed OpenClaw delivery projection. Its presence is the
+  // producer's explicit publication receipt; assistant text and the original
+  // user prompt are intentionally not consulted here.
+  if (!sourceRunId) {
+    return [];
+  }
+  const receipt = typedOpenClawDeliveryReceipt(message.openclawDelivery, sourceRunId)
+    ?? adaptOpenClawMessageToolDelivery({ message, ...payload }, sourceRunId);
+  if (!receipt) {
+    return [];
+  }
+
+  const paths = trustedDeliverablePaths(receipt.mediaUrls);
+  if (paths.length === 0) {
+    return [];
+  }
+
+  return relayLocalArtifactPaths(paths, payload, opts, receipt.sourceRunId, receipt.toolCallId);
+}
+
+/**
+ * Adapt the shape emitted by the currently deployed OpenClaw message tool.
+ * The installed OpenClaw type declares `openclawDelivery.mediaUrls` only as a
+ * display projection. The authoritative toolResult carries the delivery
+ * status, tool call, idempotency key, run metadata, and trusted local media
+ * list in `details.sourceReply`; only that explicit relation becomes the
+ * internal typed v1 receipt. Generic mediaUrls stay inert.
+ */
+export function adaptOpenClawMessageToolDelivery(
+  value: unknown,
+  expectedSourceRunId?: string,
+): OpenClawDeliveryReceipt | undefined {
+  const envelope = asRecord(value);
+  if (!envelope) return undefined;
+  const candidates = [
+    asRecord(envelope.message),
+    asRecord(envelope.toolResult),
+    ...(Array.isArray(envelope.toolResults) ? envelope.toolResults.map(asRecord) : []),
+    envelope.role === "toolResult" || envelope.role === "tool_result" ? envelope : undefined,
+  ].filter((candidate): candidate is Record<string, unknown> => Boolean(candidate));
+
+  for (const message of candidates) {
+    const details = asRecord(message.details);
+    const sourceReply = asRecord(details?.sourceReply);
+    const messageDelivery = asRecord(details?.messageDelivery);
+    const metadata = asRecord(message.__openclaw);
+    const toolName = firstString(message.toolName, message.tool_name);
+    const toolCallId = firstString(message.toolCallId, message.tool_call_id);
+    const idempotencyKey = firstString(details?.idempotencyKey, message.idempotencyKey, message.idempotency_key);
+    const sourceRunId = firstString(
+      metadata?.runId,
+      metadata?.sourceRunId,
+      message.runId,
+      message.sourceRunId,
+      envelope.runId,
+      envelope.sourceRunId,
+    );
+    const mediaUrls = sourceReply?.mediaUrls;
+    const attachments = sourceReply?.attachments;
+    const trustedAttachments = Array.isArray(attachments)
+      && attachments.length > 0
+      && attachments.every((attachment) => asRecord(attachment)?.trustedLocalMedia === true);
+    if (
+      (message.role !== "toolResult" && message.role !== "tool_result")
+      || toolName !== "message"
+      || !toolCallId
+      || !idempotencyKey
+      || !sourceRunId
+      || (expectedSourceRunId && sourceRunId !== expectedSourceRunId)
+      || details?.status !== "ok"
+      || details.deliveryStatus !== "sent"
+      || details.sourceReplyDeliveryMode !== "message_tool_only"
+      || details.sourceReplyTranscriptOwner !== true
+      || details.dryRun === true
+      || sourceReply?.trustedLocalMedia !== true
+      || !trustedAttachments
+      || messageDelivery?.status !== "settled"
+      || messageDelivery.partialDelivery !== false
+      || !Array.isArray(mediaUrls)
+      || !mediaUrls.every((path): path is string => typeof path === "string" && path.trim().length > 0)
+    ) {
+      continue;
+    }
+    return {
+      contract: OPENCLAW_DELIVERY_CONTRACT,
+      toolName: "message",
+      toolCallId,
+      idempotencyKey,
+      sourceRunId,
+      mediaUrls: mediaUrls.map((path) => path.trim()),
+    };
+  }
+  return undefined;
+}
+
+function typedOpenClawDeliveryReceipt(value: unknown, sourceRunId: string): OpenClawDeliveryReceipt | undefined {
+  const delivery = asRecord(value);
+  if (!delivery
+    || delivery.contract !== OPENCLAW_DELIVERY_CONTRACT
+    || delivery.toolName !== "message"
+    || typeof delivery.toolCallId !== "string"
+    || !delivery.toolCallId.trim()
+    || typeof delivery.idempotencyKey !== "string"
+    || !delivery.idempotencyKey.trim()
+    || delivery.sourceRunId !== sourceRunId
+    || !Array.isArray(delivery.mediaUrls)
+    || !delivery.mediaUrls.every((path): path is string => typeof path === "string" && path.trim().length > 0)) {
+    return undefined;
+  }
+  return {
+    contract: OPENCLAW_DELIVERY_CONTRACT,
+    toolName: "message",
+    toolCallId: delivery.toolCallId.trim(),
+    idempotencyKey: delivery.idempotencyKey.trim(),
+    sourceRunId,
+    mediaUrls: delivery.mediaUrls.map((path) => path.trim()),
+  };
+}
+
+function relayOpenClawDeliveryMediaInTimelineEvents(
+  events: unknown,
+  blocks: Record<string, unknown>[],
+  sourceRunId?: string,
+  sessionDefaults?: GatewaySessionDefaults,
+): { events: unknown; changed: boolean } {
+  if (!Array.isArray(events) || blocks.length === 0 || !sourceRunId) {
+    return { events, changed: false };
+  }
+
+  let changed = false;
+  const nextEvents = events.map((event) => {
+    const record = asRecord(event);
+    if (!record || record.eventType !== "message.completed" || record.role !== "assistant") {
+      return event;
+    }
+    const eventRunId = firstString(record.runId);
+    const eventTurnId = firstString(record.turnId);
+    const matchesSourceRun = eventRunId === sourceRunId || (!eventRunId && eventTurnId === sourceRunId);
+    if (!matchesSourceRun) {
+      return event;
+    }
+    if (!Array.isArray(record.content)) {
+      return event;
+    }
+
+    const eventRelation = extractOpenClawMessageToolRelation(record);
+    const eventScope = canonicalizeOpenClawSessionScope(
+      firstString(record.sessionKey, record.sessionId),
+      sessionDefaults,
+    );
+    const matchingEvents = events.filter((candidate) => {
+      const candidateRecord = asRecord(candidate);
+      if (!candidateRecord || candidateRecord.eventType !== "message.completed" || candidateRecord.role !== "assistant") {
+        return false;
+      }
+      if (eventScope) {
+        const candidateScope = canonicalizeOpenClawSessionScope(
+          firstString(candidateRecord.sessionKey, candidateRecord.sessionId),
+          sessionDefaults,
+        );
+        if (candidateScope !== eventScope) return false;
+      }
+      const eventRunId = firstString(candidateRecord.runId);
+      const eventTurnId = firstString(candidateRecord.turnId);
+      return eventRunId === sourceRunId || (!eventRunId && eventTurnId === sourceRunId);
+    });
+    const relationBlocks = blocks.filter((block) => {
+      const relation = extractOpenClawMessageToolRelation(block);
+      if (relation?.sourceRunId !== sourceRunId || !relation.toolCallId) return false;
+      if (!eventScope) return true;
+      const blockScope = canonicalizeOpenClawSessionScope(
+        firstString(block.sessionKey, block.sessionId),
+        sessionDefaults,
+      );
+      return !blockScope || blockScope === eventScope;
+    });
+    let eventBlocks = blocks;
+    if (relationBlocks.length > 0) {
+      if (!eventRelation?.toolCallId) {
+        // A run-level completion can own delivery blocks only when it is the
+        // sole completion for that run. Otherwise association is ambiguous;
+        // do not duplicate the media onto every assistant row.
+        if (matchingEvents.length !== 1) return event;
+      } else {
+        const matchingRelation = relationBlocks.filter((block) => (
+          extractOpenClawMessageToolRelation(block)?.toolCallId === eventRelation.toolCallId
+        ));
+        if (matchingRelation.length === 0) return event;
+        eventBlocks = matchingRelation;
+      }
+    }
+
+    const appended = appendUniqueContentBlocks(record.content, eventBlocks);
+    const attachmentIds = attachmentIdsFromContent(appended.blocks);
+    const currentAttachmentIds = Array.isArray(record.attachmentIds)
+      ? record.attachmentIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      : [];
+    const attachmentIdsChanged = JSON.stringify(currentAttachmentIds) !== JSON.stringify(attachmentIds);
+    if (!appended.changed && !attachmentIdsChanged) {
+      return event;
+    }
+
+    changed = true;
+    const { attachmentIds: _staleAttachmentIds, ...eventWithoutAttachmentIds } = record;
+    return {
+      ...eventWithoutAttachmentIds,
+      content: appended.blocks,
+      ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
+    };
+  });
+  return { events: changed ? nextEvents : events, changed };
+}
+
+function appendUniqueContentBlocks(
+  content: unknown[],
+  additions: unknown[],
+): { blocks: unknown[]; changed: boolean } {
+  if (additions.length === 0) return { blocks: content, changed: false };
+  const existingIdentities = new Set(
+    content.map(contentBlockIdentity).filter((identity): identity is string => Boolean(identity)),
+  );
+  const blocks = [...content];
+  let changed = false;
+  for (const addition of additions) {
+    const identity = contentBlockIdentity(addition);
+    if (identity && existingIdentities.has(identity)) continue;
+    blocks.push(addition);
+    if (identity) existingIdentities.add(identity);
+    changed = true;
+  }
+  return { blocks, changed };
+}
+
+function contentBlockIdentity(block: unknown): string | undefined {
+  const record = asRecord(block);
+  if (!record) return undefined;
+  const sourceRunId = firstString(record.sourceRunId, record.source_run_id);
+  const toolCallId = firstString(record.toolCallId, record.tool_call_id, record.sourceToolCallId, record.source_tool_call_id);
+  const mediaId = firstString(
+    record.attachmentId,
+    record.attachment_id,
+    record.fileId,
+    record.file_id,
+    record.artifactId,
+    record.artifact_id,
+    record.url,
+    record.openUrl,
+    record.downloadUrl,
+    record.downloadPath,
+    record.download_path,
+  );
+  if (sourceRunId && toolCallId) {
+    return `openclaw-tool-call\u0000${sourceRunId}\u0000${toolCallId}\u0000${mediaId ?? "media"}`;
+  }
+  return mediaId;
 }
 
 async function relayOutgoingMediaInTimelineEvents(
@@ -101,8 +420,19 @@ async function relayOutgoingMediaInTimelineEvents(
   const nextEvents = await Promise.all(events.map(async (event) => {
     const record = asRecord(event);
     if (!record || !Array.isArray(record.content)) return event;
-    const sourceRunId = firstString(record.runId, record.turnId, fallbackSourceRunId);
-    const content = await relayOutgoingMediaContent(record.content, { ...opts, sourceRunId });
+    const eventRelation = extractOpenClawMessageToolRelation(record);
+    const sourceRunId = eventRelation?.sourceRunId
+      ?? firstString(record.runId, record.turnId, fallbackSourceRunId);
+    const sessionKey = canonicalRelationSessionKey(
+      firstString(record.sessionKey, record.sessionId),
+      opts,
+    );
+    const content = await relayOutgoingMediaContent(record.content, {
+      ...opts,
+      sourceRunId,
+      ...(sessionKey ? { sessionKey } : {}),
+      ...(eventRelation?.toolCallId ? { toolCallId: eventRelation.toolCallId } : {}),
+    });
     if (!content.changed) return event;
     changed = true;
     const { attachmentIds: _staleAttachmentIds, ...eventWithoutAttachmentIds } = record;
@@ -150,44 +480,119 @@ export async function relayOutgoingMediaInHistoryResponse(
   }
 
   const responseRecord = response as Record<string, unknown>;
-  const responseSessionKey = firstString(responseRecord.sessionKey, responseRecord.sessionId);
-  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(messages, responseSessionKey);
-  const normalizedMessages = normalizeOpenClawAutomaticMediaReplies(explicitSidecars.messages, responseSessionKey);
-  const messageResult = await relayOutgoingMediaInMessageList(normalizedMessages.messages, responseSessionKey, opts);
+  const responseSessionKey = canonicalRelationSessionKey(
+    firstString(responseRecord.sessionKey, responseRecord.sessionId),
+    opts,
+  );
   const snapshot = responseRecord.timelineSnapshot;
   const snapshotMessages = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
     ? (snapshot as Record<string, unknown>).messages
     : undefined;
+  const projectionV3 = Array.isArray(snapshotMessages)
+    && snapshotMessages.some((message) => (
+      Boolean(message) && typeof message === "object" && (message as Record<string, unknown>).projectionVersion === 3
+    ));
+  const projectionOptions = projectionV3 ? { projectionVersion: 3 as const } : undefined;
+  const relationOptions = {
+    ...(projectionOptions ?? {}),
+    ...(opts.sessionDefaults ? { sessionDefaults: opts.sessionDefaults } : {}),
+  };
+  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(messages, responseSessionKey, relationOptions);
+  const normalizedMessages = normalizeOpenClawAutomaticMediaReplies(
+    explicitSidecars.messages,
+    responseSessionKey,
+    relationOptions,
+  );
+  const messageResult = await relayOutgoingMediaInMessageList(normalizedMessages.messages, responseSessionKey, opts);
   const explicitSnapshotSidecars = Array.isArray(snapshotMessages)
-    ? normalizeOpenClawAssistantMediaSidecars(snapshotMessages, responseSessionKey)
+    ? normalizeOpenClawAssistantMediaSidecars(snapshotMessages, responseSessionKey, relationOptions)
     : undefined;
   const normalizedSnapshotMessages = explicitSnapshotSidecars
-    ? normalizeOpenClawAutomaticMediaReplies(explicitSnapshotSidecars.messages, responseSessionKey)
+    ? normalizeOpenClawAutomaticMediaReplies(
+      explicitSnapshotSidecars.messages,
+      responseSessionKey,
+      relationOptions,
+    )
     : undefined;
   const snapshotResult = normalizedSnapshotMessages
     ? await relayOutgoingMediaInMessageList(normalizedSnapshotMessages.messages, responseSessionKey, opts)
+    : undefined;
+  // The history projector builds the canonical snapshot before this relay
+  // enriches the provider rows. Reuse the already-relayed row by its explicit
+  // source identity so the canonical timeline receives the same attachment
+  // blocks without re-reading local paths or merging by run/text/time.
+  const reconciledSnapshot = snapshotResult
+    ? reconcileHistorySnapshotWithRelayedMessages(snapshotResult.messages, messageResult.messages)
     : undefined;
   const changed = explicitSidecars.changed
     || normalizedMessages.changed
     || messageResult.changed
     || Boolean(explicitSnapshotSidecars?.changed)
     || Boolean(normalizedSnapshotMessages?.changed)
-    || Boolean(snapshotResult?.changed);
+    || Boolean(snapshotResult?.changed)
+    || Boolean(reconciledSnapshot?.changed);
 
   return changed
     ? {
         ...responseRecord,
         messages: messageResult.messages,
-        ...(snapshotResult
+        ...(reconciledSnapshot
           ? {
               timelineSnapshot: {
                 ...(snapshot as Record<string, unknown>),
-                messages: snapshotResult.messages,
+                messages: reconciledSnapshot.messages,
               },
             }
           : {}),
       }
     : response;
+}
+
+function reconcileHistorySnapshotWithRelayedMessages(
+  snapshotMessages: unknown[],
+  relayedMessages: unknown[],
+): { messages: unknown[]; changed: boolean } {
+  const bySourceIdentity = new Map<string, Record<string, unknown>>();
+  for (const message of relayedMessages) {
+    const record = asRecord(message);
+    const identity = historySourceIdentity(record);
+    if (record && identity) bySourceIdentity.set(identity, record);
+  }
+
+  let changed = false;
+  const messages = snapshotMessages.map((message) => {
+    const record = asRecord(message);
+    const source = record ? bySourceIdentity.get(historySourceIdentity(record) ?? "") : undefined;
+    if (!record || !source || !Array.isArray(source.content) || source.content.length === 0) {
+      return message;
+    }
+    const content = source.content;
+    const attachmentIds = attachmentIdsFromContent(content);
+    const currentContent = Array.isArray(record.content) ? record.content : undefined;
+    const currentAttachmentIds = Array.isArray(record.attachmentIds) ? record.attachmentIds : undefined;
+    if (
+      JSON.stringify(currentContent) === JSON.stringify(content)
+      && JSON.stringify(currentAttachmentIds ?? []) === JSON.stringify(attachmentIds)
+    ) {
+      return message;
+    }
+    changed = true;
+    return {
+      ...record,
+      content,
+      ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
+    };
+  });
+  return { messages: changed ? messages : snapshotMessages, changed };
+}
+
+function historySourceIdentity(record: Record<string, unknown> | undefined): string | undefined {
+  return firstString(
+    record?.sourceMessageId,
+    record?.id,
+    record?.messageId,
+    record?.message_id,
+  );
 }
 
 async function relayOutgoingMediaInMessageList(
@@ -198,7 +603,9 @@ async function relayOutgoingMediaInMessageList(
   let changed = false;
   const nextMessages = await Promise.all(messages.map(async (message) => {
     const restoredMessage = restoreOpenClawInputMediaInHistoryMessage(message);
-    const wrapperInput = sessionKey ? { sessionKey, message: restoredMessage } : { message: restoredMessage };
+    const wrapperInput = sessionKey
+      ? { sessionKey: canonicalRelationSessionKey(sessionKey, opts), message: restoredMessage }
+      : { message: restoredMessage };
     const wrapper = await relayOutgoingMediaInPayload(wrapperInput, opts) as Record<string, unknown>;
     const nextMessage = wrapper.message ?? message;
     changed ||= nextMessage !== message;
@@ -260,9 +667,22 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
         sourceRunId: opts.sourceRunId, timelineDelivery: "embedded",
         sourceRole: "user",
       });
-      return { ...uploadToContentBlock(upload), attachmentId, fileName: source.fileName || upload.fileName };
+      return {
+        ...uploadToContentBlock(upload),
+        attachmentId,
+        fileName: source.fileName || upload.fileName,
+        ...(opts.toolCallId ? { toolCallId: opts.toolCallId } : {}),
+      };
     } catch {
-      return { type: source.type, attachmentId, fileName: source.fileName || "图片", transferState: "expired", isRemoteExpired: true, attachmentStatusText: "图片文件暂不可用" };
+      return {
+        type: source.type,
+        attachmentId,
+        fileName: source.fileName || "图片",
+        ...(opts.toolCallId ? { toolCallId: opts.toolCallId } : {}),
+        transferState: "expired",
+        isRemoteExpired: true,
+        attachmentStatusText: "图片文件暂不可用",
+      };
     }
   }
   const attachmentId = outgoingAttachmentId(url);
@@ -276,11 +696,12 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
   try {
     const record = await readOutgoingMediaRecordWhenReady(attachmentId, opts);
     const filePath = record.original?.path?.trim();
-    const sessionKey = record.sessionKey?.trim();
-    if (!filePath || !sessionKey) {
+    const rawSessionKey = record.sessionKey?.trim();
+    if (!filePath || !rawSessionKey) {
       console.warn(`[relay] outgoing media record is incomplete attachment=${attachmentId}`);
       return undefined;
     }
+    const sessionKey = canonicalRelationSessionKey(rawSessionKey, opts) ?? rawSessionKey;
     const cacheKey = await outgoingFileCacheKey({
       gatewayId: opts.gatewayId,
       sessionKey,
@@ -289,16 +710,16 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
       sourceRunId: opts.sourceRunId,
     });
     const upload = await cachedUpload(opts, cacheKey, {
-        relayServerUrl: opts.relayServerUrl,
-        relaySecret: opts.relaySecret,
-        gatewayId: opts.gatewayId,
-        sessionKey,
-        filePath,
-        senderDisplayName: opts.senderDisplayName,
-        sourceRunId: opts.sourceRunId,
-        timelineDelivery: "embedded",
-        sourceRole: "assistant",
-      });
+      relayServerUrl: opts.relayServerUrl,
+      relaySecret: opts.relaySecret,
+      gatewayId: opts.gatewayId,
+      sessionKey,
+      filePath,
+      senderDisplayName: opts.senderDisplayName,
+      sourceRunId: opts.sourceRunId,
+      timelineDelivery: "embedded",
+      sourceRole: "assistant",
+    });
 
     return {
       ...source,
@@ -317,6 +738,7 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
       downloadPath: upload.downloadPath,
       expiresAt: upload.expiresAt,
       sourceRunId: upload.sourceRunId,
+      ...(opts.toolCallId ? { toolCallId: opts.toolCallId } : {}),
       sourceRole: upload.sourceRole ?? "assistant",
       gatewayId: upload.gatewayId,
       sessionKey: upload.sessionKey,
@@ -340,6 +762,7 @@ async function relayOutgoingMediaBlock(block: unknown, opts: OutgoingMediaOption
       type: typeof source.type === "string" && source.type.trim() ? source.type : "image",
       attachmentId,
       fileName: firstString(source.fileName, source.alt, "图片"),
+      ...(opts.toolCallId ? { toolCallId: opts.toolCallId } : {}),
       transferState: "expired",
       isRemoteExpired: true,
       attachmentStatusText: "图片文件在桌面端已不可用",
@@ -409,7 +832,9 @@ async function readOutgoingMediaRecordWhenReady(
   // enrichment avoids making ordinary history reads slower for genuinely
   // expired media while giving the transaction up to roughly one second to
   // become observable.
-  const delaysMs = options.waitForOutgoingMediaRecord ? [80, 160, 320, 640] : [];
+  const delaysMs = options.waitForOutgoingMediaRecord
+    ? OUTGOING_MEDIA_RECORD_WAIT_DELAYS_MS
+    : [];
   let lastError: unknown;
   for (const delayMs of [...delaysMs, 0]) {
     if (delayMs > 0) {
@@ -512,34 +937,21 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-async function relayLocalArtifactPathsInContent(
-  content: unknown[],
+async function relayLocalArtifactPaths(
+  paths: string[],
   payload: Record<string, unknown>,
   opts: OutgoingMediaRelayOptions,
+  sourceRunIdOverride?: string,
+  toolCallId?: string,
 ): Promise<Record<string, unknown>[]> {
-  if (opts.userMessage === undefined) {
-    return [];
-  }
-  if (content.some(isUploadedMediaBlock)) {
-    return [];
-  }
-  const text = content
-    .map((block) => {
-      if (!block || typeof block !== "object" || Array.isArray(block)) {
-        return "";
-      }
-      const record = block as Record<string, unknown>;
-      return record.type === "text" && typeof record.text === "string" ? record.text : "";
-    })
-    .filter(Boolean)
-    .join("\n");
-  const paths = extractDeliverablePaths(text, opts.userMessage);
-  if (paths.length === 0) {
-    return [];
-  }
-
-  const sessionKey = firstString(payload.sessionKey, (payload.message as Record<string, unknown> | undefined)?.sessionKey) ?? "main";
-  const runId = payloadSourceRunId(payload);
+  const messageRecord = asRecord(payload.message);
+  const rawSessionKey = firstString(
+    messageRecord?.sessionKey,
+    messageRecord?.sessionId,
+    payload.sessionKey,
+  ) ?? "main";
+  const sessionKey = canonicalRelationSessionKey(rawSessionKey, opts) ?? rawSessionKey;
+  const runId = sourceRunIdOverride ?? payloadSourceRunId(payload);
   const blocks: Record<string, unknown>[] = [];
   for (const filePath of paths) {
     try {
@@ -551,18 +963,18 @@ async function relayLocalArtifactPathsInContent(
         sourceRunId: runId,
       });
       const request: FileUploadRequest = {
-          relayServerUrl: opts.relayServerUrl,
-          relaySecret: opts.relaySecret,
-          gatewayId: opts.gatewayId,
-          sessionKey,
-          filePath,
-          senderDisplayName: opts.senderDisplayName,
-          sourceRunId: runId,
-          timelineDelivery: "embedded",
-          sourceRole: "assistant",
-        };
+        relayServerUrl: opts.relayServerUrl,
+        relaySecret: opts.relaySecret,
+        gatewayId: opts.gatewayId,
+        sessionKey,
+        filePath,
+        senderDisplayName: opts.senderDisplayName,
+        sourceRunId: runId,
+        timelineDelivery: "embedded",
+        sourceRole: "assistant",
+      };
       const upload = await cachedUpload(opts, cacheKey, request);
-      blocks.push(uploadToContentBlock(upload));
+      blocks.push(uploadToContentBlock(upload, toolCallId));
     } catch (error) {
       console.warn(`[relay] failed to publish local artifact ${filePath}: ${String(error)}`);
     }
@@ -594,7 +1006,7 @@ function attachmentIdsFromContent(content: unknown): string[] {
   return [...ids];
 }
 
-function uploadToContentBlock(upload: FileUploadResult): Record<string, unknown> {
+function uploadToContentBlock(upload: FileUploadResult, toolCallId?: string): Record<string, unknown> {
   const type = upload.mimeType.startsWith("image/")
     ? "image"
     : upload.mimeType.startsWith("audio/")
@@ -618,6 +1030,7 @@ function uploadToContentBlock(upload: FileUploadResult): Record<string, unknown>
     downloadPath: upload.downloadPath,
     expiresAt: upload.expiresAt,
     sourceRunId: upload.sourceRunId,
+    ...(toolCallId ? { toolCallId } : {}),
     sourceRole: upload.sourceRole,
     sha256: upload.sha256,
     contentHash: upload.sha256,
@@ -692,6 +1105,18 @@ async function cachedUpload(
   }
 }
 
+function canonicalRelationSessionKey(
+  rawSessionKey: string | undefined,
+  opts: Pick<OutgoingMediaRelayOptions, "sessionDefaults">,
+): string | undefined {
+  if (!rawSessionKey) return undefined;
+  const gatewayKey = opts.sessionDefaults
+    ? canonicalizeSessionKey(rawSessionKey, opts.sessionDefaults)
+    : rawSessionKey;
+  if (typeof gatewayKey !== "string" || !gatewayKey.trim()) return undefined;
+  return canonicalizeOpenClawSessionScope(gatewayKey, opts.sessionDefaults);
+}
+
 function sanitizeOpenClawMediaControlBlocks(content: unknown[]): { content: unknown[]; changed: boolean } {
   let changed = false;
   const nextContent: unknown[] = [];
@@ -757,76 +1182,28 @@ const DELIVERABLE_EXTENSIONS = [
   ".html", ".htm",
 ];
 
-const DELIVERABLE_EXTENSION_PATTERN = DELIVERABLE_EXTENSIONS
-  .map((extension) => extension.slice(1).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-  .sort((a, b) => b.length - a.length)
-  .join("|");
-
-const DELIVERABLE_PATH_START = String.raw`(?:~[\\/]|\/|[A-Za-z]:[\\/]|\\\\[^\\/\s"'` + "`" + String.raw`<>|]+[\\/])`;
-const DELIVERABLE_PATH_REGEX_SOURCE = DELIVERABLE_PATH_START + String.raw`[^\n"'` + "`" + String.raw`<>|]*?\.(?:${DELIVERABLE_EXTENSION_PATTERN})(?=$|[\s).,"'` + "`" + String.raw`，。；;:：!?？])`;
-const DELIVERABLE_PATH_REGEX = new RegExp(String.raw`(?:^|[\s("'` + "`" + String.raw`:：])(${DELIVERABLE_PATH_REGEX_SOURCE})`, "gi");
-
-export function extractDeliverablePathCandidates(text: string): string[] {
-  return [...text.matchAll(DELIVERABLE_PATH_REGEX)].map((match) => match[1]);
-}
-
-function extractDeliverablePaths(text: string, userMessage?: string): string[] {
-  if (userMessage !== undefined && !hasDeliverableSendIntent(userMessage)) {
-    return [];
-  }
-  const allowed = new Set(DELIVERABLE_EXTENSIONS);
+function trustedDeliverablePaths(values: unknown[]): string[] {
   const paths = new Set<string>();
-  for (const rawPath of extractDeliverablePathCandidates(text)) {
-    const absolutePath = rawPath.startsWith("~/") || rawPath.startsWith("~\\")
-      ? join(homedir(), rawPath.slice(2))
-      : rawPath;
-    if (allowed.has(extname(absolutePath).toLowerCase()) && existsSync(resolve(absolutePath))) {
-      paths.add(resolve(absolutePath));
-    }
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const filePath = trustedDeliverablePath(value);
+    if (filePath) paths.add(filePath);
   }
   return [...paths];
 }
 
-function hasDeliverableSendIntent(message: string): boolean {
-  const text = message.trim().toLowerCase();
-  if (!text) {
-    return false;
+function trustedDeliverablePath(rawPath: string): string | undefined {
+  const candidate = rawPath.trim();
+  if (!candidate) return undefined;
+  if (!candidate.startsWith("~/") && !candidate.startsWith("~\\") && !isAbsoluteHostPath(candidate)) {
+    return undefined;
   }
-  if (/(不要|不用|别|无需|不需要).{0,20}(发|发送|传|上传|转发|分享|附件|attach|send|upload|share|deliver)/.test(text)
-    || /(只要|仅要).{0,20}(路径|文件名|名字|文本|文字)/.test(text)
-    || /\b(do not|don't|dont|no need to|without|not need to)\b.{0,30}\b(send|upload|attach|share|deliver)\b/.test(text)
-    || /\bonly\b.{0,30}\b(path|filename|file name|text)\b/.test(text)) {
-    return false;
+  const expandedPath = candidate.startsWith("~/") || candidate.startsWith("~\\")
+    ? join(homedir(), candidate.slice(2))
+    : candidate;
+  if (!DELIVERABLE_EXTENSIONS.includes(extname(expandedPath).toLowerCase())) {
+    return undefined;
   }
-  const sendVerbs = [
-    "发", "发送", "传", "上传", "转发", "分享", "发给", "传给", "send", "upload", "attach", "share", "deliver",
-  ].join("|");
-  const deliverableWords = [
-    "文件", "图片", "照片", "图", "附件", "文档", "报告", "表格", "截图", "压缩包", "备份", "录音", "音频", "视频",
-    "file", "image", "photo", "picture", "attachment", "document", "report", "spreadsheet", "screenshot", "archive",
-    "zip", "pdf", "doc", "docx", "xlsx", "ppt", "pptx",
-  ].join("|");
-  const pathIntentPattern = new RegExp(
-    `(?:(${sendVerbs}).{0,80}${DELIVERABLE_PATH_REGEX_SOURCE}|${DELIVERABLE_PATH_REGEX_SOURCE}.{0,80}(${sendVerbs}))`,
-  );
-  if (pathIntentPattern.test(text)) {
-    return true;
-  }
-  if (new RegExp(`(你.{0,6}(能|可以|会)|能不能|可不可以|能否|是否|会不会|支持).{0,30}(${sendVerbs}).{0,30}(${deliverableWords}).{0,8}(吗|么|嘛|\\?|？)?`).test(text)) {
-    return false;
-  }
-  const directChinesePatterns = [
-    new RegExp(`(把|将).{0,50}(${deliverableWords}).{0,30}(${sendVerbs})(给我|到手机|到移动端|过来|回来|一下|给这边)?`),
-    new RegExp(`(${sendVerbs})(这张|这个|这份|该|那张|那份|一张|几张|一些|些|一下)?[^，。,.!?？]{0,24}(${deliverableWords})(给我|到手机|到移动端|过来|回来|一下|给这边)?`),
-    new RegExp(`(${sendVerbs})(给我|到手机|到移动端|过来|回来).{0,50}(${deliverableWords})?`),
-    new RegExp(`(给我|帮我).{0,20}(${sendVerbs}).{0,50}(${deliverableWords})`),
-  ];
-  if (directChinesePatterns.some((pattern) => pattern.test(text))) {
-    return true;
-  }
-  const englishPatterns = [
-    new RegExp(`\\b(send|upload|attach|share|deliver)\\b.{0,50}\\b(${deliverableWords})\\b`),
-    new RegExp(`\\b(${deliverableWords})\\b.{0,50}\\b(send|upload|attach|share|deliver)\\b`),
-  ];
-  return englishPatterns.some((pattern) => pattern.test(text));
+  const filePath = resolve(expandedPath);
+  return existsSync(filePath) ? filePath : undefined;
 }

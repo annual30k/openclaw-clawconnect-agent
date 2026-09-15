@@ -11,6 +11,11 @@ export type LocalCommandEventPublisher = (event: {
 export type LocalCommandContext = {
   requestId?: string;
   gatewayId?: string;
+  /**
+   * Typed bridge capability supplied by the Hermes mobile relay.  This is a
+   * transport contract, not an inference from user wording.
+   */
+  hermesFileTransferCapability?: "cli";
   publishEvent?: LocalCommandEventPublisher;
   abortSignal?: AbortSignal;
 };

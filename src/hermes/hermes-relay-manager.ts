@@ -488,6 +488,7 @@ export async function runHermesRelayManagerWithDependencies(
         const chat = await dependencies.runChat(paramsWithFiles, {
           requestId: runId,
           gatewayId: opts.gatewayId,
+          hermesFileTransferCapability: "cli",
           abortSignal: abortController.signal,
           publishEvent: (event) => {
             const confirmation = sendWithWriteConfirmation(event);

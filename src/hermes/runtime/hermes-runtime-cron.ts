@@ -1,5 +1,6 @@
 
 import { execFileSync } from "child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "fs";
 import { readFile } from "fs/promises";
 import type { LocalResult } from "../../core/command-types.js";
@@ -29,7 +30,8 @@ export function runHermesCronCreate(params: unknown): LocalResult {
     return { ok: false, error: "schedule_and_prompt_required" };
   }
   const name = stringParam(record, "name", "title");
-  const duplicate = findDuplicateHermesCronJobPayload({ name, prompt, schedule });
+  const dedupeKey = stringParam(record, "dedupeKey", "dedupe_key", "idempotencyKey", "idempotency_key");
+  const duplicate = findDuplicateHermesCronJobPayload({ name, prompt, schedule, dedupeKey });
   if (duplicate) {
     return { ok: true, payload: { ...duplicate, deduplicated: true } };
   }
@@ -74,7 +76,9 @@ export function runHermesCronRemove(params: unknown): LocalResult {
     return { ok: false, error: "job_id_required" };
   }
   const output = runHermes(["cron", "remove", id]);
-  return { ok: true, payload: { removed: !/not found/i.test(output), output } };
+  // `runHermes` returning means the fixed CLI command exited successfully;
+  // do not reinterpret arbitrary stdout prose as a removal result.
+  return { ok: true, payload: { removed: true, output } };
 }
 
 export function runHermesCronRun(params: unknown): LocalResult {
@@ -139,29 +143,37 @@ function findDuplicateHermesCronJobPayload(candidate: {
   name?: string;
   prompt: string;
   schedule: string;
+  dedupeKey?: string;
 }): Record<string, unknown> | undefined {
   return readHermesCronJobsSync(true).find((job) => isDuplicateHermesCronJob(job, candidate));
 }
 
 export function isDuplicateHermesCronJob(
   job: Record<string, unknown>,
-  candidate: { name?: string; prompt: string; schedule: string },
+  candidate: { name?: string; prompt: string; schedule: string; dedupeKey?: string },
 ): boolean {
   const raw = toRecord(job.raw);
-  const existingName = stringParam(raw, "name") ?? stringParam(job, "name");
-  if (candidate.name && existingName && normalizeCronText(candidate.name) !== normalizeCronText(existingName)) {
+  const existingDedupeKey = stringParam(raw, "dedupeKey", "dedupe_key", "idempotencyKey", "idempotency_key");
+  const candidateDedupeKey = candidate.dedupeKey?.trim();
+  // A prompt is content, not task identity. Only an explicit stable key from
+  // the caller/provider may deduplicate two cron jobs.
+  if (!candidateDedupeKey || !existingDedupeKey || candidateDedupeKey !== existingDedupeKey) {
     return false;
   }
-
-  const existingPrompt = stringParam(raw, "prompt") ?? stringParam(toRecord(job.payload), "message", "text");
-  if (!existingPrompt || !areDuplicateCronPrompts(existingPrompt, candidate.prompt)) {
-    return false;
-  }
-
-  const existingSchedule = stringParam(raw, "schedule_display")
-    ?? stringParam(toRecord(raw.schedule), "display", "expr")
-    ?? scheduleStringFromNormalizedJob(job);
-  return areDuplicateCronSchedules(existingSchedule, candidate.schedule);
+  return canonicalCronPayloadHash({
+    name: candidate.name,
+    prompt: candidate.prompt,
+    schedule: candidate.schedule,
+    dedupeKey: candidateDedupeKey,
+  }) === canonicalCronPayloadHash({
+    name: stringParam(raw, "name") ?? stringParam(job, "name"),
+    prompt: stringParam(raw, "prompt") ?? stringParam(toRecord(job.payload), "message", "text") ?? "",
+    schedule: stringParam(raw, "schedule_display")
+      ?? stringParam(toRecord(raw.schedule), "display", "expr")
+      ?? scheduleStringFromNormalizedJob(job)
+      ?? "",
+    dedupeKey: existingDedupeKey,
+  });
 }
 
 function normalizeHermesCronJob(job: Record<string, unknown>): Record<string, unknown> {
@@ -237,18 +249,6 @@ function hermesScheduleFromParams(record: Record<string, unknown>): string | und
   return undefined;
 }
 
-function areDuplicateCronSchedules(left: string | undefined, right: string): boolean {
-  const leftFingerprint = cronScheduleFingerprint(left);
-  const rightFingerprint = cronScheduleFingerprint(right);
-  if (!leftFingerprint || !rightFingerprint) {
-    return normalizeCronText(left ?? "") === normalizeCronText(right);
-  }
-  if (leftFingerprint === rightFingerprint) {
-    return true;
-  }
-  return leftFingerprint === "daily" && rightFingerprint === "daily";
-}
-
 function cronScheduleFingerprint(value: string | undefined): string | undefined {
   const normalized = value?.trim().toLowerCase().replace(/\s+/g, " ");
   if (!normalized) return undefined;
@@ -264,47 +264,20 @@ function cronScheduleFingerprint(value: string | undefined): string | undefined 
   return normalized;
 }
 
-function areDuplicateCronPrompts(left: string, right: string): boolean {
-  const normalizedLeft = normalizeCronPrompt(left);
-  const normalizedRight = normalizeCronPrompt(right);
-  if (!normalizedLeft || !normalizedRight) return false;
-  if (normalizedLeft === normalizedRight) return true;
-  if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) return true;
-  return ngramOverlapRatio(normalizedLeft, normalizedRight, 3) >= 0.55;
-}
-
-function normalizeCronPrompt(value: string): string {
-  return normalizeCronText(value)
-    .replace(/^你是每日/, "每日")
-    .replace(/^每天执行一次/, "")
-    .replace(/^每天/, "");
-}
-
-function normalizeCronText(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[\s"'“”‘’.,，。:：;；!！?？()（）[\]【】{}<>《》|、\\/-]+/g, "");
-}
-
-function ngramOverlapRatio(left: string, right: string, size: number): number {
-  const leftGrams = ngrams(left, size);
-  const rightGrams = ngrams(right, size);
-  const smallerSize = Math.min(leftGrams.size, rightGrams.size);
-  if (smallerSize === 0) return 0;
-  let overlap = 0;
-  for (const gram of leftGrams) {
-    if (rightGrams.has(gram)) overlap += 1;
-  }
-  return overlap / smallerSize;
-}
-
-function ngrams(value: string, size: number): Set<string> {
-  if (value.length <= size) return new Set([value]);
-  const grams = new Set<string>();
-  for (let index = 0; index <= value.length - size; index += 1) {
-    grams.add(value.slice(index, index + size));
-  }
-  return grams;
+function canonicalCronPayloadHash(value: {
+  name?: string;
+  prompt: string;
+  schedule: string;
+  dedupeKey: string;
+}): string {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      dedupeKey: value.dedupeKey.trim(),
+      name: value.name?.trim() ?? "",
+      prompt: value.prompt,
+      schedule: cronScheduleFingerprint(value.schedule) ?? value.schedule.trim().replace(/\s+/g, " "),
+    }))
+    .digest("hex");
 }
 
 function promptFromCronParams(record: Record<string, unknown>): string | undefined {

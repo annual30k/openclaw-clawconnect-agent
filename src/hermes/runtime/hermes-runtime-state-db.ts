@@ -246,7 +246,11 @@ try:
             else:
                 lines = target["content"].splitlines()
                 source_run_id_matches = False
-                for index, line in enumerate(lines):
+                # The bridge appends the controlled metadata block after user
+                # text. Only the final marker is authoritative; earlier
+                # look-alikes may be user prose and must not bind a rewind.
+                for index in range(len(lines) - 1, -1, -1):
+                    line = lines[index]
                     if line.strip() != "[ClawConnect mobile turn]":
                         continue
                     source_run_id = None
@@ -326,6 +330,24 @@ export async function exportHermesSessionFromStateDb(sessionId: string): Promise
   return payload && typeof payload === "object" && !Array.isArray(payload)
     ? payload as Record<string, unknown>
     : undefined;
+}
+
+/**
+ * Read the authoritative Hermes message rows for a single session. Callers
+ * use the row order and the mobile-turn sourceRunId marker to scope evidence
+ * to the current turn; text similarity or timestamps are not identities.
+ */
+export async function readHermesSessionMessages(
+  sessionId: string,
+): Promise<Array<Record<string, unknown>> | undefined> {
+  const exported = await exportHermesSessionFromStateDb(sessionId);
+  if (!exported || !Array.isArray(exported.messages)) {
+    return undefined;
+  }
+  return exported.messages.flatMap((value) => {
+    const message = toRecord(value);
+    return Object.keys(message).length > 0 ? [message] : [];
+  });
 }
 
 export async function queryHermesHistoryPageFromStateDb(params: {

@@ -45,7 +45,17 @@ export function handleHermesCommand(
 ): LocalResult | Promise<LocalResult> | null {
   switch (method) {
     case "chat.history":
-      return runHermesChatHistory(params);
+      return runHermesChatHistory(
+        context.gatewayId
+          ? {
+              ...(params && typeof params === "object" && !Array.isArray(params)
+                ? params as Record<string, unknown>
+                : {}),
+              projectionVersion: 3,
+              projectionGatewayId: context.gatewayId,
+            }
+          : params,
+      );
     case "hermes.status":
       // Readiness shares this Node event loop with the Relay WebSocket. Keep the
       // CLI probe asynchronous so a slow Hermes status command cannot starve

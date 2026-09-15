@@ -123,3 +123,15 @@ test("buildOfficeEventPayload accepts Hermes final chat payloads", () => {
   assert.equal(payload?.office.kind, "idle");
   assert.equal(payload?.office.updatedAt, "2026-05-19T07:10:00.000Z");
 });
+
+test("buildOfficeEventPayload does not infer activity from arbitrary text", () => {
+  const payload = buildOfficeEventPayload("chat", {
+    role: "assistant",
+    state: "streaming but already complete",
+    text: "search and execute this later",
+    data: { toolName: "researcher" },
+  });
+
+  assert.equal(payload?.office.kind, "idle");
+  assert.equal(payload?.office.progress, 0);
+});

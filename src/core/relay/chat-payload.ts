@@ -1,17 +1,3 @@
-const ASSISTANT_CHAT_STATES = new Set([
-  "delta",
-  "streaming",
-  "in_progress",
-  "final",
-  "done",
-  "completed",
-  "complete",
-  "error",
-  "failed",
-  "fail",
-  "aborted",
-]);
-
 function canonicalChatState(rawState: string): string {
   const state = rawState.trim().toLowerCase();
   if (state === "done" || state === "completed" || state === "complete") {
@@ -32,12 +18,28 @@ export function normalizeChatEventPayload(rawPayload: unknown): unknown {
   if (hasState) {
     payload.state = canonicalChatState(stateRaw);
   } else if (phaseRaw) {
-    if (phaseRaw.includes("delta") || phaseRaw.includes("stream")) {
-      payload.state = "delta";
-    } else if (phaseRaw.includes("final") || phaseRaw.includes("complete") || phaseRaw.includes("done")) {
-      payload.state = "final";
-    } else if (phaseRaw.includes("error") || phaseRaw.includes("fail")) {
-      payload.state = "error";
+    // `phase` is a controlled protocol field. Do not classify free-form
+    // assistant text or a compound label by substring matching.
+    switch (phaseRaw) {
+      case "delta":
+      case "stream":
+      case "streaming":
+      case "streaming_delta":
+      case "in_progress":
+        payload.state = "delta";
+        break;
+      case "final":
+      case "complete":
+      case "completed":
+      case "done":
+        payload.state = "final";
+        break;
+      case "error":
+      case "failed":
+      case "fail":
+      case "aborted":
+        payload.state = "error";
+        break;
     }
   }
 
@@ -136,7 +138,17 @@ export function extractChatRole(rawPayload: unknown): string {
   if (typeof message?.role === "string" && message.role.trim()) {
     return message.role.trim().toLowerCase();
   }
-  return ASSISTANT_CHAT_STATES.has(normalizeChatState(rawPayload)) ? "assistant" : "";
+  const data =
+    payload.data && typeof payload.data === "object" && !Array.isArray(payload.data)
+      ? (payload.data as Record<string, unknown>)
+      : undefined;
+  if (typeof data?.role === "string" && data.role.trim()) {
+    return data.role.trim().toLowerCase();
+  }
+  // A chat state is not a role. OpenClaw can echo the user turn on the same
+  // stream without carrying assistant provenance; fail closed until the
+  // gateway supplies an explicit structured role.
+  return "";
 }
 
 export function withMessageText(rawPayload: unknown, text: string): unknown {

@@ -4,10 +4,6 @@ import {
   formatFileSize,
   normalizeSessionKey,
 } from "../core/relay/file-upload-utils.js";
-import {
-  inferLatestOpenClawSendFileSourceRunId,
-  inferLatestOpenClawSessionKey,
-} from "../openclaw/session-store.js";
 
 export interface SendFileCommandOptions {
   filePath: string;
@@ -54,11 +50,22 @@ export async function sendFileCommand(
     throw new Error("gateway_id_required");
   }
 
+  const explicitSessionKey = opts.session?.trim() || resolveSessionKeyFromEnv(env);
+  const explicitSourceRunId = resolveSourceRunId(opts.sourceRunId, env, config.gatewayType);
+  const isOpenClaw = config.gatewayType === "openclaw" || !config.gatewayType;
+  if (isOpenClaw && (!explicitSessionKey || !explicitSourceRunId)) {
+    throw new Error("openclaw_send_file_requires_explicit_session_and_source_run_id");
+  }
+  if (isOpenClaw && explicitSessionKey && !isFullOpenClawSessionKey(explicitSessionKey)) {
+    throw new Error("openclaw_send_file_requires_full_agent_session_key");
+  }
   const hostSessionKey = await resolveTargetSessionKey(opts.session, config, deps.sessionStoreRoot, env);
   const sessionKey = relayUploadSessionKey(hostSessionKey, config);
-  const sourceRunId =
-    resolveSourceRunId(opts.sourceRunId, env)
-    ?? await resolveOpenClawTranscriptSourceRunId(opts, config, hostSessionKey, deps.sessionStoreRoot);
+  // OpenClaw child processes do not reliably inherit the Relay manager's
+  // per-run environment. Never consult a "unique/latest" active-run record:
+  // the caller must carry the exact session and sourceRunId (or use the native
+  // message tool, whose structured tool result is handled by the Relay path).
+  const sourceRunId = explicitSourceRunId;
   writeLog(stderr, `[send-file] preparing ${opts.filePath} for gateway ${gatewayId} session ${sessionKey}`);
 
   const result = await uploadFileToRelay(
@@ -100,43 +107,31 @@ function relayUploadSessionKey(hostSessionKey: string, config: ClawConnectConfig
     return normalized;
   }
   // OpenClaw stores transcripts under agent:<agentId>:<session>, while Relay
-  // and all mobile clients address the same chat as <session>. Keep the Host
-  // key for transcript/sourceRunId lookup, but persist the file in the mobile
-  // session from the start so file, attachment timeline, and reply share scope.
+  // and all mobile clients address the same chat as <session>. Persist the
+  // file in the mobile session from the start so file and attachment timeline
+  // share scope; sourceRunId is supplied separately by the typed contract.
   const match = /^agent:[^:]+:(.+)$/i.exec(normalized);
   return normalizeSessionKey(match?.[1] ?? normalized);
 }
 
-async function resolveOpenClawTranscriptSourceRunId(
-  opts: SendFileCommandOptions,
-  config: ClawConnectConfig,
-  sessionKey: string,
-  sessionStoreRoot?: string,
-): Promise<string | undefined> {
-  if (config.gatewayType && config.gatewayType !== "openclaw") {
-    return undefined;
-  }
-  // OpenClaw exec tools do not always inject the relay run id into subprocess
-  // env. Infer it from the target transcript so returned files attach to the
-  // triggering user turn instead of the assistant/tool call or arrival time.
-  return inferLatestOpenClawSendFileSourceRunId({
-    sessionKey,
-    filePath: opts.filePath,
-    sessionStoreRoot,
-  });
-}
-
-function resolveSourceRunId(explicit: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
+function resolveSourceRunId(
+  explicit: string | undefined,
+  env: NodeJS.ProcessEnv,
+  gatewayType?: ClawConnectConfig["gatewayType"],
+): string | undefined {
   const explicitValue = normalizeSourceRunId(explicit);
   if (explicitValue) return explicitValue;
 
-  for (const key of [
-    "CLAWCONNECT_SOURCE_RUN_ID",
-    "OPENCLAW_RUN_ID",
-    "OPENCLAW_TRACE_RUN_ID",
-    "OPENCLAW_REQUEST_ID",
-    "CODEX_RUN_ID",
-  ]) {
+  const keys = gatewayType === "openclaw" || !gatewayType
+    ? ["CLAWCONNECT_SOURCE_RUN_ID"]
+    : [
+        "CLAWCONNECT_SOURCE_RUN_ID",
+        "OPENCLAW_RUN_ID",
+        "OPENCLAW_TRACE_RUN_ID",
+        "OPENCLAW_REQUEST_ID",
+        "CODEX_RUN_ID",
+      ];
+  for (const key of keys) {
     const value = normalizeSourceRunId(env[key]);
     if (value) return value;
   }
@@ -155,6 +150,15 @@ function normalizeSourceRunId(value: string | undefined): string | undefined {
   return trimmed || undefined;
 }
 
+/**
+ * OpenClaw ownership is keyed by the complete transcript scope.  A Relay
+ * display alias such as `main` is deliberately not sufficient here because
+ * different OpenClaw agents may use that alias concurrently.
+ */
+function isFullOpenClawSessionKey(value: string): boolean {
+  return /^agent:[^:]+:.+$/.test(value.trim());
+}
+
 async function resolveTargetSessionKey(
   explicitSessionKey: string | undefined,
   config: ClawConnectConfig,
@@ -171,10 +175,7 @@ async function resolveTargetSessionKey(
     return envSessionKey;
   }
 
-  if (config.gatewayType === "openclaw" || !config.gatewayType) {
-    const inferredSessionKey = await inferLatestOpenClawSessionKey(sessionStoreRoot);
-    return normalizeSessionKey(inferredSessionKey ?? "main");
-  }
+  if (config.gatewayType === "openclaw" || !config.gatewayType) return "main";
 
   return "main";
 }
@@ -184,8 +185,6 @@ function resolveSessionKeyFromEnv(env: NodeJS.ProcessEnv): string | undefined {
     "CLAWCONNECT_SESSION_KEY",
     "CLAWCONNECT_CHAT_SESSION_KEY",
     "CLAWCONNECT_MOBILE_SESSION_KEY",
-    "OPENCLAW_SESSION_KEY",
-    "OPENCLAW_CHAT_SESSION_KEY",
   ]) {
     const value = env[key]?.trim();
     if (value) {

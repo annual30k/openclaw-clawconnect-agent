@@ -4,6 +4,7 @@ import { ensureWindowsConsoleUtf8 } from "./platform/service-manager-common.js";
 import { DEFAULT_RELAY_SERVER_URL, ensureUserEnvFile, loadAgentEnv } from "./config/env.js";
 import { pairCommand } from "./commands/pair.js";
 import { sendFileCommand } from "./commands/send-file.js";
+import { hermesFileTransferOutcomeCommand } from "./commands/hermes-file-transfer-outcome.js";
 import { installCommand, uninstallCommand, stopCommand, restartCommand, resetCommand } from "./commands/install.js";
 import { statusCommand } from "./commands/status.js";
 import { setTokenCommand } from "./commands/set-token.js";
@@ -112,8 +113,8 @@ program
     .description("Upload a local file to the paired gateway's chat session")
     .argument("<path>", "Path to the local file")
     .option("-g, --gateway <id>", "Override gateway ID from local config")
-    .option("-s, --session <key>", "Target chat session key (defaults to the latest active session)")
-    .option("--source-run-id <id>", "Message/run ID this file belongs to")
+    .option("-s, --session <key>", "Explicit target chat session key (required for OpenClaw)")
+    .option("--source-run-id <id>", "Explicit message/run ID this file belongs to (required for OpenClaw)")
     .option(...profileOption)
     .option("--json", "Print the upload result as JSON", false)
     .action(async (filePath, opts) => {
@@ -126,6 +127,19 @@ program
             sourceRunId: opts.sourceRunId,
             json: opts.json,
         });
+    }
+    catch (err) {
+        console.error("Error:", err instanceof Error ? err.message : err);
+        process.exit(1);
+    }
+});
+program
+    .command("hermes-file-transfer-outcome")
+    .description("Emit a typed Hermes mobile file-transfer outcome for the terminal receipt")
+    .requiredOption("--json <payload>", "JSON object with kind and sourceRunId")
+    .action((opts) => {
+    try {
+        hermesFileTransferOutcomeCommand(opts.json);
     }
     catch (err) {
         console.error("Error:", err instanceof Error ? err.message : err);

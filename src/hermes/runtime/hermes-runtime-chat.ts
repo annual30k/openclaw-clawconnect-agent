@@ -35,13 +35,15 @@ import {
   readCachedHermesStatusSnapshot,
   readHermesStatusSnapshotAsync,
 } from "./hermes-runtime-usage.js";
-import { compactStringArray, sanitizeFileName } from "./hermes-runtime-values.js";
+import { compactStringArray, sanitizeFileName, stringValue } from "./hermes-runtime-values.js";
 import {
   detectHermesHistoryCompletion,
+  hermesSourceRunIdFromMessage,
   selectHermesSessionForCompletedChat,
 } from "./hermes-runtime-history-completion.js";
 import {
   captureHermesSessionActiveHead,
+  readHermesSessionMessages,
   rewindHermesSessionAfterActiveHead,
 } from "./hermes-runtime-state-db.js";
 import { tryRunHermesApiChat } from "./hermes-runtime-api-client.js";
@@ -55,6 +57,13 @@ import {
   isHermesSlashCommandMessage,
   runHermesSlashCommand,
 } from "./hermes-runtime-slash-command.js";
+import {
+  clearPendingHermesFileTransfer,
+  getPendingHermesFileTransfer,
+  recordPendingHermesFileTransfer,
+  type PendingHermesFileTransfer,
+} from "./hermes-file-transfer-state.js";
+import type { HermesFileTransferOutcome } from "../../commands/hermes-file-transfer-outcome.js";
 
 export { selectHermesSessionForCompletedChat } from "./hermes-runtime-history-completion.js";
 export { latestTerminalAssistantReplyFromHermesExport } from "./hermes-runtime-history-completion.js";
@@ -85,7 +94,15 @@ type PreparedHermesMessage = {
 
 type HermesChatPreparationPlan = {
   preloadFileTransferSkill: boolean;
+  fileTransferMode: "continuation" | undefined;
+  pendingFileTransfer?: PendingHermesFileTransfer;
 };
+
+const HERMES_FILE_TRANSFER_NOT_SENT_MESSAGE =
+  "文件尚未发送：没有检测到可验证的 clawconnect send-file 成功结果，请补充或确认要发送的文件后重试。";
+const HERMES_FILE_TRANSFER_CONTENT_MISSING_MESSAGE =
+  "本轮没有可显示的结构化回答。";
+const HERMES_FILE_TRANSFER_CANCELLED_MESSAGE = "文件发送已取消。";
 
 export async function runHermesChat(
   params: unknown,
@@ -115,8 +132,7 @@ export async function runHermesChat(
   const sourceRunId = typeof context.requestId === "string" && context.requestId.trim().length > 0
     ? context.requestId.trim()
     : undefined;
-  const preparationPlan = planHermesChatPreparation(rawMessage);
-  const preparedMessage = await prepareHermesMessage(rawMessage, record.attachments, sessionKey, sourceRunId, preparationPlan);
+  const preparedMessage = await prepareHermesMessage(rawMessage, record.attachments, sessionKey, sourceRunId);
   if (!preparedMessage.cliMessage.trim()) {
     throw new Error("message_required");
   }
@@ -129,7 +145,6 @@ export async function runHermesChat(
       sourceRunId,
       hermesSessionId: record.hermesSessionId,
       context,
-      preparationPlan,
     });
   });
 }
@@ -159,37 +174,60 @@ async function runHermesChatPrepared(params: {
   sourceRunId: string | undefined;
   hermesSessionId: unknown;
   context: LocalCommandContext;
-  preparationPlan: HermesChatPreparationPlan;
 }): Promise<HermesChatResult> {
   const explicitResume = typeof params.hermesSessionId === "string" && params.hermesSessionId.trim().length > 0
     ? params.hermesSessionId.trim()
     : undefined;
   const mappedResume = explicitResume ? undefined : await getMappedHermesSessionId(params.sessionKey);
   let resume = explicitResume ?? mappedResume;
-  const preloadedSkillContext = params.preparationPlan.preloadFileTransferSkill
+  const preparationPlan = await planHermesChatPreparation({
+    message: params.rawMessage,
+    gatewayId: params.context.gatewayId ?? "clawconnect",
+    sessionKey: params.sessionKey,
+    sessionId: resume,
+    sourceRunId: params.sourceRunId,
+    fileTransferCapability: params.context.hermesFileTransferCapability,
+  });
+  const preloadedSkillContext = preparationPlan.preloadFileTransferSkill
     ? await resolveHermesPreloadedSkillContext({ forceFileTransfer: true })
     : EMPTY_PRELOADED_SKILL_CONTEXT;
   try {
-    const apiChat = await tryRunHermesApiChat({
-      message: params.preparedMessage.apiMessage,
-      instructions: params.preparedMessage.apiInstructions,
-      sessionKey: params.sessionKey,
-      resume,
-      preloadedSkillNames: preloadedSkillContext.skillNames,
-      requiredToolsets: preloadedSkillContext.requiredToolsets,
-      context: params.context,
-    });
+    // File delivery is fail-closed and must be backed by the local
+    // clawconnect send-file tool.  The API stream publishes assistant deltas
+    // before its final tool evidence is persisted, so route these turns
+    // through the CLI path where the answer is buffered until verification.
+    const apiChat = preparationPlan.preloadFileTransferSkill
+      ? undefined
+      : await tryRunHermesApiChat({
+        message: params.preparedMessage.apiMessage,
+        instructions: params.preparedMessage.apiInstructions,
+        sessionKey: params.sessionKey,
+        resume,
+        preloadedSkillNames: preloadedSkillContext.skillNames,
+        requiredToolsets: preloadedSkillContext.requiredToolsets,
+        context: params.context,
+      });
     if (apiChat) {
       const recoveredOutput = await recoverEmptyHermesApiOutputFromHistory({
         output: apiChat.output,
         hermesSessionId: apiChat.hermesSessionId,
         sessionKey: params.sessionKey,
         userMessage: params.rawMessage,
+        sourceRunId: params.sourceRunId,
         abortSignal: params.context.abortSignal,
       });
+      const visibleOutput = requireVisibleHermesOutput(recoveredOutput || apiChat.output);
       return {
         ...apiChat,
-        output: requireVisibleHermesOutput(recoveredOutput || apiChat.output),
+        output: visibleOutput,
+        ...(await verifyHermesFileTransferIfRequired({
+          plan: preparationPlan,
+          gatewayId: params.context.gatewayId ?? "clawconnect",
+          sessionKey: params.sessionKey,
+          sessionId: apiChat.hermesSessionId,
+          sourceRunId: params.sourceRunId,
+          output: visibleOutput,
+        })),
       };
     }
   } catch (error) {
@@ -203,25 +241,37 @@ async function runHermesChatPrepared(params: {
     }
     await forgetHermesSession(params.sessionKey, mappedResume);
     resume = undefined;
-    const retryApiChat = await tryRunHermesApiChat({
-      message: params.preparedMessage.apiMessage,
-      instructions: params.preparedMessage.apiInstructions,
-      sessionKey: params.sessionKey,
-      preloadedSkillNames: preloadedSkillContext.skillNames,
-      requiredToolsets: preloadedSkillContext.requiredToolsets,
-      context: params.context,
-    });
+    const retryApiChat = preparationPlan.preloadFileTransferSkill
+      ? undefined
+      : await tryRunHermesApiChat({
+        message: params.preparedMessage.apiMessage,
+        instructions: params.preparedMessage.apiInstructions,
+        sessionKey: params.sessionKey,
+        preloadedSkillNames: preloadedSkillContext.skillNames,
+        requiredToolsets: preloadedSkillContext.requiredToolsets,
+        context: params.context,
+      });
     if (retryApiChat) {
       const recoveredOutput = await recoverEmptyHermesApiOutputFromHistory({
         output: retryApiChat.output,
         hermesSessionId: retryApiChat.hermesSessionId,
         sessionKey: params.sessionKey,
         userMessage: params.rawMessage,
+        sourceRunId: params.sourceRunId,
         abortSignal: params.context.abortSignal,
       });
+      const visibleOutput = requireVisibleHermesOutput(recoveredOutput || retryApiChat.output);
       return {
         ...retryApiChat,
-        output: requireVisibleHermesOutput(recoveredOutput || retryApiChat.output),
+        output: visibleOutput,
+        ...(await verifyHermesFileTransferIfRequired({
+          plan: preparationPlan,
+          gatewayId: params.context.gatewayId ?? "clawconnect",
+          sessionKey: params.sessionKey,
+          sessionId: retryApiChat.hermesSessionId,
+          sourceRunId: params.sourceRunId,
+          output: visibleOutput,
+        })),
       };
     }
   }
@@ -242,6 +292,7 @@ async function runHermesChatPrepared(params: {
         resume,
         sessionKey: params.sessionKey,
         userMessage: params.rawMessage,
+        sourceRunId: params.sourceRunId,
       }),
     });
   } catch (error) {
@@ -270,6 +321,7 @@ async function runHermesChatPrepared(params: {
         beforeSessions,
         sessionKey: params.sessionKey,
         userMessage: params.rawMessage,
+        sourceRunId: params.sourceRunId,
       }),
     });
   }
@@ -284,6 +336,14 @@ async function runHermesChatPrepared(params: {
   if (mappedSession) {
     await rememberHermesSession(params.sessionKey, mappedSession);
   }
+  const verifiedFileTransfer = await verifyHermesFileTransferIfRequired({
+    plan: preparationPlan,
+    gatewayId: params.context.gatewayId ?? "clawconnect",
+    sessionKey: params.sessionKey,
+    sessionId: resume ?? mappedSession?.hermesSessionId,
+    sourceRunId: params.sourceRunId,
+    output,
+  });
   const usage = mappedSession?.hermesSessionId
     ? await collectHermesUsageSnapshot(mappedSession.hermesSessionId)
     : await readHermesStatusSnapshotAsync();
@@ -292,6 +352,7 @@ async function runHermesChatPrepared(params: {
     sessionKey: params.sessionKey,
     artifactPaths: [],
     usage,
+    ...verifiedFileTransfer,
   };
 }
 
@@ -362,6 +423,7 @@ async function recoverEmptyHermesApiOutputFromHistory(params: {
   hermesSessionId?: string;
   sessionKey: string;
   userMessage: string;
+  sourceRunId?: string;
   abortSignal?: AbortSignal;
 }): Promise<string | undefined> {
   if (sanitizeHermesChatOutput(params.output).trim()) {
@@ -381,6 +443,7 @@ async function recoverEmptyHermesApiOutputFromHistory(params: {
       resume: params.hermesSessionId,
       sessionKey: params.sessionKey,
       userMessage: params.userMessage,
+      sourceRunId: params.sourceRunId,
     });
     if (detectedOutput) {
       return detectedOutput;
@@ -788,7 +851,6 @@ async function prepareHermesMessage(
   attachments: unknown,
   sessionKey: string,
   sourceRunId?: string,
-  preparationPlan: HermesChatPreparationPlan = planHermesChatPreparation(message),
 ): Promise<PreparedHermesMessage> {
   const refs: string[] = [];
   if (Array.isArray(attachments)) {
@@ -886,35 +948,289 @@ export async function cleanupExpiredHermesInbox(
   }));
 }
 
-function planHermesChatPreparation(message: string): HermesChatPreparationPlan {
+export async function planHermesChatPreparation(params: {
+  message: string;
+  gatewayId: string;
+  sessionKey: string;
+  sessionId?: string;
+  sourceRunId?: string;
+  fileTransferCapability?: "cli";
+}): Promise<HermesChatPreparationPlan> {
+  // A continuation is enabled only by a durable host-side pending state from
+  // the same gateway/mobile/Hermes session.  The user's wording is deliberately
+  // opaque to this router; Hermes receives the full history and decides what it
+  // means (including any language, selection, or clarification).
+  const pending = params.sessionId
+    ? await getPendingHermesFileTransfer({
+      gatewayId: params.gatewayId,
+      sessionKey: params.sessionKey,
+      hermesSessionId: params.sessionId,
+      sourceRunId: params.sourceRunId,
+    })
+    : undefined;
   return {
-    preloadFileTransferSkill: shouldPreloadHermesFileTransferSkill(message),
+    // The mobile relay explicitly grants the typed CLI file-transfer
+    // capability on every turn. The model/tool protocol, rather than a
+    // language-specific intent table, decides whether a send is needed. This
+    // deliberately trades the API fast path for a buffered CLI path on mobile
+    // turns, where send-file receipts are persisted atomically.
+    preloadFileTransferSkill: params.fileTransferCapability === "cli" || pending !== undefined,
+    fileTransferMode: pending ? "continuation" : undefined,
+    ...(pending ? { pendingFileTransfer: pending } : {}),
   };
 }
 
-function shouldPreloadHermesFileTransferSkill(message: string): boolean {
-  const text = message.trim();
-  const lower = text.toLowerCase();
-  if (!text) {
-    return false;
-  }
-  if (/\bfile-transfer\b|clawconnect\s+send-file/.test(lower)) {
-    return true;
-  }
+function normalizeHermesRole(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
 
-  const pathOrExtension = /(?:^|\s|["'“”‘’])(?:~|\/|[a-z]:\\)|\.(?:png|jpe?g|gif|webp|heic|pdf|docx?|xlsx?|pptx?|zip|txt|md)\b/i.test(text);
-  const englishSend = /\b(send|transfer|upload|attach|share|copy)\b/i.test(text);
-  const englishFile = /\b(file|image|photo|picture|screenshot|document|attachment)\b/i.test(text) || pathOrExtension;
-  const englishTarget = /\b(phone|iphone|mobile|clawlink|this device|me)\b/i.test(text);
-  if (englishSend && englishFile && englishTarget) {
-    return true;
+export async function verifyHermesFileTransferIfRequired(params: {
+  plan: HermesChatPreparationPlan;
+  gatewayId: string;
+  sessionKey: string;
+  sessionId?: string;
+  sourceRunId?: string;
+  output?: string;
+}): Promise<{ verifiedFileTransferCount?: number; output?: string }> {
+  if (!params.plan.preloadFileTransferSkill) {
+    return {};
   }
+  const messages = params.sessionId ? await readHermesSessionMessages(params.sessionId) : undefined;
+  const evidence = params.sourceRunId
+    ? collectHermesFileTransferEvidence(messages, params.sourceRunId)
+    : [];
+  if (evidence.length > 0) {
+    await clearPendingHermesFileTransfer(
+      params.gatewayId,
+      params.sessionKey,
+      params.plan.pendingFileTransfer?.sourceRunId,
+    );
+    return {
+      verifiedFileTransferCount: evidence.length,
+      output: `已发送 ${evidence.length} 个文件，请查收。`,
+    };
+  }
+  const outcome = params.sourceRunId
+    ? collectHermesFileTransferOutcome(messages, params.sourceRunId)
+    : undefined;
+  if (outcome?.kind === "clarification") {
+    if (params.sessionId && params.sourceRunId) {
+      await recordPendingHermesFileTransfer({
+        gatewayId: params.gatewayId,
+        sessionKey: params.sessionKey,
+        hermesSessionId: params.sessionId,
+        sourceRunId: params.sourceRunId,
+        continuation: false,
+      });
+    }
+    // Only the typed content field is displayable. Raw assistant prose is
+    // deliberately discarded, and this outcome is never delivery evidence.
+    return {
+      output: outcome.assistantText ?? HERMES_FILE_TRANSFER_CONTENT_MISSING_MESSAGE,
+    };
+  }
+  if (outcome?.kind === "cancelled") {
+    await clearPendingHermesFileTransfer(
+      params.gatewayId,
+      params.sessionKey,
+      params.plan.pendingFileTransfer?.sourceRunId,
+    );
+    return {
+      output: outcome.assistantText ?? HERMES_FILE_TRANSFER_CANCELLED_MESSAGE,
+    };
+  }
+  if (outcome?.kind === "ordinary") {
+    await clearPendingHermesFileTransfer(
+      params.gatewayId,
+      params.sessionKey,
+      params.plan.pendingFileTransfer?.sourceRunId,
+    );
+    // Ordinary chat is shown only through the typed assistantText field. The
+    // model's ordinary label is routing metadata, never proof of delivery.
+    return {
+      output: outcome.assistantText ?? HERMES_FILE_TRANSFER_CONTENT_MISSING_MESSAGE,
+    };
+  }
+  if (outcome?.kind === "attempted") {
+    await clearPendingHermesFileTransfer(
+      params.gatewayId,
+      params.sessionKey,
+      params.plan.pendingFileTransfer?.sourceRunId,
+    );
+    return {
+      verifiedFileTransferCount: 0,
+      output: HERMES_FILE_TRANSFER_NOT_SENT_MESSAGE,
+    };
+  }
+  // A mobile turn with the typed file capability must publish either a typed
+  // ordinary/clarification/attempted/cancelled outcome or a send-file receipt.
+  // Without one, assistant prose such as “已发送” is never accepted as fact.
+  return {
+    verifiedFileTransferCount: 0,
+    output: HERMES_FILE_TRANSFER_NOT_SENT_MESSAGE,
+  };
+}
 
-  const chineseSend = /发送|发给|发到|发过来|传到|传给|传输|上传|分享|转发|给我|发/.test(text);
-  const chineseFile = /文件|图片|照片|截图|文档|附件|桌面|本机|路径|微信图片/.test(text) || pathOrExtension;
-  const chineseTarget = /手机|移动端|这台|给我|发过来|iPhone|ClawLink/i.test(text);
-  // 文件传输技能会触发 Hermes CLI 的 skills list；普通文本必须不走这条慢路径。
-  return chineseSend && chineseFile && chineseTarget;
+/** Read only first-party terminal outcome records for the exact current turn. */
+export function collectHermesFileTransferOutcome(
+  messages: Array<Record<string, unknown>> | undefined,
+  sourceRunId: string,
+): HermesFileTransferOutcome | undefined {
+  const currentIndex = currentHermesTurnIndex(messages, sourceRunId);
+  if (currentIndex < 0 || !messages) return undefined;
+  const outcomes: HermesFileTransferOutcome[] = [];
+  for (const message of messages.slice(currentIndex + 1)) {
+    if (normalizeHermesRole(message.role) === "user") break;
+    if (normalizeHermesRole(message.role) !== "tool" || normalizeHermesRole(message.tool_name) !== "terminal") continue;
+    for (const record of terminalResultRecords(message)) {
+      if (
+        record.protocol !== "clawconnect.hermes-file-transfer-outcome.v1"
+        || record.sourceRunId !== sourceRunId
+        || record.sourceRole !== "assistant"
+        || record.status !== "completed"
+        || record.exit_code !== 0
+        || (record.kind !== "ordinary" && record.kind !== "clarification" && record.kind !== "attempted" && record.kind !== "cancelled")
+      ) continue;
+      const assistantText = typeof record.assistantText === "string" ? record.assistantText.trim() : "";
+      if (record.kind !== "attempted" && !assistantText) continue;
+      outcomes.push({
+        protocol: "clawconnect.hermes-file-transfer-outcome.v1",
+        kind: record.kind,
+        sourceRunId,
+        sourceRole: "assistant",
+        status: "completed",
+        ...(assistantText ? { assistantText } : {}),
+      });
+    }
+  }
+  if (outcomes.length !== 1) return undefined;
+  return outcomes[0];
+}
+
+export function collectHermesFileTransferEvidence(
+  messages: Array<Record<string, unknown>> | undefined,
+  sourceRunId: string,
+): string[] {
+  if (!messages) {
+    return [];
+  }
+  const currentIndex = currentHermesTurnIndex(messages, sourceRunId);
+  if (currentIndex < 0) {
+    return [];
+  }
+  const ids = new Set<string>();
+  for (const message of messages.slice(currentIndex + 1)) {
+    if (normalizeHermesRole(message.role) === "user") {
+      break;
+    }
+    // Only a first-party terminal result is evidence.  A delegate/sub-agent
+    // summary, wrapper output, or a final assistant claim cannot manufacture
+    // an attachment by repeating the command name and a success word.
+    if (normalizeHermesRole(message.role) !== "tool"
+      || normalizeHermesRole(message.tool_name) !== "terminal") {
+      continue;
+    }
+    for (const record of terminalResultRecords(message)) {
+      if (record.sourceRunId !== sourceRunId
+        || record.sourceRole !== "assistant"
+        || record.status !== "completed"
+        || record.exit_code !== 0
+        || typeof record.fileId !== "string"
+        || !/^file_[a-z0-9]+$/i.test(record.fileId)) {
+        continue;
+      }
+      ids.add(record.fileId);
+    }
+  }
+  return [...ids];
+}
+
+function currentHermesTurnIndex(
+  messages: Array<Record<string, unknown>> | undefined,
+  sourceRunId: string,
+): number {
+  if (!messages || !sourceRunId.trim()) return -1;
+  let currentIndex = -1;
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (normalizeHermesRole(message?.role) === "user" && hermesSourceRunIdFromMessage(message) === sourceRunId) {
+      currentIndex = index;
+    }
+  }
+  return currentIndex;
+}
+
+function terminalResultRecords(message: Record<string, unknown>): Array<Record<string, unknown>> {
+  const content = stringValue(message.content);
+  if (!content) {
+    return [];
+  }
+  const outer = parseJsonRecord(content);
+  if (!outer) {
+    return [];
+  }
+  const records: Array<Record<string, unknown>> = [outer];
+  const output = stringValue(outer.output);
+  if (output) {
+    for (const fragment of extractJsonObjects(output)) {
+      const record = parseJsonRecord(fragment);
+      if (record) {
+        // Hermes stores the command envelope's exit_code beside the textual
+        // send-file JSON payload; the payload itself carries the Relay fields.
+        records.push(record.exit_code === undefined && outer.exit_code !== undefined
+          ? { ...record, exit_code: outer.exit_code }
+          : record);
+      }
+    }
+  }
+  return records;
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractJsonObjects(value: string): string[] {
+  const fragments: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+    } else if (character === "{") {
+      if (depth === 0) {
+        start = index;
+      }
+      depth += 1;
+    } else if (character === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        fragments.push(value.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+  return fragments;
 }
 
 export function buildHermesRuntimeContextHint(snapshot: HermesUsageSnapshot): string | undefined {

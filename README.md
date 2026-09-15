@@ -282,16 +282,20 @@ Notes:
 Send a local file into the paired chat session:
 
 ```bash
-clawconnect send-file ~/Pictures/demo.jpg
+clawconnect send-file ~/Pictures/demo.jpg \\
+  --session "agent:main:main" \\
+  --source-run-id "<sourceRunId>"
 ```
 
 Options:
 - `-g, --gateway <id>` — Override the gateway ID from local config
-- `-s, --session <key>` — Target chat session key. If omitted, the latest active session is used
+- `-s, --session <key>` — Explicit target chat session key; OpenClaw requires the full `agent:<agentId>:<session>` key
+- `--source-run-id <id>` — Explicit mobile message/run identity; OpenClaw requires this together with `--session`
 - `--json` — Print the upload result as JSON
 
 Notes:
 - `send-file` uploads through the relay and posts a file message to mobile.
+- Native OpenClaw message-tool sends should use the structured tool result path. A bare OpenClaw `send-file` child cannot safely discover the current run, so it fails closed instead of selecting a latest/unique active run. Callers using the CLI must pass both explicit identity fields (or provide the equivalent `CLAWCONNECT_SESSION_KEY` and `CLAWCONNECT_SOURCE_RUN_ID` bridge environment).
 - Image MIME types render as preview cards in the iPhone chat UI.
 - `chat.send` attachments are local staging references, not the cross-device file transfer path.
 
@@ -417,7 +421,7 @@ Tests are colocated with the source as `*.test.ts`. They run with `npm test`, an
 2. **Scan QR with mobile app** — iOS or Android app pairs with your host
 3. **Run** — Host agent stays connected to your relay server
 4. **Communicate** — Mobile app sends commands through the relay to OpenClaw
-5. **Send files** — Use `clawconnect send-file <path>` to deliver a local file or image into the chat session
+5. **Send files** — Prefer the native OpenClaw message-tool delivery record; explicit CLI transfers use `clawconnect send-file <path> --session <agent-qualified-session> --source-run-id <run-id>`
 
 ## Requirements
 

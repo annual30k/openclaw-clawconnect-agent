@@ -194,6 +194,79 @@ test("runHermesChatHistory returns OpenClaw-shaped canonical history", async () 
   }
 });
 
+test("runHermesChatHistory projection v3 rejects missing gateway, source ids, or source seq", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-v3-identity-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = join(root, "hermes");
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId: "hermes-v3-identity",
+      displayName: "v3 identity",
+      kind: "hermes",
+    });
+    const validExport = {
+      sessionId: "hermes-v3-identity",
+      messages: [{ id: "source-1", seq: 1, role: "user", content: "hello" }],
+    };
+    writeFileSync(binPath, [
+      "#!/usr/bin/env node",
+      `console.log(${JSON.stringify(JSON.stringify(validExport))});`,
+      "",
+    ].join("\n"));
+    chmodSync(binPath, 0o755);
+
+    await assert.rejects(
+      runHermesChatHistory({ sessionKey: "main", projectionVersion: 3, limit: 10 }),
+      /gatewayId/,
+    );
+
+    const invalidExport = {
+      sessionId: "hermes-v3-identity",
+      messages: [{ seq: 1, role: "user", content: "hello" }],
+    };
+    writeFileSync(binPath, [
+      "#!/usr/bin/env node",
+      `console.log(${JSON.stringify(JSON.stringify(invalidExport))});`,
+      "",
+    ].join("\n"));
+    const invalidResult = runHermesChatHistory({
+      sessionKey: "main",
+      projectionVersion: 3,
+      projectionGatewayId: "gw-hermes",
+      limit: 10,
+    });
+    await assert.rejects(invalidResult, /sourceMessageId/);
+
+    const invalidSeqExport = {
+      sessionId: "hermes-v3-identity",
+      messages: [{ id: "source-1", role: "user", content: "hello" }],
+    };
+    writeFileSync(binPath, [
+      "#!/usr/bin/env node",
+      `console.log(${JSON.stringify(JSON.stringify(invalidSeqExport))});`,
+      "",
+    ].join("\n"));
+    await assert.rejects(
+      runHermesChatHistory({
+        sessionKey: "main",
+        projectionVersion: 3,
+        projectionGatewayId: "gw-hermes",
+        limit: 10,
+      }),
+      /sourceOrderSeq/,
+    );
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runHermesChatHistory does not emit epoch timestamps when export omits message times", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-untimed-"));
   const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;

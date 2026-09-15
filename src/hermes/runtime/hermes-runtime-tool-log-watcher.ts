@@ -84,7 +84,10 @@ export function parseHermesToolLogLine(line: string): HermesToolLogEvent | null 
   if (executor) {
     const toolName = normalizeHermesToolName(executor[1] ?? "tool");
     const detail = (executor[2] ?? "").trim();
-    if (/\b(?:running|started|executing|start)\b/i.test(detail)) {
+    // `agent.tool_executor` is a fixed Hermes logger grammar.  Accept only
+    // its anchored lifecycle phrases; arbitrary detail prose is not evidence
+    // that a tool started, completed, or failed.
+    if (/^(?:running|started|executing|start)$/i.test(detail)) {
       return {
         toolName,
         phase: "streaming",
@@ -92,7 +95,10 @@ export function parseHermesToolLogLine(line: string): HermesToolLogEvent | null 
         isError: false,
       };
     }
-    const failed = /\b(?:failed|error|errored|denied|aborted)\b/i.test(detail);
+    const failed = /^(?:failed|errored|denied|aborted)(?:\b|\s*[:(])/i.test(detail)
+      || /^returned\s+error\s*:/i.test(detail);
+    const completed = /^(?:completed|finished)(?:\b|\s*[(])/i.test(detail);
+    if (!failed && !completed) return null;
     return {
       toolName,
       phase: failed ? "failed" : "completed",
@@ -109,24 +115,9 @@ export function parseHermesToolLogLine(line: string): HermesToolLogEvent | null 
   if (!/(?:_tool|_tools)$/i.test(loggerName)) {
     return null;
   }
-  let toolName = normalizeHermesToolName(loggerName);
-  let detail = (toolLogger[2] ?? "").trim();
-  if (/\b(?:Shutting down \d+ remaining sandbox(?:\(es\))?|Manually cleaned up environment|Cleaned \d+ environments?)\b/i.test(detail)) {
-    return null;
-  }
-  const nestedTool = detail.match(/^([A-Za-z0-9_.-]+):\s*(.+)$/);
-  if (nestedTool) {
-    toolName = normalizeHermesToolName(nestedTool[1] ?? toolName);
-    detail = (nestedTool[2] ?? "").trim();
-  }
-  if (!detail) {
-    return null;
-  }
-  return {
-    toolName,
-    phase: "streaming",
-    text: `${toolName}: ${detail}`,
-  };
+  // `tools.*` lines contain human-facing logger prose without a typed
+  // lifecycle receipt. Do not turn that prose into a tool execution event.
+  return null;
 }
 
 function normalizeHermesToolName(rawName: string): string {

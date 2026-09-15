@@ -31,6 +31,15 @@ export interface OfficeStreamPayload {
 }
 
 export const OFFICE_DETAIL_MAX_CODE_POINTS = 240;
+const OFFICE_ACTIVITY_KINDS = new Set<OfficeActivityKind>([
+  "idle",
+  "writing",
+  "researching",
+  "executing",
+  "syncing",
+  "offline",
+  "error",
+]);
 const OFFICE_DETAIL_SEGMENTER = typeof Intl.Segmenter === "function"
   ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
   : undefined;
@@ -71,8 +80,11 @@ export function buildOfficeEventPayload(
     ?? stringValue(office?.tool_call_id)
     ?? stringValue(data?.toolCallId)
     ?? stringValue(data?.tool_call_id);
+  const explicitKind = officeActivityKind(office?.kind)
+    ?? officeActivityKind(record.activityKind)
+    ?? officeActivityKind(data?.activityKind);
 
-  const kind = resolveKind(eventName, phase, role, toolName);
+  const kind = resolveKind(eventName, phase, role, toolName, explicitKind);
   const title = resolveTitle(kind);
   const detail = truncateOfficeDetail(resolveDetail(kind, {
     eventName,
@@ -148,31 +160,48 @@ function resolveKind(
   phase: string,
   role: string,
   toolName: string | undefined,
+  explicitKind: OfficeActivityKind | undefined,
 ): OfficeActivityKind {
-  const loweredTool = toolName?.toLowerCase() ?? "";
+  // The producer may provide an explicit typed office kind. Otherwise only
+  // exact protocol phases are accepted; arbitrary phase/tool text must not be
+  // interpreted as evidence of a lifecycle or tool state.
+  if (explicitKind) return explicitKind;
   if (eventName === "gateway_disconnected") {
     return "offline";
   }
   if (eventName === "gateway_connected" || eventName === "context_usage") {
     return "syncing";
   }
-  if (phase.includes("error") || phase.includes("fail")) {
-    return "error";
+  switch (phase) {
+    case "error":
+    case "failed":
+    case "fail":
+    case "aborted":
+      return "error";
+    case "final":
+    case "complete":
+    case "completed":
+    case "done":
+    case "end":
+      return "idle";
+    case "sync":
+    case "syncing":
+    case "waiting":
+      return "syncing";
+    case "executing":
+    case "tool_call":
+    case "tool_running":
+      return "executing";
+    case "stream":
+    case "streaming":
+    case "delta":
+    case "progress":
+    case "write":
+    case "writing":
+      return eventName === "agent" && toolName ? "executing" : "writing";
   }
-  if (phase.includes("final") || phase.includes("complete") || phase.includes("done") || phase.includes("end")) {
-    return "idle";
-  }
-  if (phase.includes("sync") || phase.includes("waiting")) {
-    return "syncing";
-  }
-  if (loweredTool.includes("search") || loweredTool.includes("browse") || loweredTool.includes("research") || loweredTool.includes("web")) {
-    return "researching";
-  }
-  if (loweredTool.includes("code") || loweredTool.includes("shell") || loweredTool.includes("run") || loweredTool.includes("exec")) {
+  if (eventName === "agent" && toolName) {
     return "executing";
-  }
-  if (phase.includes("stream") || phase.includes("delta") || phase.includes("progress") || phase.includes("write")) {
-    return eventName === "agent" ? "executing" : "writing";
   }
   if (role === "user") {
     return "writing";
@@ -256,10 +285,7 @@ function resolveDetail(
 }
 
 function resolveProgress(kind: OfficeActivityKind, phase: string): number | undefined {
-  if (phase.includes("final") || phase.includes("complete") || phase.includes("done")) {
-    return 1;
-  }
-  if (phase.includes("error") || phase.includes("fail")) {
+  if (["final", "complete", "completed", "done", "error", "failed", "fail", "aborted"].includes(phase)) {
     return 1;
   }
   switch (kind) {
@@ -301,6 +327,12 @@ function numberValue(value: unknown): number | undefined {
 
 function normalizePhaseValue(value: string | undefined): string {
   return value?.trim().toLowerCase() ?? "";
+}
+
+function officeActivityKind(value: unknown): OfficeActivityKind | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase() as OfficeActivityKind;
+  return OFFICE_ACTIVITY_KINDS.has(normalized) ? normalized : undefined;
 }
 
 function formatCount(value: number): string {

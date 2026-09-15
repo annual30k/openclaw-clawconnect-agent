@@ -112,8 +112,12 @@ type NormalizedUsageRecord = {
 };
 
 export const DEFAULT_GATEWAY_SESSION_DEFAULTS: GatewaySessionDefaults = {
-  mainSessionKey: "main",
+  // OpenClaw rejects the bare `main` alias when more than one explicitly
+  // owned agent exists. The system/default agent is `main`; keep the fallback
+  // subscription key explicit until config.get supplies a richer snapshot.
+  mainSessionKey: "agent:main:main",
   mainKey: "main",
+  defaultAgentId: "main",
 };
 
 export async function readContextUsageSnapshot(
@@ -194,10 +198,19 @@ export function extractGatewaySessionDefaults(rawPayload: unknown): GatewaySessi
     : "";
 
   if (mainSessionKey) {
+    // OpenClaw 2026.9 can omit defaultAgentId from the hello snapshot even
+    // when agents.ownership is explicit. In that configuration the bare
+    // `main` alias is rejected by sessions.* as ambiguous; the system agent
+    // is still the documented `main` owner, so make the subscription key
+    // explicit before the Relay starts its source observer.
+    const resolvedMainSessionKey = !defaultAgentId
+      && (mainSessionKey === "main" || mainSessionKey === (mainKey || "main"))
+      ? `agent:main:${mainKey || "main"}`
+      : mainSessionKey;
     return {
-      mainSessionKey,
+      mainSessionKey: resolvedMainSessionKey,
       mainKey: mainKey || "main",
-      defaultAgentId: defaultAgentId || undefined,
+      defaultAgentId: defaultAgentId || (resolvedMainSessionKey.startsWith("agent:main:") ? "main" : undefined),
     };
   }
 
@@ -239,6 +252,41 @@ export function canonicalizeSessionKey(rawValue: unknown, defaults: GatewaySessi
       : false);
 
   return isMainAlias ? defaults.mainSessionKey : trimmed;
+}
+
+/**
+ * Canonical identity used by OpenClaw relation registries (media, live
+ * delivery, history reconciliation, and timeline projection). OpenClaw can
+ * expose the default agent's dashboard session both as `dashboard:<id>` and
+ * `agent:<defaultAgentId>:dashboard:<id>`. Only the unqualified dashboard
+ * alias is qualified here; an explicitly named agent always remains in its
+ * own namespace.
+ *
+ * This builds on `canonicalizeSessionKey` for the main-session aliases, then
+ * adds the relation-only dashboard rule. Without the explicit default-agent
+ * boundary, a bare dashboard alias could accidentally match another agent's
+ * dashboard.
+ */
+export function canonicalizeOpenClawSessionScope(
+  rawValue: unknown,
+  defaults?: GatewaySessionDefaults,
+): string | undefined {
+  const canonicalValue = defaults ? canonicalizeSessionKey(rawValue, defaults) : rawValue;
+  if (typeof canonicalValue !== "string") return undefined;
+  const value = canonicalValue.trim();
+  if (!value) return undefined;
+
+  const explicitAgent = /^agent:([^:]+):(.+)$/i.exec(value);
+  if (explicitAgent?.[1] && explicitAgent[2]?.trim()) {
+    return `agent:${explicitAgent[1].trim()}:${explicitAgent[2].trim()}`;
+  }
+  if (!/^dashboard:.+$/i.test(value)) {
+    return value;
+  }
+
+  const defaultAgentId = defaults?.defaultAgentId?.trim()
+    || defaults?.mainSessionKey.match(/^agent:([^:]+):/i)?.[1]?.trim();
+  return defaultAgentId ? `agent:${defaultAgentId}:${value}` : value;
 }
 
 export function canonicalizeRelayParams(
@@ -334,7 +382,7 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
   return undefined;
 }
 
-function sessionKeyCandidates(rawValue: unknown, defaults: GatewaySessionDefaults): Set<string> {
+export function sessionKeyCandidates(rawValue: unknown, defaults: GatewaySessionDefaults): Set<string> {
   if (typeof rawValue !== "string" || !rawValue.trim()) return new Set();
   const key = canonicalizeSessionKey(rawValue, defaults);
   if (typeof key !== "string" || !key.trim()) return new Set();

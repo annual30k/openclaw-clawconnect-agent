@@ -279,10 +279,12 @@ export function parseGatewayRuntimeState(output: string): GatewayRuntimeState {
   }
 
   const runtime = runtimeLine.replace(/^Runtime:\s*/i, "").trim().toLowerCase();
-  if (runtime === "running" || (runtime.includes("running") && !runtime.includes("not running"))) {
+  // `Runtime:` is a controlled CLI field. Accept only its documented values;
+  // arbitrary prose must not become evidence that the gateway is healthy.
+  if (runtime === "running") {
     return "running";
   }
-  if (runtime === "stopped" || runtime.includes("stopped") || runtime.includes("not running")) {
+  if (runtime === "stopped" || runtime === "not running") {
     return "stopped";
   }
   return "unknown";

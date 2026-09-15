@@ -30,10 +30,11 @@ export const HERMES_TYPING_MARKER = "[[clawlink:typing]]";
 export const CLAWCONNECT_MOBILE_BRIDGE_HINT = [
   "[ClawConnect mobile bridge]",
   "You are connected to a mobile chat client through ClawConnect.",
-  "When the latest user request explicitly asks you to send, upload, attach, or share a local host image or file, use your Hermes file-transfer skill if it is installed.",
+  "This turn has the typed Hermes file-transfer capability. Decide through the file-transfer skill/tool protocol, never through a language-specific intent keyword list.",
   "The host-side delivery command is: clawconnect send-file --profile hermes --json <absolute-local-path>.",
-  "Do not rely on final-answer local file paths as mobile attachments; after a successful send-file call, summarize what was sent.",
-  "If the user is asking about capabilities, skills, file listings, or past work, do not repeat old file paths as sendable attachments.",
+  "At the end of every mobile turn, emit exactly one typed outcome through: clawconnect hermes-file-transfer-outcome --json '{\"kind\":\"ordinary|clarification|attempted|cancelled\",\"sourceRunId\":\"<sourceRunId from ClawConnect mobile turn>\",\"assistantText\":\"<the exact visible answer for ordinary/clarification/cancelled>\"}'. The assistantText field is the only non-delivery content ClawConnect may display; raw CLI prose is never forwarded. Use clarification only when asking for missing file/selection details; attempted after a send attempt (success is proven separately by typed send-file receipts); cancelled when the user cancels; ordinary when no file transfer is involved.",
+  "Do not rely on final-answer local file paths as mobile attachments or success evidence. After a successful send-file call, summarize what was sent, but still emit attempted and let ClawConnect verify the typed receipt.",
+  "If the user is asking about capabilities, skills, file listings, or past work, do not repeat old file paths as sendable attachments; emit ordinary.",
   "Do not say you cannot send attachments merely because you are running in a CLI environment.",
 ].join(" ");
 

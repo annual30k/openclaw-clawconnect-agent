@@ -10,6 +10,7 @@ import { runRelayManager as runRelayManagerImplementation } from "./relay-manage
 import type { RelayManagerOptions } from "./relay/relay-manager-protocol.js";
 import { openClawChatRunIdentities } from "./relay/chat-run-identity.js";
 import { clearReliableRelayOutboxesForTests } from "../core/relay/reliable-relay-outbox-registry.js";
+import { canonicalProjectionMessageId } from "../core/relay/timeline-projection-v3.js";
 
 const reliableOutboxStorageDirectory = mkdtempSync(join(tmpdir(), "clawconnect-openclaw-manager-test-"));
 
@@ -323,6 +324,19 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
       }
       socket.send(JSON.stringify({ type: "res", id: msg.id, ok: true, payload: {} }));
       if (msg.method === "connect") {
+        // OpenClaw can echo the user turn on the chat stream without an
+        // assistant role. It is not live assistant provenance.
+        socket.send(JSON.stringify({
+          type: "event",
+          event: "chat",
+          payload: {
+            runId: "run-1",
+            sessionKey: "main",
+            state: "delta",
+            seq: 0,
+            delta: "把微信图片发过来",
+          },
+        }));
         socket.send(JSON.stringify({
           type: "event",
           event: "chat",
@@ -345,6 +359,20 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
             role: "assistant",
             seq: 2,
             delta: "world",
+          },
+        }));
+        // A terminal text echo without message.role is still not assistant
+        // provenance, even though the run context was registered by the
+        // preceding assistant delta.
+        socket.send(JSON.stringify({
+          type: "event",
+          event: "chat",
+          payload: {
+            runId: "run-1",
+            sessionKey: "main",
+            state: "final",
+            seq: 2.5,
+            text: "把微信图片发过来",
           },
         }));
         socket.send(JSON.stringify({
@@ -399,6 +427,11 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
       .filter((message) => message.type === "event" && message.event === "chat" && isRecord(message.payload))
       .map((message) => message.payload as Record<string, unknown>)
       .filter((payload) => payload.runId === "run-1");
+    assert.equal(
+      runChatFrames.some((payload) => extractPayloadText(payload).includes("把微信图片发过来")),
+      false,
+      "an unproven user/source echo must not become assistant text",
+    );
     assert.equal(runChatFrames.filter((payload) => payload.state === "delta").length, 1);
 
     await waitFor(() => relayMessages.some((message) => {
@@ -434,6 +467,160 @@ test("relay manager publishes OpenClaw chat deltas as accumulated assistant text
   }
 });
 
+test("relay manager handles registered roleless terminal errors without accepting unregistered terminals", async () => {
+  openClawChatRunIdentities.clear();
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let gatewaySocket: WebSocket | undefined;
+
+  relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-roleless-terminal");
+    socket.on("message", (raw) => relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>));
+  });
+
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({
+      type: "event",
+      event: "connect.challenge",
+      payload: { nonce: "nonce-roleless-terminal", ts: Date.now() },
+    }));
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as { type?: string; id?: string; method?: string };
+      if (message.type !== "req" || !message.id) return;
+      socket.send(JSON.stringify({
+        type: "res",
+        id: message.id,
+        ok: true,
+        payload: message.method === "config.get" ? sessionDefaultsPayload() : {},
+      }));
+      if (message.method !== "connect") return;
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "registered-run",
+          sessionKey: "main",
+          state: "delta",
+          message: { role: "assistant", content: [{ type: "text", text: "处理中" }] },
+        },
+      }));
+      // OpenClaw terminal lifecycle errors may omit message.role. The
+      // previously registered provider run is the only trusted identity.
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "registered-run",
+          sessionKey: "main",
+          state: "error",
+          error: { message: "provider failed" },
+        },
+      }));
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "empty-terminal-run",
+          sessionKey: "main",
+          state: "delta",
+          message: { role: "assistant", content: [{ type: "text", text: "" }] },
+        },
+      }));
+      // An empty roleless final is lifecycle-only. The source-commit watcher
+      // owns canonical transcript rows; this event must not carry an empty
+      // assistant message through the live relay payload.
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "empty-terminal-run",
+          sessionKey: "main",
+          state: "final",
+          message: { content: [] },
+        },
+      }));
+      // Without a registered run context this same shape must be inert.
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "unregistered-run",
+          sessionKey: "main",
+          state: "error",
+          error: { message: "should not publish" },
+        },
+      }));
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-roleless-terminal",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+
+  try {
+    await waitFor(() => relayMessages.some((message) => (
+      message.type === "event"
+      && message.event === "chat"
+      && isRecord(message.payload)
+      && message.payload.runId === "registered-run"
+      && message.payload.state === "error"
+      && timelineEvents(message.payload).some((event) => event.eventType === "run.failed")
+    )), 4_000);
+    const errorFrames = relayMessages.filter((message) => (
+      message.type === "event"
+      && message.event === "chat"
+      && isRecord(message.payload)
+      && message.payload.state === "error"
+    ));
+    assert.equal(errorFrames.length, 1);
+    assert.equal(extractPayloadText(errorFrames[0]!.payload as Record<string, unknown>), "provider failed");
+    await waitFor(() => relayMessages.some((message) => (
+      message.type === "event"
+      && message.event === "chat"
+      && isRecord(message.payload)
+      && message.payload.runId === "empty-terminal-run"
+      && message.payload.state === "final"
+    )), 4_000);
+    const emptyCompletion = relayMessages
+      .filter((message) => message.type === "event" && message.event === "chat" && isRecord(message.payload))
+      .map((message) => message.payload as Record<string, unknown>)
+      .find((payload) => payload.runId === "empty-terminal-run" && payload.state === "final");
+    assert.ok(emptyCompletion);
+    assert.equal(emptyCompletion.message, undefined);
+    assert.deepEqual(
+      timelineEvents(emptyCompletion).map((event) => event.eventType),
+      ["run.completed"],
+    );
+    assert.equal(
+      relayMessages.some((message) => (
+        message.type === "event"
+        && message.event === "chat"
+        && isRecord(message.payload)
+        && message.payload.runId === "unregistered-run"
+      )),
+      false,
+    );
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+    openClawChatRunIdentities.clear();
+  }
+});
+
 test("relay manager enriches a text terminal with delivery-mirror images from history", async () => {
   openClawChatRunIdentities.clear();
   const openclawHome = await createEmptyOpenClawHomeFixture();
@@ -463,22 +650,27 @@ test("relay manager enriches a text terminal with delivery-mirror images from hi
           ok: true,
           payload: {
             sessionKey: "main",
+            sessionId: "session-live-delivery-mirror",
             messages: [
               {
                 id: "user-live-media",
                 role: "user",
+                seq: 1,
                 idempotencyKey: `${runId}:user`,
                 content: "把图片发过来",
               },
               {
                 id: "tool-live-media",
                 role: "assistant",
+                seq: 2,
                 __openclaw: { runId },
                 content: [{ type: "toolCall", id: "call_live_media", name: "message" }],
               },
               {
                 id: "delivery-live-media",
                 role: "assistant",
+                seq: 3,
+                parentId: "final-live-media",
                 idempotencyKey: `${runId}:message-tool:delivery:call_live_media`,
                 __openclaw: { runId },
                 content: [],
@@ -490,6 +682,7 @@ test("relay manager enriches a text terminal with delivery-mirror images from hi
               {
                 id: "final-live-media",
                 role: "assistant",
+                seq: 4,
                 runId,
                 content: [{ type: "text", text: "3 张都发过去了 📸" }],
               },
@@ -609,10 +802,11 @@ test("relay manager projects an OpenClaw assistant-media sidecar onto the parent
           message: {
             role: "assistant",
             idempotencyKey: `${runId}:assistant-media`,
-            content: [
-              { type: "text", text: "桌面只找到一张图片" },
-              { type: "image", url: "/api/chat/media/outgoing/agent%3Amain%3Asession_1/att_missing/full" },
-            ],
+            content: [{ type: "text", text: "桌面只找到一张图片" }],
+            openclawDisplayContent: [{
+              type: "image",
+              url: "/api/chat/media/outgoing/agent%3Amain%3Asession_1/att_missing/full",
+            }],
           },
         },
       }));
@@ -656,7 +850,407 @@ test("relay manager projects an OpenClaw assistant-media sidecar onto the parent
   }
 });
 
+test("relay manager forwards distinct message-tool replies after the provider terminal", async () => {
+  openClawChatRunIdentities.clear();
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let gatewaySocket: WebSocket | undefined;
+  const runId = "run-multi-message-tool";
+  const reply = (label: string, key: string, attachmentId: string) => ({
+    type: "event",
+    event: "chat",
+    payload: {
+      runId,
+      sessionKey: "main",
+      idempotencyKey: `${runId}:message-tool:${key}:call_${key}`,
+      state: "final",
+      role: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: label },
+          { type: "image", attachmentId, transferState: "expired" },
+        ],
+      },
+    },
+  });
+
+  relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-multi-message-tool");
+    socket.on("message", (raw) => relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>));
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({
+      type: "event",
+      event: "connect.challenge",
+      payload: { nonce: "nonce-multi-message-tool", ts: Date.now() },
+    }));
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as { type?: string; id?: string; method?: string };
+      if (message.type !== "req" || !message.id) return;
+      socket.send(JSON.stringify({ type: "res", id: message.id, ok: true, payload: {} }));
+      if (message.method === "connect") {
+        socket.send(JSON.stringify(reply("第一张", "first", "att-first")));
+      }
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-multi-message-tool",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+  try {
+    await waitFor(() => relayMessages.filter((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload)
+      && message.payload.state === "final"
+    )).length === 1, 4_000);
+    gatewaySocket!.send(JSON.stringify(reply("第二张", "second", "att-second")));
+    await waitFor(() => relayMessages.filter((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload)
+      && message.payload.state === "final"
+    )).length === 2, 4_000);
+    const terminals = relayMessages.filter((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload)
+      && message.payload.state === "final"
+    ));
+    const completed = terminals.map((terminal) => timelineEvents(terminal.payload as Record<string, unknown>)
+      .find((event) => event.eventType === "message.completed"));
+    assert.deepEqual(completed.map((event) => event?.messageId).length, 2);
+    assert.notEqual(completed[0]?.messageId, completed[1]?.messageId);
+    assert.deepEqual(completed.map((event) => event?.content?.[1]), [
+      { type: "image", attachmentId: "att-first", transferState: "expired" },
+      { type: "image", attachmentId: "att-second", transferState: "expired" },
+    ]);
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+    openClawChatRunIdentities.clear();
+  }
+});
+
+test("relay manager recovers later history media when one OpenClaw terminal carries only the first image", async () => {
+  // Reproduce the gateway shape observed in production: the terminal carries
+  // the first delivery's display media, while both delivery-mirror rows (and
+  // their media) are available through chat.history with stable transcript ids.
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  const isolatedStateDir = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-multi-media-state-"));
+  process.env.OPENCLAW_STATE_DIR = isolatedStateDir;
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let gatewaySocket: WebSocket | undefined;
+  let historyRequests = 0;
+  const runId = "wx_history_multi_media";
+  const history = {
+    sessionKey: "main",
+    sessionId: "session-history-multi-media",
+    messages: [
+      {
+        id: "history-user-multi-media",
+        role: "user",
+        seq: 1,
+        idempotencyKey: `${runId}:user`,
+        content: "把图片发过来",
+      },
+      {
+        id: "history-delivery-image-1",
+        role: "assistant",
+        seq: 2,
+        parentId: "history-final-multi-media",
+        runId,
+        idempotencyKey: `${runId}:message-tool:first:call_first`,
+        content: [{ type: "text", text: "图片 1" }],
+        openclawDisplayContent: [{
+          type: "image",
+          url: "/api/chat/media/outgoing/agent%3Amain%3Amain/att-history-1/full",
+        }],
+      },
+      {
+        id: "history-delivery-image-2",
+        role: "assistant",
+        seq: 3,
+        parentId: "history-final-multi-media",
+        runId,
+        idempotencyKey: `${runId}:message-tool:second:call_second`,
+        content: [{ type: "text", text: "图片 2" }],
+        openclawDisplayContent: [{
+          type: "image",
+          url: "/api/chat/media/outgoing/agent%3Amain%3Amain/att-history-2/full",
+        }],
+      },
+      {
+        id: "history-final-multi-media",
+        role: "assistant",
+        runId,
+        seq: 4,
+        content: [{ type: "text", text: "两张图片都发好了" }],
+      },
+    ],
+  };
+
+  relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-history-multi-media");
+    socket.on("message", (raw) => relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>));
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({
+      type: "event",
+      event: "connect.challenge",
+      payload: { nonce: "nonce-history-multi-media", ts: Date.now() },
+    }));
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as { type?: string; id?: string; method?: string };
+      if (message.type !== "req" || !message.id) return;
+      const requestNumber = message.method === "chat.history" ? ++historyRequests : historyRequests;
+      socket.send(JSON.stringify({
+        type: "res",
+        id: message.id,
+        ok: true,
+        payload: message.method === "chat.history"
+          ? (requestNumber === 1 ? { ...history, messages: history.messages.slice(0, 2) } : history)
+          : {},
+      }));
+      if (message.method === "chat.history" && requestNumber === 1) {
+        // Reconciliation is driven by the next OpenClaw terminal, not a
+        // timer. Its history now contains the second delivery row.
+        socket.send(JSON.stringify({
+          type: "event",
+          event: "chat",
+          payload: {
+            runId,
+            sessionKey: "main",
+            state: "final",
+            role: "assistant",
+            message: { role: "assistant", content: [{ type: "text", text: "两张图片都发好了" }] },
+          },
+        }));
+      }
+      if (message.method !== "connect") return;
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId,
+          sessionKey: "main",
+          state: "final",
+          role: "assistant",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "图片 1" }],
+            openclawDisplayContent: [
+              { type: "text", text: "图片 1" },
+              { type: "image", url: "/api/chat/media/outgoing/agent%3Amain%3Amain/att-history-1/full" },
+            ],
+          },
+        },
+      }));
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-history-multi-media",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+  try {
+    await waitFor(() => relayMessages.filter((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload)
+      && message.payload.state === "final"
+      && timelineEvents(message.payload).some((event) => (
+        event.eventType === "message.completed"
+        && event.content?.filter((block) => isRecord(block) && block.type === "image").length === 2
+      ))
+    )).length === 1, 5_000);
+    const terminals = relayMessages.filter((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload)
+      && message.payload.state === "final"
+      && timelineEvents(message.payload).some((event) => (
+        event.eventType === "message.completed"
+        && event.content?.filter((block) => isRecord(block) && block.type === "image").length === 2
+      ))
+    ));
+    const completed = terminals.map((terminal) => timelineEvents(terminal.payload as Record<string, unknown>)
+      .find((event) => event.eventType === "message.completed"));
+    assert.ok(completed.length >= 1);
+    assert.ok(completed[0]?.messageId);
+    assert.equal(completed[0]?.content?.filter((block) => isRecord(block) && block.type === "image").length, 2);
+    assert.deepEqual(completed[0]?.content
+      ?.filter((block) => isRecord(block) && block.type === "image")
+      .map((block) => (block as Record<string, unknown>).attachmentId), ["att-history-1", "att-history-2"]);
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    await rm(isolatedStateDir, { recursive: true, force: true });
+    openClawChatRunIdentities.clear();
+  }
+});
+
+test("relay manager reconciles a later text-only OpenClaw delivery terminal", async () => {
+  // A message-tool delivery can be delivered to Gateway as text first; its
+  // image projection may be committed only after that terminal is observed.
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  const isolatedStateDir = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-text-only-media-state-"));
+  process.env.OPENCLAW_STATE_DIR = isolatedStateDir;
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let gatewaySocket: WebSocket | undefined;
+  let historyRequests = 0;
+  const runId = "wx_text_only_media";
+  const user = { id: "text-only-user", role: "user", seq: 1, idempotencyKey: `${runId}:user`, content: "把图片发过来" };
+  const firstDelivery = {
+    id: "text-only-delivery-1",
+    role: "assistant",
+    seq: 2,
+    parentId: "text-only-final-comment",
+    runId,
+    idempotencyKey: `${runId}:message-tool:first:call_first`,
+    content: [{ type: "text", text: "图片 1" }],
+    openclawDisplayContent: [{ type: "image", url: "/api/chat/media/outgoing/agent%3Amain%3Amain/text-only-1/full" }],
+  };
+  const secondDelivery = {
+    id: "text-only-delivery-2",
+    role: "assistant",
+    seq: 3,
+    parentId: "text-only-final-comment",
+    runId,
+    idempotencyKey: `${runId}:message-tool:second:call_second`,
+    content: [{ type: "text", text: "图片 2" }],
+    openclawDisplayContent: [{ type: "image", url: "/api/chat/media/outgoing/agent%3Amain%3Amain/text-only-2/full" }],
+  };
+  const finalComment = {
+    id: "text-only-final-comment",
+    role: "assistant",
+    seq: 4,
+    runId,
+    content: [{ type: "text", text: "两张图片都发好了" }],
+  };
+  const sendChatEvent = (text: string): void => {
+    gatewaySocket?.send(JSON.stringify({
+      type: "event",
+      event: "chat",
+      payload: {
+        runId,
+        sessionKey: "main",
+        state: "final",
+        role: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text }] },
+      },
+    }));
+  };
+
+  relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-text-only-media");
+    socket.on("message", (raw) => relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>));
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "nonce-text-only-media", ts: Date.now() } }));
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as { type?: string; id?: string; method?: string };
+      if (message.type !== "req" || !message.id) return;
+      const payload = message.method === "chat.history"
+        ? {
+            sessionKey: "main",
+            sessionId: "session-text-only-media",
+            messages: historyRequests++ === 0
+              ? [user, firstDelivery]
+              : [user, firstDelivery, secondDelivery, finalComment],
+          }
+        : {};
+      socket.send(JSON.stringify({ type: "res", id: message.id, ok: true, payload }));
+      if (message.method === "chat.history" && historyRequests === 1) {
+        // The next terminal is the explicit reconciliation signal. It models
+        // OpenClaw's later final/commentary event without relying on a timer.
+        sendChatEvent("两张图片都发好了");
+      }
+      if (message.method !== "connect") return;
+      sendChatEvent("图片 2");
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-text-only-media",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+  try {
+    await waitFor(() => relayMessages.some((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload)
+      && message.payload.state === "final"
+      && timelineEvents(message.payload).some((event) => (
+        event.eventType === "message.completed"
+        && event.content?.filter((block) => isRecord(block) && block.type === "image").length === 2
+      ))
+    )), 5_000);
+    const terminal = relayMessages.find((message) => (
+      message.type === "event" && message.event === "chat" && isRecord(message.payload)
+      && message.payload.state === "final"
+      && timelineEvents(message.payload).some((event) => (
+        event.eventType === "message.completed"
+        && event.content?.filter((block) => isRecord(block) && block.type === "image").length === 2
+      ))
+    ));
+    assert.ok(terminal);
+    const completed = timelineEvents(terminal.payload as Record<string, unknown>)
+      .find((event) => event.eventType === "message.completed");
+    assert.ok(completed?.messageId);
+    assert.deepEqual(completed?.content
+      ?.filter((block) => isRecord(block) && block.type === "image")
+      .map((block) => (block as Record<string, unknown>).attachmentId), ["text-only-1", "text-only-2"]);
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    await rm(isolatedStateDir, { recursive: true, force: true });
+    openClawChatRunIdentities.clear();
+  }
+});
+
 test("relay manager replaces the OpenClaw media display placeholder with source-run media history", async () => {
+  // This test supplies history from its fake gateway. Isolate the host state
+  // database so a developer's real `agent:main:main` session cannot win the
+  // SQLite alias lookup before the fake gateway responds.
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  const isolatedStateDir = await mkdtemp(join(tmpdir(), "clawconnect-openclaw-placeholder-state-"));
+  process.env.OPENCLAW_STATE_DIR = isolatedStateDir;
   const relayServer = new WebSocketServer({ port: 0 });
   const gatewayServer = new WebSocketServer({ port: 0 });
   const abort = new AbortController();
@@ -677,22 +1271,27 @@ test("relay manager replaces the OpenClaw media display placeholder with source-
       const history = message.method === "chat.history"
         ? {
             sessionKey: "main",
+            sessionId: "session-media-history",
             messages: [
               {
                 id: "user-media-history",
                 role: "user",
+                seq: 1,
                 idempotencyKey: `${runId}:user`,
                 content: [{ type: "text", text: "把图片发过来" }],
               },
               {
                 id: "assistant-media-history",
                 role: "assistant",
+                seq: 2,
                 runId,
                 content: [{ type: "text", text: "图片已经发过来" }],
               },
               {
                 id: "message-tool-media-history",
                 role: "assistant",
+                seq: 3,
+                parentId: "assistant-media-history",
                 sourceRunId: runId,
                 content: [{ type: "image", url: "/api/chat/media/outgoing/agent%3Amain%3Amain/att_history/full" }],
               },
@@ -754,6 +1353,9 @@ test("relay manager replaces the OpenClaw media display placeholder with source-
     await manager.catch(() => false);
     await closeServer(relayServer);
     await closeServer(gatewayServer);
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    await rm(isolatedStateDir, { recursive: true, force: true });
   }
 });
 
@@ -969,7 +1571,13 @@ test("relay manager keeps mobile chat identity across provider events and transc
     }, {
       runId: "mobile-run-stable",
       turnId: "mobile-run-stable",
-      messageId: "assistant-mobile-run-stable",
+      messageId: canonicalProjectionMessageId({
+        gatewayType: "openclaw",
+        gatewayId: "gw-stable-identity",
+        producerId: "main",
+        sourceSessionId: "session-identity",
+        sourceMessageId: "transcript-assistant-stable",
+      }),
     });
   } finally {
     abort.abort();
@@ -1148,7 +1756,7 @@ test("relay manager does not complete an OpenClaw run for a thinking plus toolCa
     }));
     await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "send-tool-preamble"), 4_000);
 
-    // Wait beyond the immediate history read and its retry. The tool preamble must not
+    // Wait beyond the immediate history read. The tool preamble must not
     // be projected as a terminal assistant reply while the actual tool is still running.
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     assert.deepEqual(terminalEvents(), []);
@@ -1551,8 +2159,20 @@ test("relay manager queries and canonicalizes non-main OpenClaw v4 history", asy
     };
     assert.deepEqual(payload.messages?.map((message) => message.role), ["user", "assistant"]);
     assert.deepEqual(payload.timelineSnapshot?.messages?.map((message) => message.messageId), [
-      "user-non-main-run",
-      "assistant-non-main-run",
+      canonicalProjectionMessageId({
+        gatewayType: "openclaw",
+        gatewayId: "gw-test",
+        producerId: "main",
+        sourceSessionId: "provider-session-c6ae",
+        sourceMessageId: "provider-user",
+      }),
+      canonicalProjectionMessageId({
+        gatewayType: "openclaw",
+        gatewayId: "gw-test",
+        producerId: "main",
+        sourceSessionId: "provider-session-c6ae",
+        sourceMessageId: "provider-assistant",
+      }),
     ]);
   } finally {
     abort.abort();

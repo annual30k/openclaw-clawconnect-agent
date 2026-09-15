@@ -7,6 +7,11 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { Writable } from "stream";
 import { calculateChunkCount, inferMimeType, normalizeSessionKey, toRelayHttpBase } from "../core/relay/file-upload-utils.js";
+import {
+  markOpenClawActiveRunTerminal,
+  recordOpenClawActiveRun,
+  resolveOpenClawActiveRun,
+} from "../openclaw/relay/openclaw-active-run-state.js";
 import { sendFileCommand } from "./send-file.js";
 
 test("utility helpers normalize relay URLs and chunk counts", () => {
@@ -141,7 +146,7 @@ test("send-file uploads chunks and finalizes the transfer", async () => {
       {
         filePath,
         gateway: "gw-1",
-        session: "main",
+        session: "agent:main:main",
         json: true,
         transcript: "这是要展示的转写文本",
         sourceRunId: "run-voice-1",
@@ -269,7 +274,13 @@ test("send-file includes image dimensions for PNG uploads", async () => {
 
   try {
     const result = await sendFileCommand(
-      { filePath, gateway: "gw-1", session: "main", json: true },
+      {
+        filePath,
+        gateway: "gw-1",
+        session: "agent:main:main",
+        sourceRunId: "run-png-1",
+        json: true,
+      },
       {
         loadConfig: () => ({
           relayServerUrl: baseUrl,
@@ -292,11 +303,10 @@ test("send-file includes image dimensions for PNG uploads", async () => {
   }
 });
 
-test("send-file infers source run id from OpenClaw environment", async () => {
+test("send-file accepts an explicit OpenClaw session and source run from bridge environment", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-send-file-source-run-"));
   const filePath = join(tempDir, "hello.txt");
   await writeFile(filePath, "hello", "utf8");
-
   let initBody: Record<string, unknown> | undefined;
   const server = createServer(async (req, res) => {
     try {
@@ -358,146 +368,7 @@ test("send-file infers source run id from OpenClaw environment", async () => {
       {
         filePath,
         gateway: "gw-1",
-        session: "main",
-        json: true,
-      },
-      {
-        loadConfig: () => ({
-          relayServerUrl: `http://127.0.0.1:${address.port}`,
-          gatewayId: "gw-1",
-          relaySecret: "secret-123",
-        }),
-        fetchImpl: fetch,
-        stdout: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-        stderr: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-        env: { OPENCLAW_RUN_ID: "env-run-1:user" },
-      },
-    );
-
-    assert.equal(initBody?.sourceRunId, "env-run-1");
-  } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    await rm(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("send-file infers source run id from the triggering OpenClaw user turn", async () => {
-  const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-send-file-openclaw-run-"));
-  const filePath = join(tempDir, "hello.txt");
-  await writeFile(filePath, "hello", "utf8");
-
-  const sessionStoreRoot = join(tempDir, ".openclaw");
-  const sessionsDir = join(sessionStoreRoot, "agents", "main", "sessions");
-  await mkdir(sessionsDir, { recursive: true });
-  const sessionKey = "agent:main:ios-device-1";
-  const relaySessionKey = "ios-device-1";
-  const transcriptPath = join(sessionsDir, "session-1.jsonl");
-  await writeFile(
-    join(sessionsDir, "sessions.json"),
-    JSON.stringify({
-      [sessionKey]: {
-        sessionId: "session-1",
-        sessionFile: "session-1.jsonl",
-        updatedAt: 2000,
-      },
-    }),
-  );
-  await writeFile(
-    transcriptPath,
-    [
-      JSON.stringify({
-        type: "message",
-        id: "user-spiderman-request",
-        timestamp: "2030-01-01T00:00:00.000Z",
-        message: {
-          role: "user",
-          idempotencyKey: "client-run-spiderman:user",
-          clientMessageId: "client-run-spiderman:user",
-          content: [{ type: "text", text: "帮我把桌面的蜘蛛侠图片发过来" }],
-        },
-      }),
-      JSON.stringify({
-        type: "message",
-        id: "assistant-send-run",
-        timestamp: "2030-01-01T00:00:01.000Z",
-        message: {
-          role: "assistant",
-          content: [{
-            type: "toolCall",
-            name: "exec",
-            arguments: {
-              command: `clawconnect send-file --profile openclaw --json ${filePath}`,
-            },
-          }],
-        },
-      }),
-    ].join("\n"),
-    "utf8",
-  );
-
-  let initBody: Record<string, unknown> | undefined;
-  const server = createServer(async (req, res) => {
-    try {
-      const body = await readRequestBody(req);
-      if (req.method === "POST" && req.url === "/api/host/gateways/gw-1/files/init") {
-        initBody = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
-        assert.equal(initBody.sessionKey, relaySessionKey);
-        sendJson(res, {
-          fileId: "file_openclaw_run",
-          uploadId: "up_openclaw_run",
-          chunkSize: 1024,
-          expiresAt: "2030-01-01T00:00:00.000Z",
-          uploadUrl: "/api/host/files/up_openclaw_run/chunks",
-        });
-        return;
-      }
-      if (req.method === "PUT" && req.url === "/api/host/files/up_openclaw_run/chunks/0") {
-        sendJson(res, { ok: true });
-        return;
-      }
-      if (req.method === "POST" && req.url === "/api/host/files/up_openclaw_run/complete") {
-        sendJson(res, {
-          ok: true,
-          payload: {
-            fileId: "file_openclaw_run",
-            gatewayId: "gw-1",
-            sessionKey: relaySessionKey,
-            fileName: "hello.txt",
-            mimeType: "text/plain",
-            sizeBytes: 5,
-            sha256: "sha",
-            origin: "host",
-            createdAt: "2030-01-01T00:00:00.000Z",
-            updatedAt: "2030-01-01T00:00:00.000Z",
-            expiresAt: "2030-01-01T00:00:00.000Z",
-            status: "completed",
-            storagePath: "/tmp/hello.txt",
-            downloadPath: "/api/mobile/files/file_openclaw_run",
-            chunkSize: 1024,
-            totalChunks: 1,
-            sourceRunId: "client-run-spiderman",
-          },
-        });
-        return;
-      }
-      res.statusCode = 404;
-      res.end("not found");
-    } catch (error) {
-      res.statusCode = 500;
-      res.end(String(error));
-    }
-  });
-
-  await new Promise<void>((resolve) => server.listen(0, resolve));
-  const address = server.address();
-  assert.ok(address && typeof address !== "string");
-
-  try {
-    await sendFileCommand(
-      {
-        filePath,
-        gateway: "gw-1",
-        session: sessionKey,
+        session: "agent:main:main",
         json: true,
       },
       {
@@ -510,41 +381,82 @@ test("send-file infers source run id from the triggering OpenClaw user turn", as
         fetchImpl: fetch,
         stdout: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
         stderr: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-        env: {},
-        sessionStoreRoot,
+        env: {
+          CLAWCONNECT_SOURCE_RUN_ID: "env-run-1",
+          CLAWCONNECT_SESSION_KEY: "agent:main:main",
+        },
       },
     );
 
-    assert.equal(initBody?.sourceRunId, "client-run-spiderman");
-    assert.equal(initBody?.sessionKey, relaySessionKey);
+    assert.equal(initBody?.sourceRunId, "env-run-1");
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(tempDir, { recursive: true, force: true });
   }
 });
 
-test("send-file infers the latest active session when session is omitted", async () => {
+test("send-file refuses OpenClaw active-run guessing even when a typed record exists", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-send-file-no-guess-"));
+  const filePath = join(tempDir, "sample.mp3");
+  await writeFile(filePath, "active-session-mp3", "utf8");
+  const previousActiveRunStore = process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE;
+  process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE = join(tempDir, "active-runs.json");
+  await recordOpenClawActiveRun({ gatewayId: "gw-1", sessionKey: "agent:main:ios-selected", sourceRunId: "run-selected" });
+  try {
+    await assert.rejects(
+      () => sendFileCommand(
+        { filePath, gateway: "gw-1", json: true },
+        {
+          loadConfig: () => ({
+            relayServerUrl: "http://127.0.0.1:1",
+            gatewayId: "gw-1",
+            relaySecret: "secret-123",
+            gatewayType: "openclaw",
+          }),
+        },
+      ),
+      { message: "openclaw_send_file_requires_explicit_session_and_source_run_id" },
+    );
+  } finally {
+    if (previousActiveRunStore === undefined) delete process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE;
+    else process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE = previousActiveRunStore;
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("send-file refuses an unqualified OpenClaw Relay alias even with an explicit source run", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-send-file-unqualified-session-"));
+  const filePath = join(tempDir, "sample.txt");
+  await writeFile(filePath, "unqualified-session", "utf8");
+  try {
+    await assert.rejects(
+      () => sendFileCommand(
+        { filePath, gateway: "gw-1", session: "main", sourceRunId: "run-explicit", json: true },
+        {
+          loadConfig: () => ({
+            relayServerUrl: "http://127.0.0.1:1",
+            gatewayId: "gw-1",
+            relaySecret: "secret-123",
+            gatewayType: "openclaw",
+          }),
+        },
+      ),
+      { message: "openclaw_send_file_requires_full_agent_session_key" },
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("send-file uses an explicit OpenClaw session and source run instead of active-run guessing", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-send-file-session-"));
   const filePath = join(tempDir, "sample.mp3");
   const fileBytes = Buffer.from("active-session-mp3", "utf8");
   await writeFile(filePath, fileBytes);
 
-  const sessionStoreRoot = join(tempDir, ".openclaw");
-  const sessionsDir = join(sessionStoreRoot, "agents", "main", "sessions");
-  const hostSessionKey = "agent:main:ios-selected";
-  await mkdir(sessionsDir, { recursive: true });
-  await writeFile(
-    join(sessionsDir, "sessions.json"),
-    JSON.stringify(
-      {
-        "agent:main:main": { updatedAt: 1000 },
-        [hostSessionKey]: { updatedAt: 2000 },
-        "agent:main:archive": { updatedAt: 1500 },
-      },
-      null,
-      2,
-    ),
-  );
+  const previousActiveRunStore = process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE;
+  process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE = join(tempDir, "active-runs.json");
+  await recordOpenClawActiveRun({ gatewayId: "gw-1", sessionKey: "agent:main:ios-selected", sourceRunId: "run-selected" });
 
   const expectedSessionKey = "ios-selected";
   const expectedSha256 = createHash("sha256").update(fileBytes).digest("hex");
@@ -630,23 +542,269 @@ test("send-file infers the latest active session when session is omitted", async
 
   try {
     const result = await sendFileCommand(
-      { filePath, gateway: "gw-1", json: true },
+      {
+        filePath,
+        gateway: "gw-1",
+        session: "agent:main:ios-selected",
+        sourceRunId: "run-selected",
+        json: true,
+      },
       {
         loadConfig: () => ({
           relayServerUrl: baseUrl,
           gatewayId: "gw-1",
           relaySecret: "secret-123",
           displayName: "Host Mac",
+          gatewayType: "openclaw",
         }),
         fetchImpl: fetch,
         stdout,
         stderr,
-        sessionStoreRoot,
+        sessionStoreRoot: join(tempDir, ".openclaw"),
       },
     );
 
     assert.equal(result.sessionKey, expectedSessionKey);
+    assert.equal(initBody?.sourceRunId, "run-selected");
     assert.ok(initBody);
+  } finally {
+    if (previousActiveRunStore === undefined) delete process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE;
+    else process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE = previousActiveRunStore;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("send-file keeps same-run two files and binds a rapid next round explicitly", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-send-file-dual-"));
+  const firstPath = join(tempDir, "first.png");
+  const secondPath = join(tempDir, "second.png");
+  const nextPath = join(tempDir, "next.png");
+  await writeFile(firstPath, Buffer.from("first", "utf8"));
+  await writeFile(secondPath, Buffer.from("second", "utf8"));
+  await writeFile(nextPath, Buffer.from("next", "utf8"));
+  const previousActiveRunStore = process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE;
+  process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE = join(tempDir, "active-runs.json");
+  await recordOpenClawActiveRun({ gatewayId: "gw-dual", sessionKey: "agent:main:main", sourceRunId: "run-dual" });
+  await recordOpenClawActiveRun({ gatewayId: "gw-dual", sessionKey: "agent:main:main", sourceRunId: "run-dual-next" });
+  const initBodies: Array<Record<string, unknown>> = [];
+  let transferNumber = 0;
+
+  const server = createServer(async (req, res) => {
+    try {
+      const body = await readRequestBody(req);
+      if (req.method === "POST" && req.url === "/api/host/gateways/gw-dual/files/init") {
+        const init = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
+        initBodies.push(init);
+        transferNumber += 1;
+        sendJson(res, {
+          fileId: `file_dual_${transferNumber}`,
+          uploadId: `up_dual_${transferNumber}`,
+          chunkSize: 4096,
+          expiresAt: "2030-01-01T00:00:00.000Z",
+          uploadUrl: `/api/host/files/up_dual_${transferNumber}/chunks`,
+        });
+        return;
+      }
+      const chunkMatch = /^\/api\/host\/files\/(up_dual_[1-3])\/chunks\/0$/.exec(req.url ?? "");
+      if (req.method === "PUT" && chunkMatch) {
+        sendJson(res, { ok: true });
+        return;
+      }
+      const completeMatch = /^\/api\/host\/files\/(up_dual_[1-3])\/complete$/.exec(req.url ?? "");
+      if (req.method === "POST" && completeMatch) {
+        const number = Number.parseInt(completeMatch[1].slice("up_dual_".length), 10);
+        const init = initBodies[number - 1];
+        sendJson(res, {
+          ok: true,
+          payload: {
+            fileId: `file_dual_${number}`,
+            gatewayId: "gw-dual",
+            sessionKey: "main",
+            fileName: init.fileName,
+            mimeType: init.mimeType,
+            sizeBytes: init.sizeBytes,
+            sha256: init.sha256,
+            origin: "host",
+            createdAt: "2030-01-01T00:00:00.000Z",
+            updatedAt: "2030-01-01T00:00:00.000Z",
+            expiresAt: "2030-01-08T00:00:00.000Z",
+            status: "completed",
+            storagePath: `/tmp/file_dual_${number}.png`,
+            downloadPath: `/api/mobile/files/file_dual_${number}`,
+            downloadUrl: `/api/mobile/files/file_dual_${number}`,
+            chunkSize: 4096,
+            totalChunks: 1,
+          },
+        });
+        return;
+      }
+      throw new Error(`unexpected route: ${req.method} ${req.url}`);
+    } catch (error) {
+      res.statusCode = 500;
+      res.end(String(error));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const deps = {
+    loadConfig: () => ({
+      relayServerUrl: baseUrl,
+      gatewayId: "gw-dual",
+      relaySecret: "secret-123",
+      gatewayType: "openclaw" as const,
+    }),
+    fetchImpl: fetch,
+    stdout: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+    stderr: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+  };
+
+  try {
+    const first = await sendFileCommand({
+      filePath: firstPath,
+      session: "agent:main:main",
+      sourceRunId: "run-dual",
+      json: true,
+    }, deps);
+    const second = await sendFileCommand({
+      filePath: secondPath,
+      session: "agent:main:main",
+      sourceRunId: "run-dual",
+      json: true,
+    }, deps);
+    const next = await sendFileCommand({
+      filePath: nextPath,
+      session: "agent:main:main",
+      sourceRunId: "run-dual-next",
+      json: true,
+    }, deps);
+    assert.deepEqual([first.fileId, second.fileId, next.fileId], ["file_dual_1", "file_dual_2", "file_dual_3"]);
+    assert.deepEqual(initBodies.map((body) => [body.sourceRunId, body.fileName]), [
+      ["run-dual", "first.png"],
+      ["run-dual", "second.png"],
+      ["run-dual-next", "next.png"],
+    ]);
+    assert.equal(
+      (await resolveOpenClawActiveRun({
+        gatewayId: "gw-dual",
+        sessionKey: "agent:main:main",
+        sourceRunId: "run-dual",
+      }))?.sourceRunId,
+      "run-dual",
+    );
+  } finally {
+    if (previousActiveRunStore === undefined) delete process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE;
+    else process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE = previousActiveRunStore;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("send-file binds concurrent agents with the same Relay alias by explicit full session and run", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "clawconnect-send-file-agent-concurrency-"));
+  const mainPath = join(tempDir, "main.png");
+  const healthPath = join(tempDir, "health.png");
+  await writeFile(mainPath, "main-agent", "utf8");
+  await writeFile(healthPath, "health-agent", "utf8");
+  const initBodies: Array<Record<string, unknown>> = [];
+  const server = createServer(async (req, res) => {
+    try {
+      const body = await readRequestBody(req);
+      if (req.method === "POST" && req.url === "/api/host/gateways/gw-agents/files/init") {
+        const init = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
+        initBodies.push(init);
+        const number = initBodies.length;
+        sendJson(res, {
+          fileId: `file_agent_${number}`,
+          uploadId: `up_agent_${number}`,
+          chunkSize: 1024,
+          expiresAt: "2030-01-01T00:00:00.000Z",
+          uploadUrl: `/api/host/files/up_agent_${number}/chunks`,
+        });
+        return;
+      }
+      const chunkMatch = /^\/api\/host\/files\/(up_agent_[12])\/chunks\/0$/.exec(req.url ?? "");
+      if (req.method === "PUT" && chunkMatch) {
+        sendJson(res, { ok: true });
+        return;
+      }
+      const completeMatch = /^\/api\/host\/files\/(up_agent_[12])\/complete$/.exec(req.url ?? "");
+      if (req.method === "POST" && completeMatch) {
+        const number = completeMatch[1].endsWith("1") ? 1 : 2;
+        const init = initBodies[number - 1]!;
+        sendJson(res, {
+          ok: true,
+          payload: {
+            fileId: `file_agent_${number}`,
+            gatewayId: "gw-agents",
+            sessionKey: init.sessionKey,
+            fileName: init.fileName,
+            mimeType: init.mimeType,
+            sizeBytes: init.sizeBytes,
+            sha256: init.sha256,
+            origin: "host",
+            createdAt: "2030-01-01T00:00:00.000Z",
+            updatedAt: "2030-01-01T00:00:00.000Z",
+            expiresAt: "2030-01-08T00:00:00.000Z",
+            status: "completed",
+            storagePath: `/tmp/file_agent_${number}.png`,
+            downloadPath: `/api/mobile/files/file_agent_${number}`,
+            downloadUrl: `/api/mobile/files/file_agent_${number}`,
+            chunkSize: 1024,
+            totalChunks: 1,
+            sourceRunId: init.sourceRunId,
+          },
+        });
+        return;
+      }
+      res.statusCode = 404;
+      res.end("not found");
+    } catch (error) {
+      res.statusCode = 500;
+      res.end(String(error));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const deps = {
+    loadConfig: () => ({
+      relayServerUrl: `http://127.0.0.1:${address.port}`,
+      gatewayId: "gw-agents",
+      relaySecret: "secret-123",
+      gatewayType: "openclaw" as const,
+    }),
+    fetchImpl: fetch,
+    stdout: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+    stderr: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+  };
+  try {
+    const [main, health] = await Promise.all([
+      sendFileCommand({
+        filePath: mainPath,
+        session: "agent:main:main",
+        sourceRunId: "run-main-agent",
+        json: true,
+      }, deps),
+      sendFileCommand({
+        filePath: healthPath,
+        session: "agent:health-manager:main",
+        sourceRunId: "run-health-agent",
+        json: true,
+      }, deps),
+    ]);
+    assert.deepEqual([main.fileId, health.fileId].sort(), ["file_agent_1", "file_agent_2"]);
+    assert.deepEqual(
+      initBodies
+        .map((body) => [body.sessionKey, body.sourceRunId, body.fileName])
+        .sort((left, right) => String(left[1]).localeCompare(String(right[1]))),
+      [
+        ["main", "run-health-agent", "health.png"],
+        ["main", "run-main-agent", "main.png"],
+      ],
+    );
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(tempDir, { recursive: true, force: true });

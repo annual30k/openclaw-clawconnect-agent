@@ -1,3 +1,5 @@
+import { isSourceCommit, type SourceCommit } from "./source-commit.js";
+
 export const CANONICAL_TIMELINE_PROTOCOL_VERSION = 2 as const;
 
 export type TimelineEventType =
@@ -65,6 +67,8 @@ export type CanonicalTimelineEvent = {
   runId: string;
   messageId: string;
   partId: string;
+  clientMessageId?: string;
+  idempotencyKey?: string;
   attachmentId: string | null;
   seq: number;
   turnSeq: number;
@@ -80,6 +84,20 @@ export type CanonicalTimelineEvent = {
   toolState?: ToolState;
   timelineItemKind?: TimelineItemKind;
   timelineResolvesWaiting?: boolean;
+  /** Transcript projection metadata (introduced by projection v3). */
+  projectionVersion?: 3;
+  canonicalMessageId?: string;
+  gatewayType?: "openclaw" | "hermes";
+  producerId?: string;
+  sourceSessionId?: string;
+  sourceMessageId?: string;
+  sourceOrderScope?: string;
+  sourceOrderSeq?: number;
+  parentSourceMessageId?: string;
+  sourceRole?: TimelineRole;
+  timelineDelivery?: "embedded" | "independent";
+  /** Durable-source watermark; never used for identity or ordering. */
+  sourceCommit?: SourceCommit;
   extensions?: Record<string, unknown>;
 };
 
@@ -97,6 +115,18 @@ export type TimelineHistoryMessage = {
   seq?: number;
   turnSeq?: number;
   attachmentIds?: string[];
+  projectionVersion?: 3;
+  canonicalMessageId?: string;
+  gatewayType?: "openclaw" | "hermes";
+  producerId?: string;
+  sourceSessionId?: string;
+  sourceMessageId?: string;
+  sourceOrderScope?: string;
+  sourceOrderSeq?: number;
+  parentSourceMessageId?: string;
+  sourceRole?: TimelineRole;
+  timelineDelivery?: "embedded" | "independent";
+  sourceCommit?: SourceCommit;
 };
 
 export type CanonicalTimelineHistorySnapshotPage = {
@@ -168,6 +198,18 @@ const canonicalEventFields = new Set([
   "toolState",
   "timelineItemKind",
   "timelineResolvesWaiting",
+  "projectionVersion",
+  "canonicalMessageId",
+  "gatewayType",
+  "producerId",
+  "sourceSessionId",
+  "sourceMessageId",
+  "sourceOrderScope",
+  "sourceOrderSeq",
+  "parentSourceMessageId",
+  "sourceRole",
+  "timelineDelivery",
+  "sourceCommit",
 ]);
 
 const historyPageFields = new Set([
@@ -304,6 +346,18 @@ export function parseCanonicalTimelineEvent(input: unknown): CanonicalTimelineEv
     ...(typeof input.toolState === "string" ? { toolState: input.toolState as ToolState } : {}),
     ...(typeof input.timelineItemKind === "string" ? { timelineItemKind: input.timelineItemKind as TimelineItemKind } : {}),
     ...(typeof input.timelineResolvesWaiting === "boolean" ? { timelineResolvesWaiting: input.timelineResolvesWaiting } : {}),
+    ...(input.projectionVersion === 3 ? { projectionVersion: 3 as const } : {}),
+    ...(typeof input.canonicalMessageId === "string" ? { canonicalMessageId: input.canonicalMessageId } : {}),
+    ...(input.gatewayType === "openclaw" || input.gatewayType === "hermes" ? { gatewayType: input.gatewayType } : {}),
+    ...(typeof input.producerId === "string" ? { producerId: input.producerId } : {}),
+    ...(typeof input.sourceSessionId === "string" ? { sourceSessionId: input.sourceSessionId } : {}),
+    ...(typeof input.sourceMessageId === "string" ? { sourceMessageId: input.sourceMessageId } : {}),
+    ...(typeof input.sourceOrderScope === "string" ? { sourceOrderScope: input.sourceOrderScope } : {}),
+    ...(typeof input.sourceOrderSeq === "number" && Number.isFinite(input.sourceOrderSeq) ? { sourceOrderSeq: input.sourceOrderSeq } : {}),
+    ...(typeof input.parentSourceMessageId === "string" ? { parentSourceMessageId: input.parentSourceMessageId } : {}),
+    ...(roles.has(input.sourceRole as TimelineRole) ? { sourceRole: input.sourceRole as TimelineRole } : {}),
+    ...(input.timelineDelivery === "embedded" || input.timelineDelivery === "independent" ? { timelineDelivery: input.timelineDelivery } : {}),
+    ...(isSourceCommit(input.sourceCommit) ? { sourceCommit: input.sourceCommit } : {}),
     ...(collectExtensions(input, canonicalEventFields)
       ? { extensions: collectExtensions(input, canonicalEventFields) }
       : {}),
@@ -344,6 +398,18 @@ function parseHistoryMessage(input: unknown): TimelineHistoryMessage {
     ...(Array.isArray(input.attachmentIds)
       ? { attachmentIds: input.attachmentIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0) }
       : {}),
+    ...(input.projectionVersion === 3 ? { projectionVersion: 3 as const } : {}),
+    ...(typeof input.canonicalMessageId === "string" ? { canonicalMessageId: input.canonicalMessageId } : {}),
+    ...(input.gatewayType === "openclaw" || input.gatewayType === "hermes" ? { gatewayType: input.gatewayType } : {}),
+    ...(typeof input.producerId === "string" ? { producerId: input.producerId } : {}),
+    ...(typeof input.sourceSessionId === "string" ? { sourceSessionId: input.sourceSessionId } : {}),
+    ...(typeof input.sourceMessageId === "string" ? { sourceMessageId: input.sourceMessageId } : {}),
+    ...(typeof input.sourceOrderScope === "string" ? { sourceOrderScope: input.sourceOrderScope } : {}),
+    ...(typeof input.sourceOrderSeq === "number" && Number.isFinite(input.sourceOrderSeq) ? { sourceOrderSeq: input.sourceOrderSeq } : {}),
+    ...(typeof input.parentSourceMessageId === "string" ? { parentSourceMessageId: input.parentSourceMessageId } : {}),
+    ...(roles.has(input.sourceRole as TimelineRole) ? { sourceRole: input.sourceRole as TimelineRole } : {}),
+    ...(input.timelineDelivery === "embedded" || input.timelineDelivery === "independent" ? { timelineDelivery: input.timelineDelivery } : {}),
+    ...(isSourceCommit(input.sourceCommit) ? { sourceCommit: input.sourceCommit } : {}),
   };
 }
 

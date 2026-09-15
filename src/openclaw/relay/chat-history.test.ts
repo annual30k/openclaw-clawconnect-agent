@@ -15,6 +15,68 @@ import {
 } from "./chat-history.js";
 import { DEFAULT_GATEWAY_SESSION_DEFAULTS } from "./session-context.js";
 
+test("OpenClaw projection v3 scopes multi-agent rows and never merges source ids in one run", () => {
+  const result = canonicalizeOpenClawGatewayHistoryResponse({
+    sessionKey: "agent:writer:mobile",
+    sessionId: "session-v3",
+    messages: [
+      { role: "assistant", runId: "run-one", id: "source-155", seq: 155, content: [{ type: "image", attachmentId: "image-1" }] },
+      { role: "assistant", runId: "run-one", id: "source-156", seq: 156, content: [{ type: "image", attachmentId: "image-2" }] },
+    ],
+  }, {
+    sessionKey: "agent:writer:mobile",
+    projectionVersion: 3,
+    projectionGatewayId: "gw-writer",
+  });
+  const messages = result.timelineSnapshot?.messages ?? [];
+  assert.equal(result.projectionVersion, 3);
+  assert.equal(result.timelineSnapshot?.extensions?.sourceOrderScope, "openclaw:writer:session-v3");
+  assert.equal(messages.length, 2);
+  assert.deepEqual(messages.map((message) => message.sourceMessageId), ["source-155", "source-156"]);
+  assert.notEqual(messages[0]?.canonicalMessageId, messages[1]?.canonicalMessageId);
+  assert.match(messages[0]?.canonicalMessageId ?? "", /^timeline:v3:openclaw:[0-9a-f]{64}$/);
+  assert.ok((messages[0]?.canonicalMessageId?.length ?? 0) <= 191);
+  assert.equal(messages[0]?.gatewayType, "openclaw");
+  assert.equal(messages[0]?.producerId, "writer");
+  assert.equal(messages[0]?.sourceSessionId, "session-v3");
+  assert.equal(messages[0]?.sourceMessageId, "source-155");
+  assert.deepEqual(messages.map((message) => message.sourceOrderSeq), [155, 156]);
+});
+
+test("OpenClaw projection v3 rejects missing gateway, session, source id, or source seq", () => {
+  const base = {
+    sessionKey: "agent:writer:mobile",
+    sessionId: "session-v3",
+    messages: [{ role: "user", id: "source-user", seq: 155, content: "hello" }],
+  } satisfies HistoryResponse;
+
+  assert.throws(() => canonicalizeOpenClawGatewayHistoryResponse(base, {
+    sessionKey: base.sessionKey!,
+    projectionVersion: 3,
+  }), /gatewayId/);
+  assert.throws(() => canonicalizeOpenClawGatewayHistoryResponse({ ...base, sessionId: undefined }, {
+    sessionKey: base.sessionKey!,
+    projectionVersion: 3,
+    projectionGatewayId: "gw-writer",
+  }), /sourceSessionId/);
+  assert.throws(() => canonicalizeOpenClawGatewayHistoryResponse({
+    ...base,
+    messages: [{ role: "user", seq: 155, content: "hello" }],
+  }, {
+    sessionKey: base.sessionKey!,
+    projectionVersion: 3,
+    projectionGatewayId: "gw-writer",
+  }), /sourceMessageId/);
+  assert.throws(() => canonicalizeOpenClawGatewayHistoryResponse({
+    ...base,
+    messages: [{ role: "user", id: "source-user", content: "hello" }],
+  }, {
+    sessionKey: base.sessionKey!,
+    projectionVersion: 3,
+    projectionGatewayId: "gw-writer",
+  }), /sourceOrderSeq/);
+});
+
 test("OpenClaw v4 gateway history becomes a canonical snapshot with native user turns", () => {
   const firstRunId = "f7ef5c1e-c3e9-48fd-a2a5-84d4f029bc07";
   const secondRunId = "b3eae41d-40ee-4a59-b65e-9182a26adf12";
@@ -259,6 +321,46 @@ test("SQLite transcript history preserves the Control UI sequence for asynchrono
     } else {
       process.env.OPENCLAW_STATE_DIR = previousStateDir;
     }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("SQLite transcript history resolves the qualified main session through its main alias", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "clawconnect-chat-history-sqlite-alias-"));
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  const sessionId = "sqlite-main-alias-session";
+  const databasePath = join(stateDir, "agents", "main", "agent", "openclaw-agent.sqlite");
+  await mkdir(join(stateDir, "agents", "main", "agent"), { recursive: true });
+
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec(`
+      CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, current_session_id TEXT NOT NULL);
+      CREATE TABLE transcript_events (session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL);
+    `);
+    database.prepare("INSERT INTO session_nodes (session_key, current_session_id) VALUES (?, ?)")
+      .run("agent:main:main", sessionId);
+    database.prepare("INSERT INTO transcript_events (session_id, seq, event_json) VALUES (?, ?, ?)")
+      .run(sessionId, 1, JSON.stringify({
+        type: "message",
+        id: "main-alias-reply",
+        message: { role: "assistant", content: "主会话别名可读" },
+      }));
+  } finally {
+    database.close();
+  }
+
+  try {
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    const page = await readOpenClawTranscriptChatHistory(
+      { sessionKey: "main", limit: 20 },
+      { mainSessionKey: "agent:main:main", mainKey: "main", defaultAgentId: "main" },
+    );
+    assert.equal(page?.sessionId, sessionId);
+    assert.equal(page?.messages?.[0]?.id, "main-alias-reply");
+  } finally {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
     await rm(stateDir, { recursive: true, force: true });
   }
 });

@@ -55,7 +55,7 @@ import {
   writeUntimedHistoryHermesBin,
 } from "./hermes-runtime-test-support.js";
 
-test("runHermesChat leaves final-answer local paths as text without send-file skill delivery", async () => {
+test("runHermesChat fails closed when a file request only returns a local path", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hermes-no-path-scan-"));
   const previousHermesBin = process.env.HERMES_BIN;
   try {
@@ -85,22 +85,22 @@ test("runHermesChat leaves final-answer local paths as text without send-file sk
     process.env.HERMES_BIN = hermesBin;
 
     const result = await runHermesChat({ message: "把这张图片发给我", sessionKey: "main" });
-
-    assert.equal(result.output, `截图好了：${imagePath}`);
-    assert.deepEqual(result.artifactPaths, []);
+    assert.match(result.output, /截图好了：/);
+    assert.doesNotMatch(result.output, /已发送 \d+ 个文件/);
   } finally {
     restoreEnv("HERMES_BIN", previousHermesBin);
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("runHermesChat exposes current run and session ids to Hermes send-file skills", async () => {
+test("runHermesChat does not treat send-file environment metadata as upload evidence", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hermes-send-file-env-"));
   const previousHermesBin = process.env.HERMES_BIN;
   try {
     const hermesBin = join(dir, "hermes");
     writeFileSync(hermesBin, [
       "#!/usr/bin/env node",
+      "const fs = require('fs');",
       "const args = process.argv.slice(2);",
       "if (args[0] === 'sessions' && args[1] === 'list') {",
       "  console.log('Title                            Preview          Last Active   ID');",
@@ -127,14 +127,9 @@ test("runHermesChat exposes current run and session ids to Hermes send-file skil
 
     const result = await runHermesChat(
       { message: "用 file-transfer 发文件", sessionKey: "ios-current-session" },
-      { requestId: "hermes-run-123", publishEvent: () => undefined },
+      { requestId: "hermes-run-123", hermesFileTransferCapability: "cli", publishEvent: () => undefined },
     );
-
-    assert.deepEqual(JSON.parse(result.output), {
-      sourceRunId: "hermes-run-123",
-      sessionKey: "ios-current-session",
-      chatSessionKey: "ios-current-session",
-    });
+    assert.doesNotMatch(result.output, /已发送 \d+ 个文件/);
   } finally {
     restoreEnv("HERMES_BIN", previousHermesBin);
     rmSync(dir, { recursive: true, force: true });
@@ -146,8 +141,10 @@ test("runHermesChat passes stable mobile turn metadata and preloads file-transfe
   const previousHermesBin = process.env.HERMES_BIN;
   try {
     const hermesBin = join(dir, "hermes");
+    const outputPath = join(dir, "hermes-output.json");
     writeFileSync(hermesBin, [
       "#!/usr/bin/env node",
+      "const fs = require('fs');",
       "const args = process.argv.slice(2);",
       "if (args[0] === 'skills' && args[1] === 'list') {",
       "  console.log('│ file-transfer │ productivity │ local │ local │ enabled │');",
@@ -164,6 +161,7 @@ test("runHermesChat passes stable mobile turn metadata and preloads file-transfe
       "if (args[0] === 'status') { process.exit(0); }",
       "if (args[0] === 'chat') {",
       "  const query = args[args.indexOf('--query') + 1];",
+      `  fs.writeFileSync(${JSON.stringify(outputPath)}, JSON.stringify({ args, query }));`,
       "  console.log(JSON.stringify({ args, query }));",
       "  process.exit(0);",
       "}",
@@ -175,10 +173,11 @@ test("runHermesChat passes stable mobile turn metadata and preloads file-transfe
 
     const result = await runHermesChat(
       { message: "把桌面上的图片发到手机", sessionKey: "main" },
-      { requestId: "client-run-file-1", publishEvent: () => undefined },
+      { requestId: "client-run-file-1", hermesFileTransferCapability: "cli", publishEvent: () => undefined },
     );
-    const payload = JSON.parse(result.output) as { args: string[]; query: string };
+    const payload = JSON.parse(readFileSync(join(dir, "hermes-output.json"), "utf8")) as { args: string[]; query: string } | undefined;
 
+    assert.doesNotMatch(result.output, /已发送 \d+ 个文件/);
     assert.ok(payload.args.includes("--skills"));
     assert.ok(payload.args.includes("file-transfer"));
     assert.match(payload.query, /\[ClawConnect mobile turn\]/);
@@ -814,6 +813,34 @@ test("selectHermesSessionForCompletedChat keeps explicit resume binding", () => 
   assert.equal(selected?.hermesSessionId, "20260521_080012_48f5ae");
 });
 
+test("selectHermesSessionForCompletedChat fails closed when multiple new sessions lack stable identity", () => {
+  const selected = selectHermesSessionForCompletedChat([
+    {
+      sessionKey: "hermes:new-a",
+      hermesSessionId: "new-a",
+      displayName: "same prompt",
+      kind: "hermes",
+    },
+    {
+      sessionKey: "hermes:new-b",
+      hermesSessionId: "new-b",
+      displayName: "same prompt",
+      kind: "hermes",
+    },
+  ], { userMessage: "same prompt" });
+  assert.equal(selected, undefined);
+});
+
+test("selectHermesSessionForCompletedChat does not bind an existing latest session without identity", () => {
+  const selected = selectHermesSessionForCompletedChat([{
+    sessionKey: "hermes:old",
+    hermesSessionId: "old",
+    displayName: "old conversation",
+    kind: "hermes",
+  }], { userMessage: "same visible text" });
+  assert.equal(selected, undefined);
+});
+
 test("Hermes history completion ignores visible tool-call assistants and waits for terminal final", () => {
   const payload = {
     output: JSON.stringify({
@@ -821,6 +848,7 @@ test("Hermes history completion ignores visible tool-call assistants and waits f
         {
           id: "user-weather",
           role: "user",
+          sourceRunId: "run-weather",
           content: "你帮我看看明天福州的天气返回表格",
         },
         {
@@ -849,7 +877,7 @@ test("Hermes history completion ignores visible tool-call assistants and waits f
   assert.equal(
     latestTerminalAssistantReplyFromHermesExport(
       payload,
-      "你帮我看看明天福州的天气返回表格",
+      "run-weather",
     ),
     "福州明日天气\n\n| 时间 | 天气 |\n|---|---|",
   );
@@ -859,7 +887,7 @@ test("Hermes history completion does not resolve while only a tool-call assistan
   const payload = {
     output: JSON.stringify({
       messages: [
-        { role: "user", content: "查天气" },
+        { role: "user", sourceRunId: "run-weather-only", content: "查天气" },
         {
           role: "assistant",
           content: "Let me check.",
@@ -871,7 +899,7 @@ test("Hermes history completion does not resolve while only a tool-call assistan
   };
 
   assert.equal(
-    latestTerminalAssistantReplyFromHermesExport(payload, "查天气"),
+    latestTerminalAssistantReplyFromHermesExport(payload, "run-weather-only"),
     undefined,
   );
 });
@@ -880,16 +908,29 @@ test("Hermes history completion keeps compatibility with legacy terminal rows wi
   const payload = {
     output: JSON.stringify({
       messages: [
-        { role: "user", content: "你好" },
+        { role: "user", sourceRunId: "run-hello", content: "你好" },
         { role: "assistant", content: "你好！", tool_calls: "[]" },
       ],
     }),
   };
 
-  assert.equal(latestTerminalAssistantReplyFromHermesExport(payload, "你好"), "你好！");
+  assert.equal(latestTerminalAssistantReplyFromHermesExport(payload, "run-hello"), "你好！");
 });
 
-test("isDuplicateHermesCronJob treats equivalent daily weather jobs as duplicates", () => {
+test("Hermes history completion does not use equal free text as current-turn identity", () => {
+  const payload = {
+    output: JSON.stringify({
+      messages: [
+        { role: "user", content: "same prompt" },
+        { role: "assistant", content: "old answer", finish_reason: "stop" },
+      ],
+    }),
+  };
+
+  assert.equal(latestTerminalAssistantReplyFromHermesExport(payload, "same prompt"), undefined);
+});
+
+test("isDuplicateHermesCronJob requires an explicit stable key and canonical payload", () => {
   const existing = {
     name: "福州每日天气简报",
     schedule: { kind: "cron", expr: "0 7 * * *" },
@@ -901,6 +942,7 @@ test("isDuplicateHermesCronJob treats equivalent daily weather jobs as duplicate
     },
     raw: {
       name: "福州每日天气简报",
+      dedupeKey: "weather:fuzhou:daily",
       prompt: [
         "每天执行一次天气简报任务。请查询中国福建省福州市当天最新可获取的天气预报，并用中文简要汇报，适合手机阅读。",
         "要求：天气状况、最高/最低温、降雨概率、风力、空气质量、出门建议。",
@@ -912,11 +954,30 @@ test("isDuplicateHermesCronJob treats equivalent daily weather jobs as duplicate
   assert.equal(isDuplicateHermesCronJob(existing, {
     name: "福州每日天气简报",
     prompt: [
-      "你是每日天气简报任务。请查询中国福建省福州市当天最新可获取的天气预报，并用中文简要汇报，适合手机阅读。",
-      "要求：天气状况、最高/最低温、降雨概率、风力、空气质量、出门建议。仅输出最终中文简报。",
+      "每天执行一次天气简报任务。请查询中国福建省福州市当天最新可获取的天气预报，并用中文简要汇报，适合手机阅读。",
+      "要求：天气状况、最高/最低温、降雨概率、风力、空气质量、出门建议。",
     ].join("\n"),
     schedule: "every 1440m",
+    dedupeKey: "weather:fuzhou:daily",
   }), true);
+});
+
+test("isDuplicateHermesCronJob never merges same prompt without the same stable key", () => {
+  const job = {
+    raw: {
+      id: "job-a",
+      dedupeKey: "task-a",
+      prompt: "同一个提醒文本",
+      schedule_display: "0 7 * * *",
+    },
+    payload: { message: "同一个提醒文本" },
+    schedule: { kind: "cron", expr: "0 7 * * *" },
+  };
+  assert.equal(isDuplicateHermesCronJob(job, {
+    prompt: "同一个提醒文本",
+    schedule: "0 7 * * *",
+    dedupeKey: "task-b",
+  }), false);
 });
 
 test("model options use Hermes provider payload without Codex fallback", () => {
@@ -1058,11 +1119,11 @@ test("Hermes model list does not synthesize fallback models when Hermes returns 
   assert.match(result.error ?? "", /Hermes.*model/i);
 });
 
-test("parseHermesToolLogLine converts terminal tool logs to tool stream events", () => {
+test("parseHermesToolLogLine converts only fixed executor lifecycle logs", () => {
   const running = parseHermesToolLogLine(
     "2026-05-21 09:06:53,100 INFO [session] agent.tool_executor: tool terminal running"
   );
-  const start = parseHermesToolLogLine(
+  const untypedLoggerProse = parseHermesToolLogLine(
     "2026-05-21 09:06:53,185 INFO [session] tools.terminal_tool: Creating new local environment for task default...",
   );
   const completed = parseHermesToolLogLine(
@@ -1075,11 +1136,7 @@ test("parseHermesToolLogLine converts terminal tool logs to tool stream events",
     text: "terminal running",
     isError: false,
   });
-  assert.deepEqual(start, {
-    toolName: "terminal",
-    phase: "streaming",
-    text: "terminal: Creating new local environment for task default...",
-  });
+  assert.equal(untypedLoggerProse, null);
   assert.deepEqual(completed, {
     toolName: "terminal",
     phase: "completed",
@@ -1088,16 +1145,12 @@ test("parseHermesToolLogLine converts terminal tool logs to tool stream events",
   });
 });
 
-test("parseHermesToolLogLine converts nested vision tool logs", () => {
+test("parseHermesToolLogLine ignores untyped nested tool prose", () => {
   const event = parseHermesToolLogLine(
     "2026-05-21 11:11:42,993 INFO [session] tools.vision_tools: vision_analyze: native fast path enabled",
   );
 
-  assert.deepEqual(event, {
-    toolName: "vision_analyze",
-    phase: "streaming",
-    text: "vision_analyze: native fast path enabled",
-  });
+  assert.equal(event, null);
 });
 
 test("parseHermesToolLogLine marks tool executor errors as failed", () => {

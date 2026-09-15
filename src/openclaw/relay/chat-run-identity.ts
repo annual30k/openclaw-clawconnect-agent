@@ -92,7 +92,9 @@ export class OpenClawChatRunIdentityRegistry {
     const identity = this.touch(this.key(gatewayId.trim(), providerRunId.trim()));
     if (!identity) return;
     identity.accumulatedText = "";
-    identity.promptText = undefined;
+    // OpenClaw can emit more than one message-tool reply after a provider
+    // terminal frame. Keep the originating prompt for the run's explicit
+    // deliverable-intent gate until a new register() starts the next run.
   }
 
   remove(gatewayId: string, providerRunId: string): void {

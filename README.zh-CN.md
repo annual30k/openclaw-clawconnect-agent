@@ -315,18 +315,22 @@ clawconnect update
 把本地图片或其他文件发到已配对的聊天会话：
 
 ```bash
-clawconnect send-file ~/Pictures/demo.jpg
+clawconnect send-file ~/Pictures/demo.jpg \\
+  --session "agent:main:main" \\
+  --source-run-id "<sourceRunId>"
 ```
 
 可选参数：
 
 - `-g, --gateway <id>`：覆盖本地配置里的网关 ID
-- `-s, --session <key>`：指定聊天会话，不传时默认使用最近活跃会话
+- `-s, --session <key>`：指定聊天会话；OpenClaw 必须传完整 `agent:<agentId>:<session>`，不能使用 Relay 的裸别名
+- `--source-run-id <id>`：指定当前移动回合/消息身份；OpenClaw 必须与 `--session` 一起传入
 - `--json`：以 JSON 输出上传结果
 
 说明：
 
 - `send-file` 会先把文件上传到 relay，再把文件消息发到手机端。
+- OpenClaw 原生 message tool 应走结构化 toolResult delivery；裸 `send-file` 子进程无法安全发现当前回合，因此会失败关闭而不是选择最近/唯一活动回合。CLI 调用方必须传入完整会话与 `sourceRunId`（或等价的显式 `CLAWCONNECT_SESSION_KEY` / `CLAWCONNECT_SOURCE_RUN_ID` bridge 上下文）。
 - 图片类型会在 iPhone 聊天里显示预览图，其他类型则显示文件卡片。
 - `chat.send` 的 `attachments` 目前只是本地落盘引用，不是跨设备文件传输入口。
 
@@ -455,7 +459,7 @@ clawconnect-agent/
 3. `ClawConnect Agent` 与中继站保持长连接
 4. `ClawConnect Agent` 再连接本机 OpenClaw Gateway
 5. 移动端的聊天、模型切换、技能操作等请求，通过中继转发到本机 OpenClaw
-6. 本机文件可通过 `clawconnect send-file <path>` 发送到聊天会话，并在手机端作为文件消息展示
+6. 本机文件可通过带显式会话与 `sourceRunId` 的 `clawconnect send-file <path>` 发送到聊天会话，并在手机端作为文件消息展示
 
 ## 本地目录
 

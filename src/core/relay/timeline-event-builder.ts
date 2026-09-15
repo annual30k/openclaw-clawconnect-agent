@@ -15,6 +15,7 @@ import {
   parseCanonicalTimelineEvent,
   parseCanonicalTimelineHistorySnapshotPage,
 } from "./timeline-event-log.js";
+import type { SourceCommit } from "./source-commit.js";
 
 type TimelineBuilderBase = {
   gatewayId: string;
@@ -30,6 +31,9 @@ type TimelineTurnBase = TimelineBuilderBase & {
   turnSeq?: number;
   role?: TimelineRole;
   source?: TimelineSource;
+  clientMessageId?: string;
+  idempotencyKey?: string;
+  sourceCommit?: SourceCommit;
 };
 
 type TimelineAttachmentInput = Record<string, unknown> & {
@@ -97,6 +101,8 @@ function buildEvent(
     runId: params.runId,
     messageId: messageId(role, params.turnId, params.messageId),
     partId: params.partId ?? DEFAULT_TEXT_PART_ID,
+    ...(params.clientMessageId ? { clientMessageId: params.clientMessageId } : {}),
+    ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
     attachmentId: params.attachmentId ?? null,
     seq: params.seq ?? defaultSeq(params),
     turnSeq: params.turnSeq ?? 1,
@@ -105,6 +111,7 @@ function buildEvent(
     runState: params.runState,
     createdAt: createdAt(params),
     source: params.source ?? "live",
+    ...(params.sourceCommit ? { sourceCommit: params.sourceCommit } : {}),
     content: sanitizeContent(params.content ?? []),
     attachment: params.attachment ?? null,
     error: params.error ?? null,
@@ -189,6 +196,8 @@ export function buildMessagePartDeltaEvent(params: TimelineTurnBase & {
   partKind?: string;
   messageId?: string;
   partId?: string;
+  timelineItemKind?: TimelineItemKind;
+  timelineResolvesWaiting?: boolean;
   content: TimelineContentBlock[];
 }): CanonicalTimelineEvent {
   return buildEvent({

@@ -12,7 +12,9 @@ import type {
   TimelineRole,
 } from "../../core/relay/timeline-event-log.js";
 import {
+  canonicalizeOpenClawSessionScope,
   resolveOpenClawSessionTranscript,
+  sessionKeyCandidates,
   type GatewaySessionDefaults,
 } from "./session-context.js";
 import { resolveOpenClawStateDir } from "../runtime/openclaw-paths.js";
@@ -20,6 +22,14 @@ import {
   normalizeOpenClawAssistantMediaSidecars,
   normalizeOpenClawAutomaticMediaReplies,
 } from "./assistant-media-sidecar.js";
+import { adaptOpenClawMessageToolDelivery } from "./outgoing-media-relay.js";
+import {
+  canonicalProjectionMessageId,
+  createProjectionMetadata,
+  openClawAgentIdFromSessionKey,
+  openClawSourceOrderScope,
+} from "../../core/relay/timeline-projection-v3.js";
+import { createSourceCommit, type SourceCommit } from "../../core/relay/source-commit.js";
 
 export type HistoryMessage = {
   [key: string]: unknown;
@@ -51,7 +61,13 @@ export type HistoryResponse = {
   hasMore?: boolean;
   nextCursor?: string;
   newestCursor?: string;
+  projectionVersion?: 3;
   timelineSnapshot?: CanonicalTimelineHistorySnapshotPage;
+  /** Internal source-range metadata used by the source-commit watcher. */
+  sourceReadThroughSeq?: number;
+  sourceRangeStartSeq?: number;
+  sourceRangeHasGap?: boolean;
+  sourceHasMore?: boolean;
 };
 
 export type ChatHistoryOutcome =
@@ -71,10 +87,59 @@ export type TranscriptHistoryRequest = {
   sessionKey: string;
   sessionId?: string;
   transcriptPath: string;
+  /** Internal Relay identity; never forwarded to OpenClaw's wire API. */
+  projectionGatewayId?: string;
   limit?: unknown;
   cursor?: unknown;
   direction?: unknown;
+  projectionVersion?: 3;
+  sessionDefaults?: GatewaySessionDefaults;
 };
+
+/**
+ * Read the durable OpenClaw SQLite watermark for one session. This is a
+ * source-commit signal only; callers must not use it to derive message ids or
+ * reorder rows. It intentionally returns null when the authoritative SQLite
+ * source is not available so the caller can use the native gateway stream.
+ */
+export function readOpenClawSourceCommitCursor(
+  rawParams: unknown,
+  defaults: GatewaySessionDefaults,
+): SourceCommit | null {
+  const params = normalizeTranscriptHistoryParams(rawParams, defaults.mainSessionKey);
+  const agentId = params.sessionKey.match(/^agent:([^:]+):/)?.[1] ?? defaults.defaultAgentId ?? "main";
+  const databasePath = join(resolveOpenClawStateDir(), "agents", agentId, "agent", "openclaw-agent.sqlite");
+  let database: DatabaseSync | undefined;
+  try {
+    database = new DatabaseSync(databasePath, { readOnly: true });
+    const session = findSqliteSessionNode(database, params.sessionKey, defaults);
+    const sourceSessionId = cleanHistoryString(session?.current_session_id);
+    if (!sourceSessionId) return null;
+    const row = database.prepare(`
+      SELECT MAX(seq) AS committed_through_seq
+      FROM transcript_events
+      WHERE session_id = ?
+    `).get(sourceSessionId) as { committed_through_seq?: unknown } | undefined;
+    const committedThroughSeq = Number(row?.committed_through_seq ?? 0);
+    if (!Number.isSafeInteger(committedThroughSeq) || committedThroughSeq < 0) return null;
+    const gatewayId = requireProjectionIdentity(params.projectionGatewayId, "gatewayId");
+    const sourceOrderScope = openClawSourceOrderScope({ agentId, sessionId: sourceSessionId });
+    return createSourceCommit({
+      gatewayType: "openclaw",
+      gatewayId,
+      producerId: agentId,
+      sourceSessionId,
+      sourceOrderScope,
+      sourceGeneration: sourceSessionId,
+      committedThroughSeq,
+      sourceRevision: `seq:${committedThroughSeq}`,
+    });
+  } catch {
+    return null;
+  } finally {
+    database?.close();
+  }
+}
 
 const DEFAULT_TRANSCRIPT_HISTORY_LIMIT = 100;
 const MAX_TRANSCRIPT_HISTORY_LIMIT = 200;
@@ -116,9 +181,12 @@ export async function readOpenClawTranscriptChatHistory(
     sessionKey: transcript.sessionKey,
     sessionId: transcript.sessionId,
     transcriptPath: transcript.logPath,
+    projectionGatewayId: params.projectionGatewayId,
     limit: params.limit,
     cursor: params.cursor,
     direction: params.direction,
+    projectionVersion: params.projectionVersion,
+    sessionDefaults: defaults,
   });
 }
 
@@ -131,12 +199,7 @@ function readOpenClawSqliteChatHistory(
   let database: DatabaseSync | undefined;
   try {
     database = new DatabaseSync(databasePath, { readOnly: true });
-    const session = database.prepare(`
-      SELECT current_session_id
-      FROM session_nodes
-      WHERE session_key = ?
-      LIMIT 1
-    `).get(params.sessionKey) as { current_session_id?: unknown } | undefined;
+    const session = findSqliteSessionNode(database, params.sessionKey, defaults);
     const sessionId = cleanHistoryString(session?.current_session_id);
     if (!sessionId) return null;
 
@@ -147,49 +210,138 @@ function readOpenClawSqliteChatHistory(
       ORDER BY seq ASC
     `).all(sessionId) as Array<{ seq?: unknown; event_json?: unknown }>;
     const messages = rows
-      .map((row) => sqliteTranscriptHistoryMessage(row, sessionId))
+      .map((row) => sqliteTranscriptHistoryMessage(row, sessionId, params.projectionVersion === 3))
       .filter((message): message is HistoryMessage => Boolean(message));
-    if (messages.length === 0) return null;
+    if (messages.length === 0 && rows.length === 0) return null;
+
+    const cursorSeq = parseHistoryCursorSeq(params.cursor);
+    const sourceRange = params.direction === "newer"
+      ? (() => {
+          const startIndex = rows.findIndex((row) => {
+            const seq = typeof row.seq === "number" && Number.isSafeInteger(row.seq) ? row.seq : undefined;
+            return seq !== undefined && (cursorSeq === undefined || seq > cursorSeq);
+          });
+          const resolvedStart = startIndex < 0 ? rows.length : startIndex;
+          const rawPage = rows.slice(resolvedStart, resolvedStart + params.limit);
+          const rawLast = rawPage.at(-1)?.seq;
+          const rawFirst = rawPage[0]?.seq;
+          const rawSeqs = rawPage.map((row) => row.seq);
+          const sourceRangeHasGap = rawSeqs.some((seq, index) => {
+            if (index === 0) return false;
+            const previous = rawSeqs[index - 1];
+            return typeof previous !== "number"
+              || !Number.isSafeInteger(previous)
+              || typeof seq !== "number"
+              || !Number.isSafeInteger(seq)
+              || seq !== previous + 1;
+          });
+          const sourceReadThroughSeq = typeof rawLast === "number" && Number.isSafeInteger(rawLast)
+            ? rawLast
+            : undefined;
+          const sourceRangeStartSeq = typeof rawFirst === "number" && Number.isSafeInteger(rawFirst)
+            ? rawFirst
+            : undefined;
+          return sourceReadThroughSeq === undefined || sourceRangeStartSeq === undefined
+            ? undefined
+            : {
+                sourceReadThroughSeq,
+                sourceRangeStartSeq,
+                sourceRangeHasGap,
+                sourceHasMore: resolvedStart + rawPage.length < rows.length,
+              };
+        })()
+      : undefined;
 
     return buildTranscriptHistoryResponse({
       sessionKey: params.sessionKey,
       sessionId,
-      messages: prepareTranscriptHistoryMessages(messages, params.sessionKey),
+      projectionGatewayId: params.projectionGatewayId,
+      messages: prepareTranscriptHistoryMessages(messages, params.sessionKey, params.projectionVersion, defaults),
       limit: params.limit,
       cursor: params.cursor,
       direction: params.direction,
+      projectionVersion: params.projectionVersion,
+      ...(sourceRange ?? {}),
     });
-  } catch {
+  } catch (error) {
+    if (params.projectionVersion === 3 && error instanceof Error && error.message.startsWith("OpenClaw projection v3")) {
+      throw error;
+    }
     return null;
   } finally {
     database?.close();
   }
 }
 
+function findSqliteSessionNode(
+  database: DatabaseSync,
+  sessionKey: string,
+  defaults: GatewaySessionDefaults,
+): { current_session_id?: unknown } | undefined {
+  const statement = database.prepare(`
+    SELECT current_session_id
+    FROM session_nodes
+    WHERE session_key = ?
+    LIMIT 1
+  `);
+  for (const candidate of sessionKeyCandidates(sessionKey, defaults)) {
+    const session = statement.get(candidate) as { current_session_id?: unknown } | undefined;
+    if (session) return session;
+  }
+  return undefined;
+}
+
 export async function readChatHistoryFromTranscriptFile(
   request: TranscriptHistoryRequest,
 ): Promise<HistoryResponse> {
-  const messages = await readIndexedTranscriptMessages(request.transcriptPath, request.sessionKey);
+  const messages = await readIndexedTranscriptMessages(
+    request.transcriptPath,
+    request.sessionKey,
+    request.projectionVersion,
+    request.sessionDefaults,
+  );
   return buildTranscriptHistoryResponse({
     sessionKey: request.sessionKey,
     ...(request.sessionId ? { sessionId: request.sessionId } : {}),
+    projectionGatewayId: request.projectionGatewayId,
     messages,
     limit: normalizeHistoryLimit(request.limit),
     cursor: normalizeCursor(request.cursor),
     direction: normalizeHistoryDirection(request.direction),
+    projectionVersion: request.projectionVersion,
   });
 }
 
 function buildTranscriptHistoryResponse(request: {
   sessionKey: string;
   sessionId?: string;
+  projectionGatewayId?: string;
   messages: HistoryMessage[];
   limit: number;
   cursor?: string;
   direction: ChatHistoryDirection;
+  projectionVersion?: 3;
+  sourceReadThroughSeq?: number;
+  sourceRangeStartSeq?: number;
+  sourceRangeHasGap?: boolean;
+  sourceHasMore?: boolean;
 }): HistoryResponse {
+  const projectionGatewayId = request.projectionVersion === 3
+    ? requireProjectionIdentity(request.projectionGatewayId, "gatewayId")
+    : request.projectionGatewayId ?? "clawconnect";
+  const projectionSessionId = request.projectionVersion === 3
+    ? requireProjectionIdentity(request.sessionId, "sourceSessionId")
+    : request.sessionId;
   const cursorSeq = parseHistoryCursorSeq(request.cursor);
-  const page = paginateHistoryMessages(request.messages, {
+  const boundedMessages = request.direction === "newer" && request.sourceReadThroughSeq !== undefined
+    ? request.messages.filter((message) => {
+        const seq = messageSeq(message);
+        return seq !== undefined
+          && (cursorSeq === undefined || seq > cursorSeq)
+          && seq <= request.sourceReadThroughSeq!;
+      })
+    : request.messages;
+  const page = paginateHistoryMessages(boundedMessages, {
     limit: request.limit,
     direction: request.direction,
     cursorSeq,
@@ -197,22 +349,38 @@ function buildTranscriptHistoryResponse(request: {
 
   return {
     sessionKey: request.sessionKey,
+    ...(request.projectionVersion === 3 ? { projectionVersion: 3 as const } : {}),
     ...(request.sessionId ? { sessionId: request.sessionId } : {}),
     messages: page.messages,
     hasMore: page.hasMore,
     ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
     ...(page.newestCursor ? { newestCursor: page.newestCursor } : {}),
+    ...(request.sourceReadThroughSeq !== undefined ? { sourceReadThroughSeq: request.sourceReadThroughSeq } : {}),
+    ...(request.sourceRangeStartSeq !== undefined ? { sourceRangeStartSeq: request.sourceRangeStartSeq } : {}),
+    ...(request.sourceRangeHasGap !== undefined ? { sourceRangeHasGap: request.sourceRangeHasGap } : {}),
+    ...(request.sourceHasMore !== undefined ? { sourceHasMore: request.sourceHasMore } : {}),
     timelineSnapshot: buildHistorySnapshotPage({
-      gatewayId: "clawconnect",
+      gatewayId: projectionGatewayId,
       sessionKey: request.sessionKey,
       cursor: normalizeCursor(request.cursor) ?? null,
       hasMore: page.hasMore,
       nextCursor: page.nextCursor ?? null,
       newestCursor: page.newestCursor ?? null,
       orderPolicy: "transcript",
-      ...(request.sessionId ? { sourceOrderScope: request.sessionId } : {}),
+      ...(projectionSessionId
+        ? {
+            sourceOrderScope: request.projectionVersion === 3
+              ? openClawSourceOrderScope({
+                  agentId: openClawAgentIdFromSessionKey(request.sessionKey),
+                  sessionId: projectionSessionId,
+                })
+              : projectionSessionId,
+          }
+        : {}),
       messages: page.messages.map((message, index) => {
-        const seq = messageSeq(message) ?? index + 1;
+        const seq = request.projectionVersion === 3
+          ? requireProjectionSequence(messageSeq(message), index)
+          : messageSeq(message) ?? index + 1;
         const role = normalizeTimelineRole(message.role);
         const clientMessageId = historyString(message, "clientMessageId", "client_message_id");
         const idempotencyKey = historyString(message, "idempotencyKey", "idempotency_key");
@@ -232,10 +400,34 @@ function buildTranscriptHistoryResponse(request: {
             ? block
             : { ...block, toolCallId })
           : content;
+        const sourceSessionId = request.projectionVersion === 3 ? projectionSessionId : undefined;
+        const sourceMessageId = request.projectionVersion === 3
+          ? requireProjectionIdentity(messageId, "sourceMessageId")
+          : messageId;
+        const projection = sourceSessionId && sourceMessageId
+          ? createProjectionMetadata({
+            gatewayType: "openclaw",
+            gatewayId: projectionGatewayId,
+            producerId: openClawAgentIdFromSessionKey(request.sessionKey),
+            sourceSessionId,
+            sourceMessageId,
+            sourceOrderScope: openClawSourceOrderScope({
+              agentId: openClawAgentIdFromSessionKey(request.sessionKey),
+              sessionId: sourceSessionId,
+            }),
+            sourceOrderSeq: seq,
+            sourceRole: role,
+            ...(historyString(message, "parentId", "parent_id")
+              ? { parentSourceMessageId: historyString(message, "parentId", "parent_id") }
+              : {}),
+            timelineDelivery: "independent",
+          })
+          : undefined;
+        const timelineMessageId = projection?.canonicalMessageId ?? messageId ?? `${role}-${turnId}`;
         return {
           turnId,
           runId: historyString(message, "runId", "run_id") ?? turnId,
-          messageId: messageId ?? `${role}-${turnId}`,
+          messageId: timelineMessageId,
           role,
           messageState: normalizeTimelineMessageState(message),
           createdAt: normalizeTimelineCreatedAt(message) ?? fallbackTimelineCreatedAt(page.messages, index),
@@ -248,6 +440,7 @@ function buildTranscriptHistoryResponse(request: {
           ...(extractAttachmentIds(canonicalContent).length > 0
             ? { attachmentIds: extractAttachmentIds(canonicalContent) }
             : {}),
+          ...(projection ?? {}),
         };
       }),
       attachments: [],
@@ -264,30 +457,67 @@ function buildTranscriptHistoryResponse(request: {
  */
 export function canonicalizeOpenClawGatewayHistoryResponse(
   history: HistoryResponse,
-  request: { sessionKey: string; cursor?: string },
+  request: {
+    sessionKey: string;
+    cursor?: string;
+    projectionVersion?: 3;
+    projectionGatewayId?: string;
+    sessionDefaults?: GatewaySessionDefaults;
+  },
 ): HistoryResponse {
+  const projectionGatewayId = request.projectionVersion === 3
+    ? requireProjectionIdentity(request.projectionGatewayId, "gatewayId")
+    : request.projectionGatewayId ?? "clawconnect";
   const requestedSessionKey = cleanHistoryString(history.sessionKey) ?? request.sessionKey;
   const restored = restoreGatewayHistoryMessages(history.messages ?? []);
-  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(restored, requestedSessionKey);
-  const automaticMediaReplies = normalizeOpenClawAutomaticMediaReplies(explicitSidecars.messages, requestedSessionKey);
-  const normalizedHistory = restored !== history.messages || explicitSidecars.changed || automaticMediaReplies.changed
+  const projectionVersion = request.projectionVersion;
+  const materializedDeliveries = materializeOpenClawMessageToolDeliveries(restored);
+  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(
+    materializedDeliveries.messages,
+    requestedSessionKey,
+    {
+      ...(projectionVersion === 3 ? { projectionVersion: 3 as const } : {}),
+      ...(request.sessionDefaults ? { sessionDefaults: request.sessionDefaults } : {}),
+    },
+  );
+  const automaticMediaReplies = normalizeOpenClawAutomaticMediaReplies(
+    explicitSidecars.messages,
+    requestedSessionKey,
+    {
+      ...(projectionVersion === 3 ? { projectionVersion: 3 as const } : {}),
+      ...(request.sessionDefaults ? { sessionDefaults: request.sessionDefaults } : {}),
+    },
+  );
+  const normalizedHistory = materializedDeliveries.changed || restored !== history.messages || explicitSidecars.changed || automaticMediaReplies.changed
     ? { ...history, messages: automaticMediaReplies.messages as HistoryMessage[] }
     : history;
   const filtered = filterOpenClawHeartbeatHistoryResponse(normalizedHistory);
-  if (filtered.timelineSnapshot) {
+  if (filtered.timelineSnapshot && projectionVersion !== 3) {
     return filtered;
   }
 
-  const sessionKey = cleanHistoryString(filtered.sessionKey) ?? request.sessionKey;
+  const sessionKey = canonicalizeOpenClawSessionScope(
+    cleanHistoryString(filtered.sessionKey) ?? request.sessionKey,
+    request.sessionDefaults,
+  ) ?? (cleanHistoryString(filtered.sessionKey) ?? request.sessionKey);
   const messages = filtered.messages ?? [];
-  const sourceOrderScope = cleanHistoryString(filtered.sessionId)
-    ?? messages.map(openClawTranscriptSource).find((value): value is string => Boolean(value));
+  const rawSourceSessionId = cleanHistoryString(filtered.sessionId);
+  const sourceSessionId = projectionVersion === 3
+    ? requireProjectionIdentity(rawSourceSessionId, "sourceSessionId")
+    : undefined;
+  const agentId = openClawAgentIdFromSessionKey(sessionKey);
+  const sourceOrderScope = rawSourceSessionId
+    ? projectionVersion === 3
+      ? openClawSourceOrderScope({ agentId, sessionId: rawSourceSessionId })
+      : rawSourceSessionId
+    : messages.map(openClawTranscriptSource).find((value): value is string => Boolean(value));
 
   return {
     ...filtered,
     sessionKey,
+    ...(projectionVersion === 3 ? { projectionVersion: 3 as const } : {}),
     timelineSnapshot: buildHistorySnapshotPage({
-      gatewayId: "clawconnect",
+      gatewayId: projectionGatewayId,
       sessionKey,
       cursor: request.cursor ?? null,
       hasMore: Boolean(filtered.hasMore),
@@ -295,7 +525,13 @@ export function canonicalizeOpenClawGatewayHistoryResponse(
       newestCursor: filtered.newestCursor ?? null,
       orderPolicy: "transcript",
       ...(sourceOrderScope ? { sourceOrderScope } : {}),
-      messages: canonicalizeOpenClawGatewayHistoryMessages(messages, sessionKey),
+      messages: canonicalizeOpenClawGatewayHistoryMessages(messages, sessionKey, {
+        agentId,
+        projectionGatewayId,
+        ...(projectionVersion === 3 ? { projectionVersion: 3 as const } : {}),
+        ...(sourceSessionId ? { sourceSessionId } : {}),
+        ...(sourceOrderScope ? { sourceOrderScope } : {}),
+      }),
       attachments: [],
     }),
   };
@@ -304,6 +540,13 @@ export function canonicalizeOpenClawGatewayHistoryResponse(
 function canonicalizeOpenClawGatewayHistoryMessages(
   messages: HistoryMessage[],
   sessionKey: string,
+  projection?: {
+    agentId: string;
+    projectionGatewayId?: string;
+    projectionVersion?: 3;
+    sourceSessionId?: string;
+    sourceOrderScope?: string;
+  },
 ): TimelineHistoryMessage[] {
   const finalAssistantIndexByRunId = new Map<string, number>();
   messages.forEach((message, index) => {
@@ -313,7 +556,9 @@ function canonicalizeOpenClawGatewayHistoryMessages(
   });
 
   return messages.map((message, index) => {
-    const seq = messageSeq(message) ?? index + 1;
+    const seq = projection?.projectionVersion === 3
+      ? requireProjectionSequence(messageSeq(message), index)
+      : messageSeq(message) ?? index + 1;
     const role = normalizeTimelineRole(message.role);
     const rawIdempotencyKey = historyString(message, "idempotencyKey", "idempotency_key")
       ?? openClawHistoryString(message, "idempotencyKey", "idempotency_key");
@@ -322,6 +567,9 @@ function canonicalizeOpenClawGatewayHistoryMessages(
       ?? normalizeTranscriptTurnId(clientMessageId);
     const providerMessageId = historyString(message, "messageId", "message_id", "id")
       ?? openClawHistoryString(message, "id");
+    const sourceMessageId = projection?.projectionVersion === 3
+      ? requireProjectionIdentity(providerMessageId, "sourceMessageId")
+      : providerMessageId;
     const runId = historyString(message, "runId", "run_id")
       ?? openClawRunId(message)
       ?? normalizedInputId;
@@ -347,12 +595,33 @@ function canonicalizeOpenClawGatewayHistoryMessages(
       toolCallId,
       index,
       finalAssistantIndexByRunId,
+      projectionVersion: projection?.projectionVersion,
     });
+    const sourceSessionId = projection?.sourceSessionId;
+    const sourceOrderScope = projection?.sourceOrderScope;
+    const projectionMetadata = projection?.projectionVersion === 3
+      && sourceSessionId && sourceOrderScope && sourceMessageId
+      ? createProjectionMetadata({
+        gatewayType: "openclaw",
+        gatewayId: requireProjectionIdentity(projection.projectionGatewayId, "gatewayId"),
+        producerId: projection.agentId,
+        sourceSessionId,
+        sourceMessageId,
+        sourceOrderScope,
+        sourceOrderSeq: seq,
+        sourceRole: role,
+        ...(historyString(message, "parentId", "parent_id")
+          ? { parentSourceMessageId: historyString(message, "parentId", "parent_id") }
+          : {}),
+        timelineDelivery: "independent",
+      })
+      : undefined;
 
+    const timelineMessageId = projectionMetadata?.canonicalMessageId ?? messageId;
     return {
       turnId,
       runId: runId ?? turnId,
-      messageId,
+      messageId: timelineMessageId,
       role,
       messageState: normalizeTimelineMessageState(message),
       createdAt: normalizeTimelineCreatedAt(message) ?? fallbackTimelineCreatedAt(messages, index),
@@ -365,6 +634,7 @@ function canonicalizeOpenClawGatewayHistoryMessages(
       ...(extractAttachmentIds(canonicalContent).length > 0
         ? { attachmentIds: extractAttachmentIds(canonicalContent) }
         : {}),
+      ...(projectionMetadata ?? {}),
     };
   });
 }
@@ -377,6 +647,7 @@ function gatewayHistoryMessageId(input: {
   toolCallId?: string;
   index: number;
   finalAssistantIndexByRunId: Map<string, number>;
+  projectionVersion?: 3;
 }): string {
   if (input.role === "user" && input.runId) {
     return `user-${input.runId}`;
@@ -415,7 +686,14 @@ function openClawTranscriptSource(message: HistoryMessage): string | undefined {
 function normalizeTranscriptHistoryParams(
   rawParams: unknown,
   fallbackSessionKey: string,
-): { sessionKey: string; limit: number; cursor?: string; direction: ChatHistoryDirection } {
+): {
+  sessionKey: string;
+  limit: number;
+  cursor?: string;
+  direction: ChatHistoryDirection;
+  projectionVersion?: 3;
+  projectionGatewayId?: string;
+} {
   const record = isRecord(rawParams) ? rawParams : {};
   const sessionKey = typeof record.sessionKey === "string" && record.sessionKey.trim().length > 0
     ? record.sessionKey.trim()
@@ -426,12 +704,22 @@ function normalizeTranscriptHistoryParams(
     limit: normalizeHistoryLimit(record.limit),
     ...(cursor ? { cursor } : {}),
     direction: normalizeHistoryDirection(record.direction),
+    ...(record.projectionVersion === 3 ? { projectionVersion: 3 as const } : {}),
+    ...(typeof record.projectionGatewayId === "string" && record.projectionGatewayId.trim().length > 0
+      ? { projectionGatewayId: record.projectionGatewayId.trim() }
+      : {}),
   };
 }
 
-async function readIndexedTranscriptMessages(transcriptPath: string, sessionKey: string): Promise<HistoryMessage[]> {
+async function readIndexedTranscriptMessages(
+  transcriptPath: string,
+  sessionKey: string,
+  projectionVersion?: 3,
+  sessionDefaults?: GatewaySessionDefaults,
+): Promise<HistoryMessage[]> {
   const stats = await stat(transcriptPath);
-  const cached = transcriptHistoryCache.get(transcriptPath);
+  const cacheKey = `${transcriptPath}\u0000${projectionVersion === 3 ? "v3" : "v2"}`;
+  const cached = transcriptHistoryCache.get(cacheKey);
   if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
     return cached.messages;
   }
@@ -443,14 +731,14 @@ async function readIndexedTranscriptMessages(transcriptPath: string, sessionKey:
     if (!trimmed) {
       continue;
     }
-    const message = parseTranscriptHistoryLine(trimmed, messages.length + 1);
+    const message = parseTranscriptHistoryLine(trimmed, messages.length + 1, projectionVersion === 3);
     if (message) {
       messages.push(message);
     }
   }
-  const visibleMessages = prepareTranscriptHistoryMessages(messages, sessionKey);
+  const visibleMessages = prepareTranscriptHistoryMessages(messages, sessionKey, projectionVersion, sessionDefaults);
 
-  transcriptHistoryCache.set(transcriptPath, {
+  transcriptHistoryCache.set(cacheKey, {
     size: stats.size,
     mtimeMs: stats.mtimeMs,
     messages: visibleMessages,
@@ -461,6 +749,7 @@ async function readIndexedTranscriptMessages(transcriptPath: string, sessionKey:
 function sqliteTranscriptHistoryMessage(
   row: { seq?: unknown; event_json?: unknown },
   sessionId: string,
+  strictProjectionV3 = false,
 ): HistoryMessage | null {
   const seq = typeof row.seq === "number" && Number.isFinite(row.seq) && row.seq > 0
     ? Math.round(row.seq)
@@ -481,6 +770,9 @@ function sqliteTranscriptHistoryMessage(
   // only through those event ids.
   const sourceMessageId = cleanHistoryString(event.id);
   const message: HistoryMessage = { ...event.message, seq };
+  if (strictProjectionV3 && !cleanHistoryString(message.id) && !sourceMessageId) {
+    throw new Error(`OpenClaw projection v3 sourceMessageId is missing at source seq ${seq}`);
+  }
   if (!cleanHistoryString(message.id)) {
     message.id = sourceMessageId ?? `sqlite-${sessionId}-${seq}`;
   }
@@ -494,15 +786,63 @@ function sqliteTranscriptHistoryMessage(
   return message;
 }
 
-function prepareTranscriptHistoryMessages(messages: HistoryMessage[], sessionKey: string): HistoryMessage[] {
+function prepareTranscriptHistoryMessages(
+  messages: HistoryMessage[],
+  sessionKey: string,
+  projectionVersion?: 3,
+  sessionDefaults?: GatewaySessionDefaults,
+): HistoryMessage[] {
+  messages = materializeOpenClawMessageToolDeliveries(messages).messages;
   // Fold the automatic assistant-media sidecar before lineage reconstruction.
   // Lineage deliberately rewrites idempotency keys to mobile turn IDs, while
   // the raw <run>:assistant-media key and parentId are the authoritative
   // relationship needed to keep the desktop and mobile projections aligned.
-  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(messages, sessionKey).messages as HistoryMessage[];
-  restoreTranscriptTurnLineage(explicitSidecars);
-  const foldedMessages = normalizeOpenClawAutomaticMediaReplies(explicitSidecars, sessionKey).messages as HistoryMessage[];
+  const projectionOptions = projectionVersion === 3 ? { projectionVersion: 3 as const } : undefined;
+  const relationOptions = {
+    ...(projectionOptions ?? {}),
+    ...(sessionDefaults ? { sessionDefaults } : {}),
+  };
+  const explicitSidecars = normalizeOpenClawAssistantMediaSidecars(messages, sessionKey, relationOptions).messages as HistoryMessage[];
+  restoreTranscriptTurnLineage(explicitSidecars, projectionVersion);
+  const foldedMessages = normalizeOpenClawAutomaticMediaReplies(
+    explicitSidecars,
+    sessionKey,
+    relationOptions,
+  ).messages as HistoryMessage[];
   return filterOpenClawHeartbeatArtifacts(foldedMessages);
+}
+
+/**
+ * The installed OpenClaw producer records a settled message-tool delivery as
+ * a `toolResult` row. That row is an execution detail, not a user-visible
+ * timeline item. Promote only the producer's strict, structured receipt to an
+ * independent assistant row; never use its prose content or generic
+ * `openclawDelivery.mediaUrls` display field as evidence.
+ */
+function materializeOpenClawMessageToolDeliveries(
+  messages: HistoryMessage[],
+): { messages: HistoryMessage[]; changed: boolean } {
+  let changed = false;
+  const materialized = messages.map((message) => {
+    if (message.role !== "toolResult" && message.role !== "tool_result") {
+      return message;
+    }
+    const receipt = adaptOpenClawMessageToolDelivery(message);
+    if (!receipt) return message;
+    changed = true;
+    return {
+      ...message,
+      role: "assistant",
+      runId: receipt.sourceRunId,
+      turnId: receipt.sourceRunId,
+      idempotencyKey: receipt.idempotencyKey,
+      // Keep the strict typed receipt on the canonical row until the relay
+      // replaces its local paths with uploaded attachment blocks.
+      openclawDelivery: receipt,
+      content: [],
+    };
+  });
+  return { messages: materialized, changed };
 }
 
 /**
@@ -648,7 +988,7 @@ function resolveTextOnlyHistoryContent(content: HistoryMessage["content"]): {
   return { text, hasNonTextContent };
 }
 
-function parseTranscriptHistoryLine(line: string, seq: number): HistoryMessage | null {
+function parseTranscriptHistoryLine(line: string, seq: number, strictProjectionV3 = false): HistoryMessage | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(line);
@@ -667,6 +1007,9 @@ function parseTranscriptHistoryLine(line: string, seq: number): HistoryMessage |
 
   const message: HistoryMessage = { ...rawMessage, seq };
   if (typeof message.id !== "string" || message.id.trim().length === 0) {
+    if (strictProjectionV3 && (typeof parsed.id !== "string" || parsed.id.trim().length === 0)) {
+      throw new Error(`OpenClaw projection v3 sourceMessageId is missing at source seq ${seq}`);
+    }
     const id = typeof parsed.id === "string" && parsed.id.trim().length > 0 ? parsed.id.trim() : `transcript-${seq}`;
     message.id = id;
   }
@@ -690,7 +1033,7 @@ function parseTranscriptHistoryLine(line: string, seq: number): HistoryMessage |
  * idempotency key through that chain so history and realtime resolve to the
  * same canonical message without comparing text or timestamps.
  */
-function restoreTranscriptTurnLineage(messages: HistoryMessage[]): void {
+function restoreTranscriptTurnLineage(messages: HistoryMessage[], projectionVersion?: 3): void {
   const byId = new Map<string, HistoryMessage>();
   const lastAssistantByMobileTurn = new Map<string, HistoryMessage>();
   for (const message of messages) {
@@ -731,8 +1074,10 @@ function restoreTranscriptTurnLineage(messages: HistoryMessage[]): void {
 
   // 一个 OpenClaw turn 可能包含若干工具中间消息；只有最后一个 assistant 输出
   // 与实时 final 共用 canonical messageId，其他中间消息继续保留 transcript 身份。
-  for (const [turnId, message] of lastAssistantByMobileTurn.entries()) {
-    message.messageId = `assistant-${turnId}`;
+  if (projectionVersion !== 3) {
+    for (const [turnId, message] of lastAssistantByMobileTurn.entries()) {
+      message.messageId = `assistant-${turnId}`;
+    }
   }
 }
 
@@ -816,6 +1161,20 @@ function normalizeHistoryLimit(value: unknown): number {
 
 function normalizeHistoryDirection(value: unknown): ChatHistoryDirection {
   return value === "newer" ? "newer" : "older";
+}
+
+function requireProjectionIdentity(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`OpenClaw projection v3 identity is missing ${field}`);
+  }
+  return value.trim();
+}
+
+function requireProjectionSequence(value: number | undefined, index: number): number {
+  if (!Number.isSafeInteger(value) || (value ?? 0) <= 0) {
+    throw new Error(`OpenClaw projection v3 sourceOrderSeq is missing or invalid at row ${index}`);
+  }
+  return value as number;
 }
 
 function normalizeCursor(value: unknown): string | undefined {
@@ -1024,22 +1383,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function extractHistoryOutcome(
   history: HistoryResponse | undefined,
   context: ChatRunContext,
+  preferredText?: string,
 ): ChatHistoryOutcome {
   const messages = history?.messages ?? [];
   if (messages.length === 0) {
     return null;
   }
 
-  const userIndex = findHistoryUserIndex(messages, context);
-  if (userIndex === -1) {
+  const scope = findHistoryScope(messages, context);
+  if (!scope) {
     return null;
   }
-  if (hasUnresolvedUserBefore(messages, userIndex)) {
+  if (scope.hasUser && hasUnresolvedUserBefore(messages, scope.startIndex)) {
     return null;
   }
 
   let latestError: string | null = null;
-  for (let index = userIndex + 1; index < messages.length; index += 1) {
+  let latestFinal: Extract<ChatHistoryOutcome, { kind: "final" }> | null = null;
+  // `preferredText` is retained for call-site compatibility only.  Assistant
+  // prose is not a message identity and must never select an attachment row;
+  // the stable turn/message/tool ids above and source order are authoritative.
+  void preferredText;
+  // When the history page starts after the user row, the first assistant row
+  // carrying the same stable run id is the deterministic scope boundary. Do
+  // not require a text/timestamp guess just because pagination omitted the
+  // user record.
+  const firstMessageIndex = scope.hasUser ? scope.startIndex + 1 : scope.startIndex;
+  for (let index = firstMessageIndex; index < messages.length; index += 1) {
     const message = messages[index];
     if (message.role === "user") {
       return null;
@@ -1048,8 +1418,15 @@ export function extractHistoryOutcome(
       continue;
     }
     const text = extractHistoryMessageText(message);
-    if (text.length > 0 || hasHistoryMessageContent(message)) {
-      return { kind: "final", text, message };
+    const mediaOnlyProjectionRow = history?.projectionVersion === 3
+      && text.length === 0
+      && nonTextHistoryContent(message).length > 0;
+    if (!mediaOnlyProjectionRow && (text.length > 0 || hasHistoryMessageContent(message))) {
+      // One OpenClaw run may contain several independent message-tool replies.
+      // The last authoritative assistant row is the terminal history outcome;
+      // returning the first row loses later media on fallback/replay.
+      latestFinal = { kind: "final", text, message };
+      continue;
     }
     if (
       typeof message.errorMessage === "string" &&
@@ -1060,7 +1437,59 @@ export function extractHistoryOutcome(
     }
   }
 
-  return latestError ? { kind: "error", errorMessage: latestError } : null;
+  return latestFinal ?? (latestError ? { kind: "error", errorMessage: latestError } : null);
+}
+
+/**
+ * Return all media delivery rows belonging to the matched OpenClaw turn.
+ * A provider may emit only the first image on the live terminal while the
+ * remaining message-tool deliveries are committed to history. This helper
+ * keeps the user-turn boundary as the only scope and never matches by text.
+ */
+export function extractHistoryMediaContent(
+  history: HistoryResponse | undefined,
+  context: ChatRunContext,
+): TimelineContentBlock[] {
+  const messages = history?.messages ?? [];
+  const scope = findHistoryScope(messages, context);
+  if (!scope || (scope.hasUser && hasUnresolvedUserBefore(messages, scope.startIndex))) return [];
+  const media: HistoryContentBlock[] = [];
+  const firstMessageIndex = scope.hasUser ? scope.startIndex + 1 : scope.startIndex;
+  for (let index = firstMessageIndex; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message.role === "user") break;
+    if (message.role === "assistant") media.push(...nonTextHistoryContent(message));
+  }
+  return media.filter((block): block is TimelineContentBlock => typeof block.type === "string");
+}
+
+/**
+ * Collect media rows only when the provider gives an explicit parent edge.
+ * v3 message-tool rows remain independent canonical messages; this helper is
+ * solely for an outgoing terminal payload that deliberately owns its child
+ * sidecars, and never falls back to run/client/text/time matching.
+ */
+export function extractExplicitParentMediaContent(
+  history: HistoryResponse | undefined,
+  parentMessage: HistoryMessage | undefined,
+): TimelineContentBlock[] {
+  if (!history || !parentMessage) return [];
+  const parentMessageId = historyString(parentMessage, "messageId", "message_id", "id");
+  if (!parentMessageId) return [];
+  return (history.messages ?? []).flatMap((message) => {
+    const explicitParentId = historyString(message, "parentId", "parent_id");
+    if (explicitParentId !== parentMessageId) return [];
+    return nonTextHistoryContent(message);
+  }).filter((block): block is TimelineContentBlock => typeof block.type === "string");
+}
+
+function nonTextHistoryContent(message: HistoryMessage): HistoryContentBlock[] {
+  return Array.isArray(message.content)
+    ? message.content.filter((block) => {
+        const type = typeof block?.type === "string" ? block.type.trim().toLowerCase() : "";
+        return ["image", "file", "audio", "voice", "video", "attachment"].includes(type);
+      })
+    : [];
 }
 
 function hasUnresolvedUserBefore(messages: HistoryMessage[], userIndex: number): boolean {
@@ -1150,10 +1579,15 @@ function isToolOnlyHistoryBlockType(type: string): boolean {
     || normalizedType === "computercalloutput";
 }
 
-function findHistoryUserIndex(messages: HistoryMessage[], context: ChatRunContext): number {
+type HistoryScope = {
+  startIndex: number;
+  hasUser: boolean;
+};
+
+function findHistoryScope(messages: HistoryMessage[], context: ChatRunContext): HistoryScope | undefined {
   const canonicalRunId = normalizeTranscriptTurnId(context.canonicalRunId);
   if (!canonicalRunId) {
-    return -1;
+    return undefined;
   }
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -1168,9 +1602,26 @@ function findHistoryUserIndex(messages: HistoryMessage[], context: ChatRunContex
       message.runId,
     ].map(normalizeTranscriptTurnId);
     if (stableIds.includes(canonicalRunId)) {
-      return index;
+      return { startIndex: index, hasUser: true };
     }
   }
 
-  return -1;
+  // `chat.history` is paginated, and a busy OpenClaw turn can append more
+  // than the live enrichment page size after its user row (tool calls,
+  // delivery mirrors, and the final commentary). The assistant delivery rows
+  // still carry the authoritative run/turn id, so use the first matching row
+  // as the scope boundary when the user row is outside this page. This is a
+  // stable identity-based reconciliation, not a text or timestamp heuristic.
+  const firstRunMessageIndex = messages.findIndex((message) => {
+    const stableIds = [
+      message.runId,
+      message.turnId,
+      message.idempotencyKey,
+      message.clientMessageId,
+    ].map(normalizeTranscriptTurnId);
+    return stableIds.includes(canonicalRunId);
+  });
+  return firstRunMessageIndex >= 0
+    ? { startIndex: firstRunMessageIndex, hasUser: false }
+    : undefined;
 }

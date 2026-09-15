@@ -6,6 +6,7 @@ import {
   buildRunErrorEvent,
 } from "./timeline-event-builder.js";
 import type { TimelineContentBlock } from "./timeline-event-log.js";
+import type { SourceCommit } from "./source-commit.js";
 
 export type MobileChatRun = {
   runId: string;
@@ -96,6 +97,8 @@ export function buildCanonicalMobileAssistantDeltaPayload(params: {
   seq: number;
   timestampMs: number;
   delta: string;
+  clientMessageId?: string;
+  idempotencyKey?: string;
   includeTimelineEvents?: boolean;
 }) {
   const timelineEvent = buildMessagePartDeltaEvent({
@@ -104,9 +107,13 @@ export function buildCanonicalMobileAssistantDeltaPayload(params: {
     turnId: params.run.runId,
     runId: params.run.runId,
     role: "assistant",
+    ...(params.clientMessageId ? { clientMessageId: params.clientMessageId } : {}),
+    ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
     seq: params.seq,
     turnSeq: params.seq,
     now: () => new Date(params.timestampMs),
+    timelineItemKind: "waiting",
+    timelineResolvesWaiting: false,
     content: [{ type: "text", text: params.delta }],
   });
   const text = timelineTextContent(timelineEvent);
@@ -115,6 +122,8 @@ export function buildCanonicalMobileAssistantDeltaPayload(params: {
     sessionKey: params.run.sessionKey,
     state: "delta",
     role: "assistant",
+    ...(params.clientMessageId ? { clientMessageId: params.clientMessageId } : {}),
+    ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
     seq: params.seq,
     ts: params.timestampMs,
     delta: text,
@@ -132,6 +141,8 @@ export function buildMobileAssistantDeltaPayload(params: {
   seq: number;
   timestampMs: number;
   delta: string;
+  clientMessageId?: string;
+  idempotencyKey?: string;
   includeTimelineEvents?: boolean;
 }) {
   return buildCanonicalMobileAssistantDeltaPayload(params);
@@ -141,6 +152,8 @@ export function buildCanonicalMobileAssistantStreamingPayload(params: {
   run: MobileChatRun;
   seq?: number;
   text: string;
+  clientMessageId?: string;
+  idempotencyKey?: string;
   includeTimelineEvents?: boolean;
 }) {
   const timelineEvent = buildMessagePartDeltaEvent({
@@ -149,8 +162,12 @@ export function buildCanonicalMobileAssistantStreamingPayload(params: {
     turnId: params.run.runId,
     runId: params.run.runId,
     role: "assistant",
+    ...(params.clientMessageId ? { clientMessageId: params.clientMessageId } : {}),
+    ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
     seq: params.seq,
     turnSeq: params.seq,
+    timelineItemKind: "waiting",
+    timelineResolvesWaiting: false,
     content: [{ type: "text", text: params.text }],
   });
   const text = timelineTextContent(timelineEvent);
@@ -159,6 +176,8 @@ export function buildCanonicalMobileAssistantStreamingPayload(params: {
     sessionKey: params.run.sessionKey,
     state: "streaming",
     role: "assistant",
+    ...(params.clientMessageId ? { clientMessageId: params.clientMessageId } : {}),
+    ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
     ...(params.seq !== undefined ? { seq: params.seq } : {}),
     message: {
       role: "assistant",
@@ -172,6 +191,8 @@ export function buildMobileAssistantStreamingPayload(params: {
   run: MobileChatRun;
   seq?: number;
   text: string;
+  clientMessageId?: string;
+  idempotencyKey?: string;
   includeTimelineEvents?: boolean;
 }) {
   return buildCanonicalMobileAssistantStreamingPayload(params);
@@ -181,7 +202,11 @@ export function buildCanonicalMobileAssistantFinalPayload(params: {
   run: MobileChatRun;
   text: string;
   contentBlocks?: TimelineContentBlock[];
+  messageId?: string;
+  clientMessageId?: string;
+  idempotencyKey?: string;
   includeTimelineEvents?: boolean;
+  sourceCommit?: SourceCommit;
 } & MobileAssistantUsage) {
   const content = [
     { type: "text", text: params.text },
@@ -193,6 +218,15 @@ export function buildCanonicalMobileAssistantFinalPayload(params: {
     turnId: params.run.runId,
     runId: params.run.runId,
     role: "assistant",
+    ...(params.clientMessageId ? { clientMessageId: params.clientMessageId } : {}),
+    ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
+    ...(params.messageId ? { messageId: params.messageId } : {}),
+    ...(params.sourceCommit ? { sourceCommit: params.sourceCommit } : {}),
+    // A live provider terminal is an overlay until the source watcher supplies
+    // a projection-v3 source identity. A derived reply id is not a source id.
+    ...(!params.sourceCommit
+      ? { timelineItemKind: "waiting" as const, timelineResolvesWaiting: false }
+      : {}),
     content,
   });
   const text = timelineTextContent(timelineEvent);
@@ -201,6 +235,8 @@ export function buildCanonicalMobileAssistantFinalPayload(params: {
     sessionKey: params.run.sessionKey,
     state: "final",
     role: "assistant",
+    ...(params.clientMessageId ? { clientMessageId: params.clientMessageId } : {}),
+    ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
     ...(params.currentModel !== undefined ? { currentModel: params.currentModel } : {}),
     ...(params.provider !== undefined ? { provider: params.provider } : {}),
     ...(params.contextUsage !== undefined ? { contextUsage: params.contextUsage } : {}),
@@ -233,9 +269,39 @@ export function buildMobileAssistantFinalPayload(params: {
   run: MobileChatRun;
   text: string;
   contentBlocks?: TimelineContentBlock[];
+  messageId?: string;
+  clientMessageId?: string;
+  idempotencyKey?: string;
   includeTimelineEvents?: boolean;
+  sourceCommit?: SourceCommit;
 } & MobileAssistantUsage) {
   return buildCanonicalMobileAssistantFinalPayload(params);
+}
+
+/**
+ * Publishes only the terminal lifecycle event for a provider completion that
+ * carried no assistant content. The source-commit watcher is responsible for
+ * publishing any canonical transcript rows later; this payload must not create
+ * an empty assistant message.
+ */
+export function buildMobileAssistantCompletedPayload(params: {
+  run: MobileChatRun;
+  includeTimelineEvents?: boolean;
+}) {
+  const timelineEvent = buildRunCompletedEvent({
+    gatewayId: "clawconnect",
+    sessionKey: params.run.sessionKey,
+    turnId: params.run.runId,
+    runId: params.run.runId,
+    role: "assistant",
+  });
+  return {
+    runId: params.run.runId,
+    sessionKey: params.run.sessionKey,
+    state: "final" as const,
+    role: "assistant" as const,
+    ...(params.includeTimelineEvents ? { timelineEvents: [timelineEvent] } : {}),
+  };
 }
 
 export function buildCanonicalMobileAssistantErrorPayload(params: {

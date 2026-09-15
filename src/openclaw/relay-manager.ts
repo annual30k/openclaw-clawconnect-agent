@@ -33,16 +33,26 @@ import {
 } from "../core/relay/chat-payload.js";
 import {
   canonicalizeOpenClawGatewayHistoryResponse,
+  extractHistoryMediaContent,
+  extractExplicitParentMediaContent,
   extractHistoryOutcome,
+  readOpenClawSourceCommitCursor,
   readOpenClawTranscriptChatHistory,
   withTimeout,
   type HistoryResponse,
 } from "./relay/chat-history.js";
+import { watchOpenClawSourceCommit, type OpenClawSourceCommitWatcher } from "./relay/openclaw-source-commit-watcher.js";
+import { projectSourceCommitHistoryPages } from "./relay/source-commit-projection.js";
+import { join } from "node:path";
+import { resolveOpenClawStateDir } from "./runtime/openclaw-paths.js";
+import type { SourceCommit } from "../core/relay/source-commit.js";
+import { openClawAgentIdFromSessionKey } from "../core/relay/timeline-projection-v3.js";
 import {
   OpenClawChatSendDedupeCoordinator,
 } from "./relay/chat-send-dedupe-coordinator.js";
 import {
   buildMobileAssistantDeltaPayload,
+  buildMobileAssistantCompletedPayload,
   buildMobileAssistantErrorPayload,
   buildMobileAssistantFinalPayload,
 } from "../core/relay/mobile-chat-run-bridge.js";
@@ -62,7 +72,10 @@ import {
   ChatSendIdempotencyGuard,
 } from "../core/relay/chat-send-idempotency.js";
 import { prepareChatSendParams } from "./relay/chat-send-attachments.js";
-import { canonicalizeOpenClawAssistantMediaSidecarPayload } from "./relay/assistant-media-sidecar.js";
+import {
+  canonicalizeOpenClawAssistantMediaSidecarPayload,
+  materializeOpenClawDisplayContentPayload,
+} from "./relay/assistant-media-sidecar.js";
 import {
   relayOutgoingMediaInHistoryResponse,
   relayOutgoingMediaInPayload,
@@ -73,11 +86,7 @@ import type { FileUploadResult } from "../core/relay/file-upload.js";
 import { buildRelayHelloMessage } from "./relay/relay-manager-hello.js";
 import { buildOpenClawHostRuntimeMetadata } from "../runtime-metadata.js";
 import {
-  CHAT_HISTORY_FALLBACK_INITIAL_DELAY_MS,
-  CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS,
-  CHAT_HISTORY_FALLBACK_RETRY_DELAY_MS,
   CHAT_HISTORY_FETCH_TIMEOUT_MS,
-  CHAT_HISTORY_FINAL_RETRY_DELAY_MS,
   CHAT_HISTORY_MEDIA_ENRICHMENT_TIMEOUT_MS,
 } from "./relay/relay-manager-history-timing.js";
 import {
@@ -88,6 +97,11 @@ import {
   restoreOpenClawProviderRunIdForCommand,
   type OpenClawChatRunIdentity,
 } from "./relay/chat-run-identity.js";
+import {
+  markOpenClawActiveRunTerminal,
+  recordOpenClawActiveRun,
+  updateOpenClawActiveRunProviderId,
+} from "./relay/openclaw-active-run-state.js";
 import { publishOfficeSnapshot } from "./relay/relay-manager-office-events.js";
 import type {
   OpenClawRelayFromServer,
@@ -101,10 +115,14 @@ import {
   buildEmptyHistoryPage,
   buildFinalPayloadFromHistoryOutcome,
   buildOpenClawGatewayHistoryParams,
+  assistantHistoryReplyMessageId,
+  assistantReplyMessageId,
   extractChatErrorMessage,
+  extractChatLineage,
   hasHistoryCursor,
   mergeCanonicalChatPayload,
   mobileAssistantUsageFromPayload,
+  mergeNonTextContentBlocks,
   nonTextContentBlocks,
   nonTextContentBlocksFromHistory,
   resolveChatPayloadSeq,
@@ -123,6 +141,11 @@ type OpenClawAssistantSnapshot = {
   publishOffice: boolean;
   userMessage?: string;
 };
+
+function hasCanonicalProjectionV3Snapshot(history: HistoryResponse | undefined): boolean {
+  return history?.projectionVersion === 3
+    && (history.timelineSnapshot?.messages ?? []).some((message) => message.projectionVersion === 3);
+}
 
 // 保留在连接实例之外，使 Relay WebSocket 断线重连后的同轮重投仍能复用终态结果。
 const openClawChatSendIdempotency = new ChatSendIdempotencyGuard<OpenClawChatCommandExecution>();
@@ -167,7 +190,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     let sessionDefaults: GatewaySessionDefaults = { ...DEFAULT_GATEWAY_SESSION_DEFAULTS };
     const subscribedSessionMessageKeys = new Set<string>();
     const pendingSessionMessageSubscriptions = new Map<string, Promise<void>>();
-    const chatFallbacks = new Map<string, ReturnType<typeof setTimeout>>();
+    const sourceCommitWatchers = new Map<string, OpenClawSourceCommitWatcher>();
     const chatRunContexts = new Map<string, OpenClawChatRunIdentity>();
     const chatSendDedupe = new OpenClawChatSendDedupeCoordinator(() => sessionDefaults);
     const outgoingMediaUploadCache = new Map<string, FileUploadResult>();
@@ -197,11 +220,15 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       });
     };
 
-    const clearChatFallback = (runId: string): void => {
-      const timer = chatFallbacks.get(runId);
-      if (timer) {
-        clearTimeout(timer);
-        chatFallbacks.delete(runId);
+    const setChatRunContext = (providerRunId: string, context: OpenClawChatRunIdentity): void => {
+      chatRunContexts.set(providerRunId, context);
+      // Delivery-mirror terminals can arrive after the provider terminal. Keep
+      // enough completed contexts for deterministic history reconciliation;
+      // bound the map explicitly instead of using a timer as correctness.
+      while (chatRunContexts.size > 2048) {
+        const oldest = chatRunContexts.keys().next().value as string | undefined;
+        if (!oldest) break;
+        chatRunContexts.delete(oldest);
       }
     };
 
@@ -258,86 +285,20 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       contextUsageRefreshes.set(key, timer);
     };
 
-    const scheduleChatHistoryFallback = (providerRunId: string, context: OpenClawChatRunIdentity, attempt = 0): void => {
-      if (!providerRunId || !context.sessionKey) {
-        return;
+    const explicitOpenClawSessionKey = (rawSessionKey: string): string => {
+      const canonical = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
+      const normalized = typeof canonical === "string" ? canonical.trim() : "";
+      if (normalized === "main") {
+        return `agent:${sessionDefaults.defaultAgentId ?? "main"}:${sessionDefaults.mainKey || "main"}`;
       }
-      clearChatFallback(providerRunId);
-      chatRunContexts.set(providerRunId, context);
-      const timer = setTimeout(() => {
-        if (!gatewayClient) {
-          chatFallbacks.delete(providerRunId);
-          return;
-        }
-        const fetchHistory = () =>
-          requestChatHistoryFromClawConnect({ sessionKey: context.sessionKey, limit: 10 });
-        withTimeout(fetchHistory(), CHAT_HISTORY_FETCH_TIMEOUT_MS, "chat.history fallback")
-          .then(async (history) => {
-            const outcome = extractHistoryOutcome(history, context);
-            if (
-              (!outcome || isOpenClawMediaDisplayPlaceholder(outcome.kind === "final" ? outcome.text : ""))
-              && attempt < CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS
-            ) {
-              scheduleChatHistoryFallback(providerRunId, context, attempt + 1);
-              return;
-            }
-            if (!outcome) {
-              chatFallbacks.delete(providerRunId);
-              chatRunContexts.delete(providerRunId);
-              openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
-              return;
-            }
-            clearChatFallback(providerRunId);
-            chatRunContexts.delete(providerRunId);
-            if (outcome.kind === "final") {
-              openClawChatRunIdentities.markTerminal(opts.gatewayId, providerRunId);
-              const basePayload = buildMobileAssistantFinalPayload({
-                run: { runId: context.canonicalRunId, sessionKey: context.sessionKey },
-                text: outcome.text,
-                includeTimelineEvents: true,
-              });
-              await publishAndSendGatewayEvent(
-                "chat",
-                buildFinalPayloadFromHistoryOutcome(basePayload, outcome),
-                true,
-                context.promptText,
-              );
-              openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
-              return;
-            }
-            openClawChatRunIdentities.markTerminal(opts.gatewayId, providerRunId);
-            await publishAndSendGatewayEvent(
-              "chat",
-              buildMobileAssistantErrorPayload({
-                run: { runId: context.canonicalRunId, sessionKey: context.sessionKey },
-                errorMessage: outcome.errorMessage,
-                includeTimelineEvents: true,
-              }),
-              true,
-            );
-            openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
-          })
-          .catch((err) => {
-            if (attempt < CHAT_HISTORY_FALLBACK_MAX_ATTEMPTS) {
-              scheduleChatHistoryFallback(providerRunId, context, attempt + 1);
-              return;
-            }
-            console.warn(`[relay] chat history fallback failed runId=${providerRunId}: ${String(err)}`);
-            chatFallbacks.delete(providerRunId);
-            chatRunContexts.delete(providerRunId);
-            openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
-          });
-      }, attempt === 0 ? CHAT_HISTORY_FALLBACK_INITIAL_DELAY_MS : CHAT_HISTORY_FALLBACK_RETRY_DELAY_MS);
-      timer.unref?.();
-      chatFallbacks.set(providerRunId, timer);
+      return normalized || rawSessionKey.trim();
     };
 
     const ensureSessionMessagesSubscribed = async (sessionKey: string): Promise<void> => {
-      const normalizedSessionKey = canonicalizeSessionKey(sessionKey, sessionDefaults);
-      if (typeof normalizedSessionKey !== "string" || normalizedSessionKey.trim().length === 0) {
+      const key = explicitOpenClawSessionKey(sessionKey);
+      if (!key) {
         throw new Error("cannot subscribe to an empty OpenClaw session key");
       }
-      const key = normalizedSessionKey.trim();
       if (subscribedSessionMessageKeys.has(key)) {
         return;
       }
@@ -378,6 +339,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           sessionDefaults = nextDefaults;
         }
         await ensureSessionMessagesSubscribed(sessionDefaults.mainSessionKey);
+        ensureSourceCommitWatcher(sessionDefaults.mainSessionKey);
         const sessionsPayload = await gatewayClient.request("sessions.list", {
           limit: 100,
           includeGlobal: true,
@@ -396,6 +358,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           // Subscribe each known session so their finished replies travel through
           // the same ClawConnect → Relay realtime path as an interactive chat.
           await ensureSessionMessagesSubscribed(sessionKey);
+          ensureSourceCommitWatcher(sessionKey);
           const snapshot = contextUsageSnapshotFromSessionsList(sessionsPayload, sessionKey, sessionDefaults);
           if (!snapshot) continue;
           emitContextUsageSnapshot(snapshot, true);
@@ -485,6 +448,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             cache: outgoingMediaUploadCache,
             userMessage,
             waitForOutgoingMediaRecord: true,
+            sessionDefaults,
           });
         } catch (error) {
           if (!hasCanonicalTerminalTimeline(payload)) throw error;
@@ -525,14 +489,18 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       },
     });
 
-    const assistantSnapshotKey = (runId: string | undefined, sessionKey: string | undefined): string | undefined => {
+    const assistantSnapshotKey = (
+      runId: string | undefined,
+      sessionKey: string | undefined,
+      messageId?: string,
+    ): string | undefined => {
       if (!runId?.trim() || !sessionKey?.trim()) {
         return undefined;
       }
       return buildAssistantStreamSnapshotKey({
         sessionKey,
         runId,
-        messageId: `assistant-${runId}`,
+        ...(messageId ? { messageId } : { messageId: `assistant-${runId}` }),
       });
     };
 
@@ -578,7 +546,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       const sessionKey = typeof record.sessionKey === "string" && record.sessionKey.trim()
         ? record.sessionKey.trim()
         : runContext?.sessionKey;
-      return assistantSnapshotKey(runId, sessionKey);
+      return assistantSnapshotKey(runId, sessionKey, runId ? assistantReplyMessageId(payload, runId) : undefined);
     };
 
     async function relayOutgoingMediaForResponse(method: string, payload: unknown): Promise<unknown> {
@@ -591,13 +559,24 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         gatewayId: opts.gatewayId,
         senderDisplayName: "OpenClaw",
         cache: outgoingMediaUploadCache,
+        sessionDefaults,
       });
     }
 
     async function requestChatHistoryFromClawConnect(params: unknown): Promise<HistoryResponse> {
+      // Relay-owned history reads opt into the v3 projection contract. The
+      // public legacy helper remains v2-compatible for older callers during
+      // rollout; every confirmed row consumed by this manager is v3.
+      const projectionParams: Record<string, unknown> = params && typeof params === "object" && !Array.isArray(params)
+        ? {
+            ...(params as Record<string, unknown>),
+            projectionVersion: 3 as const,
+            projectionGatewayId: opts.gatewayId,
+          }
+        : { projectionVersion: 3 as const, projectionGatewayId: opts.gatewayId };
       try {
-        await chatSendDedupe.dedupePendingForSession(params);
-        const transcriptHistory = await readOpenClawTranscriptChatHistory(params, sessionDefaults);
+        await chatSendDedupe.dedupePendingForSession(projectionParams);
+        const transcriptHistory = await readOpenClawTranscriptChatHistory(projectionParams, sessionDefaults);
         if (transcriptHistory) {
           return transcriptHistory;
         }
@@ -606,20 +585,83 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       }
 
       if (hasHistoryCursor(params)) {
-        return buildEmptyHistoryPage(params, sessionDefaults);
+        return buildEmptyHistoryPage(projectionParams, sessionDefaults);
       }
       if (!gatewayClient) {
         throw new Error("gateway not connected");
       }
-      const gatewayHistoryParams = buildOpenClawGatewayHistoryParams(params, sessionDefaults);
+      const gatewayHistoryParams: Record<string, unknown> = buildOpenClawGatewayHistoryParams(params, sessionDefaults);
       const history = await gatewayClient.request<HistoryResponse>(
         "chat.history",
         gatewayHistoryParams,
       );
       return canonicalizeOpenClawGatewayHistoryResponse(history, {
         sessionKey: String(gatewayHistoryParams.sessionKey),
+        projectionVersion: 3,
+        projectionGatewayId: opts.gatewayId,
+        sessionDefaults,
       });
     }
+
+    const ensureSourceCommitWatcher = (sessionKey: string): void => {
+      const normalizedSessionKey = explicitOpenClawSessionKey(sessionKey);
+      if (!normalizedSessionKey) return;
+      const key = `${opts.gatewayId}\u0000${normalizedSessionKey}`;
+      if (sourceCommitWatchers.has(key)) return;
+      const agentId = openClawAgentIdFromSessionKey(normalizedSessionKey);
+      const databasePath = join(
+        resolveOpenClawStateDir(),
+        "agents",
+        agentId,
+        "agent",
+        "openclaw-agent.sqlite",
+      );
+      const watcher = watchOpenClawSourceCommit({
+        databasePath,
+        readCursor: () => readOpenClawSourceCommitCursor({
+          sessionKey: normalizedSessionKey,
+          projectionVersion: 3,
+          projectionGatewayId: opts.gatewayId,
+        }, sessionDefaults),
+        onCommit: async (sourceCommit: SourceCommit, previousCommittedThroughSeq) => {
+          await projectSourceCommitHistoryPages({
+            sourceCommit,
+            previousCommittedThroughSeq,
+            readPage: (cursorSeq) => withTimeout(
+              requestChatHistoryFromClawConnect({
+                sessionKey: normalizedSessionKey,
+                limit: 200,
+                cursor: `seq:${cursorSeq}`,
+                direction: "newer",
+              }),
+              CHAT_HISTORY_FETCH_TIMEOUT_MS,
+              "source commit history reconciliation",
+            ),
+            publish: async ({ sourceCommit: pageSourceCommit, events }) => {
+              const deliveryResult = await publishAndSendGatewayEvent(
+                "chat",
+                {
+                  state: "source_commit",
+                  sessionKey: normalizedSessionKey,
+                  sourceCommit: pageSourceCommit,
+                  timelineEvents: events,
+                },
+                true,
+                undefined,
+                true,
+              );
+              if (deliveryResult?.status === "retryable") {
+                throw deliveryResult.error;
+              }
+            },
+          });
+        },
+        onError: (error) => {
+          console.warn(`[relay] source commit reconciliation failed session=${normalizedSessionKey}: ${String(error)}`);
+        },
+      });
+      sourceCommitWatchers.set(key, watcher);
+    };
 
     relayWs.on("open", () => {
       console.log(`Connected to relay server (gatewayId=${opts.gatewayId})`);
@@ -667,8 +709,30 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         },
 
         onEvent: (event, payload) => {
+          if (event === "session.message") {
+            // OpenClaw emits this subscription event after the transcript
+            // append has committed. It is the primary wake-up for source
+            // reconciliation; SQLite notifications and the low-frequency
+            // anti-entropy scan remain recovery paths for dropped events.
+            const record = payload && typeof payload === "object" && !Array.isArray(payload)
+              ? payload as Record<string, unknown>
+              : undefined;
+            const rawSessionKey = typeof record?.sessionKey === "string"
+              ? record.sessionKey.trim()
+              : "";
+            if (rawSessionKey) {
+              const sessionKey = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
+              if (typeof sessionKey === "string" && sessionKey.trim()) {
+                ensureSourceCommitWatcher(sessionKey);
+                sourceCommitWatchers.get(`${opts.gatewayId}\u0000${sessionKey.trim()}`)?.notify();
+              }
+            }
+            return;
+          }
           const normalizedPayload = event === "chat"
-            ? canonicalizeOpenClawAssistantMediaSidecarPayload(normalizeChatEventPayload(payload))
+            ? materializeOpenClawDisplayContentPayload(
+                canonicalizeOpenClawAssistantMediaSidecarPayload(normalizeChatEventPayload(payload)),
+              )
             : payload;
           const shouldPublishOffice = event === "chat" || event === "agent" || event === "context_usage";
           if (event === "chat") {
@@ -679,10 +743,16 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             const isTerminalState = state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted";
             const sessionKey = typeof p?.sessionKey === "string" && p.sessionKey.trim().length > 0 ? p.sessionKey.trim() : undefined;
             const explicitCanonicalRunId = resolveExplicitMobileRunIdFromChatPayload(normalizedPayload);
+            const currentText = extractChatText(normalizedPayload);
+            const role = extractChatRole(normalizedPayload);
             let runContext = providerRunId
               ? chatRunContexts.get(providerRunId) ?? openClawChatRunIdentities.resolve(opts.gatewayId, providerRunId)
               : undefined;
-            if (!runContext && providerRunId && sessionKey) {
+            // Event-only registration is safe only after the provider proves
+            // assistant provenance. A roleless terminal may contain a user
+            // echo or an unrelated provider event and must not create a run
+            // context from its text/session fields.
+            if (!runContext && providerRunId && sessionKey && role === "assistant") {
               runContext = {
                 gatewayId: opts.gatewayId,
                 providerRunId,
@@ -690,19 +760,39 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 sessionKey,
               };
               openClawChatRunIdentities.ensure(runContext);
-              chatRunContexts.set(providerRunId, runContext);
-            }
-            if (providerRunId && isStreamingState && openClawChatRunIdentities.isTerminal(opts.gatewayId, providerRunId)) {
-              return;
+              setChatRunContext(providerRunId, runContext);
             }
             if (providerRunId && isTerminalState) {
               openClawChatRunIdentities.markTerminal(opts.gatewayId, providerRunId);
             }
             const canonicalRunId = runContext?.canonicalRunId ?? explicitCanonicalRunId ?? providerRunId;
             const resolvedSessionKey = sessionKey ?? runContext?.sessionKey;
-            const currentText = extractChatText(normalizedPayload);
-            const role = extractChatRole(normalizedPayload);
-            const runSnapshotKey = assistantSnapshotKey(canonicalRunId, resolvedSessionKey);
+            if (isTerminalState && runContext && canonicalRunId && resolvedSessionKey) {
+              void markOpenClawActiveRunTerminal({
+                gatewayId: opts.gatewayId,
+                sessionKey: resolvedSessionKey,
+                sourceRunId: canonicalRunId,
+              }).catch((error) => {
+                console.warn(`[relay] failed to mark OpenClaw run terminal: ${String(error)}`);
+              });
+            }
+            const replyMessageId = role === "assistant" && canonicalRunId
+              ? assistantReplyMessageId(normalizedPayload, canonicalRunId)
+              : undefined;
+            const chatLineage = extractChatLineage(normalizedPayload);
+            const runSnapshotKey = assistantSnapshotKey(canonicalRunId, resolvedSessionKey, replyMessageId);
+            // OpenClaw's message tool may emit several independent assistant
+            // replies after a provider-level terminal snapshot. Keep filtering
+            // late stream deltas for the run-level text reply, but let a reply
+            // with its own upstream message/tool/media identity through.
+            if (
+              providerRunId
+              && isStreamingState
+              && openClawChatRunIdentities.isTerminal(opts.gatewayId, providerRunId)
+              && !replyMessageId
+            ) {
+              return;
+            }
             if (isOpenClawHeartbeatText(currentText) || (runContext?.promptText && isOpenClawHeartbeatText(runContext.promptText))) {
               if (providerRunId && (state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted")) {
                 openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
@@ -710,6 +800,67 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               }
               if (runSnapshotKey) {
                 assistantSnapshots.clear(runSnapshotKey);
+              }
+              return;
+            }
+            // A roleless error/abort is still a terminal lifecycle signal when
+            // it belongs to a previously registered provider run. Its identity
+            // comes from that run context; never infer it from the payload
+            // text. A roleless empty final is lifecycle-only and leaves source
+            // rows to the transcript/source-commit watcher. Text-bearing
+            // roleless deltas/finals remain rejected user/source echoes.
+            if (role !== "assistant") {
+              if (!runContext || !providerRunId || !canonicalRunId || !resolvedSessionKey) {
+                return;
+              }
+              if (state === "error" || state === "failed" || state === "fail" || state === "aborted") {
+                chatSendDedupe.scheduleForRun(providerRunId, 100);
+                chatRunContexts.delete(providerRunId);
+                runAfterAssistantSnapshot(runSnapshotKey, true, async () => {
+                  await publishAndSendGatewayEvent(
+                    event,
+                    mergeCanonicalChatPayload(
+                      normalizedPayload,
+                      buildMobileAssistantErrorPayload({
+                        run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
+                        errorMessage: extractChatErrorMessage(normalizedPayload),
+                        includeTimelineEvents: true,
+                      }),
+                    ),
+                    shouldPublishOffice,
+                    runContext?.promptText,
+                  );
+                  openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
+                }, true);
+                return;
+              }
+              if (state === "final" && !currentText) {
+                chatRunContexts.delete(providerRunId);
+                const lifecyclePayload = normalizedPayload && typeof normalizedPayload === "object" && !Array.isArray(normalizedPayload)
+                  ? (() => {
+                      const payload = { ...(normalizedPayload as Record<string, unknown>) };
+                      delete payload.message;
+                      delete payload.content;
+                      delete payload.text;
+                      delete payload.delta;
+                      return payload;
+                    })()
+                  : normalizedPayload;
+                runAfterAssistantSnapshot(runSnapshotKey, true, async () => {
+                  await publishAndSendGatewayEvent(
+                    event,
+                    mergeCanonicalChatPayload(
+                      lifecyclePayload,
+                      buildMobileAssistantCompletedPayload({
+                        run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
+                        includeTimelineEvents: true,
+                      }),
+                    ),
+                    shouldPublishOffice,
+                    runContext?.promptText,
+                  );
+                  openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
+                }, true);
               }
               return;
             }
@@ -725,9 +876,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               if (state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted") {
                 chatSendDedupe.scheduleForRun(providerRunId, 100);
               }
-              if (role === "assistant" && (state === "delta" || state === "final" || state === "error" || state === "failed" || state === "fail")) {
-                clearChatFallback(providerRunId);
-              }
               if (state === "delta" || state === "streaming" || state === "in_progress") {
                 const previousText = openClawChatRunIdentities.accumulatedText(opts.gatewayId, providerRunId);
                 const bufferedText = appendUniqueSuffix(previousText, currentText);
@@ -741,6 +889,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                           seq: resolveChatPayloadSeq(normalizedPayload),
                           timestampMs: resolveChatPayloadTimestamp(normalizedPayload),
                           delta: bufferedText,
+                          ...chatLineage,
                           includeTimelineEvents: true,
                         }),
                       )
@@ -775,39 +924,75 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               return;
             }
 
-            if (state === "final" && resolvedSessionKey) {
+            if (state === "final" && resolvedSessionKey && role === "assistant") {
               scheduleContextUsageRefresh(resolvedSessionKey, 450);
               const bufferedText = providerRunId
                 ? openClawChatRunIdentities.accumulatedText(opts.gatewayId, providerRunId)
                 : "";
               const resolvedText = appendUniqueSuffix(bufferedText, currentText);
               if (resolvedText.trim() && !isOpenClawMediaDisplayPlaceholder(resolvedText)) {
-                runAfterAssistantSnapshot(runSnapshotKey, true, async () => {
+                // A provider-level terminal without a reply identity stays
+                // open for later text-only delivery terminals. Each such
+                // terminal re-reads the current turn history and reconciles
+                // the canonical media snapshot deterministically.
+                runAfterAssistantSnapshot(runSnapshotKey, Boolean(replyMessageId), async () => {
                   let outgoingPayload: unknown;
                   const directContentBlocks = nonTextContentBlocks(normalizedPayload);
-                  if (providerRunId && runContext && directContentBlocks.length === 0) {
+                  if (providerRunId && runContext) {
                     try {
                       const history = await withTimeout(
                         requestChatHistoryFromClawConnect({ sessionKey: resolvedSessionKey, limit: 10 }),
                         CHAT_HISTORY_MEDIA_ENRICHMENT_TIMEOUT_MS,
                         "chat.history media enrichment",
                       );
-                      const outcome = extractHistoryOutcome(history, runContext);
-                      const historyContentBlocks = outcome?.kind === "final"
-                        ? nonTextContentBlocksFromHistory(outcome.message)
+                      let outcome = extractHistoryOutcome(history, runContext, currentText);
+                      // A message-tool delivery can reach the gateway as a
+                      // text-only terminal before OpenClaw commits its
+                      // display-media projection. Always inspect the whole
+                      // matched turn, not just the selected outcome row, so
+                      // either a direct image or a later delivery row can
+                      // keep the terminal media-complete.
+                      let historyContentBlocks = outcome?.kind === "final"
+                        ? hasCanonicalProjectionV3Snapshot(history)
+                          ? mergeNonTextContentBlocks(
+                              nonTextContentBlocksFromHistory(outcome.message),
+                              extractExplicitParentMediaContent(history, outcome.message),
+                            )
+                          : extractHistoryMediaContent(history, runContext)
                         : [];
                       if (outcome?.kind === "final" && historyContentBlocks.length > 0) {
+                        // A text terminal is not guaranteed to carry the
+                        // message-tool identity. Recover it from the stable
+                        // transcript delivery row before building timeline
+                        // events; otherwise every sidecar in the run is
+                        // projected onto assistant-${runId}.
+                        const historyReplyMessageId = assistantHistoryReplyMessageId(
+                          outcome.message,
+                          canonicalRunId,
+                        );
+                        const mergedContentBlocks = mergeNonTextContentBlocks(
+                          directContentBlocks,
+                          historyContentBlocks,
+                        );
                         const basePayload = mergeCanonicalChatPayload(
                           normalizedPayload,
                           buildMobileAssistantFinalPayload({
                             run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
                             text: resolvedText,
-                            contentBlocks: historyContentBlocks,
+                            contentBlocks: mergedContentBlocks,
+                            ...chatLineage,
+                            ...((replyMessageId ?? historyReplyMessageId)
+                              ? { messageId: replyMessageId ?? historyReplyMessageId }
+                              : {}),
                             includeTimelineEvents: true,
                             ...mobileAssistantUsageFromPayload(normalizedPayload),
                           }),
                         );
-                        outgoingPayload = buildFinalPayloadFromHistoryOutcome(basePayload, outcome);
+                        outgoingPayload = buildFinalPayloadFromHistoryOutcome(
+                          basePayload,
+                          outcome,
+                          [{ type: "text", text: outcome.text }, ...mergedContentBlocks],
+                        );
                       }
                     } catch (error) {
                       // Media enrichment is opportunistic. The final text event
@@ -823,6 +1008,8 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                             run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
                             text: resolvedText,
                             contentBlocks: directContentBlocks,
+                            ...chatLineage,
+                            ...(replyMessageId ? { messageId: replyMessageId } : {}),
                             includeTimelineEvents: true,
                             ...mobileAssistantUsageFromPayload(normalizedPayload),
                           }),
@@ -832,7 +1019,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                   await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
                   if (providerRunId) {
                     openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
-                    chatRunContexts.delete(providerRunId);
                   }
                 }, Boolean(providerRunId));
                 return;
@@ -846,33 +1032,42 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 "chat.history",
               )
                 .then(async (history) => {
-                  let outcome = runContext ? extractHistoryOutcome(history, runContext) : null;
-                  // Retry once if OpenClaw has emitted final before the transcript is committed.
-                  if (!outcome || isOpenClawMediaDisplayPlaceholder(outcome.kind === "final" ? outcome.text : "")) {
-                    await new Promise((resolve) => setTimeout(resolve, CHAT_HISTORY_FINAL_RETRY_DELAY_MS));
-                    const retryHistory = await withTimeout(fetchHistory(), CHAT_HISTORY_FETCH_TIMEOUT_MS, "chat.history retry");
-                    outcome = runContext ? extractHistoryOutcome(retryHistory, runContext) : null;
-                  }
+                  // The terminal event is the only completion signal. Do not
+                  // turn transcript visibility into a wall-clock race: a
+                  // later provider terminal/history page will re-enter this
+                  // path and reconcile the newly committed source rows.
+                  const outcome = runContext ? extractHistoryOutcome(history, runContext, currentText) : null;
                   if (providerRunId && outcome) {
-                    chatRunContexts.delete(providerRunId);
                   }
                   if (outcome?.kind === "final") {
-                    if (isOpenClawMediaDisplayPlaceholder(outcome.text) && providerRunId && runContext) {
-                      scheduleChatHistoryFallback(providerRunId, runContext, 0);
-                      return;
-                    }
+                    const historyReplyMessageId = providerRunId
+                      ? assistantHistoryReplyMessageId(outcome.message, canonicalRunId)
+                      : undefined;
                     const basePayload = providerRunId
                       ? buildMobileAssistantFinalPayload({
                           run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
                           text: outcome.text,
-                          contentBlocks: nonTextContentBlocksFromHistory(outcome.message),
+                          ...chatLineage,
+                          contentBlocks: runContext
+                            ? hasCanonicalProjectionV3Snapshot(history)
+                              ? mergeNonTextContentBlocks(
+                                  nonTextContentBlocksFromHistory(outcome.message),
+                                  extractExplicitParentMediaContent(history, outcome.message),
+                                )
+                              : extractHistoryMediaContent(history, runContext)
+                            : nonTextContentBlocksFromHistory(outcome.message),
+                          ...((replyMessageId ?? historyReplyMessageId)
+                            ? { messageId: replyMessageId ?? historyReplyMessageId }
+                            : {}),
                           includeTimelineEvents: true,
                           ...mobileAssistantUsageFromPayload(normalizedPayload),
                         })
                       : normalizedPayload;
                     const outgoingPayload = buildFinalPayloadFromHistoryOutcome(basePayload, outcome);
                     await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
-                    if (providerRunId) openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
+                    if (providerRunId) {
+                      openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
+                    }
                     return;
                   }
                   if (outcome?.kind === "error") {
@@ -894,21 +1089,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     if (providerRunId) openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
                     return;
                   }
-                  if (providerRunId && runContext) {
-                    scheduleChatHistoryFallback(providerRunId, runContext, 0);
-                    return;
-                  }
                   await publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice);
                 })
                 .catch((err) => {
                   console.error(`[relay] chat.history fetch failed: ${err}`);
-                  if (providerRunId && runContext) {
-                    scheduleChatHistoryFallback(providerRunId, runContext, 0);
-                    return;
-                  }
                   void publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice);
                 });
-              runAfterAssistantSnapshot(runSnapshotKey, true, publishHistoryTerminal, Boolean(providerRunId));
+              runAfterAssistantSnapshot(runSnapshotKey, Boolean(replyMessageId), publishHistoryTerminal, Boolean(providerRunId));
               return;
             }
 
@@ -1101,6 +1288,22 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           // thinking/tool/text event cannot win the race with this request.
           await ensureSessionMessagesSubscribed(commandSessionKey);
         }
+        const sourceRunIdForState = commandMethod === "chat.send"
+          ? normalizeOpenClawMobileRunId(paramsRecord?.idempotencyKey)
+            ?? normalizeOpenClawMobileRunId(voiceInputRun?.runId)
+            ?? requestId
+          : normalizeOpenClawMobileRunId(paramsRecord?.runId)
+            ?? normalizeOpenClawMobileRunId(paramsRecord?.idempotencyKey)
+            ?? requestId;
+        if ((commandMethod === "chat.send" || commandMethod === "agent") && sourceRunIdForState) {
+          await recordOpenClawActiveRun({
+            gatewayId: opts.gatewayId,
+            sessionKey: typeof paramsRecord?.sessionKey === "string" && paramsRecord.sessionKey.trim()
+              ? paramsRecord.sessionKey.trim()
+              : sessionDefaults.mainSessionKey,
+            sourceRunId: sourceRunIdForState,
+          });
+        }
         const registerIdentity = (result: unknown): OpenClawChatRunIdentity | undefined => {
           const resultRecord = result && typeof result === "object" && !Array.isArray(result)
             ? result as Record<string, unknown>
@@ -1129,7 +1332,15 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               : undefined,
           };
           openClawChatRunIdentities.register(identity);
-          chatRunContexts.set(identity.providerRunId, identity);
+          setChatRunContext(identity.providerRunId, identity);
+          void updateOpenClawActiveRunProviderId({
+            gatewayId: opts.gatewayId,
+            sessionKey: identity.sessionKey,
+            sourceRunId: identity.canonicalRunId,
+            providerRunId: identity.providerRunId,
+          }).catch((error) => {
+            console.warn(`[relay] failed to update OpenClaw active run provider id: ${String(error)}`);
+          });
           return identity;
         };
         let identity: OpenClawChatRunIdentity | undefined;
@@ -1178,9 +1389,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 typeof paramsRecord?.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
                   ? paramsRecord.sessionKey.trim()
                   : sessionDefaults.mainSessionKey;
-              if (providerRunId && identity) {
-                scheduleChatHistoryFallback(providerRunId, identity);
-              }
+              ensureSourceCommitWatcher(sessionKey);
               if (commandMethod === "chat.send" && chatSendDedupeRequest) {
                 chatSendDedupe.register(chatSendDedupeRequest, providerRunId);
               }
@@ -1231,10 +1440,8 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       opts.onDisconnected?.();
       gatewayClient?.stop();
       gatewayClient = null;
-      for (const timer of chatFallbacks.values()) {
-        clearTimeout(timer);
-      }
-      chatFallbacks.clear();
+      for (const watcher of sourceCommitWatchers.values()) watcher.close();
+      sourceCommitWatchers.clear();
       chatSendDedupe.clearAll();
       for (const timer of contextUsageRefreshes.values()) {
         clearTimeout(timer);

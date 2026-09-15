@@ -5,6 +5,7 @@ import {
   buildCanonicalMobileAssistantErrorPayload,
   buildCanonicalMobileAssistantFinalPayload,
   buildCanonicalMobileAssistantStreamingPayload,
+  buildMobileAssistantCompletedPayload,
   buildMobileAssistantDeltaPayload,
   buildMobileAssistantErrorPayload,
   buildMobileAssistantFinalPayload,
@@ -313,6 +314,15 @@ test("mobile assistant builders can include canonical timeline events during mig
   assert.equal(finalPayload.timelineEvents?.[0]?.eventType, "message.completed");
   assert.equal(finalPayload.timelineEvents?.[1]?.eventType, "run.completed");
   assert.equal(finalPayload.timelineEvents?.[0]?.turnId, "client-run-1");
+  assert.equal(finalPayload.timelineEvents?.[0]?.timelineItemKind, "waiting");
+  assert.equal(finalPayload.timelineEvents?.[0]?.timelineResolvesWaiting, false);
+
+  const lifecycleOnlyPayload = buildMobileAssistantCompletedPayload({
+    run,
+    includeTimelineEvents: true,
+  });
+  assert.equal(lifecycleOnlyPayload.message, undefined);
+  assert.deepEqual(lifecycleOnlyPayload.timelineEvents?.map((event) => event.eventType), ["run.completed"]);
 
   const errorPayload = buildMobileAssistantErrorPayload({
     run,
