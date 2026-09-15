@@ -554,13 +554,20 @@ function normalizeHistoryText(role: string, text: string): string {
 
 function parseClawConnectMobileTurnMetadata(text: string): ClawConnectMobileTurnMetadata {
   // The bridge appends this controlled metadata block after the user text;
-  // the final marker is authoritative and prevents prompt text from spoofing
-  // a preceding turn identity.
-  const markerIndex = text.lastIndexOf(CLAWCONNECT_MOBILE_TURN_MARKER);
-  if (markerIndex < 0) {
+  // only a complete marker line is authoritative. Instructional prose can
+  // mention the marker name after the block and must not hide its identity.
+  const lines = text.split(/\r?\n/);
+  let markerLineIndex = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (lines[index]?.trim() === CLAWCONNECT_MOBILE_TURN_MARKER) {
+      markerLineIndex = index;
+      break;
+    }
+  }
+  if (markerLineIndex < 0) {
     return {};
   }
-  const metadataBlock = text.slice(markerIndex + CLAWCONNECT_MOBILE_TURN_MARKER.length);
+  const metadataBlock = lines.slice(markerLineIndex + 1).join("\n");
   return {
     sourceRunId: metadataValue(metadataBlock, "sourceRunId"),
     sessionKey: metadataValue(metadataBlock, "sessionKey"),

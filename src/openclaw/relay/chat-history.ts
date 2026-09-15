@@ -209,8 +209,14 @@ function readOpenClawSqliteChatHistory(
       WHERE session_id = ?
       ORDER BY seq ASC
     `).all(sessionId) as Array<{ seq?: unknown; event_json?: unknown }>;
+    const visibleParentIds = resolveSqliteVisibleParentIds(rows);
     const messages = rows
-      .map((row) => sqliteTranscriptHistoryMessage(row, sessionId, params.projectionVersion === 3))
+      .map((row) => sqliteTranscriptHistoryMessage(
+        row,
+        sessionId,
+        params.projectionVersion === 3,
+        visibleParentIds,
+      ))
       .filter((message): message is HistoryMessage => Boolean(message));
     if (messages.length === 0 && rows.length === 0) return null;
 
@@ -750,6 +756,7 @@ function sqliteTranscriptHistoryMessage(
   row: { seq?: unknown; event_json?: unknown },
   sessionId: string,
   strictProjectionV3 = false,
+  visibleParentIds?: ReadonlyMap<string, string>,
 ): HistoryMessage | null {
   const seq = typeof row.seq === "number" && Number.isFinite(row.seq) && row.seq > 0
     ? Math.round(row.seq)
@@ -781,9 +788,67 @@ function sqliteTranscriptHistoryMessage(
     message.timestamp = timestamp;
     message.createdAt = cleanHistoryString(message.createdAt) ?? new Date(timestamp).toISOString();
   }
-  const parentId = cleanHistoryString(event.parentId) ?? cleanHistoryString(message.parentId);
+  const parentId = (sourceMessageId ? visibleParentIds?.get(sourceMessageId) : undefined)
+    ?? cleanHistoryString(event.parentId)
+    ?? cleanHistoryString(message.parentId);
   if (parentId) message.parentId = parentId;
   return message;
+}
+
+/**
+ * SQLite stores every transcript event in one parent graph, including hidden
+ * custom/thinking rows. Collapse only those hidden hops so visible messages
+ * retain deterministic source lineage and can inherit the originating mobile
+ * run id. Distinct message identities remain untouched.
+ */
+function resolveSqliteVisibleParentIds(
+  rows: Array<{ seq?: unknown; event_json?: unknown }>,
+): Map<string, string> {
+  type SqliteEventNode = {
+    eventId: string;
+    parentId?: string;
+    visibleMessageId?: string;
+  };
+
+  const nodes = new Map<string, SqliteEventNode>();
+  for (const row of rows) {
+    if (typeof row.event_json !== "string") continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(row.event_json);
+    } catch {
+      continue;
+    }
+    if (!isRecord(event)) continue;
+    const eventId = cleanHistoryString(event.id);
+    if (!eventId) continue;
+    const visibleMessageId = event.type === "message" && isRecord(event.message)
+      ? cleanHistoryString(event.message.id) ?? eventId
+      : undefined;
+    nodes.set(eventId, {
+      eventId,
+      ...(cleanHistoryString(event.parentId) ? { parentId: cleanHistoryString(event.parentId) } : {}),
+      ...(visibleMessageId ? { visibleMessageId } : {}),
+    });
+  }
+
+  const resolved = new Map<string, string>();
+  for (const node of nodes.values()) {
+    if (!node.visibleMessageId || !node.parentId) continue;
+    let parentId: string | undefined = node.parentId;
+    const visited = new Set<string>();
+    while (parentId && !visited.has(parentId)) {
+      visited.add(parentId);
+      const parent = nodes.get(parentId);
+      if (!parent) break;
+      if (parent.visibleMessageId) {
+        resolved.set(node.eventId, parent.visibleMessageId);
+        break;
+      }
+      parentId = parent.parentId;
+    }
+  }
+  return resolved;
 }
 
 function prepareTranscriptHistoryMessages(

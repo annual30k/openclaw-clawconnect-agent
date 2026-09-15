@@ -20,6 +20,7 @@ type FixtureMessage = {
   role: string;
   content?: string;
   tool_name?: string;
+  tool_calls?: string;
 };
 
 const STATE_DB_INSERT_SCRIPT = String.raw`
@@ -38,8 +39,8 @@ conn.execute(
 )
 for index, row in enumerate(rows, start=1):
     conn.execute(
-        "INSERT INTO messages (session_id, role, content, tool_name, timestamp, active) VALUES (?, ?, ?, ?, ?, 1)",
-        (session_id, row.get("role", ""), row.get("content"), row.get("tool_name"), index),
+        "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, timestamp, active) VALUES (?, ?, ?, ?, ?, ?, 1)",
+        (session_id, row.get("role", ""), row.get("content"), row.get("tool_name"), row.get("tool_calls"), index),
     )
 conn.commit()
 conn.close()
@@ -82,6 +83,42 @@ function terminalSendFileResult(sourceRunId: string, fileId: string): FixtureMes
       exit_code: 0,
       error: null,
     }),
+  };
+}
+
+function assistantTerminalCommand(command: string): FixtureMessage {
+  return {
+    role: "assistant",
+    tool_calls: JSON.stringify([{
+      type: "function",
+      function: {
+        name: "terminal",
+        arguments: JSON.stringify({ command }),
+      },
+    }]),
+  };
+}
+
+function assistantTypedSendFile(path: string): FixtureMessage {
+  return {
+    role: "assistant",
+    tool_calls: JSON.stringify([{
+      type: "function",
+      function: {
+        name: "clawconnect_send_file",
+        arguments: JSON.stringify({ path }),
+      },
+    }]),
+  };
+}
+
+function typedSendFileResult(sourceRunId: string, fileId: string, ok = true): FixtureMessage {
+  return {
+    role: "tool",
+    tool_name: "clawconnect_send_file",
+    content: JSON.stringify(ok
+      ? { ok: true, fileId, sourceRunId, status: "completed" }
+      : { ok: false, error: "clawconnect_mobile_route_unavailable" }),
   };
 }
 
@@ -247,13 +284,36 @@ test("zero, one, and two typed receipts produce safe or exact host-generated out
     assert.deepEqual(ordinaryFake, { output: "普通回答" });
     assert.notEqual(ordinaryFake.output, "已发送两张图片，请查收。");
 
-    writeFixtureMessages(dbPath, "output-no-receipt", [mobileUser("任意语言", "run-no-receipt")]);
-    const fakeSuccess = await verifyHermesFileTransferIfRequired({
+    writeFixtureMessages(dbPath, "output-ordinary-no-outcome", [mobileUser("普通聊天", "run-ordinary-no-outcome")]);
+    const ordinaryWithoutOutcome = await verifyHermesFileTransferIfRequired({
       plan: { preloadFileTransferSkill: true, fileTransferMode: undefined },
-      gatewayId: "gw_test", sessionKey: "mobile-test", sessionId: "output-no-receipt", sourceRunId: "run-no-receipt", output: "已发送两张图片，请查收。",
+      gatewayId: "gw_test", sessionKey: "mobile-test", sessionId: "output-ordinary-no-outcome", sourceRunId: "run-ordinary-no-outcome", output: "你好，有什么可以帮你？",
     });
-    assert.equal(fakeSuccess.verifiedFileTransferCount, 0);
-    assert.match(fakeSuccess.output ?? "", /文件尚未发送/);
+    assert.deepEqual(ordinaryWithoutOutcome, {});
+
+    writeFixtureMessages(dbPath, "output-unverified-attempt", [
+      mobileUser("任意语言", "run-unverified-attempt"),
+      assistantTerminalCommand("/Users/test/bin/clawconnect send-file --profile hermes --json /tmp/reply.png"),
+      { role: "tool", tool_name: "terminal", content: JSON.stringify({ output: "upload failed", exit_code: 1, error: null }) },
+    ]);
+    const unverifiedAttempt = await verifyHermesFileTransferIfRequired({
+      plan: { preloadFileTransferSkill: true, fileTransferMode: undefined },
+      gatewayId: "gw_test", sessionKey: "mobile-test", sessionId: "output-unverified-attempt", sourceRunId: "run-unverified-attempt", output: "已发送两张图片，请查收。",
+    });
+    assert.equal(unverifiedAttempt.verifiedFileTransferCount, 0);
+    assert.match(unverifiedAttempt.output ?? "", /文件尚未发送/);
+
+    writeFixtureMessages(dbPath, "output-typed-failure", [
+      mobileUser("把图片发过来", "run-typed-failure"),
+      assistantTypedSendFile("/tmp/reply.png"),
+      typedSendFileResult("run-typed-failure", "file_unused", false),
+    ]);
+    const typedFailure = await verifyHermesFileTransferIfRequired({
+      plan: { preloadFileTransferSkill: true, fileTransferMode: undefined },
+      gatewayId: "gw_test", sessionKey: "mobile-test", sessionId: "output-typed-failure", sourceRunId: "run-typed-failure", output: "发送失败。",
+    });
+    assert.equal(typedFailure.verifiedFileTransferCount, 0);
+    assert.match(typedFailure.output ?? "", /文件尚未发送/);
 
     writeFixtureMessages(dbPath, "output-attempted", [mobileUser("任意语言", "run-attempted"), terminalOutcome("run-attempted", "attempted")]);
     const attempted = await verifyHermesFileTransferIfRequired({
@@ -270,6 +330,17 @@ test("zero, one, and two typed receipts produce safe or exact host-generated out
     });
     assert.equal(one.verifiedFileTransferCount, 1);
     assert.equal(one.output, "已发送 1 个文件，请查收。");
+
+    writeFixtureMessages(dbPath, "output-typed-one", [
+      mobileUser("把图片发过来", "run-typed-one"),
+      assistantTypedSendFile("/tmp/reply.png"),
+      typedSendFileResult("run-typed-one", "file_typedone"),
+    ]);
+    const typedOne = await verifyHermesFileTransferIfRequired({
+      plan: { preloadFileTransferSkill: true, fileTransferMode: undefined },
+      gatewayId: "gw_test", sessionKey: "mobile-test", sessionId: "output-typed-one", sourceRunId: "run-typed-one", output: "图片已经发送。",
+    });
+    assert.deepEqual(typedOne, { verifiedFileTransferCount: 1, output: "已发送 1 个文件，请查收。" });
 
     writeFixtureMessages(dbPath, "output-two", [mobileUser("把图片发过来", "run-two"), terminalSendFileResult("run-two", "file_twoa"), terminalSendFileResult("run-two", "file_twob")]);
     const two = await verifyHermesFileTransferIfRequired({

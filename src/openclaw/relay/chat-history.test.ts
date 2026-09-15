@@ -325,6 +325,92 @@ test("SQLite transcript history preserves the Control UI sequence for asynchrono
   }
 });
 
+test("SQLite projection v3 carries a mobile run id across hidden first-turn events", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "clawconnect-chat-history-sqlite-lineage-"));
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  const sessionKey = "agent:main:mobile-first-turn";
+  const sessionId = "sqlite-first-turn-session";
+  const runId = "wx_1789454924396_90d3l1a9";
+  const databasePath = join(stateDir, "agents", "main", "agent", "openclaw-agent.sqlite");
+  await mkdir(join(stateDir, "agents", "main", "agent"), { recursive: true });
+
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec(`
+      CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, current_session_id TEXT NOT NULL);
+      CREATE TABLE transcript_events (session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL);
+    `);
+    database.prepare("INSERT INTO session_nodes (session_key, current_session_id) VALUES (?, ?)")
+      .run(sessionKey, sessionId);
+    const insertEvent = database.prepare(
+      "INSERT INTO transcript_events (session_id, seq, event_json) VALUES (?, ?, ?)",
+    );
+    insertEvent.run(sessionId, 1, JSON.stringify({
+      type: "message",
+      id: "source-user",
+      message: { role: "user", content: "你好", idempotencyKey: `${runId}:user` },
+    }));
+    insertEvent.run(sessionId, 2, JSON.stringify({
+      type: "thinking_level_change",
+      id: "source-thinking",
+      parentId: "source-user",
+    }));
+    insertEvent.run(sessionId, 3, JSON.stringify({
+      type: "custom",
+      id: "source-custom",
+      parentId: "source-thinking",
+    }));
+    insertEvent.run(sessionId, 4, JSON.stringify({
+      type: "message",
+      id: "source-assistant",
+      parentId: "source-custom",
+      message: { role: "assistant", content: "你好，有什么可以帮忙的？" },
+    }));
+  } finally {
+    database.close();
+  }
+
+  try {
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    const page = await readOpenClawTranscriptChatHistory({
+      sessionKey,
+      projectionGatewayId: "gw-openclaw",
+      projectionVersion: 3,
+      limit: 20,
+    }, DEFAULT_GATEWAY_SESSION_DEFAULTS);
+    const messages = page?.timelineSnapshot?.messages ?? [];
+
+    assert.equal(messages.length, 2);
+    assert.deepEqual(messages.map((message) => ({
+      sourceMessageId: message.sourceMessageId,
+      parentSourceMessageId: message.parentSourceMessageId,
+      runId: message.runId,
+      turnId: message.turnId,
+      idempotencyKey: message.idempotencyKey,
+    })), [
+      {
+        sourceMessageId: "source-user",
+        parentSourceMessageId: undefined,
+        runId: `${runId}:user`,
+        turnId: `${runId}:user`,
+        idempotencyKey: `${runId}:user`,
+      },
+      {
+        sourceMessageId: "source-assistant",
+        parentSourceMessageId: "source-user",
+        runId,
+        turnId: runId,
+        idempotencyKey: runId,
+      },
+    ]);
+    assert.notEqual(messages[0]?.canonicalMessageId, messages[1]?.canonicalMessageId);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("SQLite transcript history resolves the qualified main session through its main alias", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "clawconnect-chat-history-sqlite-alias-"));
   const previousStateDir = process.env.OPENCLAW_STATE_DIR;

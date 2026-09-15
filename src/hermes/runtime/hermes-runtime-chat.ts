@@ -46,7 +46,7 @@ import {
   readHermesSessionMessages,
   rewindHermesSessionAfterActiveHead,
 } from "./hermes-runtime-state-db.js";
-import { tryRunHermesApiChat } from "./hermes-runtime-api-client.js";
+import { ensureHermesApiSessionForMobileRoute, tryRunHermesApiChat } from "./hermes-runtime-api-client.js";
 import { resolveHermesPreloadedSkillContext } from "./hermes-runtime-preloaded-skills.js";
 import {
   createHermesToolLogWatcher,
@@ -64,6 +64,10 @@ import {
   type PendingHermesFileTransfer,
 } from "./hermes-file-transfer-state.js";
 import type { HermesFileTransferOutcome } from "../../commands/hermes-file-transfer-outcome.js";
+import {
+  clearHermesMobileFileRoute,
+  registerHermesMobileFileRoute,
+} from "./hermes-mobile-file-route-store.js";
 
 export { selectHermesSessionForCompletedChat } from "./hermes-runtime-history-completion.js";
 export { latestTerminalAssistantReplyFromHermesExport } from "./hermes-runtime-history-completion.js";
@@ -191,6 +195,18 @@ async function runHermesChatPrepared(params: {
   const preloadedSkillContext = preparationPlan.preloadFileTransferSkill
     ? await resolveHermesPreloadedSkillContext({ forceFileTransfer: true })
     : EMPTY_PRELOADED_SKILL_CONTEXT;
+  if (preparationPlan.preloadFileTransferSkill && !resume && params.sourceRunId) {
+    const ensuredSessionId = await ensureHermesApiSessionForMobileRoute(params.sessionKey);
+    if (ensuredSessionId) {
+      resume = ensuredSessionId;
+      await rememberHermesSession(params.sessionKey, {
+        sessionKey: params.sessionKey,
+        hermesSessionId: ensuredSessionId,
+        displayName: params.sessionKey,
+        kind: "hermes",
+      });
+    }
+  }
   try {
     // File delivery is fail-closed and must be backed by the local
     // clawconnect send-file tool.  The API stream publishes assistant deltas
@@ -281,12 +297,15 @@ async function runHermesChatPrepared(params: {
     : undefined;
   let rawOutput: string;
   try {
-    rawOutput = await runHermesChatOnce({
+    rawOutput = await runHermesChatOnceWithMobileFileRoute({
       message: params.preparedMessage.cliMessage,
       sessionKey: params.sessionKey,
       resume,
       context: params.context,
       preloadedSkillArgs: preloadedSkillContext.cliArgs,
+      enableFileTransferRoute: preparationPlan.preloadFileTransferSkill,
+      gatewayId: params.context.gatewayId ?? "clawconnect",
+      sourceRunId: params.sourceRunId,
       historyCompletion: () => detectHermesHistoryCompletion({
         beforeSessions,
         resume,
@@ -312,11 +331,14 @@ async function runHermesChatPrepared(params: {
     await forgetHermesSession(params.sessionKey, mappedResume);
     resume = undefined;
     cliActiveHead = undefined;
-    rawOutput = await runHermesChatOnce({
+    rawOutput = await runHermesChatOnceWithMobileFileRoute({
       message: params.preparedMessage.cliMessage,
       sessionKey: params.sessionKey,
       context: params.context,
       preloadedSkillArgs: preloadedSkillContext.cliArgs,
+      enableFileTransferRoute: preparationPlan.preloadFileTransferSkill,
+      gatewayId: params.context.gatewayId ?? "clawconnect",
+      sourceRunId: params.sourceRunId,
       historyCompletion: () => detectHermesHistoryCompletion({
         beforeSessions,
         sessionKey: params.sessionKey,
@@ -490,6 +512,29 @@ async function runHermesChatOnce(params: {
   return params.context.publishEvent
     ? await runHermesChatStreaming(args, params.sessionKey, params.context, runId, env, params.historyCompletion)
     : runHermes(args, CHAT_TIMEOUT_MS, env);
+}
+
+async function runHermesChatOnceWithMobileFileRoute(params: Parameters<typeof runHermesChatOnce>[0] & {
+  enableFileTransferRoute: boolean;
+  gatewayId: string;
+  sourceRunId?: string;
+}): Promise<string> {
+  const hermesSessionId = params.resume?.trim();
+  const sourceRunId = params.sourceRunId?.trim();
+  if (!params.enableFileTransferRoute || !hermesSessionId || !sourceRunId) {
+    return await runHermesChatOnce(params);
+  }
+  await registerHermesMobileFileRoute({
+    hermesSessionId,
+    gatewayId: params.gatewayId,
+    sessionKey: params.sessionKey,
+    sourceRunId,
+  });
+  try {
+    return await runHermesChatOnce(params);
+  } finally {
+    await clearHermesMobileFileRoute(hermesSessionId, sourceRunId);
+  }
 }
 
 async function runHermesChatStreaming(
@@ -1062,13 +1107,67 @@ export async function verifyHermesFileTransferIfRequired(params: {
       output: HERMES_FILE_TRANSFER_NOT_SENT_MESSAGE,
     };
   }
-  // A mobile turn with the typed file capability must publish either a typed
-  // ordinary/clarification/attempted/cancelled outcome or a send-file receipt.
-  // Without one, assistant prose such as “已发送” is never accepted as fact.
-  return {
-    verifiedFileTransferCount: 0,
-    output: HERMES_FILE_TRANSFER_NOT_SENT_MESSAGE,
-  };
+  if (params.sourceRunId && hasHermesSendFileAttempt(messages, params.sourceRunId)) {
+    return {
+      verifiedFileTransferCount: 0,
+      output: HERMES_FILE_TRANSFER_NOT_SENT_MESSAGE,
+    };
+  }
+  // File-transfer capability is available on every mobile turn, but capability
+  // alone does not turn ordinary chat into a file operation. Preserve the Host
+  // answer unless this exact turn emitted a typed outcome or actually invoked
+  // the first-party terminal command. This keeps failure closed around a real
+  // send attempt without replacing unrelated Hermes replies.
+  return {};
+}
+
+function hasHermesSendFileAttempt(
+  messages: Array<Record<string, unknown>> | undefined,
+  sourceRunId: string,
+): boolean {
+  const currentIndex = currentHermesTurnIndex(messages, sourceRunId);
+  if (currentIndex < 0 || !messages) return false;
+  for (const message of messages.slice(currentIndex + 1)) {
+    if (normalizeHermesRole(message.role) === "user") break;
+    if (normalizeHermesRole(message.role) !== "assistant") continue;
+    const rawToolCalls = typeof message.tool_calls === "string"
+      ? parseJsonValue(message.tool_calls)
+      : message.tool_calls;
+    if (!Array.isArray(rawToolCalls)) continue;
+    for (const rawToolCall of rawToolCalls) {
+      const toolCall = rawToolCall && typeof rawToolCall === "object" && !Array.isArray(rawToolCall)
+        ? rawToolCall as Record<string, unknown>
+        : undefined;
+      const fn = toolCall?.function && typeof toolCall.function === "object" && !Array.isArray(toolCall.function)
+        ? toolCall.function as Record<string, unknown>
+        : undefined;
+      const functionName = normalizeHermesRole(fn?.name);
+      if (functionName === "clawconnect_send_file") return true;
+      if (functionName !== "terminal") continue;
+      const rawArguments = typeof fn?.arguments === "string"
+        ? parseJsonValue(fn.arguments)
+        : fn?.arguments;
+      const args = rawArguments && typeof rawArguments === "object" && !Array.isArray(rawArguments)
+        ? rawArguments as Record<string, unknown>
+        : undefined;
+      if (typeof args?.command === "string" && isClawConnectSendFileCommand(args.command)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isClawConnectSendFileCommand(command: string): boolean {
+  return /(?:^|[\s;&|])(?:["'][^"']*clawconnect["']|[^\s;&|]*clawconnect)\s+send-file(?:\s|$)/i.test(command);
+}
+
+function parseJsonValue(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Read only first-party terminal outcome records for the exact current turn. */
@@ -1123,13 +1222,23 @@ export function collectHermesFileTransferEvidence(
     if (normalizeHermesRole(message.role) === "user") {
       break;
     }
-    // Only a first-party terminal result is evidence.  A delegate/sub-agent
-    // summary, wrapper output, or a final assistant claim cannot manufacture
-    // an attachment by repeating the command name and a success word.
-    if (normalizeHermesRole(message.role) !== "tool"
-      || normalizeHermesRole(message.tool_name) !== "terminal") {
+    if (normalizeHermesRole(message.role) !== "tool") continue;
+    const toolName = normalizeHermesRole(message.tool_name);
+    if (toolName === "clawconnect_send_file") {
+      const receipt = parseJsonRecord(stringValue(message.content) ?? "");
+      if (receipt?.ok === true
+        && receipt.sourceRunId === sourceRunId
+        && receipt.status === "completed"
+        && typeof receipt.fileId === "string"
+        && /^file_[a-z0-9]+$/i.test(receipt.fileId)) {
+        ids.add(receipt.fileId);
+      }
       continue;
     }
+    // Only the legacy first-party terminal result is additional evidence. A
+    // delegate summary, wrapper output, or assistant claim cannot manufacture
+    // an attachment by repeating the command name and a success word.
+    if (toolName !== "terminal") continue;
     for (const record of terminalResultRecords(message)) {
       if (record.sourceRunId !== sourceRunId
         || record.sourceRole !== "assistant"

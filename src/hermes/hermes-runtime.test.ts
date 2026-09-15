@@ -189,6 +189,70 @@ test("runHermesChat passes stable mobile turn metadata and preloads file-transfe
   }
 });
 
+test("runHermesChat publishes the exact mobile file route only while the mapped Hermes run is active", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hermes-mobile-file-route-run-"));
+  const previousHermesBin = process.env.HERMES_BIN;
+  const previousSessionStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousRouteStore = process.env.CLAWCONNECT_HERMES_MOBILE_FILE_ROUTE_STORE;
+  try {
+    const hermesBin = join(dir, "hermes");
+    const sessionStore = join(dir, "sessions.json");
+    const routeStore = join(dir, "routes.json");
+    const observedRoute = join(dir, "observed-route.json");
+    writeFileSync(hermesBin, [
+      "#!/usr/bin/env node",
+      "const fs = require('fs');",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'skills' && args[1] === 'list') {",
+      "  console.log('│ file-transfer │ productivity │ local │ local │ enabled │');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'list') { process.exit(0); }",
+      "if (args[0] === 'sessions' && args[1] === 'export') {",
+      "  console.log(JSON.stringify({ sessionId: 'route-hermes-session', messages: [] }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'status') { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      `  const store = JSON.parse(fs.readFileSync(${JSON.stringify(routeStore)}, 'utf8'));`,
+      `  fs.writeFileSync(${JSON.stringify(observedRoute)}, JSON.stringify(store.routes['route-hermes-session']));`,
+      "  console.log('route observed');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"));
+    chmodSync(hermesBin, 0o755);
+    process.env.HERMES_BIN = hermesBin;
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = sessionStore;
+    process.env.CLAWCONNECT_HERMES_MOBILE_FILE_ROUTE_STORE = routeStore;
+    await rememberHermesSession("mobile-route-session", {
+      sessionKey: "mobile-route-session",
+      hermesSessionId: "route-hermes-session",
+      kind: "hermes",
+    });
+
+    await runHermesChat(
+      { message: "发送图片", sessionKey: "mobile-route-session" },
+      { requestId: "route-run-1", gatewayId: "gw_route", hermesFileTransferCapability: "cli" },
+    );
+    assert.deepEqual(JSON.parse(readFileSync(observedRoute, "utf8")), {
+      hermesSessionId: "route-hermes-session",
+      gatewayId: "gw_route",
+      sessionKey: "mobile-route-session",
+      sourceRunId: "route-run-1",
+      expiresAt: JSON.parse(readFileSync(observedRoute, "utf8")).expiresAt,
+    });
+    const storeAfterRun = JSON.parse(readFileSync(routeStore, "utf8")) as { routes: Record<string, unknown> };
+    assert.equal(storeAfterRun.routes["route-hermes-session"], undefined);
+  } finally {
+    restoreEnv("HERMES_BIN", previousHermesBin);
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousSessionStore);
+    restoreEnv("CLAWCONNECT_HERMES_MOBILE_FILE_ROUTE_STORE", previousRouteStore);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("runHermesChat starts ordinary text chat without preflight status or skills list", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hermes-ordinary-chat-fast-start-"));
   const previousHermesBin = process.env.HERMES_BIN;
@@ -382,6 +446,7 @@ test("runHermesChatHistory excludes tool-call assistant interims and keeps the t
             "[ClawConnect mobile turn]",
             "sourceRunId: mobile-weather-run",
             "sessionKey: qa-no-cli-stream",
+            "Use [ClawConnect mobile turn] metadata only for attribution.",
           ].join("\n"),
         },
         {

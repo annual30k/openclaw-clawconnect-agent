@@ -233,6 +233,20 @@ async function createHermesApiSession(config: HermesApiConfig, sessionKey: strin
   return sessionId;
 }
 
+export async function ensureHermesApiSessionForMobileRoute(sessionKey: string): Promise<string | undefined> {
+  try {
+    if (resolveHermesRuntimeExecutionMode() !== "api") return undefined;
+    const config = readHermesApiConfig();
+    if (!config || !await isHermesApiHealthy(config)) return undefined;
+    return await createHermesApiSession(config, sessionKey);
+  } catch {
+    // Session precreation only closes the first-turn routing gap. If the API is
+    // temporarily unavailable, the existing CLI compatibility path still owns
+    // the chat and must surface its normal deterministic failure behavior.
+    return undefined;
+  }
+}
+
 async function findExistingHermesApiSessionByTitle(
   config: HermesApiConfig,
   sessionKey: string,
