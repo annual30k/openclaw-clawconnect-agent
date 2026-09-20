@@ -75,6 +75,7 @@ export type SourceCommitObserverOptions<TCursor extends SourceCommit = SourceCom
   readCursor: SourceCommitCursorReader<TCursor> | (() => Promise<TCursor | null>);
   onCommit: (commit: TCursor, previousCommittedThroughSeq: number | undefined) => void | Promise<void>;
   onError?: (error: unknown) => void;
+  initialWatermarkMode?: "latest" | "from_zero";
 };
 
 /**
@@ -89,6 +90,7 @@ export function createSourceCommitObserver<TCursor extends SourceCommit = Source
   let closed = false;
   let running = false;
   let pending = false;
+  let initialWatermarkPending = options.initialWatermarkMode === "latest";
   const latestByScope = new Map<string, number>();
 
   const drain = async (): Promise<void> => {
@@ -103,6 +105,14 @@ export function createSourceCommitObserver<TCursor extends SourceCommit = Source
         } catch (error) {
           options.onError?.(error);
           continue;
+        }
+        if (initialWatermarkPending) {
+          initialWatermarkPending = false;
+          if (cursor) {
+            const scope = sourceCommitScope(cursor);
+            latestByScope.set(scope, cursor.committedThroughSeq);
+            continue;
+          }
         }
         if (!cursor) continue;
         const scope = sourceCommitScope(cursor);

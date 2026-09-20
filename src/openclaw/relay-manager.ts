@@ -9,6 +9,7 @@ import {
   sendRelayJson,
   sendRelayJsonWithWriteConfirmation,
   shouldRetryRelayClose,
+  waitForRelaySocketDrain,
   type RelaySendResult,
 } from "../core/relay/relay-server-connection.js";
 import { handleLocalCommand } from "./handlers/local-handlers.js";
@@ -339,7 +340,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           sessionDefaults = nextDefaults;
         }
         await ensureSessionMessagesSubscribed(sessionDefaults.mainSessionKey);
-        ensureSourceCommitWatcher(sessionDefaults.mainSessionKey);
+        ensureSourceCommitWatcher(sessionDefaults.mainSessionKey, "latest");
         const sessionsPayload = await gatewayClient.request("sessions.list", {
           limit: 100,
           includeGlobal: true,
@@ -354,11 +355,12 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             ? (session as { key?: unknown }).key
             : undefined;
           if (typeof sessionKey !== "string" || !sessionKey.trim()) continue;
+          if (/(?:^|:)dashboard:/i.test(sessionKey)) continue;
           // Cron jobs can target an agent session other than the default one.
           // Subscribe each known session so their finished replies travel through
           // the same ClawConnect → Relay realtime path as an interactive chat.
           await ensureSessionMessagesSubscribed(sessionKey);
-          ensureSourceCommitWatcher(sessionKey);
+          ensureSourceCommitWatcher(sessionKey, "latest");
           const snapshot = contextUsageSnapshotFromSessionsList(sessionsPayload, sessionKey, sessionDefaults);
           if (!snapshot) continue;
           emitContextUsageSnapshot(snapshot, true);
@@ -603,7 +605,10 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       });
     }
 
-    const ensureSourceCommitWatcher = (sessionKey: string): void => {
+    const ensureSourceCommitWatcher = (
+      sessionKey: string,
+      initialWatermarkMode: "latest" | "from_zero" = "from_zero",
+    ): void => {
       const normalizedSessionKey = explicitOpenClawSessionKey(sessionKey);
       if (!normalizedSessionKey) return;
       const key = `${opts.gatewayId}\u0000${normalizedSessionKey}`;
@@ -618,6 +623,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       );
       const watcher = watchOpenClawSourceCommit({
         databasePath,
+        initialWatermarkMode,
         readCursor: () => readOpenClawSourceCommitCursor({
           sessionKey: normalizedSessionKey,
           projectionVersion: 3,
@@ -638,6 +644,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               "source commit history reconciliation",
             ),
             publish: async ({ sourceCommit: pageSourceCommit, events }) => {
+              await waitForRelaySocketDrain(relayWs, 256 * 1024);
               const deliveryResult = await publishAndSendGatewayEvent(
                 "chat",
                 {
@@ -723,7 +730,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             if (rawSessionKey) {
               const sessionKey = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
               if (typeof sessionKey === "string" && sessionKey.trim()) {
-                ensureSourceCommitWatcher(sessionKey);
+                ensureSourceCommitWatcher(sessionKey, "from_zero");
                 sourceCommitWatchers.get(`${opts.gatewayId}\u0000${sessionKey.trim()}`)?.notify();
               }
             }
@@ -1389,7 +1396,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 typeof paramsRecord?.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
                   ? paramsRecord.sessionKey.trim()
                   : sessionDefaults.mainSessionKey;
-              ensureSourceCommitWatcher(sessionKey);
+              ensureSourceCommitWatcher(sessionKey, "from_zero");
               if (commandMethod === "chat.send" && chatSendDedupeRequest) {
                 chatSendDedupe.register(chatSendDedupeRequest, providerRunId);
               }

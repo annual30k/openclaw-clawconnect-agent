@@ -23,11 +23,13 @@ export function watchOpenClawSourceCommit(options: {
   onCommit: (commit: SourceCommit, previousCommittedThroughSeq: number | undefined) => void | Promise<void>;
   onError?: (error: unknown) => void;
   rescanIntervalMs?: number;
+  initialWatermarkMode?: "latest" | "from_zero";
 }): OpenClawSourceCommitWatcher {
   const observer = createSourceCommitObserver({
     readCursor: options.readCursor,
     onCommit: options.onCommit,
     onError: options.onError,
+    initialWatermarkMode: options.initialWatermarkMode,
   });
   const watchers: FSWatcher[] = [];
   const watchedDirectory = dirname(options.databasePath);

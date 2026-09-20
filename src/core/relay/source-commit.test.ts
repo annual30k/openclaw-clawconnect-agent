@@ -97,3 +97,45 @@ test("source commit acknowledges hidden-only commits without throwing and preser
   assert.equal(observer.lastCommittedThroughSeq(current), 12);
   observer.close();
 });
+
+test("initialWatermarkMode latest suppresses pre-existing history but emits subsequent commits", async () => {
+  let current: ReturnType<typeof commit> | null = commit(50);
+  const emitted: number[] = [];
+  const observer = createSourceCommitObserver({
+    initialWatermarkMode: "latest",
+    readCursor: () => current,
+    onCommit: async (value) => { emitted.push(value.committedThroughSeq); },
+  });
+  observer.rescan();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(emitted, []);
+  assert.equal(observer.lastCommittedThroughSeq(current), 50);
+
+  current = commit(51);
+  observer.notify();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(emitted, [51]);
+  assert.equal(observer.lastCommittedThroughSeq(current), 51);
+  observer.close();
+});
+
+test("initialWatermarkMode latest does not drop the first commit when initial cursor is null", async () => {
+  let current: ReturnType<typeof commit> | null = null;
+  const emitted: number[] = [];
+  const observer = createSourceCommitObserver({
+    initialWatermarkMode: "latest",
+    readCursor: () => current,
+    onCommit: async (value) => { emitted.push(value.committedThroughSeq); },
+  });
+  observer.rescan();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(emitted, []);
+
+  current = commit(1);
+  observer.notify();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(emitted, [1]);
+  assert.equal(observer.lastCommittedThroughSeq(current), 1);
+  observer.close();
+});
+

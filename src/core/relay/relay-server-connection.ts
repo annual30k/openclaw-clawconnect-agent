@@ -255,6 +255,30 @@ export function shouldRetryRelayClose(code: number, signal?: AbortSignal): boole
   return !(signal?.aborted || code === 4000);
 }
 
+export function waitForRelaySocketDrain(
+  ws: WebSocket,
+  lowWaterMarkBytes = 256 * 1024,
+  timeoutMs = 5_000,
+): Promise<void> {
+  if (ws.readyState !== WebSocket.OPEN || finiteNonNegative(ws.bufferedAmount) <= lowWaterMarkBytes) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    const start = Date.now();
+    const timer = setInterval(() => {
+      if (
+        ws.readyState !== WebSocket.OPEN
+        || finiteNonNegative(ws.bufferedAmount) <= lowWaterMarkBytes
+        || Date.now() - start >= timeoutMs
+      ) {
+        clearInterval(timer);
+        resolve();
+      }
+    }, 20);
+    timer.unref?.();
+  });
+}
+
 function finiteNonNegative(value: number): number {
   return Number.isFinite(value) && value >= 0 ? value : 0;
 }
