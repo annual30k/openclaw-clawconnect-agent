@@ -255,9 +255,9 @@ test("OpenClaw v4 gateway history folds concurrent media replies in tool-call or
   ]);
   assert.deepEqual(page.timelineSnapshot?.messages[2]?.content, [
     { type: "text", text: "三张图片再发一遍" },
-    { type: "image", attachmentId: "att-first", transferState: "available" },
-    { type: "image", attachmentId: "att-second", transferState: "available" },
-    { type: "image", attachmentId: "att-third", transferState: "available" },
+    { type: "image", attachmentId: "att-first", transferState: "expired", isRemoteExpired: true },
+    { type: "image", attachmentId: "att-second", transferState: "expired", isRemoteExpired: true },
+    { type: "image", attachmentId: "att-third", transferState: "expired", isRemoteExpired: true },
   ]);
 });
 
@@ -726,7 +726,8 @@ test("transcript history provider returns a canonical timeline snapshot page", a
             fileId: "file-history-1",
             fileName: "desktop.png",
             mimeType: "image/png",
-            transferState: "available",
+            transferState: "expired",
+            isRemoteExpired: true,
           },
         ],
         seq: 2,

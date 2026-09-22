@@ -1372,6 +1372,18 @@ function normalizeTimelineContentBlock(block: TimelineContentBlock): TimelineCon
   }
 
   const fileId = historyString(block, "fileId", "file_id");
+  const previewUrl = historyString(block, "previewUrl", "preview_url", "thumbnailUrl", "thumbnail_url");
+  const downloadUrl = historyString(block, "downloadUrl", "download_url", "downloadPath", "download_path", "url");
+  const declaredTransferState = historyString(block, "transferState", "transfer_state", "status");
+  // OpenClaw transcripts can retain an attachment identity after its media
+  // object has disappeared. Such a block is a stable unavailable placeholder,
+  // not an available attachment: Relay intentionally rejects available blocks
+  // that cannot be previewed or downloaded.
+  const claimsAvailability = declaredTransferState === undefined
+    || ["available", "linked", "uploaded"].includes(declaredTransferState.toLowerCase());
+  const transferState = !previewUrl && !downloadUrl && claimsAvailability
+    ? "expired"
+    : declaredTransferState ?? "available";
   const attachmentId =
     historyString(block, "attachmentId", "attachment_id")
     ?? fileId
@@ -1381,6 +1393,8 @@ function normalizeTimelineContentBlock(block: TimelineContentBlock): TimelineCon
     type: type === "voice" ? "audio" : type,
     ...(attachmentId ? { attachmentId } : {}),
     ...(fileId ? { fileId } : {}),
+    ...(previewUrl ? { previewUrl } : {}),
+    ...(downloadUrl ? { downloadUrl } : {}),
     ...(historyString(block, "fileName", "file_name", "name", "filename") ? {
       fileName: historyString(block, "fileName", "file_name", "name", "filename"),
     } : {}),
@@ -1396,7 +1410,8 @@ function normalizeTimelineContentBlock(block: TimelineContentBlock): TimelineCon
     ...(historyNumber(block, "height", "imageHeight", "image_height") ? {
       height: historyNumber(block, "height", "imageHeight", "image_height"),
     } : {}),
-    transferState: historyString(block, "transferState", "transfer_state", "status") ?? "available",
+    transferState,
+    ...(!previewUrl && !downloadUrl && transferState === "expired" ? { isRemoteExpired: true } : {}),
   });
 }
 
