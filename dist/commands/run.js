@@ -4,7 +4,14 @@ import { withReconnect } from "../core/relay/reconnect.js";
 import { t } from "../i18n/index.js";
 import { createInterface } from "readline";
 import { disposeReliableRelayOutboxes } from "../core/relay/reliable-relay-outbox-registry.js";
+import { rotateProfileLogsIfOversized } from "../config/profile-log-rotation.js";
+import { getActiveProfile } from "../config/profile.js";
 export async function runCommand() {
+    // 服务管理器只会追加写日志；每次进程启动先做一次有界轮转，避免日志无限增长。
+    for (const result of rotateProfileLogsIfOversized(getActiveProfile())) {
+        if (result.rotated)
+            console.log(`[clawconnect] rotated ${result.path} (${result.bytesBefore} bytes)`);
+    }
     const config = readConfig();
     const gatewayType = config.gatewayType ?? "openclaw";
     const runtimeAdapter = getGatewayRuntimeAdapter(gatewayType);

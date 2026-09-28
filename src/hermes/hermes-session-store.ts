@@ -189,8 +189,10 @@ async function quarantineCorruptStore(path: string): Promise<void> {
   try {
     const quarantinePath = `${path}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
     await copyFile(path, quarantinePath);
-  } catch {
+    console.warn(`[hermes] session store was corrupt; quarantined to ${quarantinePath}`);
+  } catch (error) {
     // Best effort only; the caller still recovers with an empty in-memory store.
+    console.warn(`[hermes] session store was corrupt and could not be quarantined: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 

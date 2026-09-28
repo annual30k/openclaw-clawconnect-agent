@@ -97,8 +97,10 @@ export function readGatewayAuth(cfg: ClawConnectConfig): { token?: string; passw
     const token = json?.gateway?.token ?? json?.gateway?.auth?.token ?? undefined;
     const password = json?.gateway?.password ?? json?.gateway?.auth?.password ?? undefined;
     if (token || password) return { token, password };
-  } catch {
-    // ignore
+  } catch (error) {
+    // 读不到/解析不了 OpenClaw 配置时会退回环境变量；但必须留下痕迹，
+    // 否则用户看到的只是“网关鉴权失败”，找不到根因是配置文件损坏。
+    warnOnceAboutOpenClawConfig(error);
   }
   // Fall back to environment variables (e.g. set via LaunchAgent)
   const envToken = process.env.OPENCLAW_GATEWAY_TOKEN;
@@ -122,4 +124,16 @@ function readOpenClawStateEnv(): Record<string, string> {
   } catch {
     return {};
   }
+}
+
+let warnedOpenClawConfigMessage: string | undefined;
+
+function warnOnceAboutOpenClawConfig(error: unknown): void {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  // 文件不存在是常见的合法状态（尚未安装 OpenClaw 或使用环境变量鉴权），不告警。
+  if (code === "ENOENT") return;
+  const message = error instanceof Error ? error.message : String(error);
+  if (warnedOpenClawConfigMessage === message) return;
+  warnedOpenClawConfigMessage = message;
+  console.warn(`[clawconnect] OpenClaw config unreadable at ${resolveOpenClawConfigPath()}: ${message}`);
 }
