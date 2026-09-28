@@ -511,6 +511,69 @@ test("SQLite projection v3 reads zstd-only transcript rows so nested provider ru
   }
 });
 
+test("SQLite projection v3 drops role=custom metadata rows but keeps lineage through them", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "clawconnect-chat-history-sqlite-custom-"));
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  const sessionKey = "agent:main:mobile-custom-rows";
+  const sessionId = "sqlite-custom-rows-session";
+  const runId = "wx_1790580006234_1w6fh9dh";
+  const databasePath = join(stateDir, "agents", "main", "agent", "openclaw-agent.sqlite");
+  await mkdir(join(stateDir, "agents", "main", "agent"), { recursive: true });
+
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec(`
+      CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, current_session_id TEXT NOT NULL);
+      CREATE TABLE transcript_events (session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL);
+    `);
+    database.prepare("INSERT INTO session_nodes (session_key, current_session_id) VALUES (?, ?)")
+      .run(sessionKey, sessionId);
+    const insertEvent = database.prepare(
+      "INSERT INTO transcript_events (session_id, seq, event_json) VALUES (?, ?, ?)",
+    );
+    insertEvent.run(sessionId, 1, JSON.stringify({
+      type: "message",
+      id: "source-user",
+      message: { role: "user", content: "把桌面的图片发过来", idempotencyKey: `${runId}:user` },
+    }));
+    // OpenClaw 把工具搜索等隐藏元数据写成 role=custom 的 message 行。
+    insertEvent.run(sessionId, 2, JSON.stringify({
+      type: "message",
+      id: "source-custom",
+      parentId: "source-user",
+      message: { role: "custom", content: "tool_search metadata", idempotencyKey: "8c651a77:tool_search:chatcmpl" },
+    }));
+    insertEvent.run(sessionId, 3, JSON.stringify({
+      type: "message",
+      id: "source-assistant",
+      parentId: "source-custom",
+      message: { role: "assistant", content: "两张桌面图片都已发送。" },
+    }));
+  } finally {
+    database.close();
+  }
+
+  try {
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    const page = await readOpenClawTranscriptChatHistory({
+      sessionKey,
+      projectionGatewayId: "gw-openclaw",
+      projectionVersion: 3,
+      limit: 20,
+    }, DEFAULT_GATEWAY_SESSION_DEFAULTS);
+    const messages = page?.timelineSnapshot?.messages ?? [];
+
+    assert.deepEqual(messages.map((message) => message.sourceMessageId), ["source-user", "source-assistant"]);
+    assert.deepEqual(messages.map((message) => message.role), ["user", "assistant"]);
+    assert.equal(messages[1]?.turnId, runId);
+    assert.equal(messages[1]?.runId, runId);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("SQLite transcript history resolves the qualified main session through its main alias", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "clawconnect-chat-history-sqlite-alias-"));
   const previousStateDir = process.env.OPENCLAW_STATE_DIR;

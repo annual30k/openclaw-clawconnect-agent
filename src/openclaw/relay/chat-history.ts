@@ -908,7 +908,23 @@ function prepareTranscriptHistoryMessages(
     sessionKey,
     relationOptions,
   ).messages as HistoryMessage[];
-  return filterOpenClawHeartbeatArtifacts(foldedMessages);
+  return filterOpenClawHiddenTranscriptRows(filterOpenClawHeartbeatArtifacts(foldedMessages));
+}
+
+const OPENCLAW_HIDDEN_TRANSCRIPT_ROLES = new Set(["custom"]);
+
+/**
+ * OpenClaw transcript 里 `role: custom` 的 message 行是插件/工具搜索等隐藏元数据，
+ * Control UI 不展示。它们必须先参与血缘回溯（parentId 链经过这些行），
+ * 但不能进入投影：默认把未知角色当成 assistant 会产生空的“已完成回复”行，
+ * 客户端会把它当作结果锚点，提前消掉 waiting 占位。
+ */
+export function filterOpenClawHiddenTranscriptRows<T extends HistoryMessage>(messages: T[]): T[] {
+  const visible = messages.filter((message) => {
+    const role = typeof message.role === "string" ? message.role.trim().toLowerCase() : "";
+    return !OPENCLAW_HIDDEN_TRANSCRIPT_ROLES.has(role);
+  });
+  return visible.length === messages.length ? messages : visible;
 }
 
 /**

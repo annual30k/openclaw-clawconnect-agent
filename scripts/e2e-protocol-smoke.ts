@@ -412,7 +412,8 @@ process.exit(0);
     let ackReceived = false;
     let terminalResponseReceived = false;
     let toolStartReceived = false;
-    let toolStreamReceived = false;
+    // `tools.*` 日志散文（如 "searching Google for ..."）按解析器契约不构成工具执行事件，
+    // 只有 agent.tool_executor 的 running/completed/failed 受理短语才会投影；因此不再等待“流式日志”事件。
     let toolCompleteReceived = false;
     let finalAssistantReceived = false;
     let runtimeMetadataReceived = foundGateway.currentModel === "fake-model";
@@ -425,7 +426,6 @@ process.exit(0);
           ackReceived &&
           terminalResponseReceived &&
           toolStartReceived &&
-          toolStreamReceived &&
           toolCompleteReceived &&
           finalAssistantReceived &&
           runtimeMetadataReceived
@@ -473,9 +473,6 @@ process.exit(0);
               if ((payload.phase === "streaming" || payload.state === "streaming") && data.text?.includes("running")) {
                 toolStartReceived = true;
                 console.log("[PASS] Received tool start/running event");
-              } else if (payload.phase === "streaming" || payload.state === "streaming") {
-                toolStreamReceived = true;
-                console.log("[PASS] Received tool streaming log event");
               } else if (payload.phase === "completed" || payload.state === "completed") {
                 toolCompleteReceived = true;
                 console.log("[PASS] Received tool completed event");
@@ -492,8 +489,7 @@ process.exit(0);
                 toolStartReceived = true;
                 console.log("[PASS] Received canonical tool start/running event");
               } else if (event.toolState === "streaming_output") {
-                toolStreamReceived = true;
-                console.log("[PASS] Received canonical tool streaming log event");
+                reject(new Error(`Unexpected tool streaming event from logger prose: ${text}`));
               } else if (event.toolState === "success") {
                 toolCompleteReceived = true;
                 console.log("[PASS] Received canonical tool completed event");
@@ -553,7 +549,6 @@ process.exit(0);
     console.log("10. Asserting E2E criteria...");
     if (!ackReceived) throw new Error("Missing Command ACK");
     if (!toolStartReceived) throw new Error("Missing Tool Start Event");
-    if (!toolStreamReceived) throw new Error("Missing Tool Log Streaming Event");
     if (!toolCompleteReceived) throw new Error("Missing Tool Log Completion Event");
     if (!finalAssistantReceived) throw new Error("Missing Final Assistant Response");
     if (!runtimeMetadataReceived) throw new Error("Missing Runtime Metadata");
