@@ -85,6 +85,7 @@ import { prepareOpenClawVoiceInputCommand } from "./relay/openclaw-voice-input.j
 import { voiceInputSetupMessage } from "../core/relay/voice-input.js";
 import type { FileUploadResult } from "../core/relay/file-upload.js";
 import { buildRelayHelloMessage } from "./relay/relay-manager-hello.js";
+import { shouldSuppressOpenClawHeartbeatChatEvent } from "./relay/openclaw-heartbeat-markers.js";
 import { buildOpenClawHostRuntimeMetadata } from "../runtime-metadata.js";
 import {
   CHAT_HISTORY_FETCH_TIMEOUT_MS,
@@ -339,8 +340,17 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         if (nextDefaults) {
           sessionDefaults = nextDefaults;
         }
+        // 把宿主的默认 agent 告诉 Relay：会话键的别名折叠只能以宿主配置为准。
+        send({
+          type: "session_defaults",
+          ...(sessionDefaults.defaultAgentId ? { defaultAgentId: sessionDefaults.defaultAgentId } : {}),
+          mainSessionKey: sessionDefaults.mainSessionKey,
+        });
         await ensureSessionMessagesSubscribed(sessionDefaults.mainSessionKey);
-        ensureSourceCommitWatcher(sessionDefaults.mainSessionKey, "latest");
+        // 启动时从零重扫：Relay 的投影必须覆盖宿主 transcript 的完整历史，
+        // 否则 Agent 首次运行之前的消息永远不会出现在移动端。已投影的行按
+        // 不可变哈希幂等，不会重复落库或重复广播。
+        ensureSourceCommitWatcher(sessionDefaults.mainSessionKey, "from_zero");
         const sessionsPayload = await gatewayClient.request("sessions.list", {
           limit: 100,
           includeGlobal: true,
@@ -360,7 +370,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           // Subscribe each known session so their finished replies travel through
           // the same ClawConnect → Relay realtime path as an interactive chat.
           await ensureSessionMessagesSubscribed(sessionKey);
-          ensureSourceCommitWatcher(sessionKey, "latest");
+          ensureSourceCommitWatcher(sessionKey, "from_zero");
           const snapshot = contextUsageSnapshotFromSessionsList(sessionsPayload, sessionKey, sessionDefaults);
           if (!snapshot) continue;
           emitContextUsageSnapshot(snapshot, true);
@@ -800,7 +810,13 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             ) {
               return;
             }
-            if (isOpenClawHeartbeatText(currentText) || (runContext?.promptText && isOpenClawHeartbeatText(runContext.promptText))) {
+            // 心跳判定与历史投影共用同一组精确标记：纯确认才隐藏，
+            // 心跳轮次里的真实告警 final 必须和历史一样对移动端可见。
+            if (shouldSuppressOpenClawHeartbeatChatEvent({
+              promptText: runContext?.promptText,
+              assistantText: currentText,
+              chatState: state,
+            })) {
               if (providerRunId && (state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted")) {
                 openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
                 chatRunContexts.delete(providerRunId);
@@ -843,16 +859,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               }
               if (state === "final" && !currentText) {
                 chatRunContexts.delete(providerRunId);
-                const lifecyclePayload = normalizedPayload && typeof normalizedPayload === "object" && !Array.isArray(normalizedPayload)
-                  ? (() => {
-                      const payload = { ...(normalizedPayload as Record<string, unknown>) };
-                      delete payload.message;
-                      delete payload.content;
-                      delete payload.text;
-                      delete payload.delta;
-                      return payload;
-                    })()
-                  : normalizedPayload;
+                const lifecyclePayload = lifecycleOnlyChatPayload(normalizedPayload);
                 runAfterAssistantSnapshot(runSnapshotKey, true, async () => {
                   await publishAndSendGatewayEvent(
                     event,
@@ -1031,6 +1038,17 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 return;
               }
 
+              // 转录里还没有这次运行的终态行（工具前导、final 先于提交到达、历史读取失败）
+              // 时，什么都不发布：正文与终态必须由 source-commit watcher 以 v3 源行投影，
+              // 运行在此期间保持打开。原始 provider payload 一旦转发，Relay 会把它包装成
+              // relay-legacy 的“已确认”空行，之后无法被 v3 行替换。没有 run 身份的旧路径保持原样。
+              const publishTerminalWithoutHistory = async (reason: string): Promise<void> => {
+                if (providerRunId && canonicalRunId) {
+                  console.warn(`[relay] provider final for run ${canonicalRunId} deferred to source projection (${reason})`);
+                  return;
+                }
+                await publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice, runContext?.promptText);
+              };
               const fetchHistory = () =>
                 requestChatHistoryFromClawConnect({ sessionKey: resolvedSessionKey, limit: 10 });
               const publishHistoryTerminal = () => withTimeout(
@@ -1096,11 +1114,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     if (providerRunId) openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
                     return;
                   }
-                  await publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice);
+                  await publishTerminalWithoutHistory("transcript has no terminal row yet");
                 })
                 .catch((err) => {
                   console.error(`[relay] chat.history fetch failed: ${err}`);
-                  void publishAndSendGatewayEvent(event, normalizedPayload, shouldPublishOffice);
+                  void publishTerminalWithoutHistory("chat.history fetch failed");
                 });
               runAfterAssistantSnapshot(runSnapshotKey, Boolean(replyMessageId), publishHistoryTerminal, Boolean(providerRunId));
               return;
@@ -1178,6 +1196,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         const deliveryMode = reliableDeliveryModeFromRelayHello(msg);
         deliveryOutbox.attach(relayWs, deliveryMode);
         console.log(`[relay] reliable delivery mode=${deliveryMode}`);
+        opts.onRelayReady?.();
         return;
       }
 
@@ -1463,21 +1482,15 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       resolve(shouldRetryRelayClose(code, opts.signal));
     });
 
-    function isOpenClawHeartbeatText(text?: string): boolean {
-      if (!text) return false;
-      const trimmed = text.replace(/\r/g, "").trim();
-      const lower = trimmed.toLowerCase();
-      const upper = trimmed.toUpperCase();
-      return (
-        lower === "[openclaw heartbeat poll]" ||
-        lower === "openclaw heartbeat poll" ||
-        lower.startsWith("[openclaw heartbeat poll]") ||
-        lower.startsWith("openclaw heartbeat poll") ||
-        upper === "HEARTBEAT_OK" ||
-        upper === "HEARTBEAT OK" ||
-        upper.startsWith("HEARTBEAT_OK") ||
-        upper.startsWith("HEARTBEAT OK")
-      );
+    /** 去掉 provider payload 里的正文字段，只保留 run/session 等生命周期信息。 */
+    function lifecycleOnlyChatPayload(payload: unknown): unknown {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+      const lifecycle = { ...(payload as Record<string, unknown>) };
+      delete lifecycle.message;
+      delete lifecycle.content;
+      delete lifecycle.text;
+      delete lifecycle.delta;
+      return lifecycle;
     }
 
     function isOpenClawMediaDisplayPlaceholder(text?: string): boolean {

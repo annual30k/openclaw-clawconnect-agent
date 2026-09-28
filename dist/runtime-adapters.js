@@ -12,6 +12,7 @@ const OPENCLAW_RUNTIME_ADAPTER = {
         gatewayPassword: context.gatewayAuth.password,
         signal: context.signal,
         onConnected: context.onConnected,
+        onRelayReady: context.onRelayReady,
         onDisconnected: context.onDisconnected,
     }),
 };
@@ -26,6 +27,7 @@ const HERMES_RUNTIME_ADAPTER = {
         capabilities: context.config.capabilities,
         signal: context.signal,
         onConnected: context.onConnected,
+        onRelayReady: context.onRelayReady,
         onDisconnected: context.onDisconnected,
     }),
 };

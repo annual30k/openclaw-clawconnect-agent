@@ -9,6 +9,8 @@ export type GatewayRuntimeContext = {
     };
     signal: AbortSignal;
     onConnected: () => void;
+    /** Relay 握手（hello 校验 + 可靠投递挂载）完成后触发；用于重置重连退避。 */
+    onRelayReady: () => void;
     onDisconnected: () => void;
 };
 export type GatewayRuntimeAdapter = {

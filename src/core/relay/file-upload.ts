@@ -108,6 +108,8 @@ const JSON_HEADERS = {
   "Content-Type": "application/json",
   Accept: "application/json",
 } as const;
+// Relay 对分片与完成请求同样校验网关密钥；init 之外的请求通过该头携带。
+const RELAY_SECRET_HEADER = "x-relay-secret";
 
 export async function uploadFileToRelay(
   opts: FileUploadRequest,
@@ -208,6 +210,7 @@ export async function uploadFileToRelay(
             headers: {
               "Content-Type": "application/octet-stream",
               Accept: "application/json",
+              [RELAY_SECRET_HEADER]: relaySecret,
             },
             body: chunk as unknown as BodyInit,
           }, `upload chunk ${chunkIndex + 1}/${totalChunks}`),
@@ -223,7 +226,7 @@ export async function uploadFileToRelay(
     () =>
       requestJson<FileUploadCompleteResponse>(fetchImpl, completeUrl, {
         method: "POST",
-        headers: JSON_HEADERS,
+        headers: { ...JSON_HEADERS, [RELAY_SECRET_HEADER]: relaySecret },
         body: JSON.stringify({ totalChunks }),
       }, "complete upload"),
   );

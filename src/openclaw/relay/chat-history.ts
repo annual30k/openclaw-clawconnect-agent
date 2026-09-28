@@ -23,6 +23,7 @@ import {
   normalizeOpenClawAutomaticMediaReplies,
 } from "./assistant-media-sidecar.js";
 import { adaptOpenClawMessageToolDelivery } from "./outgoing-media-relay.js";
+import { isOpenClawHeartbeatAckText, isOpenClawHeartbeatPromptText } from "./openclaw-heartbeat-markers.js";
 import {
   canonicalProjectionMessageId,
   createProjectionMetadata,
@@ -144,8 +145,6 @@ export function readOpenClawSourceCommitCursor(
 const DEFAULT_TRANSCRIPT_HISTORY_LIMIT = 100;
 const MAX_TRANSCRIPT_HISTORY_LIMIT = 200;
 const CURSOR_PREFIX = "seq:";
-const OPENCLAW_HEARTBEAT_TRANSCRIPT_PROMPT = "[OpenClaw heartbeat poll]";
-const OPENCLAW_HEARTBEAT_ACK = "HEARTBEAT_OK";
 
 type TranscriptHistoryCacheEntry = {
   size: number;
@@ -997,8 +996,7 @@ function isOpenClawHeartbeatPrompt(message: HistoryMessage): boolean {
   if (content.hasNonTextContent) {
     return false;
   }
-  const text = content.text.replace(/\r/g, "").trim();
-  return text === "[OpenClaw heartbeat poll]" || text === "OpenClaw heartbeat poll";
+  return isOpenClawHeartbeatPromptText(content.text);
 }
 
 function isOpenClawHeartbeatAcknowledgement(message: HistoryMessage): boolean {
@@ -1009,8 +1007,7 @@ function isOpenClawHeartbeatAcknowledgement(message: HistoryMessage): boolean {
   if (content.hasNonTextContent) {
     return false;
   }
-  const text = content.text.replace(/\r/g, "").trim();
-  return text === "HEARTBEAT_OK" || text === "HEARTBEAT OK";
+  return isOpenClawHeartbeatAckText(content.text);
 }
 
 function isHeartbeatToolArtifact(message: HistoryMessage): boolean {

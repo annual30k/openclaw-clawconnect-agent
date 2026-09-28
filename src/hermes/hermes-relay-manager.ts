@@ -126,6 +126,8 @@ export interface HermesRelayManagerOptions {
   capabilities?: string[];
   signal?: AbortSignal;
   onConnected?: () => void;
+  /** Relay hello 校验通过并挂载可靠投递 outbox 后触发；仅此时才算一次成功连接。 */
+  onRelayReady?: () => void;
   onDisconnected?: () => void;
   /** @internal Allows deterministic protocol-negotiation timeout tests. */
   relayHelloTimeoutMs?: number;
@@ -315,6 +317,7 @@ export async function runHermesRelayManagerWithDependencies(
           const deliveryMode = reliableDeliveryModeFromRelayHello(msg);
           deliveryOutbox.attach(relayWs, deliveryMode);
           console.log(`[hermes-relay] reliable delivery mode=${deliveryMode}`);
+          opts.onRelayReady?.();
           return;
         }
         if (msg.type === "event_ack") {

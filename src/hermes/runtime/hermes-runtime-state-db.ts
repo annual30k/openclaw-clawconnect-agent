@@ -41,8 +41,15 @@ def to_iso(value):
         return None
     return datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
+def json_safe(value):
+    # 新版 Hermes 会把 display_identity 等列存成 BLOB；bytes 无法被 json.dumps 序列化，
+    # 会让整页查询失败。统一转成十六进制字符串，保持确定性且无损。
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    return value
+
 def row_dict(row):
-    return {key: row[key] for key in row.keys()}
+    return {key: json_safe(row[key]) for key in row.keys()}
 
 def connect(writable=False):
     uri_mode = "rw" if writable else "ro"
@@ -454,7 +461,14 @@ async function runHermesStateDbQuery(
     });
     const parsed = JSON.parse(stdout.trim()) as { ok?: boolean; payload?: unknown };
     return parsed.ok === true ? parsed.payload : undefined;
-  } catch {
+  } catch (error) {
+    // 静默返回 undefined 会让上层退回不带 seq 的导出路径，最终表现为“会话为空”。
+    // 这里只记录失败原因（不含任何行内容），便于定位 state.db 读取问题。
+    const detail = error instanceof Error ? error.message : String(error);
+    const stderr = typeof (error as { stderr?: unknown })?.stderr === "string"
+      ? (error as { stderr: string }).stderr.trim().split("\n").at(-1) ?? ""
+      : "";
+    console.warn(`[hermes-state-db] ${mode} query failed: ${detail}${stderr ? ` (${stderr})` : ""}`);
     return undefined;
   }
 }

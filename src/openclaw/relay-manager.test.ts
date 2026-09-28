@@ -42,19 +42,59 @@ test("relay manager reconnects on missing Relay hello instead of silently select
   assert.ok(relayAddress && typeof relayAddress === "object");
   assert.ok(gatewayAddress && typeof gatewayAddress === "object");
 
+  let readySignals = 0;
   const retry = await runRelayManager({
     relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
     gatewayId: "gw-hello-timeout",
     relaySecret: "secret",
     gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
     relayHelloTimeoutMs: 25,
+    onRelayReady: () => { readySignals += 1; },
   });
 
   await waitFor(() => relayClose !== undefined);
   assert.equal(retry, true);
   assert.deepEqual(relayClose, { code: 1013, reason: "relay_hello_timeout" });
+  assert.equal(readySignals, 0);
   await closeServer(relayServer);
   await closeServer(gatewayServer);
+});
+
+test("relay manager signals relay readiness only after a valid Relay hello", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const lifecycle: string[] = [];
+
+  relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-ready");
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-ready",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+    onConnected: () => lifecycle.push("connected"),
+    onRelayReady: () => lifecycle.push("ready"),
+  });
+
+  try {
+    await waitFor(() => lifecycle.includes("ready"));
+    // 套接字打开只代表 TCP/WS 建立；只有 hello 校验通过才算一次成功连接。
+    assert.deepEqual(lifecycle, ["connected", "ready"]);
+  } finally {
+    abort.abort();
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+  }
 });
 
 test("relay manager forwards OpenClaw agent tool events to relay", async () => {
@@ -1356,6 +1396,100 @@ test("relay manager replaces the OpenClaw media display placeholder with source-
     if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
     else process.env.OPENCLAW_STATE_DIR = previousStateDir;
     await rm(isolatedStateDir, { recursive: true, force: true });
+  }
+});
+
+test("relay manager never forwards a raw provider final while the transcript has no terminal row", async () => {
+  openClawChatRunIdentities.clear();
+  const openclawHome = await createEmptyOpenClawHomeFixture();
+  const previousOpenClawHome = process.env.CLAWCONNECT_OPENCLAW_HOME;
+  process.env.CLAWCONNECT_OPENCLAW_HOME = openclawHome.home;
+  const sessionsDir = join(openclawHome.home, "agents", "main", "sessions");
+  await writeFile(
+    join(sessionsDir, "sessions.json"),
+    `${JSON.stringify({ "agent:main:main": { sessionId: "session-empty-final", sessionFile: "session-empty-final.jsonl" } })}\n`,
+    "utf8",
+  );
+  // 转录始终为空：模拟 provider 终态先于 transcript 提交到达。
+  await writeFile(join(sessionsDir, "session-empty-final.jsonl"), "", "utf8");
+
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let relaySocket: WebSocket | undefined;
+  let gatewaySocket: WebSocket | undefined;
+
+  relayServer.on("connection", (socket) => {
+    relaySocket = socket;
+    sendRelayHello(socket, "gw-empty-final");
+    socket.on("message", (raw) => {
+      relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
+    });
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "nonce-empty-final", ts: Date.now() } }));
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as { type?: string; id?: string; method?: string };
+      if (message.type !== "req" || !message.id) return;
+      if (message.method !== "chat.send") {
+        socket.send(JSON.stringify({ type: "res", id: message.id, ok: true, payload: sessionDefaultsPayload() }));
+        return;
+      }
+      socket.send(JSON.stringify({ type: "res", id: message.id, ok: true, payload: { runId: "provider-run-empty", status: "started" } }));
+      setImmediate(() => {
+        socket.send(JSON.stringify({
+          type: "event",
+          event: "chat",
+          payload: { runId: "provider-run-empty", sessionKey: "agent:main:main", state: "final", role: "assistant", seq: 1 },
+        }));
+      });
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-empty-final",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+
+  try {
+    await waitFor(() => Boolean(relaySocket) && relayMessages.some((message) => message.type === "gateway_connected"), 4_000);
+    relaySocket?.send(JSON.stringify({
+      type: "cmd",
+      id: "send-empty-final",
+      method: "chat.send",
+      params: { sessionKey: "agent:main:main", message: "prompt without transcript", idempotencyKey: "mobile-run-empty" },
+    }));
+
+    await waitFor(() => relayMessages.some((message) => message.type === "res" && message.id === "send-empty-final"), 4_000);
+    // 等过一次立即的历史读取：transcript 没有终态行，Agent 不得转发原始 provider final，
+    // 否则 Relay 会把它包装成 relay-legacy 的“已确认”空行。
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    const finalPayloads = relayMessages
+      .filter((message) => message.type === "event" && message.event === "chat" && isRecord(message.payload))
+      .map((message) => message.payload as Record<string, unknown>)
+      .filter((payload) => payload.state === "final" || payload.runId === "mobile-run-empty" || payload.runId === "provider-run-empty");
+    assert.deepEqual(finalPayloads, []);
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+    if (previousOpenClawHome === undefined) {
+      delete process.env.CLAWCONNECT_OPENCLAW_HOME;
+    } else {
+      process.env.CLAWCONNECT_OPENCLAW_HOME = previousOpenClawHome;
+    }
+    await openclawHome.cleanup();
   }
 });
 

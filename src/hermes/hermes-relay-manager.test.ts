@@ -56,11 +56,13 @@ test("Hermes relay manager reconnects on missing Relay hello instead of silently
   const relayAddress = relayServer.address();
   assert.ok(relayAddress && typeof relayAddress === "object");
 
+  let readySignals = 0;
   const retry = await runHermesRelayManagerWithDependencies({
     relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
     gatewayId: "gw-hermes-hello-timeout",
     relaySecret: "secret",
     relayHelloTimeoutMs: 25,
+    onRelayReady: () => { readySignals += 1; },
   }, hermesTestDependencies(async () => ({
     output: "unused",
     sessionKey: "main",
@@ -70,7 +72,42 @@ test("Hermes relay manager reconnects on missing Relay hello instead of silently
   await waitForHermesTest(() => relayClose !== undefined);
   assert.equal(retry, true);
   assert.deepEqual(relayClose, { code: 1013, reason: "relay_hello_timeout" });
+  assert.equal(readySignals, 0);
   await closeHermesTestServer(relayServer);
+});
+
+test("Hermes relay manager signals relay readiness only after a valid Relay hello", async () => {
+  const relayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const lifecycle: string[] = [];
+
+  relayServer.on("connection", (socket) => {
+    sendHermesRelayHello(socket, "gw-hermes-ready");
+  });
+  const relayAddress = relayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+
+  const manager = runHermesRelayManagerWithDependencies({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-hermes-ready",
+    relaySecret: "secret",
+    signal: abort.signal,
+    onConnected: () => lifecycle.push("connected"),
+    onRelayReady: () => lifecycle.push("ready"),
+  }, hermesTestDependencies(async () => ({
+    output: "unused",
+    sessionKey: "main",
+    artifactPaths: [],
+  })));
+
+  try {
+    await waitForHermesTest(() => lifecycle.includes("ready"));
+    assert.deepEqual(lifecycle, ["connected", "ready"]);
+  } finally {
+    abort.abort();
+    await manager.catch(() => false);
+    await closeHermesTestServer(relayServer);
+  }
 });
 
 const imageUpload = {

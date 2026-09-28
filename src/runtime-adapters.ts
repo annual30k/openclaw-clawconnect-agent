@@ -9,6 +9,8 @@ export type GatewayRuntimeContext = {
   gatewayAuth: { token?: string; password?: string };
   signal: AbortSignal;
   onConnected: () => void;
+  /** Relay 握手（hello 校验 + 可靠投递挂载）完成后触发；用于重置重连退避。 */
+  onRelayReady: () => void;
   onDisconnected: () => void;
 };
 
@@ -30,6 +32,7 @@ const OPENCLAW_RUNTIME_ADAPTER: GatewayRuntimeAdapter = {
     gatewayPassword: context.gatewayAuth.password,
     signal: context.signal,
     onConnected: context.onConnected,
+    onRelayReady: context.onRelayReady,
     onDisconnected: context.onDisconnected,
   }),
 };
@@ -45,6 +48,7 @@ const HERMES_RUNTIME_ADAPTER: GatewayRuntimeAdapter = {
     capabilities: context.config.capabilities,
     signal: context.signal,
     onConnected: context.onConnected,
+    onRelayReady: context.onRelayReady,
     onDisconnected: context.onDisconnected,
   }),
 };

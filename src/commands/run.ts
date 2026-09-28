@@ -43,12 +43,13 @@ export async function runCommand(): Promise<void> {
 
   try {
     await withReconnect(
-      () => runtimeAdapter.start({
+      (session) => runtimeAdapter.start({
         config,
         gatewayUrl: () => readGatewayUrl(),
         gatewayAuth,
         signal: shutdown.signal,
         onConnected: () => console.log(t("run.connected")),
+        onRelayReady: () => session.markEstablished(),
         onDisconnected: () => console.log(t("run.disconnected")),
       }),
       {

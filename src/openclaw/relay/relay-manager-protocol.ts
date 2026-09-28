@@ -13,6 +13,8 @@ export type OpenClawRelayToServer =
   | RelayHelloMessage
   | { type: "heartbeat" }
   | { type: "gateway_connected" }
+  /** 宿主 OpenClaw 的会话默认值；Relay 据此折叠默认 agent 的 `agent:<id>:` 别名，不再写死 `main`。 */
+  | { type: "session_defaults"; defaultAgentId?: string; mainSessionKey: string }
   | { type: "gateway_disconnected"; reason: string }
   | { type: "event"; event: string; payload: unknown; deliveryId?: string }
   | {
@@ -46,6 +48,8 @@ export interface RelayManagerOptions {
   gatewayToken?: string;
   gatewayPassword?: string;
   onConnected?: () => void;
+  /** Relay hello 校验通过并挂载可靠投递 outbox 后触发；仅此时才算一次成功连接。 */
+  onRelayReady?: () => void;
   onDisconnected?: () => void;
   /** @internal Allows deterministic protocol-negotiation timeout tests. */
   relayHelloTimeoutMs?: number;

@@ -42,7 +42,7 @@ export function buildSourceCommitTimelineEvents(
       eventId,
       eventType: "message.completed",
       gatewayId: sourceCommit.gatewayId,
-      sessionKey: history.sessionKey ?? "main",
+      sessionKey: requireProjectionSessionKey(history.sessionKey),
       turnId: message.turnId,
       runId: message.runId ?? message.turnId,
       messageId,
@@ -148,6 +148,15 @@ export async function projectSourceCommitHistoryPages(options: {
     }
   }
   return readThroughSeq;
+}
+
+/** 源投影必须带会话归属；缺失时显式失败，绝不猜成 main 写错会话。 */
+function requireProjectionSessionKey(value: unknown): string {
+  const sessionKey = typeof value === "string" ? value.trim() : "";
+  if (!sessionKey) {
+    throw new Error("Source projection history page is missing sessionKey");
+  }
+  return sessionKey;
 }
 
 function requireSourceProjectionString(value: unknown, field: string, index: number): string {

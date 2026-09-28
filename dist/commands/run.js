@@ -35,12 +35,13 @@ export async function runCommand() {
         console.log(t("run.gatewayUrl", gatewayUrl));
     }
     try {
-        await withReconnect(() => runtimeAdapter.start({
+        await withReconnect((session) => runtimeAdapter.start({
             config,
             gatewayUrl: () => readGatewayUrl(),
             gatewayAuth,
             signal: shutdown.signal,
             onConnected: () => console.log(t("run.connected")),
+            onRelayReady: () => session.markEstablished(),
             onDisconnected: () => console.log(t("run.disconnected")),
         }), {
             signal: shutdown.signal,
