@@ -13,12 +13,11 @@ import {
   type RelaySendResult,
 } from "../core/relay/relay-server-connection.js";
 import { handleLocalCommand } from "./handlers/local-handlers.js";
+import { createOpenClawContextUsagePublisher } from "./relay/openclaw-context-usage-publisher.js";
 import { handleProviderCommand } from "./handlers/provider-handlers.js";
 import {
   DEFAULT_GATEWAY_SESSION_DEFAULTS,
-  buildContextUsageFingerprint,
   contextUsageSnapshotFromSessionsList,
-  readContextUsageSnapshot,
   canonicalizeRelayParams,
   canonicalizeSessionKey,
   extractGatewaySessionDefaults,
@@ -197,31 +196,16 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     const chatRunContexts = new Map<string, OpenClawChatRunIdentity>();
     const chatSendDedupe = new OpenClawChatSendDedupeCoordinator(() => sessionDefaults);
     const outgoingMediaUploadCache = new Map<string, FileUploadResult>();
-    const contextUsageRefreshes = new Map<string, ReturnType<typeof setTimeout>>();
-    const contextUsageFingerprints = new Map<string, string>();
     let relayHelloNegotiated = false;
     let relayHelloTimer: ReturnType<typeof setTimeout> | undefined;
 
-    const emitContextUsageSnapshot = (snapshot: NonNullable<Awaited<ReturnType<typeof readContextUsageSnapshot>>>, force = false): void => {
-      const fingerprint = buildContextUsageFingerprint(snapshot);
-      if (!force && contextUsageFingerprints.get(snapshot.sessionKey) === fingerprint) {
-        return;
-      }
-      contextUsageFingerprints.set(snapshot.sessionKey, fingerprint);
-
-      send({
-        type: "event",
-        event: "context_usage",
-        payload: {
-          sessionKey: snapshot.sessionKey,
-          currentModel: snapshot.currentModel,
-          contextUsage: snapshot.promptTokens ?? snapshot.contextUsage,
-          contextLimit: snapshot.contextLimit,
-          promptTokens: snapshot.promptTokens,
-          maxInputTokens: snapshot.contextLimit,
-        },
-      });
-    };
+    const contextUsage = createOpenClawContextUsagePublisher({
+      getGatewayClient: () => gatewayClient,
+      getSessionDefaults: () => sessionDefaults,
+      sendContextUsage: (payload) => {
+        send({ type: "event", event: "context_usage", payload });
+      },
+    });
 
     const setChatRunContext = (providerRunId: string, context: OpenClawChatRunIdentity): void => {
       chatRunContexts.set(providerRunId, context);
@@ -233,59 +217,6 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         if (!oldest) break;
         chatRunContexts.delete(oldest);
       }
-    };
-
-    const publishContextUsageSnapshot = async (sessionKey: string, force = false): Promise<void> => {
-      const normalizedSessionKey = canonicalizeSessionKey(sessionKey, sessionDefaults);
-      if (typeof normalizedSessionKey !== "string" || normalizedSessionKey.trim().length === 0) {
-        return;
-      }
-
-      const requestedSessionKey = normalizedSessionKey.trim();
-      let snapshot = null;
-      if (gatewayClient) {
-        try {
-          const sessions = await gatewayClient.request("sessions.list", {
-            limit: 100,
-            includeGlobal: true,
-            includeUnknown: true,
-          });
-          snapshot = contextUsageSnapshotFromSessionsList(sessions, requestedSessionKey, sessionDefaults);
-        } catch (error) {
-          console.warn(`[relay] failed to read context usage from sessions.list: ${String(error)}`);
-        }
-      }
-      snapshot ??= await readContextUsageSnapshot(requestedSessionKey, sessionDefaults);
-      if (!snapshot) {
-        return;
-      }
-
-      emitContextUsageSnapshot(snapshot, force);
-    };
-
-    const scheduleContextUsageRefresh = (sessionKey: string | undefined, delayMs = 250, force = false): void => {
-      if (!sessionKey) {
-        return;
-      }
-      const normalizedSessionKey = canonicalizeSessionKey(sessionKey, sessionDefaults);
-      if (typeof normalizedSessionKey !== "string" || normalizedSessionKey.trim().length === 0) {
-        return;
-      }
-
-      const key = normalizedSessionKey.trim();
-      const existing = contextUsageRefreshes.get(key);
-      if (existing) {
-        clearTimeout(existing);
-      }
-
-      const timer = setTimeout(() => {
-        contextUsageRefreshes.delete(key);
-        void publishContextUsageSnapshot(key, force).catch((error) => {
-          console.warn(`[relay] failed to publish context usage for session ${key}: ${String(error)}`);
-        });
-      }, delayMs);
-      timer.unref?.();
-      contextUsageRefreshes.set(key, timer);
     };
 
     const explicitOpenClawSessionKey = (rawSessionKey: string): string => {
@@ -374,11 +305,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           ensureSourceCommitWatcher(sessionKey, "from_zero");
           const snapshot = contextUsageSnapshotFromSessionsList(sessionsPayload, sessionKey, sessionDefaults);
           if (!snapshot) continue;
-          emitContextUsageSnapshot(snapshot, true);
+          contextUsage.emit(snapshot, true);
           publishedAny = true;
         }
         if (!publishedAny) {
-          scheduleContextUsageRefresh(sessionDefaults.mainSessionKey, 50, true);
+          contextUsage.scheduleRefresh(sessionDefaults.mainSessionKey, 50, true);
         }
       } catch (err) {
         console.warn(`[relay] failed to load session defaults: ${String(err)}`);
@@ -946,7 +877,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             }
 
             if (state === "final" && resolvedSessionKey && role === "assistant") {
-              scheduleContextUsageRefresh(resolvedSessionKey, 450);
+              contextUsage.scheduleRefresh(resolvedSessionKey, 450);
               const bufferedText = providerRunId
                 ? openClawChatRunIdentities.accumulatedText(opts.gatewayId, providerRunId)
                 : "";
@@ -1133,7 +1064,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
             if (providerRunId && (state === "error" || state === "failed" || state === "fail" || state === "aborted")) {
               chatRunContexts.delete(providerRunId);
-              scheduleContextUsageRefresh(p?.sessionKey, 450);
+              contextUsage.scheduleRefresh(p?.sessionKey, 450);
             }
             const isTerminal = state === "error" || state === "failed" || state === "fail" || state === "aborted";
             runAfterAssistantSnapshot(runSnapshotKey, isTerminal, async () => {
@@ -1428,7 +1359,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               }
               // Let a model switch settle before publishing context usage again.
               // Forced refreshes can replay a stale model snapshot and overwrite the new selection.
-              scheduleContextUsageRefresh(sessionKey, 1200);
+              contextUsage.scheduleRefresh(sessionKey, 1200);
             }
           }
           if (requestId) {
@@ -1477,10 +1408,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       for (const watcher of sourceCommitWatchers.values()) watcher.close();
       sourceCommitWatchers.clear();
       chatSendDedupe.clearAll();
-      for (const timer of contextUsageRefreshes.values()) {
-        clearTimeout(timer);
-      }
-      contextUsageRefreshes.clear();
+      contextUsage.dispose();
       if (relayHelloTimer) {
         clearTimeout(relayHelloTimer);
         relayHelloTimer = undefined;
