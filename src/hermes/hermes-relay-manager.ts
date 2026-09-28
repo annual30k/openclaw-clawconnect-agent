@@ -2,6 +2,7 @@ import { createHash } from "crypto";
 import { statSync } from "fs";
 import { WebSocket } from "ws";
 import { uploadFileToRelay, type FileUploadRequest, type FileUploadResult } from "../core/relay/file-upload.js";
+import { startRelayLivenessMonitor, type RelayLivenessMonitor } from "../core/relay/relay-liveness.js";
 import {
   bindRelayAbortSignal,
   buildRelayUrl,
@@ -131,6 +132,9 @@ export interface HermesRelayManagerOptions {
   onDisconnected?: () => void;
   /** @internal Allows deterministic protocol-negotiation timeout tests. */
   relayHelloTimeoutMs?: number;
+  /** @internal 存活检测的 ping 周期与超时（毫秒），仅用于测试。 */
+  relayLivenessPingIntervalMs?: number;
+  relayLivenessTimeoutMs?: number;
   /** @internal Isolates durable outbox files in tests. */
   reliableOutboxStorageDirectory?: string;
 }
@@ -241,9 +245,15 @@ export async function runHermesRelayManagerWithDependencies(
     // Relay 长连接只承载命令和当前运行产生的事件，和 OpenClaw 共用同一传输模型。
     // state.db 仅可在显式 history/session 请求中按需读取，不能在此处挂轮询或子进程，
     // 否则数据库压力或失败会扩大为移动端 Relay 的可用性问题。
+    let livenessMonitor: RelayLivenessMonitor | undefined;
     relayWs.on("open", () => {
       console.log(`Connected to relay server (hermes gatewayId=${opts.gatewayId})`);
       opts.onConnected?.();
+      livenessMonitor = startRelayLivenessMonitor(relayWs, {
+        pingIntervalMs: opts.relayLivenessPingIntervalMs,
+        timeoutMs: opts.relayLivenessTimeoutMs,
+        onTimeout: (idleMs) => console.warn(`[hermes-relay] no frame from Relay for ${idleMs}ms; terminating half-open socket`),
+      });
       const hermesRuntimeMode = resolveHermesRuntimeExecutionMode();
       const runtimeMetadata = buildHermesHostRuntimeMetadata(
         hermesRuntimeMode,
@@ -669,6 +679,7 @@ export async function runHermesRelayManagerWithDependencies(
 
     relayWs.on("close", (code, reason) => {
       console.log(`Hermes relay connection closed: ${code} ${reason.toString()}`);
+      livenessMonitor?.stop();
       opts.onDisconnected?.();
       if (relayHelloTimer) {
         clearTimeout(relayHelloTimer);

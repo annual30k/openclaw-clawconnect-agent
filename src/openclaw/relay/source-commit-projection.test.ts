@@ -56,6 +56,9 @@ test("source commit projects every text, tool, and image row in source order", (
   assert.deepEqual(events.map((event) => event.sourceOrderSeq), [155, 156, 157, 158, 159, 160, 161, 162, 163]);
   assert.equal(events.filter((event) => event.sourceCommit?.sourceRevision === "seq:163").length, 9);
   assert.equal(events[0]?.role, "user");
+  // user 行与 Relay 历史快照/Hermes 投影一致地使用 turn.user.created，其余行为 message.completed。
+  assert.equal(events[0]?.eventType, "turn.user.created");
+  assert.ok(events.slice(1).every((event) => event.eventType === "message.completed"));
   assert.equal(events[4]?.role, "tool");
   assert.equal(events[1]?.content[0]?.type, "image");
 

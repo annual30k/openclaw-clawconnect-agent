@@ -76,6 +76,31 @@ test("Hermes relay manager reconnects on missing Relay hello instead of silently
   await closeHermesTestServer(relayServer);
 });
 
+test("Hermes relay manager terminates a half-open relay socket that stops answering pings", async () => {
+  const relayServer = new WebSocketServer({ port: 0, autoPong: false });
+  let relayClose: { code: number } | undefined;
+  relayServer.on("connection", (socket) => {
+    sendHermesRelayHello(socket, "gw-hermes-half-open");
+    socket.on("close", (code) => { relayClose = { code }; });
+  });
+  const relayAddress = relayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+
+  const startedAt = Date.now();
+  const retry = await runHermesRelayManagerWithDependencies({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-hermes-half-open",
+    relaySecret: "secret",
+    relayLivenessPingIntervalMs: 25,
+    relayLivenessTimeoutMs: 120,
+  }, hermesTestDependencies(async () => ({ output: "unused", sessionKey: "main", artifactPaths: [] })));
+
+  assert.equal(retry, true);
+  assert.ok(Date.now() - startedAt < 3_000);
+  await waitForHermesTest(() => relayClose !== undefined);
+  await closeHermesTestServer(relayServer);
+});
+
 test("Hermes relay manager signals relay readiness only after a valid Relay hello", async () => {
   const relayServer = new WebSocketServer({ port: 0 });
   const abort = new AbortController();

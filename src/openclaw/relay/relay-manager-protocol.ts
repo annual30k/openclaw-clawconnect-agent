@@ -53,6 +53,9 @@ export interface RelayManagerOptions {
   onDisconnected?: () => void;
   /** @internal Allows deterministic protocol-negotiation timeout tests. */
   relayHelloTimeoutMs?: number;
+  /** @internal 存活检测的 ping 周期与超时（毫秒），仅用于测试。 */
+  relayLivenessPingIntervalMs?: number;
+  relayLivenessTimeoutMs?: number;
   /** @internal Isolates durable outbox files in tests. */
   reliableOutboxStorageDirectory?: string;
   /** Optional abort signal.  When aborted the relay WebSocket is closed

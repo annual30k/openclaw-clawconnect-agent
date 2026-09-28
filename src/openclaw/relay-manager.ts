@@ -86,6 +86,7 @@ import { voiceInputSetupMessage } from "../core/relay/voice-input.js";
 import type { FileUploadResult } from "../core/relay/file-upload.js";
 import { buildRelayHelloMessage } from "./relay/relay-manager-hello.js";
 import { shouldSuppressOpenClawHeartbeatChatEvent } from "./relay/openclaw-heartbeat-markers.js";
+import { startRelayLivenessMonitor, type RelayLivenessMonitor } from "../core/relay/relay-liveness.js";
 import { buildOpenClawHostRuntimeMetadata } from "../runtime-metadata.js";
 import {
   CHAT_HISTORY_FETCH_TIMEOUT_MS,
@@ -680,9 +681,15 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       sourceCommitWatchers.set(key, watcher);
     };
 
+    let livenessMonitor: RelayLivenessMonitor | undefined;
     relayWs.on("open", () => {
       console.log(`Connected to relay server (gatewayId=${opts.gatewayId})`);
       opts.onConnected?.();
+      livenessMonitor = startRelayLivenessMonitor(relayWs, {
+        pingIntervalMs: opts.relayLivenessPingIntervalMs,
+        timeoutMs: opts.relayLivenessTimeoutMs,
+        onTimeout: (idleMs) => console.warn(`[relay] no frame from Relay for ${idleMs}ms; terminating half-open socket`),
+      });
       const runtimeMetadata = buildOpenClawHostRuntimeMetadata();
       console.log(`[relay] ClawConnect Agent ${runtimeMetadata.agentVersion}; live events=timeline-delta,tool-lifecycle`);
       send(
@@ -1463,6 +1470,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
     relayWs.on("close", (code, reason) => {
       console.log(`Relay connection closed: ${code} ${reason.toString()}`);
+      livenessMonitor?.stop();
       opts.onDisconnected?.();
       gatewayClient?.stop();
       gatewayClient = null;

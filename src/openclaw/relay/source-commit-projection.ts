@@ -33,6 +33,15 @@ export function buildSourceCommitTimelineEvents(
       return [];
     }
     const messageId = canonicalMessageId;
+    const role = message.sourceRole ?? message.role;
+    // 与 Relay 历史快照及 Hermes 投影保持同一事件契约：user 行是 turn.user.created，
+    // 失败/中止的行是 run.failed，其余为 message.completed。客户端按事件类型对账本地回显，
+    // 若把 user 行发成 message.completed，会被只认 assistant 的解码器丢弃。
+    const eventType: CanonicalTimelineEvent["eventType"] = role === "user"
+      ? "turn.user.created"
+      : message.messageState === "failed" || message.messageState === "aborted"
+        ? "run.failed"
+        : "message.completed";
     const eventId = `evt_source_commit_${createHash("sha256")
       .update(JSON.stringify([sourceCommit.sourceOrderScope, sourceCommit.sourceGeneration, messageId, sourceSeq]))
       .digest("hex")
@@ -40,7 +49,7 @@ export function buildSourceCommitTimelineEvents(
     return [parseCanonicalTimelineEvent({
       protocolVersion: 2,
       eventId,
-      eventType: "message.completed",
+      eventType,
       gatewayId: sourceCommit.gatewayId,
       sessionKey: requireProjectionSessionKey(history.sessionKey),
       turnId: message.turnId,
@@ -50,7 +59,7 @@ export function buildSourceCommitTimelineEvents(
       attachmentId: null,
       seq: sourceSeq,
       turnSeq: message.turnSeq ?? sourceSeq,
-      role: message.sourceRole ?? message.role,
+      role,
       messageState: message.messageState,
       runState: "completed",
       createdAt: message.createdAt,

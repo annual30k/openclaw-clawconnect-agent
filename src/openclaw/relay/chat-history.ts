@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
+import { zstdDecompressSync } from "node:zlib";
 import { restoreGatewayHistoryMessages } from "./gateway-history-projection.js";
 import { readFile, stat } from "fs/promises";
 import { buildHistorySnapshotPage } from "../../core/relay/timeline-event-builder.js";
@@ -202,12 +203,7 @@ function readOpenClawSqliteChatHistory(
     const sessionId = cleanHistoryString(session?.current_session_id);
     if (!sessionId) return null;
 
-    const rows = database.prepare(`
-      SELECT seq, event_json
-      FROM transcript_events
-      WHERE session_id = ?
-      ORDER BY seq ASC
-    `).all(sessionId) as Array<{ seq?: unknown; event_json?: unknown }>;
+    const rows = readSqliteTranscriptEventRows(database, sessionId);
     const visibleParentIds = resolveSqliteVisibleParentIds(rows);
     const messages = rows
       .map((row) => sqliteTranscriptHistoryMessage(
@@ -751,8 +747,45 @@ async function readIndexedTranscriptMessages(
   return visibleMessages;
 }
 
+type SqliteTranscriptEventRow = {
+  seq?: unknown;
+  event_json?: unknown;
+  event_zstd?: unknown;
+};
+
+/**
+ * OpenClaw 会把体积较大的 transcript 事件只写入 `event_zstd`（此时 `event_json` 为 NULL）。
+ * 这些行同样是权威时间线的一部分：漏读会造成 source seq 缺口，并切断 `parentId` 血缘链，
+ * 使后续嵌套 provider 运行（如 codex-app-server）的行无法回溯到发起它们的移动端 turn。
+ * 旧版本 OpenClaw 没有 `event_zstd` 列，因此按实际列集合决定查询语句。
+ */
+function readSqliteTranscriptEventRows(database: DatabaseSync, sessionId: string): SqliteTranscriptEventRow[] {
+  const columns = database.prepare("PRAGMA table_info(transcript_events)").all() as Array<{ name?: unknown }>;
+  const hasZstdColumn = columns.some((column) => column.name === "event_zstd");
+  const projection = hasZstdColumn ? "seq, event_json, event_zstd" : "seq, event_json";
+  return database.prepare(`
+    SELECT ${projection}
+    FROM transcript_events
+    WHERE session_id = ?
+    ORDER BY seq ASC
+  `).all(sessionId) as SqliteTranscriptEventRow[];
+}
+
+function sqliteTranscriptEventJson(row: SqliteTranscriptEventRow): string | undefined {
+  if (typeof row.event_json === "string") return row.event_json;
+  if (row.event_zstd instanceof Uint8Array && row.event_zstd.byteLength > 0) {
+    try {
+      return zstdDecompressSync(row.event_zstd).toString("utf8");
+    } catch (error) {
+      console.warn("[openclaw] failed to decompress transcript event", { seq: row.seq, error: String(error) });
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 function sqliteTranscriptHistoryMessage(
-  row: { seq?: unknown; event_json?: unknown },
+  row: SqliteTranscriptEventRow,
   sessionId: string,
   strictProjectionV3 = false,
   visibleParentIds?: ReadonlyMap<string, string>,
@@ -760,11 +793,12 @@ function sqliteTranscriptHistoryMessage(
   const seq = typeof row.seq === "number" && Number.isFinite(row.seq) && row.seq > 0
     ? Math.round(row.seq)
     : undefined;
-  if (!seq || typeof row.event_json !== "string") return null;
+  const eventJson = sqliteTranscriptEventJson(row);
+  if (!seq || eventJson === undefined) return null;
 
   let event: unknown;
   try {
-    event = JSON.parse(row.event_json);
+    event = JSON.parse(eventJson);
   } catch {
     return null;
   }
@@ -801,7 +835,7 @@ function sqliteTranscriptHistoryMessage(
  * run id. Distinct message identities remain untouched.
  */
 function resolveSqliteVisibleParentIds(
-  rows: Array<{ seq?: unknown; event_json?: unknown }>,
+  rows: SqliteTranscriptEventRow[],
 ): Map<string, string> {
   type SqliteEventNode = {
     eventId: string;
@@ -811,10 +845,11 @@ function resolveSqliteVisibleParentIds(
 
   const nodes = new Map<string, SqliteEventNode>();
   for (const row of rows) {
-    if (typeof row.event_json !== "string") continue;
+    const eventJson = sqliteTranscriptEventJson(row);
+    if (eventJson === undefined) continue;
     let event: unknown;
     try {
-      event = JSON.parse(row.event_json);
+      event = JSON.parse(eventJson);
     } catch {
       continue;
     }

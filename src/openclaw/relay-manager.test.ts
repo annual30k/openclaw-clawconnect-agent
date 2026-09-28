@@ -60,6 +60,37 @@ test("relay manager reconnects on missing Relay hello instead of silently select
   await closeServer(gatewayServer);
 });
 
+test("relay manager terminates a half-open relay socket that stops answering pings", async () => {
+  // 服务端不自动回 pong、也不再发任何帧：模拟 TCP 半开。Agent 必须自行判定并重连。
+  const relayServer = new WebSocketServer({ port: 0, autoPong: false });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  let relayClose: { code: number } | undefined;
+  relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-half-open");
+    socket.on("close", (code) => { relayClose = { code }; });
+  });
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+
+  const startedAt = Date.now();
+  const retry = await runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-half-open",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    relayLivenessPingIntervalMs: 25,
+    relayLivenessTimeoutMs: 120,
+  });
+
+  assert.equal(retry, true);
+  assert.ok(Date.now() - startedAt < 3_000);
+  await waitFor(() => relayClose !== undefined);
+  await closeServer(relayServer);
+  await closeServer(gatewayServer);
+});
+
 test("relay manager signals relay readiness only after a valid Relay hello", async () => {
   const relayServer = new WebSocketServer({ port: 0 });
   const gatewayServer = new WebSocketServer({ port: 0 });

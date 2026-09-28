@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
+import { zstdCompressSync } from "node:zlib";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -404,6 +405,105 @@ test("SQLite projection v3 carries a mobile run id across hidden first-turn even
       },
     ]);
     assert.notEqual(messages[0]?.canonicalMessageId, messages[1]?.canonicalMessageId);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("SQLite projection v3 reads zstd-only transcript rows so nested provider runs keep the mobile turn lineage", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "clawconnect-chat-history-sqlite-zstd-"));
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  const sessionKey = "agent:health-manager:mobile-zstd-turn";
+  const sessionId = "sqlite-zstd-session";
+  const runId = "wx_1790565919422_4ffcv0xt";
+  const providerTurn = "codex-app-server:01a0e5fe-8f85-7c13-bfc3-e284ca90b78d:01a0e60b-b44f-7523-bd18-8ca9bd9e8089";
+  const databasePath = join(stateDir, "agents", "health-manager", "agent", "openclaw-agent.sqlite");
+  await mkdir(join(stateDir, "agents", "health-manager", "agent"), { recursive: true });
+
+  const database = new DatabaseSync(databasePath);
+  try {
+    // 真实 OpenClaw 表结构：大事件只写 event_zstd，event_json 为 NULL。
+    database.exec(`
+      CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, current_session_id TEXT NOT NULL);
+      CREATE TABLE transcript_events (
+        session_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        event_json TEXT,
+        created_at INTEGER,
+        event_zstd BLOB,
+        event_utf8_bytes INTEGER,
+        navigation_json TEXT
+      );
+    `);
+    database.prepare("INSERT INTO session_nodes (session_key, current_session_id) VALUES (?, ?)")
+      .run(sessionKey, sessionId);
+    const insertJson = database.prepare(
+      "INSERT INTO transcript_events (session_id, seq, event_json) VALUES (?, ?, ?)",
+    );
+    const insertZstd = database.prepare(
+      "INSERT INTO transcript_events (session_id, seq, event_json, event_zstd) VALUES (?, ?, NULL, ?)",
+    );
+    insertJson.run(sessionId, 35, JSON.stringify({
+      type: "message",
+      id: "source-user",
+      message: { role: "user", content: "发过来", idempotencyKey: `${runId}:user` },
+    }));
+    insertJson.run(sessionId, 36, JSON.stringify({
+      type: "message",
+      id: "source-tool-call",
+      parentId: "source-user",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_1", name: "exec", arguments: "{}" }],
+        idempotencyKey: providerTurn,
+      },
+    }));
+    const largeToolResult = JSON.stringify({
+      type: "message",
+      id: "source-tool-result",
+      parentId: "source-tool-call",
+      message: {
+        role: "toolResult",
+        toolCallId: "call_1",
+        content: [{ type: "text", text: "x".repeat(15_000) }],
+        idempotencyKey: providerTurn,
+      },
+    });
+    insertZstd.run(sessionId, 37, zstdCompressSync(Buffer.from(largeToolResult, "utf8")));
+    insertJson.run(sessionId, 38, JSON.stringify({
+      type: "message",
+      id: "source-final",
+      parentId: "source-tool-result",
+      message: { role: "assistant", content: "已把桌面上的两张图片发给你了。", idempotencyKey: providerTurn },
+    }));
+  } finally {
+    database.close();
+  }
+
+  try {
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    const page = await readOpenClawTranscriptChatHistory({
+      sessionKey,
+      projectionGatewayId: "gw-openclaw",
+      projectionVersion: 3,
+      limit: 20,
+    }, DEFAULT_GATEWAY_SESSION_DEFAULTS);
+    const messages = page?.timelineSnapshot?.messages ?? [];
+
+    // zstd 行本身必须出现在投影里（source seq 不能有缺口）。
+    assert.deepEqual(messages.map((message) => message.sourceOrderSeq), [35, 36, 37, 38]);
+    assert.deepEqual(messages.map((message) => message.sourceMessageId), [
+      "source-user",
+      "source-tool-call",
+      "source-tool-result",
+      "source-final",
+    ]);
+    // 血缘链穿过 zstd 行后，嵌套 provider 运行的每一行都归属发起它的移动端 turn。
+    assert.deepEqual(messages.map((message) => message.turnId), [`${runId}:user`, runId, runId, runId]);
+    assert.deepEqual(messages.map((message) => message.runId), [`${runId}:user`, runId, runId, runId]);
+    assert.equal(messages[3]?.role, "assistant");
   } finally {
     if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
     else process.env.OPENCLAW_STATE_DIR = previousStateDir;
