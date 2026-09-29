@@ -66,7 +66,11 @@ test("postRelayJson surfaces the underlying network cause instead of a bare fetc
 
 test("postRelayJson aborts a relay request that never responds", async () => {
   const hangingFetch = ((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
-    init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+    const failIfNotAborted = setTimeout(() => reject(new Error("mock request was not aborted")), 1_000);
+    init?.signal?.addEventListener("abort", () => {
+      clearTimeout(failIfNotAborted);
+      reject(init.signal?.reason);
+    }, { once: true });
   })) as typeof fetch;
 
   await assert.rejects(
