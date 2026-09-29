@@ -6,7 +6,7 @@ type GatewayType = "openclaw" | "hermes";
 export declare function statusCommand(opts?: {
     profile?: string;
 }): void;
-export declare function readHealth(logPath: string, gatewayType?: GatewayType): {
+export declare function readHealth(logPath: string, gatewayType?: GatewayType, profile?: string): {
     relay: HealthState;
     gateway: HealthState;
 };

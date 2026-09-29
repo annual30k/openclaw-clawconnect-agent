@@ -3,6 +3,7 @@ import { execFileSync } from "child_process";
 import { configExists, readConfig, readGatewayUrl } from "../config/config.js";
 import { listProfileNames, profileDisplayName } from "../config/profile.js";
 import { t } from "../i18n/index.js";
+import { invalidCredentialsRecoveryHint } from "./profile-hints.js";
 import { getServiceStatus } from "../platform/service-manager.js";
 import { decodeTextBuffer } from "../platform/text-file-decoder.js";
 import { resolveOpenClawConfigPath, resolveOpenClawStateDir } from "../openclaw/runtime/openclaw-paths.js";
@@ -94,7 +95,7 @@ function statusOne(profile) {
     else if (service.running) {
         console.log(t("status.serviceRunning", service.manager));
         console.log(t("status.serviceLog", service.logPath));
-        const health = readHealth(service.logPath, gatewayType);
+        const health = readHealth(service.logPath, gatewayType, profile);
         console.log(formatHealthLine("status.relayHealth", health.relay));
         console.log(formatHealthLine(gatewayType === "openclaw" ? "status.gatewayHealth" : "status.agentHealth", health.gateway));
     }
@@ -109,7 +110,7 @@ function statusOne(profile) {
     }
     console.log("");
 }
-export function readHealth(logPath, gatewayType = "openclaw") {
+export function readHealth(logPath, gatewayType = "openclaw", profile) {
     if (!existsSync(logPath)) {
         return {
             relay: { kind: "unknown", detail: "log missing" },
@@ -118,7 +119,7 @@ export function readHealth(logPath, gatewayType = "openclaw") {
     }
     const lines = readTailLines(logPath, 400);
     return {
-        relay: parseRelayHealth(lines, gatewayType),
+        relay: withRelayRecoveryHint(parseRelayHealth(lines, gatewayType), profile),
         gateway: parseGatewayHealth(lines, gatewayType),
     };
 }
@@ -169,11 +170,19 @@ function parseRelayHealth(lines, gatewayType) {
     if (connectedIndex > disconnectedIndex) {
         return { kind: "ok", detail: "connected" };
     }
-    const line = disconnectedIndex >= 0 ? lines[disconnectedIndex] : "";
-    const detail = line.includes("Relay connection closed:") || line.includes("Hermes relay connection closed:")
-        ? line.replace(/^.*(?:Hermes relay connection closed:|Relay connection closed:)\s*/, "").trim()
+    // Agent 先写 "connection closed: <code>" 再写 "Relay disconnected."；关闭码才是诊断依据，
+    // 只要它发生在最近一次连接之后，就优先展示它。
+    const closedIndex = findLastIndex(lines, (line) => line.includes("Relay connection closed:") || line.includes("Hermes relay connection closed:"));
+    const detail = closedIndex > connectedIndex
+        ? lines[closedIndex].replace(/^.*(?:Hermes relay connection closed:|Relay connection closed:)\s*/, "").trim() || "disconnected"
         : "disconnected";
     return { kind: "error", detail };
+}
+// 4401 表示 Relay 已不认可本机凭证，重试无法自愈；状态里直接给出重新配对的命令。
+function withRelayRecoveryHint(state, profile) {
+    if (state.kind !== "error" || !/^4401\b/.test(state.detail ?? ""))
+        return state;
+    return { ...state, detail: `${state.detail} — ${invalidCredentialsRecoveryHint(profile)}` };
 }
 function parseGatewayHealth(lines, gatewayType) {
     if (gatewayType === "hermes") {

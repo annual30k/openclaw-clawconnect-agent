@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { createServer, type Socket } from "node:net";
 import test from "node:test";
 import { WebSocket, WebSocketServer } from "ws";
 import {
@@ -8,6 +9,7 @@ import {
   createRelayWebSocket,
   parseRelayFrame,
   RELAY_WS_CLIENT_OPTIONS,
+  RELAY_WS_HANDSHAKE_TIMEOUT_MS,
   RELAY_WS_COMPRESSION_THRESHOLD_BYTES,
   sendRelayJson,
   sendRelayJsonWithWriteConfirmation,
@@ -350,4 +352,30 @@ test("shouldRetryRelayClose stops retrying for replacement and shutdown closes",
   assert.equal(shouldRetryRelayClose(4000, controller.signal), false);
   controller.abort();
   assert.equal(shouldRetryRelayClose(1001, controller.signal), false);
+});
+
+test("Relay client bounds the opening handshake so a stalled upgrade closes and can reconnect", async () => {
+  // 服务端接受 TCP 但永不回应 HTTP Upgrade，模拟代理/NAT 把握手卡在半路。
+  const heldSockets: Socket[] = [];
+  const server = createServer((socket) => {
+    heldSockets.push(socket);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    assert.equal(RELAY_WS_CLIENT_OPTIONS.handshakeTimeout, RELAY_WS_HANDSHAKE_TIMEOUT_MS);
+    const client = createRelayWebSocket(`ws://127.0.0.1:${address.port}/relay/gw_stalled`, 200);
+    const errors: string[] = [];
+    client.on("error", (error) => errors.push(error.message));
+    const code = await new Promise<number>((resolve) => client.on("close", (closeCode) => resolve(closeCode)));
+
+    assert.equal(code, 1006);
+    assert.deepEqual(errors, ["Opening handshake has timed out"]);
+    assert.equal(shouldRetryRelayClose(code), true);
+  } finally {
+    for (const socket of heldSockets) socket.destroy();
+    server.close();
+  }
 });

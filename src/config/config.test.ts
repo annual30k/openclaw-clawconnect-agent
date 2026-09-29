@@ -3,11 +3,11 @@ import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isolateHomeDirectory } from "../test-support/isolated-home.js";
 
 test("writeConfig stores secrets in user-only default and profile config files", async () => {
   const tempHome = await mkdtemp(join(tmpdir(), "clawconnect-config-"));
-  const originalHome = process.env.HOME;
-  process.env.HOME = tempHome;
+  const restoreHome = isolateHomeDirectory(tempHome);
 
   try {
     const { getConfigPath, readConfig, writeConfig } = await import(`./config.js?home=${encodeURIComponent(tempHome)}`);
@@ -35,11 +35,7 @@ test("writeConfig stores secrets in user-only default and profile config files",
     assert.equal(getConfigPath("Hermes Agent"), profileConfigPath);
     assert.equal(readConfig("Hermes Agent").gatewayId, "gw_profile");
   } finally {
-    if (originalHome === undefined) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
+    restoreHome();
     await rm(tempHome, { recursive: true, force: true });
   }
 });

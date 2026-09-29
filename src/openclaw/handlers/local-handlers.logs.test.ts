@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, writeFile, rm, utimes } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isolateHomeDirectory } from "../../test-support/isolated-home.js";
 
 const tempHome = await mkdtemp(join(tmpdir(), "clawconnect-logs-"));
 const openclawDir = join(tempHome, ".openclaw");
@@ -15,9 +16,8 @@ const profileOpenClawLogPath = join(profileOpenClawDir, "clawconnect.log");
 const latestLogPath = join(logsDir, "clawconnect.log");
 const olderLogPath = join(logsDir, "clawconnect-error.log");
 
-const originalHome = process.env.HOME;
 const originalProfile = process.env.CLAWCONNECT_PROFILE;
-process.env.HOME = tempHome;
+const restoreHome = isolateHomeDirectory(tempHome);
 
 await mkdir(logsDir, { recursive: true });
 await mkdir(profileOpenClawDir, { recursive: true });
@@ -40,11 +40,7 @@ await writeFile(profileOpenClawLogPath, "profile-openclaw\n");
 const { handleLocalCommand } = await import(`./local-handlers.js?logs-test=${encodeURIComponent(tempHome)}`);
 
 test.after(async () => {
-  if (originalHome === undefined) {
-    delete process.env.HOME;
-  } else {
-    process.env.HOME = originalHome;
-  }
+  restoreHome();
   if (originalProfile === undefined) {
     delete process.env.CLAWCONNECT_PROFILE;
   } else {

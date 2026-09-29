@@ -1402,7 +1402,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     relayWs.on("close", (code, reason) => {
       console.log(`Relay connection closed: ${code} ${reason.toString()}`);
       livenessMonitor?.stop();
-      opts.onDisconnected?.();
+      opts.onDisconnected?.(code);
       gatewayClient?.stop();
       gatewayClient = null;
       for (const watcher of sourceCommitWatchers.values()) watcher.close();

@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import {
   invalidCredentialsRecoveryHint,
   pairCommandForProfile,
+  relayCredentialsRejectedHint,
   resetCommandForProfile,
 } from "./profile-hints.js";
 
@@ -80,4 +81,12 @@ test("top-level help includes the full command quick reference", () => {
   assert.match(output, /reset-hermes\s+Stop Hermes Agent service and clear profile 'hermes'/);
   assert.match(output, /send-file\s+Upload a local file/);
   assert.match(output, /help\s+Show detailed help for a command/);
+});
+
+test("relay credential rejection hint names 4401 and the profile-specific recovery commands", () => {
+  const hint = relayCredentialsRejectedHint("openclaw");
+  assert.match(hint, /\(4401\)/);
+  assert.match(hint, /`clawconnect reset-openclaw`/);
+  assert.match(hint, /`clawconnect pair-openclaw`/);
+  assert.match(relayCredentialsRejectedHint(undefined), /`clawconnect reset`.*`clawconnect pair`/);
 });

@@ -129,7 +129,7 @@ export interface HermesRelayManagerOptions {
   onConnected?: () => void;
   /** Relay hello 校验通过并挂载可靠投递 outbox 后触发；仅此时才算一次成功连接。 */
   onRelayReady?: () => void;
-  onDisconnected?: () => void;
+  onDisconnected?: (closeCode: number) => void;
   /** @internal Allows deterministic protocol-negotiation timeout tests. */
   relayHelloTimeoutMs?: number;
   /** @internal 存活检测的 ping 周期与超时（毫秒），仅用于测试。 */
@@ -680,7 +680,7 @@ export async function runHermesRelayManagerWithDependencies(
     relayWs.on("close", (code, reason) => {
       console.log(`Hermes relay connection closed: ${code} ${reason.toString()}`);
       livenessMonitor?.stop();
-      opts.onDisconnected?.();
+      opts.onDisconnected?.(code);
       if (relayHelloTimer) {
         clearTimeout(relayHelloTimer);
         relayHelloTimer = undefined;

@@ -50,7 +50,7 @@ export interface RelayManagerOptions {
   onConnected?: () => void;
   /** Relay hello 校验通过并挂载可靠投递 outbox 后触发；仅此时才算一次成功连接。 */
   onRelayReady?: () => void;
-  onDisconnected?: () => void;
+  onDisconnected?: (closeCode: number) => void;
   /** @internal Allows deterministic protocol-negotiation timeout tests. */
   relayHelloTimeoutMs?: number;
   /** @internal 存活检测的 ping 周期与超时（毫秒），仅用于测试。 */

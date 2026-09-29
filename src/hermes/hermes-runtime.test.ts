@@ -364,9 +364,11 @@ test("runHermesChat rejects provider failure text returned with exit zero", asyn
 
 test("runHermesChatHistory extracts stable mobile turn metadata from Hermes export", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hermes-history-turn-metadata-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
   const previousHermesBin = process.env.HERMES_BIN;
   try {
     const hermesBin = join(dir, "hermes");
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = join(dir, "sessions.json");
     const exported = {
       sessionId: "s1",
       messages: [
@@ -404,6 +406,11 @@ test("runHermesChatHistory extracts stable mobile turn metadata from Hermes expo
     ].join("\n"));
     chmodSync(hermesBin, 0o755);
     process.env.HERMES_BIN = hermesBin;
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId: "s1",
+      kind: "hermes",
+    });
 
     const result = await runHermesChatHistory({ sessionKey: "main", limit: 10 });
     assert.equal(result.ok, true);
@@ -421,6 +428,7 @@ test("runHermesChatHistory extracts stable mobile turn metadata from Hermes expo
     assert.equal(assistant?.turnId, "client-run-file-1");
     assert.equal(assistant?.runId, "client-run-file-1");
   } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
     restoreEnv("HERMES_BIN", previousHermesBin);
     rmSync(dir, { recursive: true, force: true });
   }

@@ -1,6 +1,5 @@
-import { copyFileSync, existsSync } from "fs";
-import { dirname, join } from "path";
 import { configExists, getConfigPath, readConfig, writeConfig } from "../config/config.js";
+import { backupConfigBeforeRegistration } from "../config/config-backups.js";
 import { installCommand } from "./install.js";
 import qrcodeTerminal from "qrcode-terminal";
 import { t } from "../i18n/index.js";
@@ -10,7 +9,8 @@ import { getServicePlatform } from "../platform/service-manager.js";
 import { normalizeRelayServerIdentity, toRelayHttpBase } from "../core/relay/file-upload-utils.js";
 import { getDefaultRelayServerUrl } from "../config/env.js";
 import { gatewayCapabilitiesForType, normalizeGatewayType } from "../gateway-profiles.js";
-import { clearProfileLogs } from "../config/profile.js";
+import { clearProfileLogs, getActiveProfile, listProfileNames, normalizeProfileName, profileDisplayName } from "../config/profile.js";
+import { pairCommandForProfile, resetCommandForProfile } from "./profile-hints.js";
 export async function pairCommand(opts) {
     let gatewayId = "";
     let relaySecret = "";
@@ -32,17 +32,7 @@ export async function pairCommand(opts) {
         displayName = opts.name ? sanitizeDisplayName(opts.name) : config.displayName;
         console.log(t("pair.alreadyRegistered", gatewayId));
         const httpBase = toRelayHttpBase(relayServerUrl);
-        let res;
-        try {
-            res = await fetch(`${httpBase}/api/relay/accesscode`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ gatewayId, relaySecret }),
-            });
-        }
-        catch (err) {
-            throw new Error(t("pair.refreshFailed", "network", String(err)));
-        }
+        const res = await postRelayJson(httpBase, "/api/relay/accesscode", { gatewayId, relaySecret });
         if (res.status === 401) {
             console.log(`Existing gateway credentials (${gatewayId}) unrecognized by relay server (401); re-registering a new gateway…`);
             reRegisterNeeded = true;
@@ -65,7 +55,11 @@ export async function pairCommand(opts) {
             console.log(`Existing ${gatewayType} gateway config is for ${toRelayHttpBase(existingConfig.relayServerUrl)}.`);
             console.log(`Requested relay is ${toRelayHttpBase(requestedRelayServerUrl)}; registering a new ${gatewayType} gateway.`);
         }
-        const backupPath = existingConfig ? backupExistingConfig() : undefined;
+        const conflict = findConflictingRegistration(getActiveProfile(), gatewayType, requestedRelayServerUrl, loadOtherProfileConfigs());
+        if (conflict) {
+            throw new Error(t("pair.duplicateRegistration", gatewayType, toRelayHttpBase(requestedRelayServerUrl), profileDisplayName(conflict.profile), pairCommandForProfile(conflict.profile), resetCommandForProfile(conflict.profile)));
+        }
+        const backupPath = existingConfig ? backupConfigBeforeRegistration(getConfigPath()) : undefined;
         if (backupPath) {
             console.log(`Previous config backed up to ${backupPath}`);
         }
@@ -73,11 +67,7 @@ export async function pairCommand(opts) {
         displayName = opts.name ? sanitizeDisplayName(opts.name) : existingConfig?.displayName ?? getDisplayName();
         console.log(t("pair.registering"));
         const httpBase = toRelayHttpBase(relayServerUrl);
-        const res = await fetch(`${httpBase}/api/relay/register`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ displayName, gatewayType, capabilities }),
-        });
+        const res = await postRelayJson(httpBase, "/api/relay/register", { displayName, gatewayType, capabilities });
         if (!res.ok) {
             const body = await res.text();
             throw new Error(t("pair.registrationFailed", String(res.status), body));
@@ -112,6 +102,64 @@ export async function pairCommand(opts) {
     console.log(t("pair.installingService"));
     installCommand();
 }
+/** 配对请求的时间上限：代理/NAT 卡住连接时必须给出明确失败，而不是让命令无限挂起。 */
+export const PAIR_REQUEST_TIMEOUT_MS = 20_000;
+export async function postRelayJson(httpBase, path, body, fetchImpl = fetch, timeoutMs = PAIR_REQUEST_TIMEOUT_MS) {
+    try {
+        return await fetchImpl(`${httpBase}${path}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(timeoutMs),
+        });
+    }
+    catch (err) {
+        throw new Error(t("pair.networkFailed", httpBase, describeNetworkError(err, timeoutMs)));
+    }
+}
+// undici 只抛 "fetch failed"，真正原因在 cause.code（如 UND_ERR_CONNECT_TIMEOUT、ENOTFOUND）。
+function describeNetworkError(err, timeoutMs) {
+    if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
+        return `no response within ${timeoutMs}ms`;
+    }
+    const cause = err instanceof Error ? err.cause : undefined;
+    if (cause && typeof cause === "object") {
+        const record = cause;
+        const code = typeof record.code === "string" ? record.code : "";
+        const message = typeof record.message === "string" ? record.message : "";
+        const described = [code, message].filter(Boolean).join(" ");
+        if (described)
+            return described;
+    }
+    return err instanceof Error ? err.message : String(err);
+}
+/**
+ * 找出已在同一 Relay 上注册了同类型网关的其他 profile。
+ * 同一台主机只有一个本地 OpenClaw/Hermes 运行时，重复注册只会产生两个指向同一运行时的网关。
+ * 多个冲突时按 profile 名排序取第一个（default 最前），结果与目录遍历顺序无关。
+ */
+export function findConflictingRegistration(currentProfile, gatewayType, relayServerUrl, candidates) {
+    const current = normalizeProfileName(currentProfile);
+    return candidates
+        .map((entry) => ({ ...entry, profile: normalizeProfileName(entry.profile) }))
+        .filter((entry) => entry.profile !== current)
+        .filter((entry) => (entry.config.gatewayType ?? "openclaw") === gatewayType
+        && sameRelayServer(entry.config.relayServerUrl, relayServerUrl))
+        .sort((left, right) => (left.profile ?? "").localeCompare(right.profile ?? ""))[0];
+}
+function loadOtherProfileConfigs() {
+    const entries = [];
+    for (const name of listProfileNames()) {
+        const profile = normalizeProfileName(name);
+        try {
+            entries.push({ profile, config: readConfig(profile) });
+        }
+        catch {
+            // 损坏或不可读的配置无法代表有效注册，不参与冲突判断。
+        }
+    }
+    return entries;
+}
 export function sameRelayServer(left, right) {
     return normalizeRelayServerIdentity(left) === normalizeRelayServerIdentity(right);
 }
@@ -122,27 +170,6 @@ export function shouldReuseExistingPairing(config, gatewayType, requestedRelaySe
         && sameRelayServer(config.relayServerUrl, requestedRelayServerUrl);
 }
 export { normalizeRelayServerIdentity } from "../core/relay/file-upload-utils.js";
-function backupExistingConfig() {
-    const configPath = getConfigPath();
-    if (!existsSync(configPath)) {
-        return undefined;
-    }
-    const backupPath = join(dirname(configPath), `config.json.server-switch-${formatBackupTimestamp(new Date())}.bak`);
-    copyFileSync(configPath, backupPath);
-    return backupPath;
-}
-function formatBackupTimestamp(date) {
-    const pad = (value) => String(value).padStart(2, "0");
-    return [
-        date.getFullYear(),
-        pad(date.getMonth() + 1),
-        pad(date.getDate()),
-        "-",
-        pad(date.getHours()),
-        pad(date.getMinutes()),
-        pad(date.getSeconds()),
-    ].join("");
-}
 function sanitizeDisplayName(name) {
     // Replace smart quotes and other problematic characters with regular ones
     return name

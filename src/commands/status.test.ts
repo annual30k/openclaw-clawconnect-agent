@@ -99,3 +99,28 @@ test("readHealth parses Windows PowerShell UTF-16LE service logs", () => {
   assert.deepEqual(health.relay, { kind: "ok", detail: "connected" });
   assert.deepEqual(health.gateway, { kind: "ok", detail: "connected" });
 });
+
+test("readHealth turns a relay 4401 rejection into a profile-specific re-pair instruction", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawconnect-status-4401-"));
+  const logPath = join(dir, "clawconnect.log");
+  writeFileSync(logPath, [
+    "Connected to relay server (gatewayId=gw_removed)",
+    "Relay connection closed: 4401 unauthorized",
+    "Relay disconnected. Reconnecting…",
+  ].join("\n"));
+
+  const health = readHealth(logPath, "openclaw", "openclaw");
+
+  assert.equal(health.relay.kind, "error");
+  assert.match(health.relay.detail ?? "", /^4401 unauthorized — Run `clawconnect reset-openclaw`.*`clawconnect pair-openclaw`/);
+});
+
+test("readHealth keeps transient relay close codes without a re-pair instruction", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawconnect-status-1006-"));
+  const logPath = join(dir, "clawconnect.log");
+  writeFileSync(logPath, "Relay connection closed: 1006 \n");
+
+  const health = readHealth(logPath, "openclaw", "openclaw");
+
+  assert.deepEqual(health.relay, { kind: "error", detail: "1006" });
+});

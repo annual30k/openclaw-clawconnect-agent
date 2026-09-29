@@ -3,8 +3,19 @@ import { WebSocket, type RawData } from "ws";
 export const RELAY_WS_BACKPRESSURE_HIGH_WATER_MARK_BYTES = 4 * 1024 * 1024;
 export const RELAY_WS_COMPRESSION_THRESHOLD_BYTES = 1024;
 export const RELAY_WS_WRITE_CONFIRMATION_TIMEOUT_MS = 10_000;
+/**
+ * 建连握手（TCP + TLS + HTTP Upgrade）的时间上限。
+ * 存活检测只在 open 之后启动；没有这个上限时，代理/NAT 把握手卡在半路会让连接永远停在
+ * CONNECTING，既不触发 close 也不再重连。超时后 ws 以 1006 关闭，交给既有重连退避处理。
+ */
+export const RELAY_WS_HANDSHAKE_TIMEOUT_MS = 15_000;
+
+/** Relay 拒绝主机凭证（网关已解绑/被清理或密钥不匹配）时使用的关闭码。 */
+export const RELAY_CLOSE_CODE_UNAUTHORIZED = 4401;
+
 export const RELAY_WS_CLIENT_OPTIONS = Object.freeze({
   perMessageDeflate: true as const,
+  handshakeTimeout: RELAY_WS_HANDSHAKE_TIMEOUT_MS,
 });
 
 export type RelaySendResult = {
@@ -21,8 +32,8 @@ export function buildRelayUrl(serverUrl: string, gatewayId: string, relaySecret:
   return `${base}/relay/${gatewayId}?secret=${encodeURIComponent(relaySecret)}`;
 }
 
-export function createRelayWebSocket(url: string): WebSocket {
-  return new WebSocket(url, RELAY_WS_CLIENT_OPTIONS);
+export function createRelayWebSocket(url: string, handshakeTimeoutMs = RELAY_WS_HANDSHAKE_TIMEOUT_MS): WebSocket {
+  return new WebSocket(url, { ...RELAY_WS_CLIENT_OPTIONS, handshakeTimeout: handshakeTimeoutMs });
 }
 
 export function sendRelayJson(

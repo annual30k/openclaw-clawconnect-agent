@@ -18,6 +18,10 @@ export function invalidCredentialsRecoveryHint(profile: string | undefined): str
   return `Run \`${resetCommandForProfile(profile)}\` to clear this profile config, then run \`${pairCommandForProfile(profile)}\` to re-register.`;
 }
 
+export function relayCredentialsRejectedHint(profile: string | undefined): string {
+  return `Relay rejected this host's credentials (4401): the gateway was unpaired or removed on the relay. ${invalidCredentialsRecoveryHint(profile)}`;
+}
+
 export const RESET_PROFILE_HELP_TEXT = [
   "",
   "Profile recovery examples:",

@@ -7,6 +7,8 @@ import type { Interface } from "readline";
 import { disposeReliableRelayOutboxes } from "../core/relay/reliable-relay-outbox-registry.js";
 import { rotateProfileLogsIfOversized } from "../config/profile-log-rotation.js";
 import { getActiveProfile } from "../config/profile.js";
+import { RELAY_CLOSE_CODE_UNAUTHORIZED } from "../core/relay/relay-server-connection.js";
+import { relayCredentialsRejectedHint } from "./profile-hints.js";
 
 export async function runCommand(): Promise<void> {
   // 服务管理器只会追加写日志；每次进程启动先做一次有界轮转，避免日志无限增长。
@@ -47,6 +49,10 @@ export async function runCommand(): Promise<void> {
     console.log(t("run.gatewayUrl", gatewayUrl));
   }
 
+  // 4401 基本是永久性的（网关已解绑或被清理），但 Relay 数据可能被恢复，因此仍按退避重连；
+  // 只在每段连续拒绝的第一次打印恢复指引，避免每 30 秒刷一条相同日志。
+  let credentialsRejectionReported = false;
+
   try {
     await withReconnect(
       (session) => runtimeAdapter.start({
@@ -55,8 +61,17 @@ export async function runCommand(): Promise<void> {
         gatewayAuth,
         signal: shutdown.signal,
         onConnected: () => console.log(t("run.connected")),
-        onRelayReady: () => session.markEstablished(),
-        onDisconnected: () => console.log(t("run.disconnected")),
+        onRelayReady: () => {
+          credentialsRejectionReported = false;
+          session.markEstablished();
+        },
+        onDisconnected: (closeCode) => {
+          console.log(t("run.disconnected"));
+          if (closeCode === RELAY_CLOSE_CODE_UNAUTHORIZED && !credentialsRejectionReported) {
+            credentialsRejectionReported = true;
+            console.error(`[relay] ${relayCredentialsRejectedHint(getActiveProfile())}`);
+          }
+        },
       }),
       {
         signal: shutdown.signal,
