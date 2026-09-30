@@ -121,7 +121,13 @@ test("closing the connection rejects pending and future queries", async () => {
 test("a query that never gets a response times out for liveness only", async () => {
   const { client } = harness({ timeoutMs: 5 });
   client.markRelayHello([RELAY_SOURCE_COMMIT_RESUME_CAPABILITY]);
-  await assert.rejects(client.resolveWatermark(cursor), /timed out/);
+  // Production query timers are unref'd; keep this test process alive until the timeout settles.
+  const keepAlive = setTimeout(() => undefined, 100);
+  try {
+    await assert.rejects(client.resolveWatermark(cursor), /timed out/);
+  } finally {
+    clearTimeout(keepAlive);
+  }
 });
 
 test("unrelated frames are not consumed and stale responses are ignored", () => {
