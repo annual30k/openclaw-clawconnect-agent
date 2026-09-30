@@ -1,6 +1,10 @@
 import { watch, type FSWatcher } from "node:fs";
 import { dirname, basename } from "node:path";
-import { createSourceCommitObserver, type SourceCommit } from "../../core/relay/source-commit.js";
+import {
+  createSourceCommitObserver,
+  type SourceCommit,
+  type SourceCommitWatermarkResolver,
+} from "../../core/relay/source-commit.js";
 
 export type OpenClawSourceCommitWatcher = {
   notify(): void;
@@ -23,13 +27,14 @@ export function watchOpenClawSourceCommit(options: {
   onCommit: (commit: SourceCommit, previousCommittedThroughSeq: number | undefined) => void | Promise<void>;
   onError?: (error: unknown) => void;
   rescanIntervalMs?: number;
-  initialWatermarkMode?: "latest" | "from_zero";
+  /** 解析每个源作用域的续传起点；缺省时从序号 0 开始投影。 */
+  resolveInitialWatermark?: SourceCommitWatermarkResolver;
 }): OpenClawSourceCommitWatcher {
   const observer = createSourceCommitObserver({
     readCursor: options.readCursor,
     onCommit: options.onCommit,
     onError: options.onError,
-    initialWatermarkMode: options.initialWatermarkMode,
+    resolveInitialWatermark: options.resolveInitialWatermark,
   });
   const watchers: FSWatcher[] = [];
   const watchedDirectory = dirname(options.databasePath);

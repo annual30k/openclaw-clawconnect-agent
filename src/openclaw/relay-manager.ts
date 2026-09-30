@@ -42,6 +42,7 @@ import {
   type HistoryResponse,
 } from "./relay/chat-history.js";
 import { watchOpenClawSourceCommit, type OpenClawSourceCommitWatcher } from "./relay/openclaw-source-commit-watcher.js";
+import { createSourceCommitCheckpointClient } from "../core/relay/source-commit-checkpoint-client.js";
 import { projectSourceCommitHistoryPages } from "./relay/source-commit-projection.js";
 import { join } from "node:path";
 import { resolveOpenClawStateDir } from "./runtime/openclaw-paths.js";
@@ -193,6 +194,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     const subscribedSessionMessageKeys = new Set<string>();
     const pendingSessionMessageSubscriptions = new Map<string, Promise<void>>();
     const sourceCommitWatchers = new Map<string, OpenClawSourceCommitWatcher>();
+    // 每条 Relay 连接一个水位查询客户端：重连后源投影从 Relay 已落库的水位续传，
+    // 只补断线期间的增量，不再把全部会话历史从零重放给 Relay。
+    const sourceCommitCheckpoints = createSourceCommitCheckpointClient({
+      send: (query) => sendRelayJson(relayWs, query).status === "sent",
+    });
     const chatRunContexts = new Map<string, OpenClawChatRunIdentity>();
     const chatSendDedupe = new OpenClawChatSendDedupeCoordinator(() => sessionDefaults);
     const outgoingMediaUploadCache = new Map<string, FileUploadResult>();
@@ -279,10 +285,9 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           mainSessionKey: sessionDefaults.mainSessionKey,
         });
         await ensureSessionMessagesSubscribed(sessionDefaults.mainSessionKey);
-        // 启动时从零重扫：Relay 的投影必须覆盖宿主 transcript 的完整历史，
-        // 否则 Agent 首次运行之前的消息永远不会出现在移动端。已投影的行按
-        // 不可变哈希幂等，不会重复落库或重复广播。
-        ensureSourceCommitWatcher(sessionDefaults.mainSessionKey, "from_zero");
+        // 启动/重连时按 Relay 已落库的水位续传：Relay 从未投影过的作用域从零补齐一次，
+        // 已有水位的作用域只补断线期间的增量。移动端更早的历史由 history 分页按需拉取。
+        ensureSourceCommitWatcher(sessionDefaults.mainSessionKey);
         const sessionsPayload = await gatewayClient.request("sessions.list", {
           limit: 100,
           includeGlobal: true,
@@ -302,7 +307,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           // Subscribe each known session so their finished replies travel through
           // the same ClawConnect → Relay realtime path as an interactive chat.
           await ensureSessionMessagesSubscribed(sessionKey);
-          ensureSourceCommitWatcher(sessionKey, "from_zero");
+          ensureSourceCommitWatcher(sessionKey);
           const snapshot = contextUsageSnapshotFromSessionsList(sessionsPayload, sessionKey, sessionDefaults);
           if (!snapshot) continue;
           contextUsage.emit(snapshot, true);
@@ -547,10 +552,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       });
     }
 
-    const ensureSourceCommitWatcher = (
-      sessionKey: string,
-      initialWatermarkMode: "latest" | "from_zero" = "from_zero",
-    ): void => {
+    const ensureSourceCommitWatcher = (sessionKey: string): void => {
       const normalizedSessionKey = explicitOpenClawSessionKey(sessionKey);
       if (!normalizedSessionKey) return;
       const key = `${opts.gatewayId}\u0000${normalizedSessionKey}`;
@@ -565,7 +567,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       );
       const watcher = watchOpenClawSourceCommit({
         databasePath,
-        initialWatermarkMode,
+        resolveInitialWatermark: (cursor) => sourceCommitCheckpoints.resolveWatermark(cursor),
         readCursor: () => readOpenClawSourceCommitCursor({
           sessionKey: normalizedSessionKey,
           projectionVersion: 3,
@@ -678,7 +680,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             if (rawSessionKey) {
               const sessionKey = canonicalizeSessionKey(rawSessionKey, sessionDefaults);
               if (typeof sessionKey === "string" && sessionKey.trim()) {
-                ensureSourceCommitWatcher(sessionKey, "from_zero");
+                ensureSourceCommitWatcher(sessionKey);
                 sourceCommitWatchers.get(`${opts.gatewayId}\u0000${sessionKey.trim()}`)?.notify();
               }
             }
@@ -1134,12 +1136,17 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         const deliveryMode = reliableDeliveryModeFromRelayHello(msg);
         deliveryOutbox.attach(relayWs, deliveryMode);
         console.log(`[relay] reliable delivery mode=${deliveryMode}`);
+        sourceCommitCheckpoints.markRelayHello(msg.protocolCapabilities);
         opts.onRelayReady?.();
         return;
       }
 
       if (msg.type === "event_ack") {
         deliveryOutbox.acknowledge(msg.id);
+        return;
+      }
+
+      if (sourceCommitCheckpoints.handleResponse(msg)) {
         return;
       }
 
@@ -1353,7 +1360,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 typeof paramsRecord?.sessionKey === "string" && paramsRecord.sessionKey.trim().length > 0
                   ? paramsRecord.sessionKey.trim()
                   : sessionDefaults.mainSessionKey;
-              ensureSourceCommitWatcher(sessionKey, "from_zero");
+              ensureSourceCommitWatcher(sessionKey);
               if (commandMethod === "chat.send" && chatSendDedupeRequest) {
                 chatSendDedupe.register(chatSendDedupeRequest, providerRunId);
               }
@@ -1407,6 +1414,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       gatewayClient = null;
       for (const watcher of sourceCommitWatchers.values()) watcher.close();
       sourceCommitWatchers.clear();
+      sourceCommitCheckpoints.close(`relay closed ${code}`);
       chatSendDedupe.clearAll();
       contextUsage.dispose();
       if (relayHelloTimer) {

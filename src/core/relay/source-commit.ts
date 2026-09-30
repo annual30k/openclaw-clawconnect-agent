@@ -71,11 +71,21 @@ export function isSourceCommit(value: unknown): value is SourceCommit {
 
 export type SourceCommitCursorReader<TCursor extends SourceCommit = SourceCommit> = () => TCursor | null | Promise<TCursor | null>;
 
+/**
+ * 解析某个源作用域的续传起点：返回下游（Relay）已持久化的水位；`undefined`
+ * 表示下游没有该作用域的任何投影，需要从序号 0 开始补齐。解析失败必须抛错，
+ * 观察者不会在起点未知时猜测或发布任何投影。
+ */
+export type SourceCommitWatermarkResolver<TCursor extends SourceCommit = SourceCommit> = (
+  cursor: TCursor,
+) => Promise<number | undefined>;
+
 export type SourceCommitObserverOptions<TCursor extends SourceCommit = SourceCommit> = {
   readCursor: SourceCommitCursorReader<TCursor> | (() => Promise<TCursor | null>);
   onCommit: (commit: TCursor, previousCommittedThroughSeq: number | undefined) => void | Promise<void>;
   onError?: (error: unknown) => void;
-  initialWatermarkMode?: "latest" | "from_zero";
+  /** 缺省时每个作用域都从序号 0 开始投影。 */
+  resolveInitialWatermark?: SourceCommitWatermarkResolver<TCursor>;
 };
 
 /**
@@ -83,6 +93,10 @@ export type SourceCommitObserverOptions<TCursor extends SourceCommit = SourceCom
  * source scope.  Notifications are hints; the reader is authoritative.  A
  * generation change creates a new scope, so a restarted transcript can start
  * at sequence zero without being mistaken for an old cursor.
+ *
+ * 每个作用域第一次出现时先解析续传起点（通常是 Relay 已落库的水位），之后只投影
+ * 起点之后的增量。这样重连不会把整段历史重新推给 Relay，也不会漏掉断线期间写入
+ * 的源行：起点来自下游的持久化事实，而不是本地“当前最新”这种时间点快照。
  */
 export function createSourceCommitObserver<TCursor extends SourceCommit = SourceCommit>(
   options: SourceCommitObserverOptions<TCursor>,
@@ -90,8 +104,11 @@ export function createSourceCommitObserver<TCursor extends SourceCommit = Source
   let closed = false;
   let running = false;
   let pending = false;
-  let initialWatermarkPending = options.initialWatermarkMode === "latest";
+  const resolveInitialWatermark: SourceCommitWatermarkResolver<TCursor> = options.resolveInitialWatermark
+    ?? (async () => undefined);
   const latestByScope = new Map<string, number>();
+  // 已确定续传起点的作用域；起点为“从零开始”时不会出现在 latestByScope 中。
+  const resolvedScopes = new Set<string>();
 
   const drain = async (): Promise<void> => {
     if (closed || running) return;
@@ -106,16 +123,28 @@ export function createSourceCommitObserver<TCursor extends SourceCommit = Source
           options.onError?.(error);
           continue;
         }
-        if (initialWatermarkPending) {
-          initialWatermarkPending = false;
-          if (cursor) {
-            const scope = sourceCommitScope(cursor);
-            latestByScope.set(scope, cursor.committedThroughSeq);
-            continue;
-          }
-        }
         if (!cursor) continue;
         const scope = sourceCommitScope(cursor);
+        if (!resolvedScopes.has(scope)) {
+          let resolvedWatermark: number | undefined;
+          try {
+            resolvedWatermark = await resolveInitialWatermark(cursor);
+          } catch (error) {
+            // 起点未知时不投影任何行；下一次源通知或周期重扫会再次解析同一作用域。
+            options.onError?.(error);
+            continue;
+          }
+          if (closed) return;
+          if (
+            resolvedWatermark !== undefined
+            && (!Number.isSafeInteger(resolvedWatermark) || resolvedWatermark < 0)
+          ) {
+            options.onError?.(new Error(`Source commit watermark is invalid: ${String(resolvedWatermark)}`));
+            continue;
+          }
+          if (resolvedWatermark !== undefined) latestByScope.set(scope, resolvedWatermark);
+          resolvedScopes.add(scope);
+        }
         const previous = latestByScope.get(scope);
         if (previous !== undefined && cursor.committedThroughSeq <= previous) continue;
         try {

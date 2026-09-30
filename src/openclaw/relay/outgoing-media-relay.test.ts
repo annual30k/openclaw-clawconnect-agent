@@ -185,6 +185,58 @@ test("managed inbound images are uploaded once across history projections and re
   }
 });
 
+test("an expired upload idempotency key is not retried by later history projections on the same connection", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "expired-media-test-"));
+  const server = await createFileUploadRelayServer("file_expired", {
+    initStatus: 400,
+    initRejectionBody: JSON.stringify({ error: "upload_idempotency_expired" }),
+  });
+  try {
+    await mkdir(join(stateDir, "media", "inbound"), { recursive: true });
+    await writeFile(join(stateDir, "media", "inbound", "old.png"), "image bytes");
+    const options = { stateDir, relayServerUrl: server.baseUrl, relaySecret: "secret", gatewayId: "gw_test", cache: new Map() };
+    const message = { role: "user", runId: "user-run", content: [{ type: "image", url: "media://inbound/old.png" }] };
+    const history = { sessionKey: "agent:health:chat", messages: [message], timelineSnapshot: { messages: [message] } };
+
+    const first = await relayOutgoingMediaInHistoryResponse(history, options) as any;
+    const second = await relayOutgoingMediaInHistoryResponse(history, options) as any;
+
+    assert.equal(server.initRequestCount(), 1);
+    assert.equal(first.messages[0].content[0].fileId, undefined);
+    assert.deepEqual(second.messages[0].content[0], first.messages[0].content[0]);
+
+    // 新连接使用新的缓存实例，仍会向 Relay 重新确认一次，不会永久屏蔽。
+    await relayOutgoingMediaInHistoryResponse(history, { ...options, cache: new Map() });
+    assert.equal(server.initRequestCount(), 2);
+  } finally {
+    await server.close();
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("a generic upload rejection is retried on the next projection", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "rejected-media-test-"));
+  const server = await createFileUploadRelayServer("file_rejected", { initStatus: 400 });
+  try {
+    await mkdir(join(stateDir, "media", "inbound"), { recursive: true });
+    await writeFile(join(stateDir, "media", "inbound", "retry.png"), "image bytes");
+    const options = { stateDir, relayServerUrl: server.baseUrl, relaySecret: "secret", gatewayId: "gw_test", cache: new Map() };
+    const message = { role: "user", runId: "user-run", content: [{ type: "image", url: "media://inbound/retry.png" }] };
+    const history = { sessionKey: "agent:health:chat", messages: [message], timelineSnapshot: { messages: [message] } };
+
+    await relayOutgoingMediaInHistoryResponse(history, options);
+    const perProjection = server.initRequestCount();
+    await relayOutgoingMediaInHistoryResponse(history, options);
+
+    // 非“幂等键已失效”的失败不做缓存：下一轮投影照常重新尝试同样次数。
+    assert.ok(perProjection > 0);
+    assert.equal(server.initRequestCount(), perProjection * 2);
+  } finally {
+    await server.close();
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("relayOutgoingMediaInPayload uploads OpenClaw outgoing media and rewrites the image block", async () => {
   const fixture = await createOutgoingMediaFixture();
   const server = await createFileUploadRelayServer("file_outgoing_payload");
@@ -1686,7 +1738,10 @@ async function createSqliteOutgoingMediaFixture() {
   return { root, stateDir, attachmentId };
 }
 
-async function createFileUploadRelayServer(fileId: string, options: { initStatus?: number; echoFileName?: boolean } = {}) {
+async function createFileUploadRelayServer(
+  fileId: string,
+  options: { initStatus?: number; initRejectionBody?: string; echoFileName?: boolean } = {},
+) {
   const uploads = new Map<string, {
     chunks: Buffer[];
     fileId: string;
@@ -1707,7 +1762,7 @@ async function createFileUploadRelayServer(fileId: string, options: { initStatus
       lastInitBody = initBody;
       if (options.initStatus !== undefined) {
         res.statusCode = options.initStatus;
-        res.end("rejected");
+        res.end(options.initRejectionBody ?? "rejected");
         return;
       }
       const uploadId = `upload_test_${initRequestCount}`;

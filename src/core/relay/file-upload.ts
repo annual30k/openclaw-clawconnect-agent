@@ -104,6 +104,23 @@ class RelayRequestError extends Error {
   }
 }
 
+/** Relay 对同一幂等键的上传记录已失效（过期/删除）；同一键重试只会得到相同结果。 */
+export const RELAY_UPLOAD_IDEMPOTENCY_EXPIRED = "upload_idempotency_expired";
+
+/** 读取 Relay 上传请求失败时返回的稳定错误码；非 Relay 请求错误返回 undefined。 */
+export function relayUploadErrorCode(error: unknown): string | undefined {
+  if (!(error instanceof RelayRequestError)) return undefined;
+  try {
+    const body = JSON.parse(error.responseBody) as unknown;
+    const code = body && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>).error
+      : undefined;
+    return typeof code === "string" ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const JSON_HEADERS = {
   "Content-Type": "application/json",
   Accept: "application/json",

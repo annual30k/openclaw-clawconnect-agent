@@ -4,7 +4,13 @@ import { homedir } from "os";
 import { isAbsolute, extname, join, relative, resolve } from "path";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "crypto";
-import { uploadFileToRelay, type FileUploadRequest, type FileUploadResult } from "../../core/relay/file-upload.js";
+import {
+  RELAY_UPLOAD_IDEMPOTENCY_EXPIRED,
+  relayUploadErrorCode,
+  uploadFileToRelay,
+  type FileUploadRequest,
+  type FileUploadResult,
+} from "../../core/relay/file-upload.js";
 import { resolveOpenClawStateDir } from "../runtime/openclaw-paths.js";
 import {
   extractOpenClawMessageToolRelation,
@@ -81,6 +87,9 @@ const inFlightUploadsByCache = new WeakMap<
   Map<string, FileUploadResult>,
   Map<string, Promise<FileUploadResult>>
 >();
+// 幂等键由 cacheKey 确定性派生；Relay 判定该键的上传记录已失效后，同一连接内重试
+// 只会得到相同的 400。记住该结果，避免每次历史投影都对同一附件重复发起失败请求。
+const expiredUploadsByCache = new WeakMap<Map<string, FileUploadResult>, Map<string, unknown>>();
 
 export async function relayOutgoingMediaInPayload(
   payload: unknown,
@@ -1093,6 +1102,8 @@ async function cachedUpload(
   }
   const existing = inFlight.get(cacheKey);
   if (existing) return existing;
+  const expiredUploads = expiredUploadsByCache.get(opts.cache);
+  if (expiredUploads?.has(cacheKey)) throw expiredUploads.get(cacheKey);
 
   const pending = uploadFileToRelay({ ...request, idempotencyKey });
   inFlight.set(cacheKey, pending);
@@ -1100,6 +1111,16 @@ async function cachedUpload(
     const uploaded = await pending;
     opts.cache.set(cacheKey, uploaded);
     return uploaded;
+  } catch (error) {
+    if (relayUploadErrorCode(error) === RELAY_UPLOAD_IDEMPOTENCY_EXPIRED) {
+      let expired = expiredUploadsByCache.get(opts.cache);
+      if (!expired) {
+        expired = new Map();
+        expiredUploadsByCache.set(opts.cache, expired);
+      }
+      expired.set(cacheKey, error);
+    }
+    throw error;
   } finally {
     inFlight.delete(cacheKey);
   }

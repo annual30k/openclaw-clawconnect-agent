@@ -98,44 +98,144 @@ test("source commit acknowledges hidden-only commits without throwing and preser
   observer.close();
 });
 
-test("initialWatermarkMode latest suppresses pre-existing history but emits subsequent commits", async () => {
-  let current: ReturnType<typeof commit> | null = commit(50);
+test("resolved downstream watermark resumes projection after the durable seq instead of replaying history", async () => {
+  let current = commit(120);
+  const callbacks: Array<{ seq: number; previous: number | undefined }> = [];
+  const resolvedScopes: string[] = [];
+  const observer = createSourceCommitObserver({
+    readCursor: () => current,
+    resolveInitialWatermark: async (cursor) => {
+      resolvedScopes.push(cursor.sourceGeneration);
+      return 100;
+    },
+    onCommit: async (value, previous) => {
+      callbacks.push({ seq: value.committedThroughSeq, previous });
+    },
+  });
+  observer.rescan();
+  await new Promise((resolve) => setImmediate(resolve));
+  current = commit(125);
+  observer.notify();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // 断线期间写入的 101..120 通过一次增量补上；同一作用域的起点只解析一次。
+  assert.deepEqual(callbacks, [
+    { seq: 120, previous: 100 },
+    { seq: 125, previous: 120 },
+  ]);
+  assert.deepEqual(resolvedScopes, ["session-a"]);
+  observer.close();
+});
+
+test("downstream watermark at the local cursor publishes nothing until the source advances", async () => {
+  let current = commit(80);
   const emitted: number[] = [];
   const observer = createSourceCommitObserver({
-    initialWatermarkMode: "latest",
     readCursor: () => current,
+    resolveInitialWatermark: async () => 80,
     onCommit: async (value) => { emitted.push(value.committedThroughSeq); },
   });
   observer.rescan();
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(emitted, []);
-  assert.equal(observer.lastCommittedThroughSeq(current), 50);
+  assert.equal(observer.lastCommittedThroughSeq(current), 80);
 
-  current = commit(51);
+  current = commit(81);
   observer.notify();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(emitted, [51]);
-  assert.equal(observer.lastCommittedThroughSeq(current), 51);
+  assert.deepEqual(emitted, [81]);
   observer.close();
 });
 
-test("initialWatermarkMode latest does not drop the first commit when initial cursor is null", async () => {
-  let current: ReturnType<typeof commit> | null = null;
-  const emitted: number[] = [];
+test("missing downstream watermark projects the scope from sequence zero exactly once", async () => {
+  const current = commit(30);
+  const callbacks: Array<{ seq: number; previous: number | undefined }> = [];
+  let resolutions = 0;
   const observer = createSourceCommitObserver({
-    initialWatermarkMode: "latest",
     readCursor: () => current,
-    onCommit: async (value) => { emitted.push(value.committedThroughSeq); },
+    resolveInitialWatermark: async () => {
+      resolutions += 1;
+      return undefined;
+    },
+    onCommit: async (value, previous) => {
+      callbacks.push({ seq: value.committedThroughSeq, previous });
+    },
   });
   observer.rescan();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(emitted, []);
-
-  current = commit(1);
   observer.notify();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(emitted, [1]);
-  assert.equal(observer.lastCommittedThroughSeq(current), 1);
+  assert.deepEqual(callbacks, [{ seq: 30, previous: undefined }]);
+  assert.equal(resolutions, 1);
   observer.close();
 });
 
+test("a failed watermark resolution publishes nothing and retries on the next notification", async () => {
+  const current = commit(40);
+  const emitted: Array<number | undefined> = [];
+  const errors: string[] = [];
+  let attempts = 0;
+  const observer = createSourceCommitObserver({
+    readCursor: () => current,
+    resolveInitialWatermark: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("relay checkpoint unavailable");
+      return 35;
+    },
+    onCommit: async (_value, previous) => { emitted.push(previous); },
+    onError: (error) => { errors.push(String(error)); },
+  });
+  observer.notify();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(emitted, []);
+  assert.equal(errors.length, 1);
+
+  observer.notify();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(emitted, [35]);
+  observer.close();
+});
+
+test("an invalid downstream watermark is rejected instead of being used as a resume point", async () => {
+  const current = commit(10);
+  const emitted: number[] = [];
+  const errors: string[] = [];
+  const observer = createSourceCommitObserver({
+    readCursor: () => current,
+    resolveInitialWatermark: async () => -1,
+    onCommit: async (value) => { emitted.push(value.committedThroughSeq); },
+    onError: (error) => { errors.push(String(error)); },
+  });
+  observer.notify();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(emitted, []);
+  assert.match(errors[0] ?? "", /watermark is invalid/);
+  observer.close();
+});
+
+test("each source generation resolves its own downstream watermark", async () => {
+  let current = commit(12, "generation-a");
+  const resolved: string[] = [];
+  const callbacks: Array<{ generation: string; previous: number | undefined }> = [];
+  const observer = createSourceCommitObserver({
+    readCursor: () => current,
+    resolveInitialWatermark: async (cursor) => {
+      resolved.push(cursor.sourceGeneration);
+      return cursor.sourceGeneration === "generation-a" ? 10 : undefined;
+    },
+    onCommit: async (value, previous) => {
+      callbacks.push({ generation: value.sourceGeneration, previous });
+    },
+  });
+  observer.notify();
+  await new Promise((resolve) => setImmediate(resolve));
+  current = commit(3, "generation-b");
+  observer.notify();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(resolved, ["generation-a", "generation-b"]);
+  assert.deepEqual(callbacks, [
+    { generation: "generation-a", previous: 10 },
+    { generation: "generation-b", previous: undefined },
+  ]);
+  observer.close();
+});
