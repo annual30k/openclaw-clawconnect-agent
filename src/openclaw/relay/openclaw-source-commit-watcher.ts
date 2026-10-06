@@ -48,9 +48,7 @@ export function watchOpenClawSourceCommit(options: {
   // performs correctness work; the cursor reader remains authoritative.
   try {
     watchers.push(watch(watchedDirectory, (_eventType, changedName) => {
-      if (!changedName || String(changedName) === databaseName || String(changedName).startsWith(`${databaseName}-`)) {
-        notify();
-      }
+      if (isSourceCommitSignal(changedName, databaseName)) notify();
     }));
   } catch {
     // The caller still gets an immediate rescan and can continue using live
@@ -78,4 +76,14 @@ export function watchOpenClawSourceCommit(options: {
       observer.close();
     },
   };
+}
+
+/**
+ * 只有主库与 -wal 的变化可能代表新提交。-shm 是 WAL 索引，读者读取时也会改写，
+ * 若把它当作信号，游标读取本身就会不断触发新的读取。目录事件缺少文件名时保守地视为信号。
+ */
+export function isSourceCommitSignal(changedName: string | Buffer | null, databaseName: string): boolean {
+  if (!changedName) return true;
+  const name = String(changedName);
+  return name === databaseName || name === `${databaseName}-wal` || name === `${databaseName}-journal`;
 }

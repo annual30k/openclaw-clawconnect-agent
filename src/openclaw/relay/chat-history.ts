@@ -1,3 +1,7 @@
+import {
+  forgetOpenClawSourceCursorConnection,
+  openClawSourceCursorStatements,
+} from "./openclaw-source-cursor-connections.js";
 import { createHash } from "node:crypto";
 import {
   CURSOR_PREFIX,
@@ -148,17 +152,19 @@ export function readOpenClawSourceCommitCursor(
   const params = normalizeTranscriptHistoryParams(rawParams, defaults.mainSessionKey);
   const agentId = params.sessionKey.match(/^agent:([^:]+):/)?.[1] ?? defaults.defaultAgentId ?? "main";
   const databasePath = join(resolveOpenClawStateDir(), "agents", agentId, "agent", "openclaw-agent.sqlite");
-  let database: DatabaseSync | undefined;
   try {
-    database = new DatabaseSync(databasePath, { readOnly: true });
-    const session = findSqliteSessionNode(database, params.sessionKey, defaults);
+    // 复用每个数据库的只读连接与预编译语句：每次读游标都开关连接会改动 -wal/-shm，
+    // 反过来触发所有会话 watcher 再读，形成自激循环。
+    const statements = openClawSourceCursorStatements(databasePath);
+    if (!statements) return null;
+    let session: { current_session_id?: unknown } | undefined;
+    for (const candidate of sessionKeyCandidates(params.sessionKey, defaults)) {
+      session = statements.sessionNode.get(candidate) as { current_session_id?: unknown } | undefined;
+      if (session) break;
+    }
     const sourceSessionId = cleanHistoryString(session?.current_session_id);
     if (!sourceSessionId) return null;
-    const row = database.prepare(`
-      SELECT MAX(seq) AS committed_through_seq
-      FROM transcript_events
-      WHERE session_id = ?
-    `).get(sourceSessionId) as { committed_through_seq?: unknown } | undefined;
+    const row = statements.committedThroughSeq.get(sourceSessionId) as { committed_through_seq?: unknown } | undefined;
     const committedThroughSeq = Number(row?.committed_through_seq ?? 0);
     if (!Number.isSafeInteger(committedThroughSeq) || committedThroughSeq < 0) return null;
     const gatewayId = requireProjectionIdentity(params.projectionGatewayId, "gatewayId");
@@ -174,12 +180,10 @@ export function readOpenClawSourceCommitCursor(
       sourceRevision: `seq:${committedThroughSeq}`,
     });
   } catch {
+    forgetOpenClawSourceCursorConnection(databasePath);
     return null;
-  } finally {
-    database?.close();
   }
 }
-
 
 type TranscriptHistoryCacheEntry = {
   size: number;

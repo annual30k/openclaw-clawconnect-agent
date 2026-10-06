@@ -43,6 +43,11 @@ import {
 } from "./relay/chat-history.js";
 import { watchOpenClawSourceCommit, type OpenClawSourceCommitWatcher } from "./relay/openclaw-source-commit-watcher.js";
 import { createSourceCommitCheckpointClient } from "../core/relay/source-commit-checkpoint-client.js";
+import {
+  createSourceCommitPublishFlow,
+  SOURCE_COMMIT_PAGE_LIMIT,
+  sourceCommitDeliveryId,
+} from "../core/relay/source-commit-publish-flow.js";
 import { projectSourceCommitHistoryPages } from "./relay/source-commit-projection.js";
 import { join } from "node:path";
 import { resolveOpenClawStateDir } from "./runtime/openclaw-paths.js";
@@ -198,6 +203,11 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
     // 只补断线期间的增量，不再把全部会话历史从零重放给 Relay。
     const sourceCommitCheckpoints = createSourceCommitCheckpointClient({
       send: (query) => sendRelayJson(relayWs, query).status === "sent",
+    });
+    // 源投影流控：至多一个投影帧在 Relay 队列中，命令响应不会被补齐流量挤到超时。
+    let relayEventsAcknowledged = false;
+    const sourceCommitPublishFlow = createSourceCommitPublishFlow({
+      isAcknowledged: () => relayEventsAcknowledged,
     });
     const chatRunContexts = new Map<string, OpenClawChatRunIdentity>();
     const chatSendDedupe = new OpenClawChatSendDedupeCoordinator(() => sessionDefaults);
@@ -378,6 +388,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       publishOffice: boolean,
       userMessage: string | undefined,
       confirmWrite: true,
+      deliveryId?: string,
     ): Promise<AssistantStreamEmitResult>;
     async function publishAndSendGatewayEvent(
       eventName: string,
@@ -385,6 +396,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       publishOffice: boolean,
       userMessage?: string,
       confirmWrite = false,
+      deliveryId?: string,
     ): Promise<void | AssistantStreamEmitResult> {
       let outgoingPayload = payload;
       if (eventName === "chat") {
@@ -416,6 +428,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         type: "event",
         event: eventName,
         payload: outgoingPayload,
+        ...(deliveryId ? { deliveryId } : {}),
       };
       if (confirmWrite) return sendWithWriteConfirmation(message);
       send(message);
@@ -580,31 +593,35 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             readPage: (cursorSeq) => withTimeout(
               requestChatHistoryFromClawConnect({
                 sessionKey: normalizedSessionKey,
-                limit: 200,
+                limit: SOURCE_COMMIT_PAGE_LIMIT,
                 cursor: `seq:${cursorSeq}`,
                 direction: "newer",
               }),
               CHAT_HISTORY_FETCH_TIMEOUT_MS,
               "source commit history reconciliation",
             ),
-            publish: async ({ sourceCommit: pageSourceCommit, events }) => {
-              await waitForRelaySocketDrain(relayWs, 256 * 1024);
-              const deliveryResult = await publishAndSendGatewayEvent(
-                "chat",
-                {
-                  state: "source_commit",
-                  sessionKey: normalizedSessionKey,
-                  sourceCommit: pageSourceCommit,
-                  timelineEvents: events,
-                },
-                true,
-                undefined,
-                true,
-              );
-              if (deliveryResult?.status === "retryable") {
-                throw deliveryResult.error;
-              }
-            },
+            publish: ({ sourceCommit: pageSourceCommit, events }) => sourceCommitPublishFlow.publish(
+              sourceCommitDeliveryId(pageSourceCommit, events.map((event) => event.eventId)),
+              async (deliveryId) => {
+                await waitForRelaySocketDrain(relayWs, 256 * 1024);
+                const deliveryResult = await publishAndSendGatewayEvent(
+                  "chat",
+                  {
+                    state: "source_commit",
+                    sessionKey: normalizedSessionKey,
+                    sourceCommit: pageSourceCommit,
+                    timelineEvents: events,
+                  },
+                  true,
+                  undefined,
+                  true,
+                  deliveryId,
+                );
+                if (deliveryResult?.status === "retryable") {
+                  throw deliveryResult.error;
+                }
+              },
+            ),
           });
         },
         onError: (error) => {
@@ -1134,6 +1151,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           relayHelloTimer = undefined;
         }
         const deliveryMode = reliableDeliveryModeFromRelayHello(msg);
+        relayEventsAcknowledged = deliveryMode === "acknowledged";
         deliveryOutbox.attach(relayWs, deliveryMode);
         console.log(`[relay] reliable delivery mode=${deliveryMode}`);
         sourceCommitCheckpoints.markRelayHello(msg.protocolCapabilities);
@@ -1142,7 +1160,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       }
 
       if (msg.type === "event_ack") {
-        deliveryOutbox.acknowledge(msg.id);
+        if (!sourceCommitPublishFlow.acknowledge(msg.id)) deliveryOutbox.acknowledge(msg.id);
         return;
       }
 
@@ -1415,6 +1433,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       for (const watcher of sourceCommitWatchers.values()) watcher.close();
       sourceCommitWatchers.clear();
       sourceCommitCheckpoints.close(`relay closed ${code}`);
+      sourceCommitPublishFlow.close(`relay closed ${code}`);
       chatSendDedupe.clearAll();
       contextUsage.dispose();
       if (relayHelloTimer) {
