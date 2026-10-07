@@ -136,7 +136,24 @@ function readHermesApiServerConfig(hermesHome: string): HermesApiServerConfig {
  * quoted values and inline comments used by Hermes' generated config file.
  */
 function parseHermesApiServerConfig(content: string): HermesApiServerConfig {
+  const values = readHermesConfigBlockScalars(content, "platforms.api_server.extra");
   const result: HermesApiServerConfig = {};
+  if ("host" in values) result.host = values.host;
+  if ("port" in values) result.port = values.port;
+  if ("key" in values) result.apiKey = values.key;
+  return result;
+}
+
+/**
+ * 读取 config.yaml 中某个块（如 "agent"）下的直接标量子项。
+ * 只解析块状 YAML 的 key: value 结构，按完整父路径精确匹配，
+ * 不会把其他块中同名的键（如 delegation.reasoning_effort）误读进来；重复键以后出现者为准。
+ */
+export function readHermesConfigBlockScalars(
+  content: string,
+  parentPath: string,
+): Record<string, string | undefined> {
+  const result: Record<string, string | undefined> = {};
   const path: Array<{ indent: number; key: string }> = [];
 
   for (const rawLine of content.split(/\r?\n/)) {
@@ -155,16 +172,8 @@ function parseHermesApiServerConfig(content: string): HermesApiServerConfig {
       path.pop();
     }
 
-    const parentPath = path.map((entry) => entry.key).join(".");
-    if (parentPath === "platforms.api_server.extra") {
-      const value = parseYamlScalar(rawValue);
-      if (key === "host") {
-        result.host = value;
-      } else if (key === "port") {
-        result.port = value;
-      } else if (key === "key") {
-        result.apiKey = value;
-      }
+    if (path.map((entry) => entry.key).join(".") === parentPath) {
+      result[key] = parseYamlScalar(rawValue);
     }
     if (!rawValue) {
       path.push({ indent, key });

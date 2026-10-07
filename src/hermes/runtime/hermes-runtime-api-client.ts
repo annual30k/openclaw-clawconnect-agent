@@ -15,12 +15,13 @@ import {
 } from "./hermes-runtime-api-settings.js";
 import { CHAT_TIMEOUT_MS, sanitizeHermesChatOutput } from "./hermes-runtime-process.js";
 import { compactStringArray } from "./hermes-runtime-values.js";
+import { buildHermesApiReasoningBody } from "./hermes-runtime-reasoning.js";
 import { hermesToolState } from "./hermes-runtime-tool-log-watcher.js";
 
 const HERMES_API_HEALTH_TIMEOUT_MS = 1_500;
 const HERMES_API_TOOLSETS_TIMEOUT_MS = 1_500;
 
-type HermesApiConfig = {
+export type HermesApiConfig = {
   baseUrl: string;
   apiKey: string;
 };
@@ -55,6 +56,8 @@ export async function tryRunHermesApiChat(params: {
   resume?: string;
   preloadedSkillNames?: string[];
   requiredToolsets?: string[];
+  /** 会话显式覆盖的 Hermes reasoning effort；未覆盖时为 undefined，由 Hermes 使用自身默认值。 */
+  reasoningEffort?: string;
   context: LocalCommandContext;
 }): Promise<HermesApiChatResult | undefined> {
   // Pair/install enables Hermes' API Server by default because this is the
@@ -78,7 +81,7 @@ export async function tryRunHermesApiChat(params: {
   return await runHermesApiChat(config, params);
 }
 
-function readHermesApiConfig(): HermesApiConfig | undefined {
+export function readHermesApiConfig(): HermesApiConfig | undefined {
   if (isTruthyEnv(process.env.CLAWCONNECT_HERMES_API_DISABLED)) {
     return undefined;
   }
@@ -165,6 +168,7 @@ async function runHermesApiChat(
     resume?: string;
     preloadedSkillNames?: string[];
     requiredToolsets?: string[];
+    reasoningEffort?: string;
     context: LocalCommandContext;
   },
 ): Promise<HermesApiChatResult | undefined> {
@@ -181,6 +185,7 @@ async function runHermesApiChat(
       sessionKey: params.sessionKey,
       message: params.message,
       instructions,
+      reasoningEffort: params.reasoningEffort,
       abortSignal: params.context.abortSignal,
     });
     parsed = await consumeHermesApiChatStream(stream, {
@@ -280,6 +285,7 @@ async function openHermesApiChatStream(
     sessionKey: string;
     message: string;
     instructions?: string;
+    reasoningEffort?: string;
     abortSignal?: AbortSignal;
   },
 ): Promise<Response> {
@@ -292,6 +298,7 @@ async function openHermesApiChatStream(
     body: JSON.stringify({
       message: params.message,
       ...(params.instructions ? { instructions: params.instructions } : {}),
+      ...buildHermesApiReasoningBody(params.reasoningEffort),
     }),
   }, CHAT_TIMEOUT_MS, params.abortSignal);
   if (!response.ok) {
@@ -759,7 +766,7 @@ function normalizeHermesApiUsage(value: unknown, hermesSessionId: string): Herme
   };
 }
 
-async function readJsonResponse(response: Response): Promise<unknown> {
+export async function readJsonResponse(response: Response): Promise<unknown> {
   const text = await response.text();
   if (!text.trim()) {
     return {};
@@ -796,14 +803,14 @@ function extractHermesApiError(payload: unknown, status: number): string {
     ?? `HTTP ${status}`;
 }
 
-function buildHermesApiHeaders(config: HermesApiConfig): Record<string, string> {
+export function buildHermesApiHeaders(config: HermesApiConfig): Record<string, string> {
   return {
     "Authorization": `Bearer ${config.apiKey}`,
     "Content-Type": "application/json",
   };
 }
 
-async function fetchWithTimeout(
+export async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeoutMs: number,

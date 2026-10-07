@@ -1,6 +1,7 @@
 
-import type { LocalResult } from "../../core/command-types.js";
-import { forgetHermesSession, getMappedHermesSessionId } from "../hermes-session-store.js";
+import type { LocalCommandContext, LocalResult } from "../../core/command-types.js";
+import { forgetHermesSession, getMappedHermesSessionId, listStoredHermesSessions } from "../hermes-session-store.js";
+import { forgetHermesSessionReasoningLevels } from "../hermes-session-reasoning-store.js";
 import { listHermesSessions } from "./hermes-runtime-usage.js";
 import { runHermesOutput, runHermesOutputAsync } from "./hermes-runtime-command-utils.js";
 import { stringParam, toRecord } from "./hermes-runtime-values.js";
@@ -36,7 +37,10 @@ export function runHermesSessionRename(params: unknown): LocalResult {
   return runHermesOutput(["sessions", "rename", sessionId, title]);
 }
 
-export async function runHermesSessionDelete(params: unknown): Promise<LocalResult> {
+export async function runHermesSessionDelete(
+  params: unknown,
+  context: LocalCommandContext = {},
+): Promise<LocalResult> {
   const record = toRecord(params);
   const sessionKey = stringParam(record, "sessionKey", "key", "session");
   const sessionId = stringParam(record, "sessionId", "hermesSessionId", "id")
@@ -48,7 +52,10 @@ export async function runHermesSessionDelete(params: unknown): Promise<LocalResu
   if (!result.ok) {
     return result;
   }
+  // 必须在清除会话映射之前收集别名，之后映射已不存在，无法再定位该会话的思考等级覆盖。
+  const reasoningSessionKeys = await collectHermesSessionKeysForDeletion(sessionKey, sessionId);
   await forgetHermesSession(sessionKey ?? sessionId, sessionId);
+  await forgetHermesSessionReasoningLevels(context.gatewayId, reasoningSessionKeys);
   return {
     ok: true,
     payload: {
@@ -58,6 +65,27 @@ export async function runHermesSessionDelete(params: unknown): Promise<LocalResu
       sessionKey,
     },
   };
+}
+
+/**
+ * 被删除 Hermes 会话的全部会话键：请求显式给出的键、hermes:<id> 别名，
+ * 以及会话映射中指向同一 hermesSessionId 的移动端键（按存储 ID 精确匹配）。
+ */
+async function collectHermesSessionKeysForDeletion(
+  sessionKey: string | undefined,
+  hermesSessionId: string,
+): Promise<string[]> {
+  const keys = new Set<string>();
+  if (sessionKey) {
+    keys.add(sessionKey);
+  }
+  keys.add(`hermes:${hermesSessionId}`);
+  for (const stored of await listStoredHermesSessions()) {
+    if (stored.hermesSessionId === hermesSessionId) {
+      keys.add(stored.sessionKey);
+    }
+  }
+  return [...keys];
 }
 
 export async function runHermesSessionExport(params: unknown): Promise<LocalResult> {

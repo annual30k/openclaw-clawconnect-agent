@@ -37,6 +37,12 @@ import {
   runHermesSessionRename,
   runHermesSessionsList,
 } from "./hermes-runtime-sessions.js";
+import {
+  HERMES_THINKING_GET_METHOD,
+  HERMES_THINKING_SET_METHOD,
+  runHermesThinkingGet,
+  runHermesThinkingSet,
+} from "./hermes-runtime-thinking.js";
 
 export function handleHermesCommand(
   method: string,
@@ -68,7 +74,7 @@ export function handleHermesCommand(
     case "hermes.sessions.rename":
       return runHermesSessionRename(params);
     case "hermes.sessions.delete":
-      return runHermesSessionDelete(params);
+      return runHermesSessionDelete(params, context);
     case "hermes.sessions.export":
       return runHermesSessionExport(params);
     case "cron.list":
@@ -106,6 +112,10 @@ export function handleHermesCommand(
     case "hermes.model.select":
     case "hermes.model.setDefault":
       return runHermesModelSelect(params);
+    case HERMES_THINKING_GET_METHOD:
+      return runHermesThinkingGet(params, context);
+    case HERMES_THINKING_SET_METHOD:
+      return runHermesThinkingSet(params, context);
     case "hermes.mcp.list":
       return runHermesMcpList();
     case "hermes.mcp.test":

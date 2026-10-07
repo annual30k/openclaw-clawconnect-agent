@@ -15,6 +15,7 @@ import {
 import { handleLocalCommand } from "./handlers/local-handlers.js";
 import { createOpenClawContextUsagePublisher } from "./relay/openclaw-context-usage-publisher.js";
 import { handleProviderCommand } from "./handlers/provider-handlers.js";
+import { handleOpenClawThinkingCommand } from "./handlers/thinking-handlers.js";
 import {
   DEFAULT_GATEWAY_SESSION_DEFAULTS,
   contextUsageSnapshotFromSessionsList,
@@ -1191,6 +1192,18 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               ? { payload: result.payload }
               : { error: { message: result.error } }),
           });
+        }
+        return;
+      }
+
+      // 会话思考等级命令经网关 sessions.list / sessions.patch 读写，需要当前网关连接。
+      const thinkingPromise = handleOpenClawThinkingCommand(msg.method, msg.params, gatewayClient);
+      if (thinkingPromise !== null) {
+        const result = await thinkingPromise;
+        if (requestId) {
+          send(result.ok
+            ? { type: "res", id: requestId, ok: true, payload: result.payload }
+            : { type: "res", id: requestId, ok: false, error: { message: result.error } });
         }
         return;
       }

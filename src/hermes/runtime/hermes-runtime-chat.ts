@@ -48,6 +48,7 @@ import {
 } from "./hermes-runtime-state-db.js";
 import { ensureHermesApiSessionForMobileRoute, tryRunHermesApiChat } from "./hermes-runtime-api-client.js";
 import { resolveHermesPreloadedSkillContext } from "./hermes-runtime-preloaded-skills.js";
+import { buildHermesCliReasoningArgs, resolveHermesSessionReasoningEffort } from "./hermes-runtime-reasoning.js";
 import {
   createHermesToolLogWatcher,
   hermesToolState,
@@ -195,6 +196,8 @@ async function runHermesChatPrepared(params: {
   const preloadedSkillContext = preparationPlan.preloadFileTransferSkill
     ? await resolveHermesPreloadedSkillContext({ forceFileTransfer: true })
     : EMPTY_PRELOADED_SKILL_CONTEXT;
+  // 会话级思考等级覆盖在本轮开始时一次性解析，API 与 CLI（含重试）使用同一值。
+  const reasoningEffort = await resolveHermesSessionReasoningEffort(params.context.gatewayId, params.sessionKey);
   if (preparationPlan.preloadFileTransferSkill && !resume && params.sourceRunId) {
     const ensuredSessionId = await ensureHermesApiSessionForMobileRoute(params.sessionKey);
     if (ensuredSessionId) {
@@ -221,6 +224,7 @@ async function runHermesChatPrepared(params: {
         resume,
         preloadedSkillNames: preloadedSkillContext.skillNames,
         requiredToolsets: preloadedSkillContext.requiredToolsets,
+        reasoningEffort,
         context: params.context,
       });
     if (apiChat) {
@@ -265,6 +269,7 @@ async function runHermesChatPrepared(params: {
         sessionKey: params.sessionKey,
         preloadedSkillNames: preloadedSkillContext.skillNames,
         requiredToolsets: preloadedSkillContext.requiredToolsets,
+        reasoningEffort,
         context: params.context,
       });
     if (retryApiChat) {
@@ -303,6 +308,7 @@ async function runHermesChatPrepared(params: {
       resume,
       context: params.context,
       preloadedSkillArgs: preloadedSkillContext.cliArgs,
+      reasoningEffort,
       enableFileTransferRoute: preparationPlan.preloadFileTransferSkill,
       gatewayId: params.context.gatewayId ?? "clawconnect",
       sourceRunId: params.sourceRunId,
@@ -336,6 +342,7 @@ async function runHermesChatPrepared(params: {
       sessionKey: params.sessionKey,
       context: params.context,
       preloadedSkillArgs: preloadedSkillContext.cliArgs,
+      reasoningEffort,
       enableFileTransferRoute: preparationPlan.preloadFileTransferSkill,
       gatewayId: params.context.gatewayId ?? "clawconnect",
       sourceRunId: params.sourceRunId,
@@ -489,6 +496,7 @@ async function runHermesChatOnce(params: {
   resume?: string;
   context: LocalCommandContext;
   preloadedSkillArgs?: string[];
+  reasoningEffort?: string;
   historyCompletion?: () => Promise<string | undefined>;
 }): Promise<string> {
   const args = [
@@ -502,6 +510,7 @@ async function runHermesChatOnce(params: {
     "--source",
     "pocketclaw",
     ...(params.preloadedSkillArgs ?? []),
+    ...buildHermesCliReasoningArgs(params.reasoningEffort),
     "--yolo",
   ];
   if (params.resume) {
