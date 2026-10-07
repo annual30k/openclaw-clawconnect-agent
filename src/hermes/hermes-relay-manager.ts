@@ -63,6 +63,7 @@ import {
   readHermesSlashCommandSearchParams,
   searchHermesSlashCommandCatalog,
 } from "./relay/hermes-slash-command-catalog.js";
+import { startHermesCronChangeRelay, type HermesCronChangeRelay } from "./relay/hermes-cron-change-relay.js";
 
 export {
   collectHermesSlashCommandCatalog,
@@ -143,12 +144,15 @@ export interface HermesRelayManagerDependencies {
   runChat: typeof runHermesChat;
   readStatusSnapshot: typeof readHermesStatusSnapshotAsync;
   publishUsageSnapshot: typeof publishHermesUsageSnapshot;
+  /** 未提供时不监听 cron 任务库（测试隔离真实 Hermes home）。 */
+  startCronChangeRelay?: typeof startHermesCronChangeRelay;
 }
 
 const DEFAULT_HERMES_RELAY_MANAGER_DEPENDENCIES: HermesRelayManagerDependencies = {
   runChat: runHermesChat,
   readStatusSnapshot: readHermesStatusSnapshotAsync,
   publishUsageSnapshot: publishHermesUsageSnapshot,
+  startCronChangeRelay: startHermesCronChangeRelay,
 };
 
 export function buildHermesRelayHelloMessage(opts: {
@@ -246,6 +250,8 @@ export async function runHermesRelayManagerWithDependencies(
     // state.db 仅可在显式 history/session 请求中按需读取，不能在此处挂轮询或子进程，
     // 否则数据库压力或失败会扩大为移动端 Relay 的可用性问题。
     let livenessMonitor: RelayLivenessMonitor | undefined;
+    // cron 任务库监听只在 Relay hello 协商成功后启动，连接关闭时停止，生命周期与本连接一致。
+    let cronChangeRelay: HermesCronChangeRelay | undefined;
     relayWs.on("open", () => {
       console.log(`Connected to relay server (hermes gatewayId=${opts.gatewayId})`);
       opts.onConnected?.();
@@ -327,6 +333,7 @@ export async function runHermesRelayManagerWithDependencies(
           const deliveryMode = reliableDeliveryModeFromRelayHello(msg);
           deliveryOutbox.attach(relayWs, deliveryMode);
           console.log(`[hermes-relay] reliable delivery mode=${deliveryMode}`);
+          cronChangeRelay = dependencies.startCronChangeRelay?.({ gatewayId: opts.gatewayId, send });
           opts.onRelayReady?.();
           return;
         }
@@ -680,6 +687,8 @@ export async function runHermesRelayManagerWithDependencies(
     relayWs.on("close", (code, reason) => {
       console.log(`Hermes relay connection closed: ${code} ${reason.toString()}`);
       livenessMonitor?.stop();
+      cronChangeRelay?.stop();
+      cronChangeRelay = undefined;
       opts.onDisconnected?.(code);
       if (relayHelloTimer) {
         clearTimeout(relayHelloTimer);

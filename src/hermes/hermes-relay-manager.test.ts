@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, test } from "node:test";
@@ -23,6 +23,10 @@ import {
 } from "./hermes-relay-manager.js";
 import type { HermesRelayManagerOptions } from "./hermes-relay-manager.js";
 import { clearReliableRelayOutboxesForTests } from "../core/relay/reliable-relay-outbox-registry.js";
+import {
+  clearHermesCronChangeRelayStateForTests,
+  startHermesCronChangeRelay,
+} from "./relay/hermes-cron-change-relay.js";
 
 const reliableOutboxStorageDirectory = mkdtempSync(join(tmpdir(), "clawconnect-hermes-manager-test-"));
 
@@ -132,6 +136,51 @@ test("Hermes relay manager signals relay readiness only after a valid Relay hell
     abort.abort();
     await manager.catch(() => false);
     await closeHermesTestServer(relayServer);
+  }
+});
+
+test("Hermes relay manager forwards a cron event after Relay hello when the cron job store changes", async () => {
+  const hermesHome = mkdtempSync(join(tmpdir(), "clawconnect-hermes-cron-manager-"));
+  const jobsFile = join(hermesHome, "cron", "jobs.json");
+  mkdirSync(join(hermesHome, "cron"), { recursive: true });
+  writeFileSync(jobsFile, JSON.stringify({ jobs: [] }));
+  const relayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const frames: Array<Record<string, unknown>> = [];
+  let ready = false;
+
+  relayServer.on("connection", (socket) => {
+    socket.on("message", (raw) => frames.push(JSON.parse(raw.toString()) as Record<string, unknown>));
+    sendHermesRelayHello(socket, "gw-hermes-cron");
+  });
+  const relayAddress = relayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+
+  const manager = runHermesRelayManagerWithDependencies({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-hermes-cron",
+    relaySecret: "secret",
+    signal: abort.signal,
+    onRelayReady: () => { ready = true; },
+  }, {
+    ...hermesTestDependencies(async () => ({ output: "unused", sessionKey: "main", artifactPaths: [] })),
+    startCronChangeRelay: (options) => startHermesCronChangeRelay({ ...options, jobsFile }),
+  });
+
+  const cronFrames = (): Array<Record<string, unknown>> => frames.filter((frame) => frame.type === "event" && frame.event === "cron");
+  try {
+    await waitForHermesTest(() => ready);
+    assert.equal(cronFrames().length, 0);
+    writeFileSync(`${jobsFile}.writing`, JSON.stringify({ jobs: [{ id: "job-1" }] }));
+    renameSync(`${jobsFile}.writing`, jobsFile);
+    await waitForHermesTest(() => cronFrames().length === 1);
+    assert.deepEqual(cronFrames()[0], { type: "event", event: "cron", payload: { action: "changed", source: "hermes" } });
+  } finally {
+    abort.abort();
+    await manager.catch(() => false);
+    await closeHermesTestServer(relayServer);
+    clearHermesCronChangeRelayStateForTests();
+    rmSync(hermesHome, { recursive: true, force: true });
   }
 });
 
