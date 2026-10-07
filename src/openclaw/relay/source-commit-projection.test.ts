@@ -4,7 +4,10 @@ import { createSourceCommit } from "../../core/relay/source-commit.js";
 import {
   buildSourceCommitTimelineEvents,
   projectSourceCommitHistoryPages,
+  projectSourceCommitRewrite,
+  type SourceCommitProjectionBatch,
 } from "./source-commit-projection.js";
+import { SourceRowFingerprints } from "./source-row-fingerprints.js";
 import type { HistoryResponse } from "./chat-history.js";
 
 test("source commit projects every text, tool, and image row in source order", () => {
@@ -255,4 +258,159 @@ test("source commit paging rejects a page with an internal source sequence gap",
     }),
     /source gap/,
   );
+});
+
+const relayedImage = {
+  type: "image",
+  fileId: "file_relay_1",
+  attachmentId: "att_relay_1",
+  downloadUrl: "/api/mobile/files/file_relay_1",
+  fileName: "desktop.png",
+  mimeType: "image/png",
+};
+/** OpenClaw 托管外发图片（取自真实 openclawDisplayContent 的结构），由媒体处理改写为 Relay 文件块。 */
+const managedImage = {
+  type: "image",
+  url: "/api/chat/media/outgoing/agent%3Amain%3Amobile-1/managed-1/full",
+  alt: "desktop.png",
+  mimeType: "image/png",
+};
+
+async function relayManagedImages(page: HistoryResponse): Promise<HistoryResponse> {
+  const snapshot = page.timelineSnapshot!;
+  return {
+    ...page,
+    timelineSnapshot: {
+      ...snapshot,
+      messages: snapshot.messages.map((message) => ({
+        ...message,
+        content: message.content.map((block) => (block as Record<string, unknown>).url === managedImage.url ? relayedImage : block),
+      })),
+    },
+  } as HistoryResponse;
+}
+
+function withManagedImage(message: Record<string, unknown>): Record<string, unknown> {
+  return { ...message, content: [...(message.content as unknown[]), managedImage] };
+}
+
+test("live source projection publishes the media-relayed rows, so images present at commit time need no refresh", async () => {
+  const sourceCommit = createSourceCommit({ ...strictSourceCommit, committedThroughSeq: 1, sourceRevision: "seq:1" });
+  const published: SourceCommitProjectionBatch[] = [];
+  await projectSourceCommitHistoryPages({
+    sourceCommit,
+    readPage: async () => projectionPage([withManagedImage(pagedProjectionMessage(1))], 1, false),
+    relayMedia: relayManagedImages,
+    publish: (batch) => { published.push(batch); },
+  });
+  const blocks = published.flatMap((batch) => batch.events.flatMap((event) => event.content as Array<Record<string, unknown>>));
+  assert.equal(blocks.some((block) => block.type === "image" && block.downloadUrl === relayedImage.downloadUrl), true);
+});
+
+test("rewrite: an image written into an already-committed final reply is republished as a new version of the same message", async () => {
+  // 真实回归：OpenClaw 先提交只有文字的最终回复（源 seq 164），约 1 秒后把两张托管图片原地补写进
+  // 同一行并更新改写代号，seq 水位不变；实时投影只发了文字，图片要刷新 history 才出现。
+  const fingerprints = new SourceRowFingerprints();
+  const sourceCommit = createSourceCommit({ ...strictSourceCommit, committedThroughSeq: 2, sourceRevision: "seq:2" });
+  const committed: SourceCommitProjectionBatch[] = [];
+  await projectSourceCommitHistoryPages({
+    sourceCommit,
+    readPage: async () => projectionPage([pagedProjectionMessage(1), pagedProjectionMessage(2)], 2, false),
+    relayMedia: relayManagedImages,
+    fingerprints,
+    publish: (batch) => { committed.push(batch); },
+  });
+  const original = committed[0]!.events.find((event) => event.sourceOrderSeq === 2)!;
+
+  const rewritten: SourceCommitProjectionBatch[] = [];
+  const rewrite = () => projectSourceCommitRewrite({
+    sourceCommit,
+    readPage: async () => projectionPage([pagedProjectionMessage(1), withManagedImage(pagedProjectionMessage(2))], 2, false),
+    relayMedia: relayManagedImages,
+    fingerprints,
+    publish: (batch) => { rewritten.push(batch); },
+  });
+  assert.equal(await rewrite(), 1);
+  const events = rewritten.flatMap((batch) => batch.events);
+  assert.equal(events.length, 1);
+  const [revision] = events;
+  // 同一 canonical 消息（身份与源坐标不变），新的事件 ID，内容带 Relay 文件块。
+  assert.equal(revision!.messageId, original.messageId);
+  assert.equal(revision!.sourceOrderSeq, 2);
+  assert.notEqual(revision!.eventId, original.eventId);
+  assert.equal((revision!.content as Array<Record<string, unknown>>).some((block) => block.downloadUrl === relayedImage.downloadUrl), true);
+  assert.equal(rewritten[0]!.sourceCommit.committedThroughSeq, 2);
+
+  // 再次通知同一改写：内容未变，不再发布。
+  assert.equal(await rewrite(), 0);
+  assert.equal(rewritten.length, 1);
+});
+
+test("rewrite: the republished event id is a pure function of the source row content", async () => {
+  const sourceCommit = createSourceCommit({ ...strictSourceCommit, committedThroughSeq: 1, sourceRevision: "seq:1" });
+  const eventIds = await Promise.all([0, 1].map(async () => {
+    const fingerprints = new SourceRowFingerprints();
+    await projectSourceCommitHistoryPages({
+      sourceCommit,
+      readPage: async () => projectionPage([pagedProjectionMessage(1)], 1, false),
+      fingerprints,
+      publish: () => undefined,
+    });
+    const published: string[] = [];
+    await projectSourceCommitRewrite({
+      sourceCommit,
+      readPage: async () => projectionPage([withManagedImage(pagedProjectionMessage(1))], 1, false),
+      fingerprints,
+      publish: ({ events }) => { published.push(...events.map((event) => event.eventId)); },
+    });
+    return published;
+  }));
+  assert.equal(eventIds[0]!.length, 1);
+  assert.deepEqual(eventIds[0], eventIds[1]);
+});
+
+test("rewrite: rows this process never projected are left to history refresh", async () => {
+  const sourceCommit = createSourceCommit({ ...strictSourceCommit, committedThroughSeq: 1, sourceRevision: "seq:1" });
+  let reads = 0;
+  const republished = await projectSourceCommitRewrite({
+    sourceCommit,
+    readPage: async () => {
+      reads += 1;
+      return projectionPage([withManagedImage(pagedProjectionMessage(1))], 1, false);
+    },
+    fingerprints: new SourceRowFingerprints(),
+    publish: () => {
+      throw new Error("must not publish untracked rows");
+    },
+  });
+  assert.equal(republished, 0);
+  assert.equal(reads, 0);
+});
+
+test("rewrite: a failed publish keeps the old fingerprint so the next rewrite notification retries", async () => {
+  const fingerprints = new SourceRowFingerprints();
+  const sourceCommit = createSourceCommit({ ...strictSourceCommit, committedThroughSeq: 1, sourceRevision: "seq:1" });
+  await projectSourceCommitHistoryPages({
+    sourceCommit,
+    readPage: async () => projectionPage([pagedProjectionMessage(1)], 1, false),
+    fingerprints,
+    publish: () => undefined,
+  });
+  const readRewritten = async () => projectionPage([withManagedImage(pagedProjectionMessage(1))], 1, false);
+  await assert.rejects(projectSourceCommitRewrite({
+    sourceCommit,
+    readPage: readRewritten,
+    fingerprints,
+    publish: () => {
+      throw new Error("relay offline");
+    },
+  }), /relay offline/);
+  const retried: string[] = [];
+  await projectSourceCommitRewrite({
+    sourceCommit,
+    readPage: readRewritten,
+    fingerprints,
+    publish: ({ events }) => { retried.push(...events.map((event) => event.eventId)); },
+  });
+  assert.equal(retried.length, 1);
 });

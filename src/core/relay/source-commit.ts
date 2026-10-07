@@ -86,6 +86,13 @@ export type SourceCommitObserverOptions<TCursor extends SourceCommit = SourceCom
   onError?: (error: unknown) => void;
   /** 缺省时每个作用域都从序号 0 开始投影。 */
   resolveInitialWatermark?: SourceCommitWatermarkResolver<TCursor>;
+  /**
+   * 源的“原地改写代号”。宿主可能在已提交的行上原地补写内容（例如 OpenClaw 在最终回复
+   * 落库后再补入托管图片），此时 seq 水位不变，只有改写代号变化。
+   */
+  rewriteGenerationOf?: (cursor: TCursor) => string | undefined;
+  /** 水位未前进但改写代号变化时调用；成功后才记录新代号，失败由下一次通知重试。 */
+  onRewrite?: (cursor: TCursor) => void | Promise<void>;
 };
 
 /**
@@ -107,6 +114,7 @@ export function createSourceCommitObserver<TCursor extends SourceCommit = Source
   const resolveInitialWatermark: SourceCommitWatermarkResolver<TCursor> = options.resolveInitialWatermark
     ?? (async () => undefined);
   const latestByScope = new Map<string, number>();
+  const rewriteGenerationByScope = new Map<string, string>();
   // 已确定续传起点的作用域；起点为“从零开始”时不会出现在 latestByScope 中。
   const resolvedScopes = new Set<string>();
 
@@ -146,13 +154,33 @@ export function createSourceCommitObserver<TCursor extends SourceCommit = Source
           resolvedScopes.add(scope);
         }
         const previous = latestByScope.get(scope);
-        if (previous !== undefined && cursor.committedThroughSeq <= previous) continue;
+        // 改写代号取自本次游标读取（早于投影读取）：投影期间发生的改写会在下一次读取时
+        // 被识别并重投，绝不会因为先记录了新代号而漏掉。
+        const rewriteGeneration = options.rewriteGenerationOf?.(cursor);
+        if (previous !== undefined && cursor.committedThroughSeq <= previous) {
+          if (!options.onRewrite || rewriteGeneration === undefined) continue;
+          const knownGeneration = rewriteGenerationByScope.get(scope);
+          if (knownGeneration === rewriteGeneration) continue;
+          if (knownGeneration === undefined) {
+            // 进程内首次看到该作用域的改写代号：作为基线，之前的改写由 history 刷新覆盖。
+            rewriteGenerationByScope.set(scope, rewriteGeneration);
+            continue;
+          }
+          try {
+            await options.onRewrite(cursor);
+            rewriteGenerationByScope.set(scope, rewriteGeneration);
+          } catch (error) {
+            options.onError?.(error);
+          }
+          continue;
+        }
         try {
           await options.onCommit(cursor, previous);
           // Advance only after the downstream durable append/broadcast path
           // succeeds. A failed send must be retried by the next notification
           // or startup rescan, rather than being silently acknowledged.
           latestByScope.set(scope, cursor.committedThroughSeq);
+          if (rewriteGeneration !== undefined) rewriteGenerationByScope.set(scope, rewriteGeneration);
         } catch (error) {
           // Do not spin or introduce a timer as a retry mechanism. The next
           // source notification/reconnect rescan will retry the same cursor.

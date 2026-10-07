@@ -38,6 +38,7 @@ import {
   extractExplicitParentMediaContent,
   extractHistoryOutcome,
   readOpenClawSourceCommitCursor,
+  type OpenClawSourceCommitCursor,
   readOpenClawTranscriptChatHistory,
   withTimeout,
   type HistoryResponse,
@@ -49,10 +50,15 @@ import {
   SOURCE_COMMIT_PAGE_LIMIT,
   sourceCommitDeliveryId,
 } from "../core/relay/source-commit-publish-flow.js";
-import { projectSourceCommitHistoryPages } from "./relay/source-commit-projection.js";
+import {
+  projectSourceCommitHistoryPages,
+  projectSourceCommitRewrite,
+  type SourceCommitProjectionBatch,
+} from "./relay/source-commit-projection.js";
+import { SourceRowFingerprints } from "./relay/source-row-fingerprints.js";
 import { join } from "node:path";
 import { resolveOpenClawStateDir } from "./runtime/openclaw-paths.js";
-import type { SourceCommit } from "../core/relay/source-commit.js";
+import { createSourceCommit, type SourceCommit } from "../core/relay/source-commit.js";
 import { openClawAgentIdFromSessionKey } from "../core/relay/timeline-projection-v3.js";
 import {
   OpenClawChatSendDedupeCoordinator,
@@ -579,50 +585,70 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
         "agent",
         "openclaw-agent.sqlite",
       );
-      const watcher = watchOpenClawSourceCommit({
+      const fingerprints = new SourceRowFingerprints();
+      const readPage = (cursorSeq: number) => withTimeout(
+        requestChatHistoryFromClawConnect({
+          sessionKey: normalizedSessionKey,
+          limit: SOURCE_COMMIT_PAGE_LIMIT,
+          cursor: `seq:${cursorSeq}`,
+          direction: "newer",
+        }),
+        CHAT_HISTORY_FETCH_TIMEOUT_MS,
+        "source commit history reconciliation",
+      );
+      // 与手机拉取 history 走同一媒体处理（共用上传缓存，同一附件得到同一文件）。
+      const relayMedia = async (page: HistoryResponse) => await relayOutgoingMediaForResponse("chat.history", page) as HistoryResponse;
+      const publish = ({ sourceCommit: pageSourceCommit, events }: SourceCommitProjectionBatch) => sourceCommitPublishFlow.publish(
+        sourceCommitDeliveryId(pageSourceCommit, events.map((event) => event.eventId)),
+        async (deliveryId) => {
+          await waitForRelaySocketDrain(relayWs, 256 * 1024);
+          const deliveryResult = await publishAndSendGatewayEvent(
+            "chat",
+            {
+              state: "source_commit",
+              sessionKey: normalizedSessionKey,
+              sourceCommit: pageSourceCommit,
+              timelineEvents: events,
+            },
+            true,
+            undefined,
+            true,
+            deliveryId,
+          );
+          if (deliveryResult?.status === "retryable") {
+            throw deliveryResult.error;
+          }
+        },
+      );
+      const watcher = watchOpenClawSourceCommit<OpenClawSourceCommitCursor>({
         databasePath,
-        resolveInitialWatermark: (cursor) => sourceCommitCheckpoints.resolveWatermark(cursor),
+        resolveInitialWatermark: (cursor) => sourceCommitCheckpoints.resolveWatermark(createSourceCommit(cursor)),
         readCursor: () => readOpenClawSourceCommitCursor({
           sessionKey: normalizedSessionKey,
           projectionVersion: 3,
           projectionGatewayId: opts.gatewayId,
         }, sessionDefaults),
-        onCommit: async (sourceCommit: SourceCommit, previousCommittedThroughSeq) => {
+        onCommit: async (cursor, previousCommittedThroughSeq) => {
           await projectSourceCommitHistoryPages({
-            sourceCommit,
+            // 改写代号只用于本地触发重投，不随 sourceCommit 发给 Relay。
+            sourceCommit: createSourceCommit(cursor),
             previousCommittedThroughSeq,
-            readPage: (cursorSeq) => withTimeout(
-              requestChatHistoryFromClawConnect({
-                sessionKey: normalizedSessionKey,
-                limit: SOURCE_COMMIT_PAGE_LIMIT,
-                cursor: `seq:${cursorSeq}`,
-                direction: "newer",
-              }),
-              CHAT_HISTORY_FETCH_TIMEOUT_MS,
-              "source commit history reconciliation",
-            ),
-            publish: ({ sourceCommit: pageSourceCommit, events }) => sourceCommitPublishFlow.publish(
-              sourceCommitDeliveryId(pageSourceCommit, events.map((event) => event.eventId)),
-              async (deliveryId) => {
-                await waitForRelaySocketDrain(relayWs, 256 * 1024);
-                const deliveryResult = await publishAndSendGatewayEvent(
-                  "chat",
-                  {
-                    state: "source_commit",
-                    sessionKey: normalizedSessionKey,
-                    sourceCommit: pageSourceCommit,
-                    timelineEvents: events,
-                  },
-                  true,
-                  undefined,
-                  true,
-                  deliveryId,
-                );
-                if (deliveryResult?.status === "retryable") {
-                  throw deliveryResult.error;
-                }
-              },
-            ),
+            readPage,
+            relayMedia,
+            fingerprints,
+            publish,
+          });
+        },
+        // OpenClaw 先提交最终回复，再把托管图片原地补写进同一行（seq 不变、改写代号变化）；
+        // 重投内容变化的行，图片无需刷新即可出现。
+        rewriteGenerationOf: (cursor) => cursor.rewriteGeneration,
+        onRewrite: async (cursor) => {
+          await projectSourceCommitRewrite({
+            sourceCommit: createSourceCommit(cursor),
+            readPage,
+            relayMedia,
+            fingerprints,
+            publish,
           });
         },
         onError: (error) => {

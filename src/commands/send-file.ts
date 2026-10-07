@@ -26,6 +26,12 @@ export interface SendFileCommandDependencies {
 
 export type SendFileResult = FileUploadResult;
 
+/** OpenClaw 发送宿主机文件到当前手机聊天的正确方式（原生附件，由 ClawConnect 归属到本次回合）。 */
+export const OPENCLAW_NATIVE_MEDIA_HINT = "[send-file] OpenClaw does not provide the current ClawLink session/run to tool processes. "
+  + "Send the file natively instead: put a standalone line `MEDIA:<absolute path>` in the final reply, "
+  + "or call the message tool with action=send and media=<absolute path>. "
+  + "OpenClaw 中请改用原生附件：在最终回复里单独一行写 `MEDIA:<绝对路径>`，或调用 message 工具 action=send 的 media 字段。";
+
 export async function sendFileCommand(
   opts: SendFileCommandOptions,
   deps: SendFileCommandDependencies = {},
@@ -54,6 +60,9 @@ export async function sendFileCommand(
   const explicitSourceRunId = resolveSourceRunId(opts.sourceRunId, env, config.gatewayType);
   const isOpenClaw = config.gatewayType === "openclaw" || !config.gatewayType;
   if (isOpenClaw && (!explicitSessionKey || !explicitSourceRunId)) {
+    // OpenClaw 工具进程不提供当前手机会话与回合标识，send-file 无法确定性地定位目标。
+    // 错误码保持不变；同时把正确做法写到 stderr，调用它的模型可据此改用原生附件发送。
+    writeLog(stderr, OPENCLAW_NATIVE_MEDIA_HINT);
     throw new Error("openclaw_send_file_requires_explicit_session_and_source_run_id");
   }
   if (isOpenClaw && explicitSessionKey && !isFullOpenClawSessionKey(explicitSessionKey)) {

@@ -145,10 +145,13 @@ export type TranscriptHistoryRequest = {
  * reorder rows. It intentionally returns null when the authoritative SQLite
  * source is not available so the caller can use the native gateway stream.
  */
+/** 源提交游标附带 OpenClaw 的原地改写代号；代号只用于触发重投，不随 sourceCommit 发给 Relay。 */
+export type OpenClawSourceCommitCursor = SourceCommit & { rewriteGeneration?: string };
+
 export function readOpenClawSourceCommitCursor(
   rawParams: unknown,
   defaults: GatewaySessionDefaults,
-): SourceCommit | null {
+): OpenClawSourceCommitCursor | null {
   const params = normalizeTranscriptHistoryParams(rawParams, defaults.mainSessionKey);
   const agentId = params.sessionKey.match(/^agent:([^:]+):/)?.[1] ?? defaults.defaultAgentId ?? "main";
   const databasePath = join(resolveOpenClawStateDir(), "agents", agentId, "agent", "openclaw-agent.sqlite");
@@ -169,7 +172,9 @@ export function readOpenClawSourceCommitCursor(
     if (!Number.isSafeInteger(committedThroughSeq) || committedThroughSeq < 0) return null;
     const gatewayId = requireProjectionIdentity(params.projectionGatewayId, "gatewayId");
     const sourceOrderScope = openClawSourceOrderScope({ agentId, sessionId: sourceSessionId });
-    return createSourceCommit({
+    const rewriteRow = statements.rewriteGeneration?.get(sourceSessionId) as { generation?: unknown } | undefined;
+    const rewriteGeneration = cleanHistoryString(rewriteRow?.generation);
+    const commit = createSourceCommit({
       gatewayType: "openclaw",
       gatewayId,
       producerId: agentId,
@@ -179,6 +184,7 @@ export function readOpenClawSourceCommitCursor(
       committedThroughSeq,
       sourceRevision: `seq:${committedThroughSeq}`,
     });
+    return rewriteGeneration ? { ...commit, rewriteGeneration } : commit;
   } catch {
     forgetOpenClawSourceCursorConnection(databasePath);
     return null;

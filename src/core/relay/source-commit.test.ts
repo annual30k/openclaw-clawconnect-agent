@@ -239,3 +239,101 @@ test("each source generation resolves its own downstream watermark", async () =>
   ]);
   observer.close();
 });
+
+type RewriteCursor = ReturnType<typeof commit> & { rewriteGeneration?: string };
+
+function rewriteCursor(seq: number, rewriteGeneration: string): RewriteCursor {
+  return { ...commit(seq), rewriteGeneration };
+}
+
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+test("an in-place rewrite at an unchanged watermark triggers exactly one rewrite projection", async () => {
+  let current = rewriteCursor(164, "rewrite-a");
+  const commits: number[] = [];
+  const rewrites: string[] = [];
+  const observer = createSourceCommitObserver<RewriteCursor>({
+    readCursor: () => current,
+    onCommit: async (value) => { commits.push(value.committedThroughSeq); },
+    rewriteGenerationOf: (value) => value.rewriteGeneration,
+    onRewrite: async (value) => { rewrites.push(value.rewriteGeneration!); },
+  });
+  observer.rescan();
+  await settle();
+  current = rewriteCursor(164, "rewrite-b");
+  observer.notify();
+  await settle();
+  observer.notify();
+  await settle();
+  assert.deepEqual(commits, [164]);
+  assert.deepEqual(rewrites, ["rewrite-b"]);
+  observer.close();
+});
+
+test("the rewrite generation read with an advancing cursor is recorded only after the commit succeeds", async () => {
+  let current = rewriteCursor(1, "rewrite-a");
+  const rewrites: string[] = [];
+  const observer = createSourceCommitObserver<RewriteCursor>({
+    readCursor: () => current,
+    onCommit: async () => undefined,
+    rewriteGenerationOf: (value) => value.rewriteGeneration,
+    onRewrite: async (value) => { rewrites.push(value.rewriteGeneration!); },
+  });
+  observer.rescan();
+  await settle();
+  // 新行与改写在两次读取之间一起发生：由提交投影读取当前内容，不再额外重投。
+  current = rewriteCursor(2, "rewrite-b");
+  observer.notify();
+  await settle();
+  observer.notify();
+  await settle();
+  assert.deepEqual(rewrites, []);
+  observer.close();
+});
+
+test("a failed rewrite projection is retried by the next notification", async () => {
+  let current = rewriteCursor(5, "rewrite-a");
+  let failNext = true;
+  const rewrites: string[] = [];
+  const errors: unknown[] = [];
+  const observer = createSourceCommitObserver<RewriteCursor>({
+    readCursor: () => current,
+    onCommit: async () => undefined,
+    onError: (error) => { errors.push(error); },
+    rewriteGenerationOf: (value) => value.rewriteGeneration,
+    onRewrite: async (value) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("relay offline");
+      }
+      rewrites.push(value.rewriteGeneration!);
+    },
+  });
+  observer.rescan();
+  await settle();
+  current = rewriteCursor(5, "rewrite-b");
+  observer.notify();
+  await settle();
+  observer.notify();
+  await settle();
+  assert.equal(errors.length, 1);
+  assert.deepEqual(rewrites, ["rewrite-b"]);
+  observer.close();
+});
+
+test("the first rewrite generation seen at a resumed watermark is a baseline, not a rewrite", async () => {
+  const rewrites: string[] = [];
+  const observer = createSourceCommitObserver<RewriteCursor>({
+    readCursor: () => rewriteCursor(9, "rewrite-a"),
+    resolveInitialWatermark: async () => 9,
+    onCommit: async () => { throw new Error("nothing new to commit"); },
+    rewriteGenerationOf: (value) => value.rewriteGeneration,
+    onRewrite: async (value) => { rewrites.push(value.rewriteGeneration!); },
+  });
+  observer.rescan();
+  await settle();
+  observer.notify();
+  await settle();
+  assert.deepEqual(rewrites, []);
+  observer.close();
+});

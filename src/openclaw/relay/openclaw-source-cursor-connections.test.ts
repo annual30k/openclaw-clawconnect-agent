@@ -87,3 +87,41 @@ test("only main database and journal files signal new commits; reader-touched -s
   assert.equal(isSourceCommitSignal("other.sqlite", name), false);
   assert.equal(isSourceCommitSignal(null, name), true);
 });
+
+test("the rewrite generation is read from OpenClaw's rewrite watermark and follows in-place rewrites", async () => {
+  const root = await mkdtemp(join(tmpdir(), "clawlink-cursor-rewrite-"));
+  const path = join(root, "openclaw-agent.sqlite");
+  try {
+    createSourceDatabase(path, "s1", [1, 2]);
+    const writer = new DatabaseSync(path);
+    writer.exec("CREATE TABLE transcript_rewrite_watermarks (session_id TEXT PRIMARY KEY, generation TEXT, updated_at INTEGER)");
+    writer.prepare("INSERT INTO transcript_rewrite_watermarks VALUES (?, ?, ?)").run("s1", "rewrite-a", 1);
+    writer.close();
+
+    const generation = () => (openClawSourceCursorStatements(path)?.rewriteGeneration?.get("s1") as { generation?: unknown } | undefined)
+      ?.generation;
+    assert.equal(generation(), "rewrite-a");
+
+    const rewriter = new DatabaseSync(path);
+    rewriter.prepare("UPDATE transcript_rewrite_watermarks SET generation = ? WHERE session_id = ?").run("rewrite-b", "s1");
+    rewriter.close();
+    assert.equal(generation(), "rewrite-b");
+    assert.equal(maxSeq(path, "s1"), 2);
+  } finally {
+    closeOpenClawSourceCursorConnections();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an OpenClaw database without rewrite watermarks still serves the seq cursor", async () => {
+  const root = await mkdtemp(join(tmpdir(), "clawlink-cursor-no-rewrite-"));
+  const path = join(root, "openclaw-agent.sqlite");
+  try {
+    createSourceDatabase(path, "s1", [1, 2, 3]);
+    assert.equal(openClawSourceCursorStatements(path)?.rewriteGeneration, undefined);
+    assert.equal(maxSeq(path, "s1"), 3);
+  } finally {
+    closeOpenClawSourceCursorConnections();
+    await rm(root, { recursive: true, force: true });
+  }
+});

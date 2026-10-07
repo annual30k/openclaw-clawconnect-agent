@@ -402,6 +402,7 @@ test("send-file refuses OpenClaw active-run guessing even when a typed record ex
   const previousActiveRunStore = process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE;
   process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE = join(tempDir, "active-runs.json");
   await recordOpenClawActiveRun({ gatewayId: "gw-1", sessionKey: "agent:main:ios-selected", sourceRunId: "run-selected" });
+  const stderrLines: string[] = [];
   try {
     await assert.rejects(
       () => sendFileCommand(
@@ -413,10 +414,14 @@ test("send-file refuses OpenClaw active-run guessing even when a typed record ex
             relaySecret: "secret-123",
             gatewayType: "openclaw",
           }),
+          env: {},
+          stderr: { write: (chunk: string | Uint8Array) => { stderrLines.push(String(chunk)); return true; } },
         },
       ),
       { message: "openclaw_send_file_requires_explicit_session_and_source_run_id" },
     );
+    // 调用 send-file 的模型能从 stderr 得知 OpenClaw 的正确发送方式。
+    assert.equal(stderrLines.join("").includes("MEDIA:<absolute path>"), true);
   } finally {
     if (previousActiveRunStore === undefined) delete process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE;
     else process.env.CLAWCONNECT_OPENCLAW_ACTIVE_RUN_STORE = previousActiveRunStore;

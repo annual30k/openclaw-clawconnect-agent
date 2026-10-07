@@ -17,6 +17,8 @@ export type OpenClawSourceCursorStatements = {
   sessionNode: StatementSync;
   /** 查某个 sessionId 已提交的最大 seq。 */
   committedThroughSeq: StatementSync;
+  /** 查某个 sessionId 的原地改写代号；旧版 OpenClaw 没有该表时为 undefined。 */
+  rewriteGeneration?: StatementSync;
 };
 
 type CachedConnection = {
@@ -67,6 +69,18 @@ export function openClawSourceCursorStatements(databasePath: string): OpenClawSo
         WHERE session_id = ?
       `),
     };
+    const hasRewriteWatermarks = database.prepare(`
+      SELECT 1 AS present
+      FROM sqlite_master
+      WHERE type = 'table' AND name = 'transcript_rewrite_watermarks'
+    `).get() !== undefined;
+    if (hasRewriteWatermarks) {
+      statements.rewriteGeneration = database.prepare(`
+        SELECT generation
+        FROM transcript_rewrite_watermarks
+        WHERE session_id = ?
+      `);
+    }
     connections.set(databasePath, { database, ino, dev, statements });
     return statements;
   } catch (error) {

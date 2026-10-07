@@ -21,20 +21,25 @@ export type OpenClawSourceCommitWatcher = {
  * cursor reader still owns identity/order and the observer only advances after
  * the downstream append path succeeds.
  */
-export function watchOpenClawSourceCommit(options: {
+export function watchOpenClawSourceCommit<TCursor extends SourceCommit = SourceCommit>(options: {
   databasePath: string;
-  readCursor: () => SourceCommit | null | Promise<SourceCommit | null>;
-  onCommit: (commit: SourceCommit, previousCommittedThroughSeq: number | undefined) => void | Promise<void>;
+  readCursor: () => TCursor | null | Promise<TCursor | null>;
+  onCommit: (commit: TCursor, previousCommittedThroughSeq: number | undefined) => void | Promise<void>;
+  /** 宿主原地改写代号（见 createSourceCommitObserver）。 */
+  rewriteGenerationOf?: (cursor: TCursor) => string | undefined;
+  onRewrite?: (cursor: TCursor) => void | Promise<void>;
   onError?: (error: unknown) => void;
   rescanIntervalMs?: number;
   /** 解析每个源作用域的续传起点；缺省时从序号 0 开始投影。 */
-  resolveInitialWatermark?: SourceCommitWatermarkResolver;
+  resolveInitialWatermark?: SourceCommitWatermarkResolver<TCursor>;
 }): OpenClawSourceCommitWatcher {
-  const observer = createSourceCommitObserver({
+  const observer = createSourceCommitObserver<TCursor>({
     readCursor: options.readCursor,
     onCommit: options.onCommit,
     onError: options.onError,
     resolveInitialWatermark: options.resolveInitialWatermark,
+    rewriteGenerationOf: options.rewriteGenerationOf,
+    onRewrite: options.onRewrite,
   });
   const watchers: FSWatcher[] = [];
   const watchedDirectory = dirname(options.databasePath);
