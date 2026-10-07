@@ -87,11 +87,25 @@ export function isHermesSlashCommandMessage(message: string): boolean {
   return /^\/[A-Za-z0-9][\w-]*(?:\s|$)/.test(message.trim());
 }
 
+/**
+ * 斜杠命令执行后留在 Hermes 待执行队列中的输入，需要作为同一移动会话的一轮对话继续执行。
+ * gatewayId 必须由调用方的命令上下文显式传入：会话级思考等级等覆盖按 gatewayId + sessionKey 存储，
+ * 缺失 gatewayId 会让这一轮落到默认作用域，从而读不到该会话的设置。
+ */
+export type HermesQueuedChatRequest = {
+  message: string;
+  sessionKey: string;
+  hermesSessionId: string | undefined;
+  gatewayId: string | undefined;
+};
+
 export async function runHermesSlashCommand(params: {
   message: string;
   sessionKey: string;
   hermesSessionId?: unknown;
-  runQueuedChat?: (message: string, hermesSessionId?: string) => Promise<HermesChatResult>;
+  /** 发起斜杠命令的网关；显式声明为必填键，避免排队对话静默丢失作用域。 */
+  gatewayId: string | undefined;
+  runQueuedChat?: (request: HermesQueuedChatRequest) => Promise<HermesChatResult>;
 }): Promise<HermesChatResult> {
   const command = params.message.trim();
   const resume = typeof params.hermesSessionId === "string" && params.hermesSessionId.trim().length > 0
@@ -130,7 +144,12 @@ export async function runHermesSlashCommand(params: {
   if (payload.pendingInputs && payload.pendingInputs.length > 0) {
     const queuedMessage = payload.pendingInputs.join("\n\n").trim();
     if (queuedMessage && params.runQueuedChat) {
-      const queued = await params.runQueuedChat(queuedMessage, sessionId);
+      const queued = await params.runQueuedChat({
+        message: queuedMessage,
+        sessionKey: params.sessionKey,
+        hermesSessionId: sessionId,
+        gatewayId: params.gatewayId,
+      });
       return {
         ...queued,
         output: [output, queued.output].filter((part) => part && part !== "(no output)").join("\n\n") || queued.output,
