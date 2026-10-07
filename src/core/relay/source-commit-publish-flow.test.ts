@@ -73,9 +73,13 @@ test("a failed send releases the gate for the next frame without waiting for an 
   await next;
 });
 
-test("an ack that never arrives times out for liveness and the gate moves on", async () => {
+test("an ack that never arrives times out for liveness and the gate moves on", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const flow = createSourceCommitPublishFlow({ isAcknowledged: () => true, ackTimeoutMs: 5 });
-  await assert.rejects(flow.publish("d1", async () => undefined), /ack timed out/);
+  const timedOut = assert.rejects(flow.publish("d1", async () => undefined), /ack timed out/);
+  await flush();
+  t.mock.timers.tick(5);
+  await timedOut;
   const sent: string[] = [];
   const next = flow.publish("d2", async (deliveryId) => { sent.push(String(deliveryId)); });
   await flush();
