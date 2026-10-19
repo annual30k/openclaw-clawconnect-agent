@@ -33,6 +33,8 @@ export function installCommand() {
         return;
     }
     const servicePaths = getServicePaths();
+    // 失败必须体现在退出码上：`clawconnect update` 依赖它判断服务是否真的重装成功。
+    process.exitCode = 1;
     console.log(t("install.installFailed", platformName(platform)));
     if (platform === "macos") {
         console.log(t("install.serviceFileWritten", servicePaths.macPlistPath));
@@ -44,8 +46,7 @@ export function installCommand() {
         console.log(t("install.startManually", `bash "${servicePaths.linuxNohupStartScriptPath}"`));
     }
     else if (platform === "windows") {
-        const taskName = getServiceStatus().serviceName;
-        console.log(t("install.startManually", `schtasks /run /tn "${taskName}"`));
+        console.log(t("install.startManually", getServiceStatus().startHint ?? ""));
     }
 }
 export function restartCommand() {
@@ -65,6 +66,7 @@ export function restartCommand() {
         console.log(t("install.serviceRestarted", platformName(platform)));
         return;
     }
+    process.exitCode = 1;
     console.log(t("install.restartFailed", platformName(platform)));
 }
 export function isActiveMobileChatProcess(env = process.env) {
@@ -139,7 +141,7 @@ function platformName(platform) {
         case "linux":
             return "systemd/nohup";
         case "windows":
-            return "Windows Task Scheduler";
+            return "Windows Service";
         default:
             return process.platform;
     }

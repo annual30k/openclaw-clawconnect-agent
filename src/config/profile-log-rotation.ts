@@ -1,7 +1,7 @@
 import { copyFileSync, statSync, truncateSync } from "fs";
 import { profileErrorLogPath, profileLogPath } from "./profile.js";
 
-/** 单个日志文件超过该体积即轮转；launchd/systemd/schtasks 都以追加方式重定向 stdout，无法自行轮转。 */
+/** 单个日志文件超过该体积即轮转；launchd/systemd/Windows 服务宿主都以追加方式写 stdout，无法自行轮转。 */
 export const PROFILE_LOG_ROTATE_BYTES = 10 * 1024 * 1024;
 
 export type ProfileLogRotationResult = {

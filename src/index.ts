@@ -236,7 +236,7 @@ program
 
 program
   .command("install")
-  .description("Register as a background service (launchd on macOS, systemd --user on Linux, Startup on Windows)")
+  .description("Register as a background service (launchd on macOS, systemd --user on Linux, Windows Service on Windows, requires an elevated terminal)")
   .option(...profileOption)
   .action((opts: { profile?: string }) => {
     runInstallCommand(opts);

@@ -353,7 +353,7 @@ function readLogs(params: unknown = undefined): LocalResult {
       candidates.push(...profileCandidates);
     } else {
       // Primary: ~/.clawconnect/ — where the service (Linux systemd/nohup,
-      // macOS launchd, Windows schtasks) redirects stdout/stderr.
+      // macOS launchd, Windows service host) redirects stdout/stderr.
       if (existsSync(CLAWCONNECT_DIR)) {
         for (const f of readdirSync(CLAWCONNECT_DIR)) {
           if (f.endsWith(".log")) candidates.push(join(CLAWCONNECT_DIR, f));

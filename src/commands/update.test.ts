@@ -19,15 +19,15 @@ test("installedServiceProfilesForUpdate finds all named background services", ()
       probes.push(profile);
       return {
         installed: profile === "hermes" || profile === "openclaw",
-        manager: "Windows Task Scheduler",
+        manager: "Windows Service",
       };
     },
   );
 
   assert.deepEqual(probes, ["hermes", "openclaw"]);
   assert.deepEqual(services, [
-    { profile: "hermes", manager: "Windows Task Scheduler" },
-    { profile: "openclaw", manager: "Windows Task Scheduler" },
+    { profile: "hermes", manager: "Windows Service" },
+    { profile: "openclaw", manager: "Windows Service" },
   ]);
 });
 
@@ -45,10 +45,10 @@ test("installedServiceProfilesForUpdate probes the default service when no profi
 test("installedServiceProfilesForUpdate preserves paired profiles that were intentionally not installed", () => {
   const services = installedServiceProfilesForUpdate(
     ["hermes", "openclaw"],
-    (profile) => ({ installed: profile === "openclaw", manager: "Windows Startup" }),
+    (profile) => ({ installed: profile === "openclaw", manager: "Windows Service" }),
   );
 
-  assert.deepEqual(services, [{ profile: "openclaw", manager: "Windows Startup" }]);
+  assert.deepEqual(services, [{ profile: "openclaw", manager: "Windows Service" }]);
 });
 
 test("buildSelfUpdateArgs targets the latest published package by default", () => {

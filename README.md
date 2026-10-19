@@ -192,9 +192,9 @@ clawconnect install
 
 - macOS: installs a `launchd` user agent
 - Linux: prefers `systemd --user`, and falls back to `nohup` when `systemctl --user` is unavailable
-- Windows: registers a limited-privilege Windows Task Scheduler task when allowed, otherwise uses the current user's Startup registry entry; both auto-start silently at logon without requiring administrator elevation
+- Windows: registers a real Windows Service that runs as the current user and starts automatically at boot. The service supervises the agent and restarts it after a crash or when it is killed. Installing, updating, restarting and removing the service require an elevated terminal ("Run as administrator"); the first install asks once for the current Windows account password, which is validated and handed to the Service Control Manager without ever being written to a command line or file. The service host is compiled at install time with the .NET Framework 4 compiler that ships with Windows (`csc.exe`), so no SDK is needed.
 
-Windows profiles use isolated background startup entries and UTF-8 logs, for example `ClawConnectAgent-openclaw` and `ClawConnectAgent-hermes`.
+Windows profiles use isolated services and UTF-8 logs, for example `ClawConnectAgent-openclaw` and `ClawConnectAgent-hermes`. Installing migrates away from the previous Task Scheduler / Startup entries: the old task is deleted so it cannot start a second agent.
 
 Linux profiles are isolated as well: systemd units use names such as
 `clawconnect-agent-openclaw.service` and `clawconnect-agent-hermes.service`,

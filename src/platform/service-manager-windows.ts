@@ -1,5 +1,5 @@
 import { execFileSync } from "child_process";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import {
   ensureLogDir,
@@ -7,46 +7,63 @@ import {
   getProfileLogDir,
   getProfileLogPath,
   getProgramArgs,
-  resolveServiceEntryPath,
-  setRestrictiveFilePermissions,
 } from "./service-manager-common.js";
 import type { ServiceStatus } from "./service-manager-common.js";
-import { getActiveProfile, listProfileNames, normalizeProfileName } from "../config/profile.js";
+import { getActiveProfile, normalizeProfileName } from "../config/profile.js";
 import { decodeTextBuffer } from "./text-file-decoder.js";
+import {
+  buildWindowsServiceHostConfig,
+  buildWindowsServiceHostSource,
+  WINDOWS_HOST_GRANT_LOGON_RIGHT_FLAG,
+} from "./windows-service-host-source.js";
+import { removeLegacyWindowsStartup } from "./windows-service-legacy-startup.js";
+import {
+  isProcessTimeoutError,
+  killWindowsProcess,
+  reportWindowsQueryTimeout,
+  WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
+} from "./windows-process-control.js";
+import type { WindowsQueryTimeoutReporter } from "./windows-process-control.js";
+import {
+  windowsServiceHostConfigPath,
+  windowsServiceHostExePath,
+  windowsServiceHostSourcePath,
+  windowsServiceName,
+  windowsServiceRunnerPath,
+} from "./windows-service-paths.js";
 
-export const TASK_NAME = "ClawConnectAgent";
-export const WINDOWS_SERVICE_RUNNER_NAME = "clawconnect-service.ps1";
-export const WINDOWS_RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-export const WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS = 5_000;
+export { windowsServiceName } from "./windows-service-paths.js";
+export {
+  buildWindowsProcessQueryScript,
+  WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
+} from "./windows-process-control.js";
 
-export interface WindowsServiceStatusProbeOptions {
+export const WINDOWS_SERVICE_STATE_POLL_INTERVAL_MS = 500;
+export const WINDOWS_SERVICE_STATE_TIMEOUT_MS = 30_000;
+/** 失败后第 1、2 次 5 秒重启，之后 60 秒；24 小时无失败则清零计数。 */
+export const WINDOWS_SERVICE_FAILURE_ACTIONS = "restart/5000/restart/5000/restart/60000";
+export const WINDOWS_SERVICE_FAILURE_RESET_SECONDS = 86_400;
+
+export type WindowsServiceState = "running" | "stopped" | "pending" | "missing" | "unknown";
+
+export interface WindowsServiceDeps {
   execFileSyncImpl?: typeof execFileSync;
-  onQueryTimeout?: (probe: string) => void;
-  scriptPath?: string;
+  onQueryTimeout?: WindowsQueryTimeoutReporter;
+  sleepSync?: (ms: number) => void;
+  /** 测试用：覆盖 csc.exe 路径解析。 */
+  cscPath?: string;
+  /** 测试用：替换"结束 Agent 进程"的动作，避免单测去执行 Windows 命令。 */
+  killProcess?: (profile: string | undefined) => boolean;
+  /** 测试用：替换"编译服务宿主 exe"的动作，避免单测写入真实主目录。 */
+  compileHost?: (profile: string | undefined) => void;
+  /** 测试用：替换"写服务宿主配置"的动作，避免单测写入真实主目录。 */
+  writeConfig?: (profile: string | undefined) => void;
+  /** 测试用：覆盖服务账户，避免依赖运行测试的机器的 USERNAME / USERDOMAIN。 */
+  account?: string;
 }
 
-type WindowsQueryTimeoutReporter = (probe: string) => void;
-
-export function windowsTaskName(profile?: string): string {
-  const normalized = normalizeProfileName(profile);
-  return normalized ? `${TASK_NAME}-${normalized}` : TASK_NAME;
-}
-
-function qps(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
-export function buildWindowsPowerShellBootstrap(command: string): string {
-  return [
-    // Native process stdout is UTF-8; teach PowerShell to decode it correctly
-    // and keep redirection writes in UTF-8 so log readers see stable text.
-    `$utf8NoBom = [System.Text.UTF8Encoding]::new($false)`,
-    `[Console]::InputEncoding = $utf8NoBom`,
-    `[Console]::OutputEncoding = $utf8NoBom`,
-    `$OutputEncoding = $utf8NoBom`,
-    `$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'`,
-    command,
-  ].join("; ");
+function defaultSleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 export function normalizeWindowsServiceLogEncoding(path: string): void {
@@ -59,613 +76,368 @@ export function normalizeWindowsServiceLogEncoding(path: string): void {
   }
 }
 
-export function buildWindowsServiceProcessCommand(
-  args: string[],
-  logPath: string,
-  errorLogPath: string,
-): string {
-  const [execPath, ...execArgs] = args;
-  if (!execPath) {
-    throw new Error("Windows service executable is required");
+export function buildWindowsServiceStateScript(): string {
+  return `[string](Get-Service -Name $env:CLAW_SERVICE_NAME -ErrorAction Stop).Status`;
+}
+
+/** 服务账户：域/计算机名\用户名。服务必须以当前用户运行，才能读写其目录下的配置、日志与本机网关。 */
+export function windowsServiceAccount(env: NodeJS.ProcessEnv = process.env): string {
+  const user = env.USERNAME?.trim();
+  const domain = (env.USERDOMAIN ?? env.COMPUTERNAME)?.trim();
+  if (!user || !domain) {
+    throw new Error("Cannot determine the current Windows account (USERNAME / USERDOMAIN are not set)");
   }
-  return buildWindowsPowerShellBootstrap(
-    `& ${qps(execPath)} ${execArgs.map((arg) => qps(arg)).join(" ")} >> ${qps(logPath)} 2>> ${qps(errorLogPath)}`,
-  );
-}
-
-export function windowsServiceRunnerPath(profile?: string): string {
-  return join(getProfileLogDir(profile), WINDOWS_SERVICE_RUNNER_NAME);
-}
-
-export function buildWindowsServiceTaskCommand(runnerPath: string): string {
-  return `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "${runnerPath}"`;
-}
-
-export function buildWindowsStartupRegistryArgs(
-  taskName: string,
-  taskCommand: string,
-): string[] {
-  return [
-    "add",
-    WINDOWS_RUN_KEY,
-    "/v",
-    taskName,
-    "/t",
-    "REG_SZ",
-    "/d",
-    taskCommand,
-    "/f",
-  ];
-}
-
-function removeWindowsStartupEntry(
-  taskName: string,
-  execFileSyncImpl: typeof execFileSync = execFileSync,
-): boolean {
-  try {
-    execFileSyncImpl("reg.exe", ["delete", WINDOWS_RUN_KEY, "/v", taskName, "/f"], {
-      stdio: "pipe",
-      windowsHide: true,
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function hasWindowsStartupEntry(
-  taskName: string,
-  execFileSyncImpl: typeof execFileSync = execFileSync,
-  onQueryTimeout: WindowsQueryTimeoutReporter = reportWindowsQueryTimeout,
-): boolean {
-  try {
-    execFileSyncImpl("reg.exe", ["query", WINDOWS_RUN_KEY, "/v", taskName], {
-      stdio: "pipe",
-      windowsHide: true,
-      timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
-    });
-    return true;
-  } catch (error) {
-    if (isProcessTimeoutError(error)) {
-      onQueryTimeout("startup registry");
-    }
-    return false;
-  }
-}
-
-function hasWindowsScheduledTask(
-  taskName: string,
-  execFileSyncImpl: typeof execFileSync = execFileSync,
-  onQueryTimeout: WindowsQueryTimeoutReporter = reportWindowsQueryTimeout,
-): boolean {
-  try {
-    execFileSyncImpl("schtasks", ["/query", "/tn", taskName], {
-      stdio: "pipe",
-      windowsHide: true,
-      timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
-    });
-    return true;
-  } catch (error) {
-    if (isProcessTimeoutError(error)) {
-      onQueryTimeout("scheduled task");
-    }
-    return false;
-  }
-}
-
-export function migrateLegacyWindowsStartup(
-  profile?: string,
-  options: Pick<WindowsServiceStatusProbeOptions, "execFileSyncImpl" | "onQueryTimeout"> & {
-    defaultProfileConfigured?: boolean;
-    stopLegacyProcess?: () => void;
-  } = {},
-): boolean {
-  const resolvedProfile = normalizeProfileName(profile);
-  if (!resolvedProfile) {
-    // The unsuffixed task is still the current task for the default profile.
-    return true;
-  }
-  const defaultProfileConfigured = options.defaultProfileConfigured
-    ?? listProfileNames().includes("default");
-  if (defaultProfileConfigured) {
-    // A configured default profile legitimately owns the unsuffixed task and Run value.
-    return true;
-  }
-
-  const execFileSyncImpl = options.execFileSyncImpl ?? execFileSync;
-  const onQueryTimeout = options.onQueryTimeout ?? reportWindowsQueryTimeout;
-  let queryTimedOut = false;
-  const reportQueryTimeout = (probe: string): void => {
-    queryTimedOut = true;
-    onQueryTimeout(probe);
-  };
-  const legacyTaskExists = hasWindowsScheduledTask(
-    TASK_NAME,
-    execFileSyncImpl,
-    reportQueryTimeout,
-  );
-  const legacyStartupExists = hasWindowsStartupEntry(
-    TASK_NAME,
-    execFileSyncImpl,
-    reportQueryTimeout,
-  );
-  if (queryTimedOut) {
-    return false;
-  }
-  if (!legacyTaskExists && !legacyStartupExists) {
-    return true;
-  }
-
-  let migrated = true;
-  if (legacyTaskExists) {
-    try {
-      execFileSyncImpl("schtasks", ["/end", "/tn", TASK_NAME], {
-        stdio: "pipe",
-        windowsHide: true,
-      });
-    } catch {
-      // The legacy task can be installed without currently running.
-    }
-
-    try {
-      execFileSyncImpl("schtasks", ["/delete", "/tn", TASK_NAME, "/f"], {
-        stdio: "pipe",
-        windowsHide: true,
-      });
-    } catch {
-      migrated = false;
-    }
-  }
-
-  if (legacyStartupExists && !removeWindowsStartupEntry(TASK_NAME, execFileSyncImpl)) {
-    migrated = false;
-  }
-
-  (options.stopLegacyProcess ?? (() => { killWindowsProcess(undefined); }))();
-  return migrated;
-}
-
-export function buildWindowsScheduledTaskStateScript(): string {
-  return `[string](Get-ScheduledTask -TaskName $env:CLAW_TASK_NAME -ErrorAction Stop).State`;
-}
-
-function isWindowsScheduledTaskRunning(
-  taskName: string,
-  execFileSyncImpl: typeof execFileSync = execFileSync,
-  onQueryTimeout: WindowsQueryTimeoutReporter = reportWindowsQueryTimeout,
-): boolean {
-  try {
-    const output = execFileSyncImpl(
-      "powershell",
-      ["-NoProfile", "-Command", buildWindowsScheduledTaskStateScript()],
-      {
-        stdio: "pipe",
-        env: { ...process.env, CLAW_TASK_NAME: taskName },
-        timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
-        windowsHide: true,
-      },
-    )
-      .toString()
-      .trim();
-    return /^running$/i.test(output);
-  } catch (error) {
-    if (isProcessTimeoutError(error)) {
-      onQueryTimeout("scheduled task state");
-    }
-    return false;
-  }
-}
-
-function isProcessTimeoutError(error: unknown): boolean {
-  if (!error || typeof error !== "object") {
-    return false;
-  }
-  const candidate = error as NodeJS.ErrnoException & { killed?: boolean };
-  return candidate.code === "ETIMEDOUT" || candidate.killed === true;
-}
-
-function reportWindowsQueryTimeout(probe: string): void {
-  console.error(
-    `[clawconnect] Windows ${probe} query timed out after ${WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS}ms; continuing with an unknown result.`,
-  );
-}
-
-export function buildWindowsDetachedRunnerStartScript(): string {
-  return [
-    `$runnerArgument = '"' + $env:CLAW_RUNNER_PATH + '"'`,
-    `$process = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $runnerArgument) -PassThru`,
-    `[string]$process.Id`,
-  ].join("; ");
-}
-
-function startWindowsRunner(runnerPath: string): boolean {
-  try {
-    // Node 的 detached spawn 在部分普通用户/远控会话中会无错误返回、但子进程随即消失。
-    // 由 Windows PowerShell 的 Start-Process 创建独立隐藏进程，并要求返回真实 PID 后才算启动成功。
-    const output = execFileSync(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-Command", buildWindowsDetachedRunnerStartScript()],
-      {
-        stdio: "pipe",
-        env: { ...process.env, CLAW_RUNNER_PATH: runnerPath },
-        timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
-        windowsHide: true,
-      },
-    ).toString().trim();
-    return /^\d+$/.test(output);
-  } catch (error) {
-    console.error("[clawconnect] Failed to start Windows service runner:", error);
-    return false;
-  }
-}
-
-function startScheduledTaskOrRunner(taskName: string, runnerPath: string): void {
-  try {
-    execFileSync("schtasks", ["/run", "/tn", taskName], { stdio: "pipe" });
-  } catch {
-    startWindowsRunner(runnerPath);
-  }
-}
-
-function installWindowsStartupEntry(
-  taskName: string,
-  taskCommand: string,
-  runnerPath: string,
-): void {
-  execFileSync("reg.exe", buildWindowsStartupRegistryArgs(taskName, taskCommand), {
-    stdio: "pipe",
-    windowsHide: true,
-  });
-  if (!startWindowsRunner(runnerPath)) {
-    throw new Error("Windows startup entry was created, but its service runner did not start");
-  }
-}
-
-export function writeWindowsServiceRunner(
-  profile: string | undefined,
-  args: string[],
-  logPath: string,
-  errorLogPath: string,
-): string {
-  const runnerPath = windowsServiceRunnerPath(profile);
-  const script = `${buildWindowsServiceProcessCommand(args, logPath, errorLogPath)}\r\n`;
-  // Windows PowerShell 5.1 treats UTF-8 files without a BOM as the active ANSI
-  // code page. Keep the BOM so user names and install paths remain intact.
-  const utf8WithBom = Buffer.concat([
-    Buffer.from([0xef, 0xbb, 0xbf]),
-    Buffer.from(script, "utf8"),
-  ]);
-  writeFileSync(runnerPath, utf8WithBom);
-  setRestrictiveFilePermissions(runnerPath);
-  return runnerPath;
-}
-
-function refreshWindowsServiceRunner(profile?: string): string {
-  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
-  const logPath = getProfileLogPath(resolvedProfile);
-  const errorLogPath = getProfileErrorLogPath(resolvedProfile);
-  ensureLogDir(resolvedProfile);
-  // 升级 npm 包后 runner 必须改用当前 Node/CLI 绝对路径；同时先归一化旧版 PowerShell 日志编码。
-  normalizeWindowsServiceLogEncoding(logPath);
-  normalizeWindowsServiceLogEncoding(errorLogPath);
-  return writeWindowsServiceRunner(
-    resolvedProfile,
-    getProgramArgs(resolvedProfile),
-    logPath,
-    errorLogPath,
-  );
+  return `${domain}\\${user}`;
 }
 
 /**
- * Kill any running node processes that are executing this specific script.
- * Uses execFileSync to bypass cmd.exe, avoiding CMD quote-mangling.
- * Returns true if any processes were killed.
+ * 创建服务并设置当前用户凭据。密码只经 Read-Host -AsSecureString 在 PowerShell 进程内流转，
+ * 不进入命令行参数，也不经过 Node。创建前先校验密码，避免注册一个永远以 1069 启动失败的服务。
  */
-export function buildWindowsProcessQueryScript(profile?: string): string {
-  const normalizedProfile = normalizeProfileName(profile);
-  const profileFilter = normalizedProfile
-    ? `($_.CommandLine -match ('(?:^|\\s)--profile(?:\\s+|=)' + [regex]::Escape($env:CLAW_PROFILE_NAME) + '(?:\\s|$)') -or $_.CommandLine -match [regex]::Escape($env:CLAW_RUNNER_PATH))`
-    : `($_.CommandLine -notmatch '(?:^|\\s)--profile(?:\\s|=)')`;
-  return `Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -OperationTimeoutSec 3 | Where-Object { ($_.CommandLine -match 'clawconnect' -or $_.CommandLine -match [regex]::Escape($env:CLAW_SCRIPT_PATH) -or $_.CommandLine -match [regex]::Escape($env:CLAW_RUNNER_PATH)) -and ${profileFilter} } | Select-Object -ExpandProperty ProcessId`;
+export function buildWindowsServiceCreateScript(): string {
+  return [
+    `$ErrorActionPreference = 'Stop'`,
+    `$secure = Read-Host -Prompt ('Windows password for ' + $env:CLAW_SERVICE_ACCOUNT) -AsSecureString`,
+    `if ($secure.Length -eq 0) { throw 'A Windows service cannot log on with an empty password.' }`,
+    `$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)`,
+    `try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }`,
+    `Add-Type -AssemblyName System.DirectoryServices.AccountManagement`,
+    `$contextType = if ($env:USERDOMAIN -eq $env:COMPUTERNAME) { 'Machine' } else { 'Domain' }`,
+    `$context = New-Object System.DirectoryServices.AccountManagement.PrincipalContext($contextType)`,
+    `if (-not $context.ValidateCredentials($env:USERNAME, $plain)) { throw 'The Windows password is incorrect.' }`,
+    `$plain = $null`,
+    `$credential = New-Object System.Management.Automation.PSCredential($env:CLAW_SERVICE_ACCOUNT, $secure)`,
+    `New-Service -Name $env:CLAW_SERVICE_NAME -BinaryPathName $env:CLAW_SERVICE_BINPATH -DisplayName $env:CLAW_SERVICE_NAME -Description 'ClawConnect host agent' -StartupType Automatic -Credential $credential | Out-Null`,
+  ].join("\n");
 }
 
-function windowsProcessQueryEnv(
-  profile?: string,
-  scriptPath = process.argv[1],
-): NodeJS.ProcessEnv {
-  const normalizedProfile = normalizeProfileName(profile);
-  return {
-    ...process.env,
-    CLAW_SCRIPT_PATH: scriptPath ? resolveServiceEntryPath(scriptPath) : "",
-    CLAW_RUNNER_PATH: windowsServiceRunnerPath(normalizedProfile),
-    CLAW_PROFILE_NAME: normalizedProfile ?? "",
-  };
+/** SCM 启动宿主时传入的参数：服务名 + 宿主配置路径。 */
+export function buildWindowsServiceBinaryPath(hostExePath: string, serviceName: string, configPath: string): string {
+  return `"${hostExePath}" "${serviceName}" "${configPath}"`;
 }
 
-function killWindowsProcess(profile?: string): boolean {
-  const scriptPath = process.argv[1];
-  if (!scriptPath) return false;
+export function resolveWindowsCscPath(
+  fileExists: (path: string) => boolean = existsSync,
+  windowsDir: string = process.env.windir ?? process.env.SystemRoot ?? "C:\\Windows",
+): string | undefined {
+  const candidates = [
+    join(windowsDir, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe"),
+    join(windowsDir, "Microsoft.NET", "Framework", "v4.0.30319", "csc.exe"),
+  ];
+  return candidates.find((candidate) => fileExists(candidate));
+}
 
-  const currentPid = process.pid;
+export function buildWindowsServiceHostCompileArgs(sourcePath: string, outputPath: string): string[] {
+  return [
+    "/nologo",
+    "/target:exe",
+    "/optimize+",
+    `/out:${outputPath}`,
+    "/reference:System.ServiceProcess.dll",
+    sourcePath,
+  ];
+}
 
+export function isWindowsElevated(execFileSyncImpl: typeof execFileSync = execFileSync): boolean {
   try {
-    const psScript = buildWindowsProcessQueryScript(profile);
-    const output = execFileSync(
+    // fltmc 只有提权后的进程才能成功执行，比解析 whoami 输出更不依赖系统语言。
+    execFileSyncImpl("fltmc", [], { stdio: "pipe", windowsHide: true, timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function requireElevation(action: string, profile: string | undefined, deps: WindowsServiceDeps): boolean {
+  if (isWindowsElevated(deps.execFileSyncImpl)) {
+    return true;
+  }
+  const profileArg = profile ? ` --profile ${profile}` : "";
+  console.error(
+    `[clawconnect] ${action} a Windows service requires an elevated terminal. `
+    + `Open PowerShell with "Run as administrator" and run: clawconnect install${profileArg}`,
+  );
+  return false;
+}
+
+export function queryWindowsServiceState(
+  serviceName: string,
+  deps: WindowsServiceDeps = {},
+): WindowsServiceState {
+  const execFileSyncImpl = deps.execFileSyncImpl ?? execFileSync;
+  try {
+    const output = execFileSyncImpl(
       "powershell",
-      ["-NoProfile", "-Command", psScript],
+      ["-NoProfile", "-NonInteractive", "-Command", buildWindowsServiceStateScript()],
       {
         stdio: "pipe",
-        env: windowsProcessQueryEnv(profile),
+        env: { ...process.env, CLAW_SERVICE_NAME: serviceName },
         timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
         windowsHide: true,
-      }
-    )
-      .toString()
-      .trim();
-
-    const pids = output
-      .split(/\r?\n/)
-      .map((p) => p.trim())
-      .filter((p) => /\d+/.test(p) && Number(p) !== currentPid);
-    if (pids.length === 0) return false;
-
-    // Step 1: graceful shutdown — taskkill without /F sends WM_CLOSE.
-    // For console/background Node.js processes this is best-effort only.
-    for (const pid of pids) {
-      try {
-        execFileSync("taskkill", ["/PID", String(pid)], { stdio: "pipe" });
-      } catch {
-        // ignore — will fall back to /F below
-      }
+      },
+    ).toString().trim().toLowerCase();
+    if (output === "running") return "running";
+    if (output === "stopped") return "stopped";
+    if (output.endsWith("pending") || output === "paused") return "pending";
+    return "unknown";
+  } catch (error) {
+    if (isProcessTimeoutError(error)) {
+      (deps.onQueryTimeout ?? reportWindowsQueryTimeout)("service state");
+      return "unknown";
     }
-
-    // Step 2: give processes a brief window to flush / clean up
-    try {
-      execFileSync("powershell", ["-NoProfile", "-Command", "Start-Sleep -Seconds 3"], { stdio: "pipe" });
-    } catch {
-      // ignore
-    }
-
-    // Step 3: force-kill anything still alive
-    for (const pid of pids) {
-      try {
-        execFileSync("taskkill", ["/F", "/PID", String(pid)], { stdio: "pipe" });
-      } catch {
-        // ignore — probably already exited gracefully
-      }
-    }
-    return true;
-  } catch (err) {
-    console.error("[clawconnect] Failed to kill Windows process:", err);
-    return false;
+    // Get-Service 找不到服务会以非零退出码结束。
+    return "missing";
   }
 }
 
-export function installWindowsService(profile?: string): boolean {
+function waitForServiceState(
+  serviceName: string,
+  wanted: WindowsServiceState,
+  deps: WindowsServiceDeps,
+): boolean {
+  const sleep = deps.sleepSync ?? defaultSleepSync;
+  const attempts = Math.ceil(WINDOWS_SERVICE_STATE_TIMEOUT_MS / WINDOWS_SERVICE_STATE_POLL_INTERVAL_MS);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (queryWindowsServiceState(serviceName, deps) === wanted) {
+      return true;
+    }
+    sleep(WINDOWS_SERVICE_STATE_POLL_INTERVAL_MS);
+  }
+  return false;
+}
+
+function runServiceControl(args: string[], deps: WindowsServiceDeps): void {
+  (deps.execFileSyncImpl ?? execFileSync)("sc.exe", args, { stdio: "pipe", windowsHide: true });
+}
+
+function stopServiceAndWait(serviceName: string, deps: WindowsServiceDeps): boolean {
+  const state = queryWindowsServiceState(serviceName, deps);
+  if (state === "missing" || state === "stopped") {
+    return true;
+  }
+  try {
+    runServiceControl(["stop", serviceName], deps);
+  } catch {
+    // 已处于停止中等状态时 sc stop 会报错，以下面的等待结果为准。
+  }
+  return waitForServiceState(serviceName, "stopped", deps);
+}
+
+function writeServiceHostConfig(profile: string | undefined, deps: WindowsServiceDeps = {}): void {
+  if (deps.writeConfig) {
+    deps.writeConfig(profile);
+    return;
+  }
+  const logPath = getProfileLogPath(profile);
+  const errorLogPath = getProfileErrorLogPath(profile);
+  ensureLogDir(profile);
+  // 旧版 PowerShell 重定向写出的是 UTF-16 日志；宿主按原始 UTF-8 字节追加，先归一化避免混合编码。
+  normalizeWindowsServiceLogEncoding(logPath);
+  normalizeWindowsServiceLogEncoding(errorLogPath);
+  const [executablePath, ...executableArgs] = getProgramArgs(profile);
+  const configPath = windowsServiceHostConfigPath(profile);
+  writeFileSync(
+    configPath,
+    buildWindowsServiceHostConfig({
+      executablePath,
+      executableArgs,
+      workingDirectory: getProfileLogDir(profile),
+      stdoutLogPath: logPath,
+      stderrLogPath: errorLogPath,
+    }),
+    "utf8",
+  );
+}
+
+function compileServiceHost(profile: string | undefined, deps: WindowsServiceDeps): void {
+  if (deps.compileHost) {
+    deps.compileHost(profile);
+    return;
+  }
+  const cscPath = deps.cscPath ?? resolveWindowsCscPath();
+  if (!cscPath) {
+    throw new Error("The .NET Framework 4 C# compiler (csc.exe) was not found; it is required to build the service host");
+  }
+  const sourcePath = windowsServiceHostSourcePath(profile);
+  writeFileSync(sourcePath, buildWindowsServiceHostSource(), "utf8");
+  try {
+    (deps.execFileSyncImpl ?? execFileSync)(
+      cscPath,
+      buildWindowsServiceHostCompileArgs(sourcePath, windowsServiceHostExePath(profile)),
+      { stdio: "pipe", windowsHide: true },
+    );
+  } catch (error) {
+    const output = (error as { stdout?: Buffer }).stdout?.toString().trim();
+    throw new Error(`Failed to compile the Windows service host${output ? `:\n${output}` : ""}`);
+  }
+}
+
+function createService(profile: string | undefined, serviceName: string, deps: WindowsServiceDeps): void {
+  const execFileSyncImpl = deps.execFileSyncImpl ?? execFileSync;
+  const account = deps.account ?? windowsServiceAccount();
+  const hostExePath = windowsServiceHostExePath(profile);
+  execFileSyncImpl(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", buildWindowsServiceCreateScript()],
+    {
+      // 继承 stdio：密码提示必须直接出现在用户的终端里。
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        CLAW_SERVICE_NAME: serviceName,
+        CLAW_SERVICE_BINPATH: buildWindowsServiceBinaryPath(hostExePath, serviceName, windowsServiceHostConfigPath(profile)),
+        CLAW_SERVICE_ACCOUNT: account,
+      },
+    },
+  );
+  execFileSyncImpl(hostExePath, [WINDOWS_HOST_GRANT_LOGON_RIGHT_FLAG, account], { stdio: "pipe", windowsHide: true });
+  runServiceControl([
+    "failure", serviceName,
+    "reset=", String(WINDOWS_SERVICE_FAILURE_RESET_SECONDS),
+    "actions=", WINDOWS_SERVICE_FAILURE_ACTIONS,
+  ], deps);
+  // 宿主进程以非零码退出也算失败，同样触发上面的自动重启。
+  runServiceControl(["failureflag", serviceName, "1"], deps);
+}
+
+function startServiceAndWait(serviceName: string, deps: WindowsServiceDeps): boolean {
+  try {
+    runServiceControl(["start", serviceName], deps);
+  } catch (error) {
+    const detail = (error as { stdout?: Buffer }).stdout?.toString().trim();
+    console.error(`[clawconnect] Failed to start Windows service ${serviceName}${detail ? `: ${detail}` : ""}`);
+    return false;
+  }
+  if (!waitForServiceState(serviceName, "running", deps)) {
+    console.error(`[clawconnect] Windows service ${serviceName} did not reach the running state.`);
+    return false;
+  }
+  return true;
+}
+
+export function installWindowsService(profile?: string, deps: WindowsServiceDeps = {}): boolean {
   const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
-  const taskName = windowsTaskName(resolvedProfile);
+  const serviceName = windowsServiceName(resolvedProfile);
+  if (!requireElevation("Installing", resolvedProfile, deps)) {
+    return false;
+  }
 
   try {
-    if (!migrateLegacyWindowsStartup(resolvedProfile)) {
-      throw new Error(`Unable to remove legacy Windows startup ${TASK_NAME}`);
+    // 先清理旧计划任务 / Run 项并结束遗留 Agent：否则下次登录会多出一个实例与服务抢占 Relay 会话。
+    if (!removeLegacyWindowsStartup(resolvedProfile, {
+      execFileSyncImpl: deps.execFileSyncImpl,
+      onQueryTimeout: deps.onQueryTimeout,
+      stopLegacyProcess: deps.killProcess ? (target) => { deps.killProcess?.(target); } : undefined,
+    })) {
+      throw new Error(`Unable to remove the legacy Windows startup entry ${serviceName}`);
     }
-    try {
-      execFileSync("schtasks", ["/end", "/tn", taskName], { stdio: "pipe" });
-    } catch {
-      // First install or already stopped.
+    if (!stopServiceAndWait(serviceName, deps)) {
+      throw new Error(`Windows service ${serviceName} did not stop; cannot replace its host executable`);
     }
-    killWindowsProcess(resolvedProfile);
+    (deps.killProcess ?? killWindowsProcess)(resolvedProfile);
 
-    // Keep the scheduled task command short. schtasks limits /tr to 261
-    // characters, while NVM/npm paths plus UTF-8 bootstrap and log redirects
-    // can easily exceed it when embedded inline.
-    const runnerPath = refreshWindowsServiceRunner(resolvedProfile);
-    const taskCommand = buildWindowsServiceTaskCommand(runnerPath);
-    const taskArguments = taskCommand.slice("powershell.exe ".length);
-
-    // ── Attempt 1: PowerShell ScheduledTasks module ──────────────────────
-    // Supports RestartOnFailure (crash recovery) and full settings control.
-    // Available on Windows 10 / Server 2016+.
-    try {
-      // We use 'powershell -WindowStyle Hidden' to launch node without a visible console window.
-      // This is the most reliable native way to run a background console app on login.
-      // Stdout/stderr are redirected to log files, matching the behavior of the
-      // Linux (systemd/nohup) and macOS (launchd) service managers.
-      const psScript = [
-        `$action   = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ${qps(taskArguments)}`,
-        `$trigger  = New-ScheduledTaskTrigger -AtLogon`,
-        `$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited`,
-        `$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`,
-        `Register-ScheduledTask -TaskName ${qps(taskName)} -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null`,
-      ].join("\n");
-
-      execFileSync("powershell", ["-NoProfile", "-Command", psScript], { stdio: "pipe" });
-      removeWindowsStartupEntry(taskName);
-      startScheduledTaskOrRunner(taskName, runnerPath);
-      return true;
-    } catch {
-      // Fall through to basic schtasks below
+    compileServiceHost(resolvedProfile, deps);
+    writeServiceHostConfig(resolvedProfile, deps);
+    // 已存在的服务保留原账户与凭据，更新/重装不需要再次输入密码。
+    if (queryWindowsServiceState(serviceName, deps) === "missing") {
+      createService(resolvedProfile, serviceName, deps);
     }
-
-    // ── Attempt 2: Basic schtasks (no crash recovery) ────────────────────
-    try {
-      execFileSync(
-        "schtasks",
-        [
-          "/create",
-          "/tn",
-          taskName,
-          "/tr",
-          taskCommand,
-          "/sc",
-          "onlogon",
-          "/rl",
-          "LIMITED",
-          "/f",
-        ],
-        { stdio: "pipe" },
-      );
-      removeWindowsStartupEntry(taskName);
-      startScheduledTaskOrRunner(taskName, runnerPath);
-      return true;
-    } catch {
-      // Some Windows policies reserve Task Scheduler registration for
-      // administrators. HKCU Run is a per-user startup mechanism and does not
-      // require elevation.
-    }
-
-    // An older task can be readable but not replaceable by the current
-    // unelevated shell. Keep that login trigger instead of installing a second
-    // autostart path, and launch the newly written runner immediately.
-    if (hasWindowsScheduledTask(taskName)) {
-      removeWindowsStartupEntry(taskName);
-      startScheduledTaskOrRunner(taskName, runnerPath);
-      return true;
-    }
-
-    installWindowsStartupEntry(taskName, taskCommand, runnerPath);
-    return true;
+    return startServiceAndWait(serviceName, deps);
   } catch (err) {
-    console.error("[clawconnect] Failed to install Windows background startup:", err);
+    console.error("[clawconnect] Failed to install Windows service:", err instanceof Error ? err.message : err);
     return false;
   }
 }
 
-export function uninstallWindowsService(profile?: string): boolean {
+export function restartWindowsService(profile?: string, deps: WindowsServiceDeps = {}): boolean {
   const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
-  const taskName = windowsTaskName(resolvedProfile);
-  const runnerPath = windowsServiceRunnerPath(resolvedProfile);
+  const serviceName = windowsServiceName(resolvedProfile);
+  if (queryWindowsServiceState(serviceName, deps) === "missing") {
+    return installWindowsService(resolvedProfile, deps);
+  }
+  if (!requireElevation("Restarting", resolvedProfile, deps)) {
+    return false;
+  }
+  try {
+    if (!stopServiceAndWait(serviceName, deps)) {
+      throw new Error(`Windows service ${serviceName} did not stop`);
+    }
+    // npm install -g 可能改变 Node 或全局包路径；重启必须刷新宿主配置，不能继续执行旧入口。
+    writeServiceHostConfig(resolvedProfile, deps);
+    return startServiceAndWait(serviceName, deps);
+  } catch (err) {
+    console.error("[clawconnect] Failed to restart Windows service:", err instanceof Error ? err.message : err);
+    return false;
+  }
+}
+
+export function stopWindowsService(profile?: string, deps: WindowsServiceDeps = {}): boolean {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+  const serviceName = windowsServiceName(resolvedProfile);
+  const state = queryWindowsServiceState(serviceName, deps);
+  let changed = false;
+  if (state === "running" || state === "pending") {
+    if (!requireElevation("Stopping", resolvedProfile, deps)) {
+      return false;
+    }
+    changed = stopServiceAndWait(serviceName, deps);
+  }
+  // 前台手动启动的 Agent 不归服务管，stop 也要一并结束。
+  return (deps.killProcess ?? killWindowsProcess)(resolvedProfile) || changed;
+}
+
+export function uninstallWindowsService(profile?: string, deps: WindowsServiceDeps = {}): boolean {
+  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+  const serviceName = windowsServiceName(resolvedProfile);
+  const state = queryWindowsServiceState(serviceName, deps);
+  if (state !== "missing" && !requireElevation("Removing", resolvedProfile, deps)) {
+    return false;
+  }
   try {
     let changed = false;
-    try {
-      execFileSync("schtasks", ["/delete", "/tn", taskName, "/f"], { stdio: "pipe" });
-      changed = true;
-    } catch {
-      // task might not exist
-    }
-
-    if (killWindowsProcess(resolvedProfile)) {
+    if (state !== "missing") {
+      if (!stopServiceAndWait(serviceName, deps)) {
+        throw new Error(`Windows service ${serviceName} did not stop`);
+      }
+      runServiceControl(["delete", serviceName], deps);
       changed = true;
     }
-    if (removeWindowsStartupEntry(taskName)) {
+    if ((deps.killProcess ?? killWindowsProcess)(resolvedProfile)) {
       changed = true;
     }
-    try {
-      unlinkSync(runnerPath);
-      changed = true;
-    } catch {
-      // runner might not exist
+    for (const path of [
+      windowsServiceHostExePath(resolvedProfile),
+      windowsServiceHostSourcePath(resolvedProfile),
+      windowsServiceHostConfigPath(resolvedProfile),
+      windowsServiceRunnerPath(resolvedProfile),
+    ]) {
+      if (existsSync(path)) {
+        rmSync(path, { force: true });
+        changed = true;
+      }
     }
     return changed;
   } catch (err) {
-    console.error("[clawconnect] Failed to uninstall Windows task:", err);
+    console.error("[clawconnect] Failed to uninstall Windows service:", err instanceof Error ? err.message : err);
     return false;
   }
-}
-
-export function restartWindowsService(profile?: string): boolean {
-  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
-  const taskName = windowsTaskName(resolvedProfile);
-  if (!migrateLegacyWindowsStartup(resolvedProfile)) {
-    console.error(`[clawconnect] Failed to remove legacy Windows startup ${TASK_NAME}`);
-    return false;
-  }
-  // Try to stop the task first
-  try {
-    execFileSync("schtasks", ["/end", "/tn", taskName], { stdio: "pipe" });
-  } catch {
-    // ignore if not running
-  }
-
-  killWindowsProcess(resolvedProfile);
-
-  let runnerPath: string;
-  try {
-    // `npm install -g` 可能改变 Node 或全局包路径；普通 restart 也必须刷新 runner，不能继续执行旧版本入口。
-    runnerPath = refreshWindowsServiceRunner(resolvedProfile);
-  } catch (error) {
-    console.error("[clawconnect] Failed to refresh Windows service runner:", error);
-    return false;
-  }
-
-  if (hasWindowsStartupEntry(taskName)) {
-    return startWindowsRunner(runnerPath);
-  }
-
-  try {
-    execFileSync("schtasks", ["/run", "/tn", taskName], { stdio: "pipe" });
-    return true;
-  } catch {
-    // If the task doesn't exist, install it
-    return installWindowsService(resolvedProfile);
-  }
-}
-
-export function stopWindowsService(profile?: string): boolean {
-  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
-  const taskName = windowsTaskName(resolvedProfile);
-  try {
-    execFileSync("schtasks", ["/end", "/tn", taskName], { stdio: "pipe" });
-  } catch {
-    // ignore if not running
-  }
-  return killWindowsProcess(resolvedProfile);
 }
 
 export function getWindowsServiceStatus(
   profile?: string,
-  options: WindowsServiceStatusProbeOptions = {},
+  deps: WindowsServiceDeps = {},
 ): ServiceStatus {
   const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
-  const taskName = windowsTaskName(resolvedProfile);
-  const logPath = getProfileLogPath(resolvedProfile);
-  const execFileSyncImpl = options.execFileSyncImpl ?? execFileSync;
-  const onQueryTimeout = options.onQueryTimeout ?? reportWindowsQueryTimeout;
-  const installedViaTask = hasWindowsScheduledTask(taskName, execFileSyncImpl, onQueryTimeout);
-  const installedViaStartup = hasWindowsStartupEntry(taskName, execFileSyncImpl, onQueryTimeout);
-  const installed = installedViaTask || installedViaStartup;
-
-  // Task Scheduler already tracks the blocking PowerShell runner. Prefer that
-  // state over Win32_Process.CommandLine, which can be blank under Windows
-  // privacy/UAC policies even for processes owned by the current user.
-  let running = installedViaTask
-    && isWindowsScheduledTaskRunning(taskName, execFileSyncImpl, onQueryTimeout);
-  if (installed && !running) {
-    try {
-      const scriptPath = options.scriptPath ?? process.argv[1];
-      if (scriptPath) {
-        const psScript = buildWindowsProcessQueryScript(resolvedProfile);
-        const output = execFileSyncImpl(
-          "powershell",
-          ["-NoProfile", "-Command", psScript],
-          {
-            stdio: "pipe",
-            env: windowsProcessQueryEnv(resolvedProfile, scriptPath),
-            timeout: WINDOWS_READ_ONLY_QUERY_TIMEOUT_MS,
-            windowsHide: true,
-          }
-        )
-          .toString()
-          .trim();
-        running = /\d+/.test(output);
-      }
-    } catch (error) {
-      if (isProcessTimeoutError(error)) {
-        onQueryTimeout("running process");
-      }
-    }
-  }
-
+  const serviceName = windowsServiceName(resolvedProfile);
+  const state = queryWindowsServiceState(serviceName, deps);
   return {
     platform: "windows",
-    installed,
-    running,
-    serviceName: taskName,
-    manager: installedViaTask ? "Windows Task Scheduler" : "Windows Startup",
-    servicePath: windowsServiceRunnerPath(resolvedProfile),
-    logPath,
-    startHint: installedViaTask
-      ? `schtasks /run /tn "${taskName}"`
-      : buildWindowsServiceTaskCommand(windowsServiceRunnerPath(resolvedProfile)),
+    installed: state !== "missing",
+    running: state === "running",
+    serviceName,
+    manager: "Windows Service",
+    servicePath: windowsServiceHostExePath(resolvedProfile),
+    logPath: getProfileLogPath(resolvedProfile),
+    startHint: `sc.exe start "${serviceName}"`,
   };
 }
