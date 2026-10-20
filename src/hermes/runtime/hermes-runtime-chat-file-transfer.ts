@@ -58,6 +58,54 @@ function normalizeHermesRole(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
+/**
+ * 一个移动端轮次最终应该展示的文本，以及它是怎么来的。
+ *
+ * 这是实时路径（`verifyHermesFileTransferIfRequired`）和历史投影（`runHermesChatHistory`）
+ * 共用的唯一规则：同一份 state.db 行只能算出同一个答案，两处不能各算一遍。
+ * 模型在 outcome 工具之后补的收尾文字（"已发送 ✅"之类）不是可信的最终回答，
+ * 只有 typed outcome 的 assistantText、第一方 send-file 回执和宿主生成的失败提示才算。
+ */
+export type HermesTurnOutput =
+  | { kind: "none" }
+  | { kind: "file-evidence"; text: string; fileCount: number }
+  | { kind: "clarification"; text: string }
+  | { kind: "cancelled"; text: string }
+  | { kind: "ordinary"; text: string }
+  | { kind: "attempted-unverified"; text: string };
+
+export function resolveHermesTurnOutput(
+  messages: Array<Record<string, unknown>> | undefined,
+  sourceRunId: string,
+): HermesTurnOutput {
+  // 优先级固定：文件回执 > typed outcome > 无回执的 send-file 尝试 > 无结论。
+  const evidence = collectHermesFileTransferEvidence(messages, sourceRunId);
+  if (evidence.length > 0) {
+    return {
+      kind: "file-evidence",
+      text: `已发送 ${evidence.length} 个文件，请查收。`,
+      fileCount: evidence.length,
+    };
+  }
+  const outcome = collectHermesFileTransferOutcome(messages, sourceRunId);
+  if (outcome?.kind === "clarification") {
+    return { kind: "clarification", text: outcome.assistantText ?? HERMES_FILE_TRANSFER_CONTENT_MISSING_MESSAGE };
+  }
+  if (outcome?.kind === "cancelled") {
+    return { kind: "cancelled", text: outcome.assistantText ?? HERMES_FILE_TRANSFER_CANCELLED_MESSAGE };
+  }
+  if (outcome?.kind === "ordinary") {
+    // ordinary 只是路由标签，不是投递证明；可见内容只来自 typed assistantText。
+    return { kind: "ordinary", text: outcome.assistantText ?? HERMES_FILE_TRANSFER_CONTENT_MISSING_MESSAGE };
+  }
+  if (outcome?.kind === "attempted" || hasHermesSendFileAttempt(messages, sourceRunId)) {
+    return { kind: "attempted-unverified", text: HERMES_FILE_TRANSFER_NOT_SENT_MESSAGE };
+  }
+  // 能力在每个移动端轮次都开放，但能力本身不会把普通聊天变成文件操作：
+  // 没有 typed outcome、也没有真实调用 send-file 的轮次，保留宿主原始回答。
+  return { kind: "none" };
+}
+
 export async function verifyHermesFileTransferIfRequired(params: {
   plan: HermesChatPreparationPlan;
   gatewayId: string;
@@ -70,84 +118,38 @@ export async function verifyHermesFileTransferIfRequired(params: {
     return {};
   }
   const messages = params.sessionId ? await readHermesSessionMessages(params.sessionId) : undefined;
-  const evidence = params.sourceRunId
-    ? collectHermesFileTransferEvidence(messages, params.sourceRunId)
-    : [];
-  if (evidence.length > 0) {
-    await clearPendingHermesFileTransfer(
-      params.gatewayId,
-      params.sessionKey,
-      params.plan.pendingFileTransfer?.sourceRunId,
-    );
-    return {
-      verifiedFileTransferCount: evidence.length,
-      output: `已发送 ${evidence.length} 个文件，请查收。`,
-    };
+  const turnOutput = params.sourceRunId
+    ? resolveHermesTurnOutput(messages, params.sourceRunId)
+    : { kind: "none" } as const;
+  const pendingSourceRunId = params.plan.pendingFileTransfer?.sourceRunId;
+  switch (turnOutput.kind) {
+    case "file-evidence":
+      await clearPendingHermesFileTransfer(params.gatewayId, params.sessionKey, pendingSourceRunId);
+      return { verifiedFileTransferCount: turnOutput.fileCount, output: turnOutput.text };
+    case "clarification":
+      if (params.sessionId && params.sourceRunId) {
+        await recordPendingHermesFileTransfer({
+          gatewayId: params.gatewayId,
+          sessionKey: params.sessionKey,
+          hermesSessionId: params.sessionId,
+          sourceRunId: params.sourceRunId,
+          continuation: false,
+        });
+      }
+      return { output: turnOutput.text };
+    case "cancelled":
+    case "ordinary":
+      await clearPendingHermesFileTransfer(params.gatewayId, params.sessionKey, pendingSourceRunId);
+      return { output: turnOutput.text };
+    case "attempted-unverified":
+      // 只有 typed outcome=attempted 才清理待续传状态；仅检测到 send-file 调用而没有回执时保持原状。
+      if (collectHermesFileTransferOutcome(messages, params.sourceRunId ?? "")?.kind === "attempted") {
+        await clearPendingHermesFileTransfer(params.gatewayId, params.sessionKey, pendingSourceRunId);
+      }
+      return { verifiedFileTransferCount: 0, output: turnOutput.text };
+    case "none":
+      return {};
   }
-  const outcome = params.sourceRunId
-    ? collectHermesFileTransferOutcome(messages, params.sourceRunId)
-    : undefined;
-  if (outcome?.kind === "clarification") {
-    if (params.sessionId && params.sourceRunId) {
-      await recordPendingHermesFileTransfer({
-        gatewayId: params.gatewayId,
-        sessionKey: params.sessionKey,
-        hermesSessionId: params.sessionId,
-        sourceRunId: params.sourceRunId,
-        continuation: false,
-      });
-    }
-    // Only the typed content field is displayable. Raw assistant prose is
-    // deliberately discarded, and this outcome is never delivery evidence.
-    return {
-      output: outcome.assistantText ?? HERMES_FILE_TRANSFER_CONTENT_MISSING_MESSAGE,
-    };
-  }
-  if (outcome?.kind === "cancelled") {
-    await clearPendingHermesFileTransfer(
-      params.gatewayId,
-      params.sessionKey,
-      params.plan.pendingFileTransfer?.sourceRunId,
-    );
-    return {
-      output: outcome.assistantText ?? HERMES_FILE_TRANSFER_CANCELLED_MESSAGE,
-    };
-  }
-  if (outcome?.kind === "ordinary") {
-    await clearPendingHermesFileTransfer(
-      params.gatewayId,
-      params.sessionKey,
-      params.plan.pendingFileTransfer?.sourceRunId,
-    );
-    // Ordinary chat is shown only through the typed assistantText field. The
-    // model's ordinary label is routing metadata, never proof of delivery.
-    return {
-      output: outcome.assistantText ?? HERMES_FILE_TRANSFER_CONTENT_MISSING_MESSAGE,
-    };
-  }
-  if (outcome?.kind === "attempted") {
-    await clearPendingHermesFileTransfer(
-      params.gatewayId,
-      params.sessionKey,
-      params.plan.pendingFileTransfer?.sourceRunId,
-    );
-    return {
-      verifiedFileTransferCount: 0,
-      output: HERMES_FILE_TRANSFER_NOT_SENT_MESSAGE,
-    };
-  }
-  if (params.sourceRunId && hasHermesSendFileAttempt(messages, params.sourceRunId)) {
-    return {
-      verifiedFileTransferCount: 0,
-      output: HERMES_FILE_TRANSFER_NOT_SENT_MESSAGE,
-    };
-  }
-  // File-transfer capability is available on every mobile turn, but capability
-  // alone does not turn ordinary chat into a file operation. Preserve the Host
-  // answer unless this exact turn emitted a typed outcome or actually invoked
-  // the first-party terminal command. This keeps failure closed around a real
-  // send attempt without replacing unrelated Hermes replies.
-  return {};
 }
 
 function hasHermesSendFileAttempt(

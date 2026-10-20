@@ -51,6 +51,32 @@ def json_safe(value):
 def row_dict(row):
     return {key: json_safe(row[key]) for key in row.keys()}
 
+def turn_rows(conn, session_id, row_id):
+    # 返回 row_id 所在用户轮次的全部有效行（上一条 user 行起，到下一条 user 行之前）。
+    # 历史页按 id 游标分页，可能把一个轮次切成两半；这里直接按轮次边界查库，
+    # 保证同一行无论落在哪一页，推导出的"本轮最终回答"都完全一致。
+    rows = conn.execute("""
+        SELECT id, role, content, tool_calls, tool_name, finish_reason FROM messages
+        WHERE session_id = ?
+          AND COALESCE(active, 1) != 0
+          AND id >= COALESCE((
+            SELECT MAX(id) FROM messages
+            WHERE session_id = ? AND COALESCE(active, 1) != 0 AND role = 'user' AND id < ?
+          ), 0)
+          AND id < COALESCE((
+            SELECT MIN(id) FROM messages
+            WHERE session_id = ? AND COALESCE(active, 1) != 0 AND role = 'user' AND id > ?
+          ), 9223372036854775807)
+        ORDER BY id ASC
+    """, (session_id, session_id, row_id, session_id, row_id)).fetchall()
+    result = []
+    for row in rows:
+        item = row_dict(row)
+        item["id"] = str(item.get("id"))
+        item["seq"] = int(row["id"])
+        result.append(item)
+    return result
+
 def connect(writable=False):
     uri_mode = "rw" if writable else "ro"
     conn = sqlite3.connect(f"file:{db_path}?mode={uri_mode}", uri=True, timeout=1.0)
@@ -174,6 +200,8 @@ try:
                 item["id"] = str(item.get("id"))
                 item["seq"] = int(message["id"])
                 item["createdAt"] = to_iso(item.get("timestamp"))
+                if str(message["role"] or "").lower() == "assistant":
+                    item["turnRows"] = turn_rows(conn, session_id, int(message["id"]))
                 messages.append(item)
             first_id = int(selected[0]["id"]) if selected else None
             last_id = int(selected[-1]["id"]) if selected else None

@@ -5,6 +5,10 @@ import { buildHistorySnapshotPage } from "../../core/relay/timeline-event-builde
 import type { TimelineContentBlock } from "../../core/relay/timeline-event-log.js";
 import { isTerminalHermesAssistantMessage } from "./hermes-runtime-history-completion.js";
 import {
+  buildHermesTurnRowResolver,
+  decideHermesAssistantRow,
+} from "./hermes-runtime-history-turn-output.js";
+import {
   hermesStateDbHistoryMessageId,
   type HermesStateDbMessageIdentityRole,
 } from "./hermes-state-db-message-identity.js";
@@ -313,8 +317,11 @@ function normalizeHermesHistoryMessages(
   const sessionId = stringParam(record, "sessionId", "session_id", "id");
   const messages: HermesHistoryMessage[] = [];
   let activeMobileTurn = activeMobileTurnFromContextUser(record.contextUser);
-  rawMessages.forEach((entry, index) => {
-    const source = toRecord(entry);
+  // 统一成记录数组：导出回退路径按它推导每个助手行所在的轮次（引用相同，可做同一性比较）。
+  const sourceRecords = rawMessages.map((entry) => toRecord(entry));
+  const resolveTurnRows = buildHermesTurnRowResolver(sourceRecords);
+  rawMessages.forEach((_entry, index) => {
+    const source = sourceRecords[index];
     if (Object.keys(source).length === 0) {
       return;
     }
@@ -330,7 +337,24 @@ function normalizeHermesHistoryMessages(
     if (role === "assistant" && !isTerminalHermesAssistantMessage(source)) {
       return;
     }
-    const rawText = extractHistoryText(source);
+    // 同一轮已有 typed 结论（outcome / send-file 回执）时，展示内容与实时路径完全一致：
+    // 由本轮最后一个终态助手行承载 typed 文本，其余终态行的原始散文不展示。
+    let typedAssistantText: string | undefined;
+    if (role === "assistant") {
+      // state.db 分页查询随助手行带来 turnRows（按轮次边界直查，不受分页切割影响）；
+      // 导出回退路径拿到的是完整会话，直接按下标推导。
+      const turnRows = Array.isArray(source.turnRows)
+        ? source.turnRows.map((row) => toRecord(row))
+        : resolveTurnRows(index);
+      const decision = decideHermesAssistantRow(source, turnRows);
+      if (decision.kind === "drop") {
+        return;
+      }
+      if (decision.kind === "typed") {
+        typedAssistantText = decision.text;
+      }
+    }
+    const rawText = typedAssistantText ?? extractHistoryText(source);
     const mobileTurn = role === "user" ? parseClawConnectMobileTurnMetadata(rawText) : {};
     const normalized = normalizeHistoryText(role, rawText);
     const content = normalizeHistoryContentBlocks(source, normalized);
