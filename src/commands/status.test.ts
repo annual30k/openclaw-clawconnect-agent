@@ -124,3 +124,35 @@ test("readHealth keeps transient relay close codes without a re-pair instruction
 
   assert.deepEqual(health.relay, { kind: "error", detail: "1006" });
 });
+
+test("readHealth 在网关重连刷出大量日志后仍能找到较早的中继连接事件", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawconnect-status-flood-"));
+  const logPath = join(dir, "clawconnect.log");
+  const flood = Array.from({ length: 5000 }, () => "[gateway-client] connect failed: AggregateError");
+  writeFileSync(logPath, [
+    "Connected to relay server (gatewayId=gw_1)",
+    "Relay connected.",
+    ...flood,
+  ].join("\n"));
+
+  const health = readHealth(logPath, "openclaw");
+
+  assert.deepEqual(health.relay, { kind: "ok", detail: "connected" });
+  assert.deepEqual(health.gateway, { kind: "error", detail: "AggregateError" });
+});
+
+test("readHealth 能解析带时间戳前缀的日志行并提取关闭码", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawconnect-status-stamped-"));
+  const logPath = join(dir, "clawconnect.log");
+  writeFileSync(logPath, [
+    "[2026-10-22T09:27:40.000+08:00] Relay connected.",
+    "[2026-10-22T09:27:41.000+08:00] Gateway connected.",
+    "[2026-10-22T09:27:50.000+08:00] Gateway disconnected: service restart",
+    "[2026-10-22T22:08:00.000+08:00] Relay connection closed: 1006",
+  ].join("\n"));
+
+  const health = readHealth(logPath, "openclaw");
+
+  assert.deepEqual(health.relay, { kind: "error", detail: "1006" });
+  assert.equal(health.gateway.detail, "service restart");
+});

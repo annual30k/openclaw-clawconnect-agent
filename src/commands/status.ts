@@ -139,14 +139,16 @@ export function readHealth(
     };
   }
 
-  const lines = readTailLines(logPath, 400);
+  // 扫描整个日志而不是末尾若干行：本地 Gateway 重连会刷出大量日志，固定窗口会把较早的
+  // 中继连接事件挤出去，误报 "no relay events yet"。日志启动时已按 10MB 轮转，体积有界。
+  const lines = readLogLines(logPath);
   return {
     relay: withRelayRecoveryHint(parseRelayHealth(lines, gatewayType), profile),
     gateway: parseGatewayHealth(lines, gatewayType),
   };
 }
 
-function readTailLines(path: string, maxLines: number): string[] {
+function readLogLines(path: string): string[] {
   let raw: string;
   try {
     raw = decodeTextBuffer(readFileSync(path)).text;
@@ -174,8 +176,7 @@ function readTailLines(path: string, maxLines: number): string[] {
       return [];
     }
   }
-  const lines = raw.split(/\r?\n/).filter(Boolean);
-  return lines.slice(-maxLines);
+  return raw.split(/\r?\n/).filter(Boolean);
 }
 
 function parseRelayHealth(lines: string[], gatewayType: GatewayType): HealthState {

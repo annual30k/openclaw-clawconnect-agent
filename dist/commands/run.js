@@ -8,7 +8,10 @@ import { rotateProfileLogsIfOversized } from "../config/profile-log-rotation.js"
 import { getActiveProfile } from "../config/profile.js";
 import { RELAY_CLOSE_CODE_UNAUTHORIZED } from "../core/relay/relay-server-connection.js";
 import { relayCredentialsRejectedHint } from "./profile-hints.js";
+import { installTimestampedConsole } from "../platform/timestamped-console.js";
 export async function runCommand() {
+    // 常驻进程的日志必须带时间戳，否则断线后无法把日志事件对应到真实故障时间。
+    installTimestampedConsole();
     // 服务管理器只会追加写日志；每次进程启动先做一次有界轮转，避免日志无限增长。
     for (const result of rotateProfileLogsIfOversized(getActiveProfile())) {
         if (result.rotated)
