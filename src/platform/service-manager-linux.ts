@@ -1,9 +1,20 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "fs";
+import { dirname } from "path";
 
 import { getActiveProfile, normalizeProfileName } from "../config/profile.js";
 import {
+  buildLinuxNohupStartScript,
+  buildLinuxSystemdUnit,
+  defaultIsPidRunning,
+  posixShellEscape,
+  readLinuxNohupPid,
+  removeLinuxNohupPidFile,
+  stopLinuxProfileProcesses,
+  type LinuxProcessControlDeps,
+  type LinuxServicePaths,
+} from "./linux-service-process.js";
+import {
   commandExists,
-  ensureLogDir,
   getLinuxNohupPidPath,
   getLinuxNohupStartScriptPath,
   getLinuxServiceName,
@@ -12,188 +23,215 @@ import {
   getProfileLogDir,
   getProfileLogPath,
   getProgramArgs,
-  LINUX_SYSTEMD_USER_DIR,
   run,
-  shellEscape,
   type ServiceStatus,
 } from "./service-manager-common.js";
 
-type LinuxServicePaths = {
-  profile?: string;
-  serviceName: string;
-  servicePath: string;
-  pidPath: string;
-  startScriptPath: string;
-  workingDirectory: string;
-  logPath: string;
-  errorLogPath: string;
-};
+export {
+  buildLinuxNohupStartScript,
+  buildLinuxSystemdUnit,
+  findLinuxProfileAgentPids,
+  formatSystemdExecArg,
+  isMatchingLinuxAgentRunArgv,
+  parseProcCmdline,
+  stopLinuxProfileProcesses,
+  type LinuxProcessControlDeps,
+  type LinuxServicePaths,
+  type LinuxSystemdUnitConfig,
+} from "./linux-service-process.js";
 
-export function getLinuxServicePaths(profile?: string): LinuxServicePaths {
-  const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
+export interface LinuxServiceDeps extends LinuxProcessControlDeps {
+  paths?: Partial<LinuxServicePaths>;
+  programArgs?: readonly string[];
+  canUseSystemd?: boolean;
+  runCommand?: (command: string, stdio?: "pipe" | "inherit") => Buffer | string;
+}
+
+export function getLinuxServicePaths(
+  profile?: string,
+  overrides: Partial<LinuxServicePaths> = {},
+): LinuxServicePaths {
+  const resolvedProfile = normalizeProfileName(overrides.profile ?? profile ?? getActiveProfile());
   return {
     profile: resolvedProfile,
-    serviceName: getLinuxServiceName(resolvedProfile),
-    servicePath: getLinuxServicePath(resolvedProfile),
-    pidPath: getLinuxNohupPidPath(resolvedProfile),
-    startScriptPath: getLinuxNohupStartScriptPath(resolvedProfile),
-    workingDirectory: getProfileLogDir(resolvedProfile),
-    logPath: getProfileLogPath(resolvedProfile),
-    errorLogPath: getProfileErrorLogPath(resolvedProfile),
+    serviceName: overrides.serviceName ?? getLinuxServiceName(resolvedProfile),
+    servicePath: overrides.servicePath ?? getLinuxServicePath(resolvedProfile),
+    pidPath: overrides.pidPath ?? getLinuxNohupPidPath(resolvedProfile),
+    startScriptPath: overrides.startScriptPath ?? getLinuxNohupStartScriptPath(resolvedProfile),
+    workingDirectory: overrides.workingDirectory ?? getProfileLogDir(resolvedProfile),
+    logPath: overrides.logPath ?? getProfileLogPath(resolvedProfile),
+    errorLogPath: overrides.errorLogPath ?? getProfileErrorLogPath(resolvedProfile),
   };
 }
 
-function canUseSystemdUser(): boolean {
-  if (!commandExists("systemctl")) return false;
+function runLinuxCommand(
+  command: string,
+  stdio: "pipe" | "inherit" = "pipe",
+  deps: LinuxServiceDeps = {},
+): Buffer | string {
+  return (deps.runCommand ?? run)(command, stdio);
+}
+
+function canUseSystemdUser(deps: LinuxServiceDeps = {}): boolean {
+  if (deps.canUseSystemd !== undefined) {
+    return deps.canUseSystemd;
+  }
+  if (!deps.runCommand && !commandExists("systemctl")) {
+    return false;
+  }
   try {
-    run("systemctl --user show-environment", "pipe");
+    runLinuxCommand("systemctl --user show-environment", "pipe", deps);
     return true;
   } catch {
     return false;
   }
 }
 
-function isPidRunning(pid: number): boolean {
+function isSystemdActive(paths: LinuxServicePaths, deps: LinuxServiceDeps = {}): boolean {
+  if (!canUseSystemdUser(deps)) return false;
   try {
-    process.kill(pid, 0);
+    runLinuxCommand(`systemctl --user is-active --quiet ${paths.serviceName}`, "pipe", deps);
     return true;
   } catch {
     return false;
   }
-}
-
-function readNohupPid(paths: LinuxServicePaths): number | null {
-  if (!existsSync(paths.pidPath)) return null;
-  try {
-    const raw = readFileSync(paths.pidPath, "utf-8").trim();
-    const pid = Number(raw);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
-function removeNohupPidFile(paths: LinuxServicePaths): void {
-  if (existsSync(paths.pidPath)) unlinkSync(paths.pidPath);
 }
 
 function getNohupStartCommand(paths: LinuxServicePaths): string {
-  return `bash ${shellEscape(paths.startScriptPath)}`;
+  return `bash ${posixShellEscape(paths.startScriptPath)}`;
 }
 
-function writeLinuxNohupStartScript(paths: LinuxServicePaths): void {
-  const args = getProgramArgs(paths.profile).map(shellEscape).join(" ");
-  const script = `#!/usr/bin/env bash
-set -euo pipefail
-
-mkdir -p ${shellEscape(paths.workingDirectory)}
-cd ${shellEscape(paths.workingDirectory)}
-if [ -f ${shellEscape(paths.pidPath)} ]; then
-  pid="$(cat ${shellEscape(paths.pidPath)} 2>/dev/null || true)"
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    echo "clawconnect is already running (pid=$pid)"
-    exit 0
-  fi
-fi
-
-nohup ${args} >> ${shellEscape(paths.logPath)} 2>> ${shellEscape(paths.errorLogPath)} < /dev/null &
-echo $! > ${shellEscape(paths.pidPath)}
-echo "clawconnect started in nohup mode (pid=$(cat ${shellEscape(paths.pidPath)}))"
-`;
+function writeLinuxNohupStartScript(paths: LinuxServicePaths, deps: LinuxServiceDeps): void {
+  const programArgs = deps.programArgs ?? getProgramArgs(paths.profile);
+  const script = buildLinuxNohupStartScript(paths, programArgs);
   writeFileSync(paths.startScriptPath, script, { encoding: "utf-8", mode: 0o755 });
 }
 
-function installLinuxServiceSystemd(paths: LinuxServicePaths): boolean {
-  mkdirSync(LINUX_SYSTEMD_USER_DIR, { recursive: true });
-  ensureLogDir(paths.profile);
-
-  const args = getProgramArgs(paths.profile).map(shellEscape).join(" ");
-  const serviceContent = `[Unit]
-Description=ClawConnect host agent (${paths.profile ?? "default"})
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${args}
-Restart=always
-RestartSec=5
-WorkingDirectory=${shellEscape(paths.workingDirectory)}
-StandardOutput=append:${paths.logPath}
-StandardError=append:${paths.errorLogPath}
-
-[Install]
-WantedBy=default.target
-`;
-
+function writeSystemdServiceUnit(paths: LinuxServicePaths, deps: LinuxServiceDeps): void {
+  mkdirSync(dirname(paths.servicePath), { recursive: true });
+  mkdirSync(paths.workingDirectory, { recursive: true });
+  const programArgs = deps.programArgs ?? getProgramArgs(paths.profile);
+  const serviceContent = buildLinuxSystemdUnit({
+    profile: paths.profile,
+    programArgs,
+    workingDirectory: paths.workingDirectory,
+    stdoutLogPath: paths.logPath,
+    stderrLogPath: paths.errorLogPath,
+  });
   writeFileSync(paths.servicePath, serviceContent, "utf-8");
-  run("systemctl --user daemon-reload", "inherit");
-  run(`systemctl --user enable --now ${paths.serviceName}`, "inherit");
+}
+
+function installLinuxServiceSystemd(paths: LinuxServicePaths, deps: LinuxServiceDeps): boolean {
+  writeSystemdServiceUnit(paths, deps);
+  runLinuxCommand("systemctl --user daemon-reload", "inherit", deps);
+  try {
+    runLinuxCommand(`systemctl --user reset-failed ${paths.serviceName}`, "pipe", deps);
+  } catch {
+    // ignore
+  }
+  try {
+    // 若服务已在运行，先停止旧实例再启用启动，确保重新配对后的新凭据与新入口立即生效。
+    runLinuxCommand(`systemctl --user stop ${paths.serviceName}`, "pipe", deps);
+  } catch {
+    // ignore when not yet loaded
+  }
+  const stopped = stopLinuxProfileProcesses(paths, deps);
+  if (!stopped.allExited) {
+    return false;
+  }
+  if (existsSync(paths.startScriptPath)) {
+    unlinkSync(paths.startScriptPath);
+  }
+  runLinuxCommand(`systemctl --user enable --now ${paths.serviceName}`, "inherit", deps);
   return true;
 }
 
-function installLinuxServiceNohup(paths: LinuxServicePaths): boolean {
-  ensureLogDir(paths.profile);
-  writeLinuxNohupStartScript(paths);
-  run(`sh -lc ${shellEscape(getNohupStartCommand(paths))}`, "inherit");
-  const pid = readNohupPid(paths);
+function installLinuxServiceNohup(paths: LinuxServicePaths, deps: LinuxServiceDeps): boolean {
+  // 先结束旧的 nohup / 遗留进程并等待退出，防止新配对后继续沿用旧进程内存中的过期凭据。
+  const stopped = stopLinuxProfileProcesses(paths, deps);
+  if (!stopped.allExited) {
+    return false;
+  }
+  mkdirSync(paths.workingDirectory, { recursive: true });
+  writeLinuxNohupStartScript(paths, deps);
+  runLinuxCommand(`sh -lc ${posixShellEscape(getNohupStartCommand(paths))}`, "inherit", deps);
+  const pid = readLinuxNohupPid(paths);
+  const isPidRunning = deps.isPidRunning ?? defaultIsPidRunning;
   return pid != null && isPidRunning(pid);
 }
 
-export function installLinuxService(profile?: string): boolean {
-  const paths = getLinuxServicePaths(profile);
-  if (canUseSystemdUser()) {
+export function installLinuxService(profile?: string, deps: LinuxServiceDeps = {}): boolean {
+  const paths = getLinuxServicePaths(profile, deps.paths);
+  if (canUseSystemdUser(deps)) {
     try {
-      return installLinuxServiceSystemd(paths);
+      if (installLinuxServiceSystemd(paths, deps)) {
+        return true;
+      }
     } catch {
-      // Fall back to nohup below.
+      if (existsSync(paths.servicePath) && !isSystemdActive(paths, deps)) {
+        try {
+          unlinkSync(paths.servicePath);
+          runLinuxCommand("systemctl --user daemon-reload", "pipe", deps);
+        } catch {
+          // ignore cleanup failure before fallback
+        }
+      }
     }
   }
 
   try {
-    return installLinuxServiceNohup(paths);
+    return installLinuxServiceNohup(paths, deps);
   } catch {
     return false;
   }
 }
 
-function uninstallLinuxArtifacts(paths: LinuxServicePaths, removeFile: boolean): boolean {
+function uninstallLinuxArtifacts(
+  paths: LinuxServicePaths,
+  removeFile: boolean,
+  deps: LinuxServiceDeps = {},
+): boolean {
   let changed = false;
-  if (canUseSystemdUser()) {
+  if (canUseSystemdUser(deps)) {
     try {
-      run(`systemctl --user stop ${paths.serviceName}`);
+      runLinuxCommand(`systemctl --user stop ${paths.serviceName}`, "pipe", deps);
       changed = true;
     } catch {
       // ignore
     }
     try {
-      run(`systemctl --user disable ${paths.serviceName}`);
+      runLinuxCommand(`systemctl --user disable ${paths.serviceName}`, "pipe", deps);
       changed = true;
     } catch {
       // ignore
     }
     try {
-      run("systemctl --user daemon-reload");
+      runLinuxCommand(`systemctl --user reset-failed ${paths.serviceName}`, "pipe", deps);
+    } catch {
+      // ignore
+    }
+    try {
+      runLinuxCommand("systemctl --user daemon-reload", "pipe", deps);
     } catch {
       // ignore
     }
   }
 
-  const nohupPid = readNohupPid(paths);
-  if (nohupPid != null) {
-    try {
-      process.kill(nohupPid, "SIGTERM");
-      changed = true;
-    } catch {
-      // ignore
-    }
-    removeNohupPidFile(paths);
+  const stopped = stopLinuxProfileProcesses(paths, deps);
+  if (stopped.changed) {
     changed = true;
   }
 
   if (removeFile && existsSync(paths.servicePath)) {
     unlinkSync(paths.servicePath);
     changed = true;
+    if (canUseSystemdUser(deps)) {
+      try {
+        runLinuxCommand("systemctl --user daemon-reload", "pipe", deps);
+      } catch {
+        // ignore
+      }
+    }
   }
   if (removeFile && existsSync(paths.startScriptPath)) {
     unlinkSync(paths.startScriptPath);
@@ -202,36 +240,52 @@ function uninstallLinuxArtifacts(paths: LinuxServicePaths, removeFile: boolean):
   return changed;
 }
 
-export function stopLinuxService(profile?: string): boolean {
-  return uninstallLinuxArtifacts(getLinuxServicePaths(profile), false);
+export function stopLinuxService(profile?: string, deps: LinuxServiceDeps = {}): boolean {
+  return uninstallLinuxArtifacts(getLinuxServicePaths(profile, deps.paths), false, deps);
 }
 
-export function uninstallLinuxService(profile?: string): boolean {
-  return uninstallLinuxArtifacts(getLinuxServicePaths(profile), true);
+export function uninstallLinuxService(profile?: string, deps: LinuxServiceDeps = {}): boolean {
+  return uninstallLinuxArtifacts(getLinuxServicePaths(profile, deps.paths), true, deps);
 }
 
-export function restartLinuxService(profile?: string): boolean {
-  const paths = getLinuxServicePaths(profile);
-  if (canUseSystemdUser() && existsSync(paths.servicePath)) {
+export function restartLinuxService(profile?: string, deps: LinuxServiceDeps = {}): boolean {
+  const paths = getLinuxServicePaths(profile, deps.paths);
+  if (canUseSystemdUser(deps) && existsSync(paths.servicePath)) {
     try {
-      run("systemctl --user daemon-reload", "inherit");
-      run(`systemctl --user restart ${paths.serviceName}`, "inherit");
+      writeSystemdServiceUnit(paths, deps);
+      runLinuxCommand("systemctl --user daemon-reload", "inherit", deps);
+      try {
+        runLinuxCommand(`systemctl --user reset-failed ${paths.serviceName}`, "pipe", deps);
+      } catch {
+        // ignore
+      }
+      try {
+        runLinuxCommand(`systemctl --user stop ${paths.serviceName}`, "pipe", deps);
+      } catch {
+        // ignore
+      }
+      const stopped = stopLinuxProfileProcesses(paths, deps);
+      if (!stopped.allExited) {
+        return false;
+      }
+      runLinuxCommand(`systemctl --user start ${paths.serviceName}`, "inherit", deps);
       return true;
     } catch {
       // Fall back to nohup restart below.
     }
   }
 
-  uninstallLinuxArtifacts(paths, false);
+  uninstallLinuxArtifacts(paths, false, deps);
   try {
-    return installLinuxServiceNohup(paths);
+    return installLinuxServiceNohup(paths, deps);
   } catch {
     return false;
   }
 }
 
-export function getLinuxServiceStatus(profile?: string): ServiceStatus {
-  const paths = getLinuxServicePaths(profile);
+export function getLinuxServiceStatus(profile?: string, deps: LinuxServiceDeps = {}): ServiceStatus {
+  const paths = getLinuxServicePaths(profile, deps.paths);
+  const isPidRunning = deps.isPidRunning ?? defaultIsPidRunning;
   const buildNohupStatus = (installed: boolean, running: boolean): ServiceStatus => ({
     platform: "linux",
     installed,
@@ -242,22 +296,13 @@ export function getLinuxServiceStatus(profile?: string): ServiceStatus {
     logPath: paths.logPath,
     startHint: getNohupStartCommand(paths),
   });
-  const isSystemdActive = (): boolean => {
-    if (!canUseSystemdUser()) return false;
-    try {
-      run(`systemctl --user is-active --quiet ${paths.serviceName}`);
-      return true;
-    } catch {
-      return false;
-    }
-  };
 
-  const pid = readNohupPid(paths);
+  const pid = readLinuxNohupPid(paths);
   const hasNohupArtifacts = pid != null || existsSync(paths.startScriptPath);
   const running = pid != null && isPidRunning(pid);
-  if (!running && pid != null) removeNohupPidFile(paths);
+  if (!running && pid != null) removeLinuxNohupPidFile(paths);
 
-  if (running || (hasNohupArtifacts && !canUseSystemdUser())) {
+  if (running || (hasNohupArtifacts && !canUseSystemdUser(deps))) {
     return buildNohupStatus(hasNohupArtifacts, running);
   }
 
@@ -265,7 +310,7 @@ export function getLinuxServiceStatus(profile?: string): ServiceStatus {
     return {
       platform: "linux",
       installed: true,
-      running: isSystemdActive(),
+      running: isSystemdActive(paths, deps),
       serviceName: paths.serviceName,
       manager: "systemd",
       servicePath: paths.servicePath,

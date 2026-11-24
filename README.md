@@ -368,6 +368,7 @@ clawconnect-agent/
       service-manager.ts
       service-manager-common.ts
       service-manager-linux.ts
+      linux-service-process.ts
       *.test.ts
 ```
 

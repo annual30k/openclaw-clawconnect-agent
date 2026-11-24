@@ -402,7 +402,8 @@ clawconnect-agent/
     platform/
       service-manager.ts              跨平台服务入口
       service-manager-common.ts       通用平台辅助常量
-      service-manager-linux.ts        Linux systemd/nohup 逻辑
+      service-manager-linux.ts        Linux systemd/nohup 生命周期控制
+      linux-service-process.ts        Linux systemd unit 生成与进程停机等待
       *.test.ts                       平台层单元测试
 ```
 
