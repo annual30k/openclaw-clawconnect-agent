@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildExecutableInvocation } from "../../platform/process-invocation.js";
-import { resolveHermesBin } from "./hermes-runtime-process.js";
+import {
+  isHermesMissingSessionError,
+  isHermesReadOnlySessionError,
+  isHermesUnknownSkillError,
+  isHermesUnresumableMappedSessionError,
+  resolveHermesBin,
+} from "./hermes-runtime-process.js";
 
 test("Windows Hermes resolution bypasses a legacy PATH shim when native hermes.exe exists", () => {
   const nativeHome = "C:\\Users\\tester\\AppData\\Local/hermes";
@@ -47,4 +53,29 @@ test("native Windows Hermes invocation preserves a multiline Chinese query as on
     command: executable,
     args,
   });
+});
+
+test("Hermes error classifiers distinguish missing, read-only, and unknown-skill refusals", () => {
+  const missingError = new Error("Session not found: 20261124_180000_missing");
+  const readOnlyError = new Error([
+    "Session api_1795512609_b66068f8 found but has no messages. Starting fresh.",
+    "Error: session_read_only",
+    "session_id: api_1795512609_b66068f8",
+  ].join("\n"));
+  const readOnlyDetailError = new Error("this stored conversation can be read but not continued; start a new chat");
+  const unknownSkillGatewayError = new Error(
+    "Hermes couldn't start the model connection: unknown_skill. Your message was not sent.",
+  );
+  const unknownSkillCliError = new Error("Unknown skill(s): file-transfer");
+  const unrelatedError = new Error("provider rate limit");
+
+  assert.equal(isHermesMissingSessionError(missingError), true);
+  assert.equal(isHermesReadOnlySessionError(readOnlyError), true);
+  assert.equal(isHermesReadOnlySessionError(readOnlyDetailError), true);
+  assert.equal(isHermesUnresumableMappedSessionError(missingError), true);
+  assert.equal(isHermesUnresumableMappedSessionError(readOnlyError), true);
+  assert.equal(isHermesUnresumableMappedSessionError(unrelatedError), false);
+  assert.equal(isHermesUnknownSkillError(unknownSkillGatewayError), true);
+  assert.equal(isHermesUnknownSkillError(unknownSkillCliError), true);
+  assert.equal(isHermesUnknownSkillError(unrelatedError), false);
 });

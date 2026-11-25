@@ -27,7 +27,7 @@ interface StoreShape {
   sessions: Record<string, StoredHermesSession>;
 }
 
-const HERMES_ID_PATTERN = /\b\d{8}_\d{6}_[A-Za-z0-9]+\b/;
+const HERMES_ID_PATTERN = /\b(?:\d{8}_\d{6}_[A-Za-z0-9_-]+|local-[0-9a-f]{16,64}|api_[0-9]+_[A-Za-z0-9]+)\b/;
 let storeMutationChain: Promise<void> = Promise.resolve();
 
 function storePath(): string {

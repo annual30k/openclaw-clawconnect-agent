@@ -29,16 +29,16 @@ export async function resolveHermesPreloadedSkillContext(
     if (fileTransfer && fileTransfer.enabled !== false) {
       return fileTransferContext();
     }
-    if (!fileTransfer && options.forceFileTransfer) {
-      return fileTransferContext();
-    }
   } catch {
-    // 普通聊天不能被 skills 探测失败影响；显式文件传输则必须保留 terminal 约束，避免落到无终端的 API 文本回复。
-    if (options.forceFileTransfer) {
-      return fileTransferContext();
-    }
+    // 技能探测失败或未安装 file-transfer 时，绝不能强传 --skills file-transfer：
+    // 新版 Hermes 在创建会话时会以 unknown_skill 直接拒绝。
   }
-  return { cliArgs: [], requiredToolsets: [], skillNames: [] };
+  // 显式文件传输回合仍保留 terminal 约束，由 CLAWCONNECT_MOBILE_BRIDGE_HINT 承担协议引导。
+  return {
+    cliArgs: [],
+    requiredToolsets: options.forceFileTransfer ? ["terminal"] : [],
+    skillNames: [],
+  };
 }
 
 function fileTransferContext(): HermesPreloadedSkillContext {

@@ -154,7 +154,7 @@ export async function resolveHermesSessionIdFromParams(record: Record<string, un
     const hermesId = sessionKey.slice("hermes:".length).trim();
     return { sessionId: hermesId || undefined, sessionKey, fromMappedSessionKey: false };
   }
-  if (/^[0-9]{8}_[0-9]{6}_[A-Za-z0-9_-]+$/.test(sessionKey)) {
+  if (/^(?:[0-9]{8}_[0-9]{6}_[A-Za-z0-9_-]+|local-[0-9a-f]{16,64}|api_[0-9]+_[A-Za-z0-9]+)$/.test(sessionKey)) {
     return { sessionId: sessionKey, sessionKey, fromMappedSessionKey: false };
   }
   return {

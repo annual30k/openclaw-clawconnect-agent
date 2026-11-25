@@ -23,7 +23,10 @@ import {
   runHermesChatHistory,
   handleHermesCommand,
 } from "./hermes-runtime.js";
-import { runHermesSessionExport } from "./runtime/hermes-runtime-sessions.js";
+import {
+  resolveHermesSessionIdFromParams,
+  runHermesSessionExport,
+} from "./runtime/hermes-runtime-sessions.js";
 import {
   hermesModelListResultFromPayload,
   modelItemsFromHermesModelOptionsPayload,
@@ -1039,8 +1042,8 @@ test("runHermesChat keeps explicit file-transfer mobile sends off the API path w
     assert.deepEqual(apiChatCalls, []);
     const args = JSON.parse(readFileSync(chatArgsPath, "utf8")) as string[];
     assert.equal(args.includes("--resume"), false);
-    assert.equal(args.includes("--skills"), true);
-    assert.equal(args.includes("file-transfer"), true);
+    assert.equal(args.includes("--skills"), false);
+    assert.equal(args.includes("file-transfer"), false);
     assert.equal(args.includes("--yolo"), true);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -1215,6 +1218,323 @@ test("runHermesChat recovers via /reasoning retry when resume hits gateway sessi
     restoreEnv("CLAWCONNECT_HERMES_REASONING_STORE", previousReasoningStore);
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+async function withHermesCliChatFixture(
+  prefix: string,
+  hermesScriptLines: (ctx: { root: string; callsPath: string }) => string[],
+  run: (ctx: { root: string; callsPath: string }) => Promise<void>,
+): Promise<void> {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousRuntimeMode = process.env.CLAWCONNECT_HERMES_RUNTIME_MODE;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  const previousHome = process.env.HERMES_HOME;
+  const previousReasoningStore = process.env.CLAWCONNECT_HERMES_REASONING_STORE;
+  const callsPath = join(root, "chat-calls.json");
+  const binPath = join(root, "hermes");
+  try {
+    writeFileSync(binPath, [
+      "#!/usr/bin/env node",
+      "const fs = require('fs');",
+      "const args = process.argv.slice(2);",
+      ...hermesScriptLines({ root, callsPath }),
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(binPath, 0o755);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = join(root, "sessions.json");
+    process.env.HERMES_BIN = binPath;
+    process.env.CLAWCONNECT_HERMES_RUNTIME_MODE = "local";
+    process.env.CLAWCONNECT_HERMES_STATE_DB = join(root, "missing-state.db");
+    process.env.HERMES_HOME = join(root, "hermes-home");
+    process.env.CLAWCONNECT_HERMES_REASONING_STORE = join(root, "reasoning-efforts.json");
+    await run({ root, callsPath });
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("CLAWCONNECT_HERMES_RUNTIME_MODE", previousRuntimeMode);
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
+    restoreEnv("HERMES_HOME", previousHome);
+    restoreEnv("CLAWCONNECT_HERMES_REASONING_STORE", previousReasoningStore);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("runHermesChat omits --skills file-transfer when Hermes does not have the skill installed", async () => {
+  await withHermesCliChatFixture(
+    "hermes-chat-no-file-transfer-skill-",
+    ({ callsPath }) => [
+      "if (args[0] === 'skills' && args[1] === 'list') {",
+      "  console.log('│ other-skill │ productivity │ local │ local │ enabled │');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'list') {",
+      "  console.log('Title  Preview  Last Active  ID');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'status' || (args[0] === 'sessions' && args[1] === 'export')) { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      `  const calls = fs.existsSync(${JSON.stringify(callsPath)}) ? JSON.parse(fs.readFileSync(${JSON.stringify(callsPath)}, 'utf8')) : [];`,
+      "  calls.push(args);",
+      `  fs.writeFileSync(${JSON.stringify(callsPath)}, JSON.stringify(calls));`,
+      "  if (args.includes('--skills')) {",
+      "    console.log(\"Hermes couldn't start the model connection: unknown_skill. Your message was not sent.\");",
+      "    process.exit(1);",
+      "  }",
+      "  console.log('fresh without skill');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+    ],
+    async ({ callsPath }) => {
+      const result = await runHermesChat(
+        { sessionKey: "main", message: "你好" },
+        { requestId: "run-no-skill", gatewayId: "gw-hermes", hermesFileTransferCapability: "cli", publishEvent: () => undefined },
+      );
+      assert.equal(result.output, "fresh without skill");
+      const calls = JSON.parse(readFileSync(callsPath, "utf8")) as string[][];
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0]?.includes("--skills"), false);
+      assert.equal(calls[0]?.includes("file-transfer"), false);
+      assert.equal(calls[0]?.includes("--yolo"), true);
+    },
+  );
+});
+
+test("runHermesChat retries without --skills when Hermes rejects session creation with unknown_skill", async () => {
+  await withHermesCliChatFixture(
+    "hermes-chat-unknown-skill-retry-",
+    ({ callsPath }) => [
+      "if (args[0] === 'skills' && args[1] === 'list') {",
+      "  console.log('│ file-transfer │ productivity │ local │ local │ enabled │');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'list') {",
+      "  console.log('Title  Preview  Last Active  ID');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'status' || (args[0] === 'sessions' && args[1] === 'export')) { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      `  const calls = fs.existsSync(${JSON.stringify(callsPath)}) ? JSON.parse(fs.readFileSync(${JSON.stringify(callsPath)}, 'utf8')) : [];`,
+      "  calls.push(args);",
+      `  fs.writeFileSync(${JSON.stringify(callsPath)}, JSON.stringify(calls));`,
+      "  if (args.includes('--skills')) {",
+      "    console.log(\"Hermes couldn't start the model connection: unknown_skill. Your message was not sent.\");",
+      "    process.exit(1);",
+      "  }",
+      "  console.log('recovered without unknown skill');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+    ],
+    async ({ callsPath }) => {
+      const result = await runHermesChat(
+        { sessionKey: "main", message: "你好" },
+        { requestId: "run-unknown-skill-retry", gatewayId: "gw-hermes", hermesFileTransferCapability: "cli", publishEvent: () => undefined },
+      );
+      assert.equal(result.output, "recovered without unknown skill");
+      const calls = JSON.parse(readFileSync(callsPath, "utf8")) as string[][];
+      assert.equal(calls.length, 2);
+      assert.equal(calls[0]?.includes("--skills"), true);
+      assert.equal(calls[1]?.includes("--skills"), false);
+      assert.equal(calls[1]?.includes("file-transfer"), false);
+    },
+  );
+});
+
+test("runHermesChat forgets an unresumable read-only mapped session and starts a fresh CLI session", async () => {
+  await withHermesCliChatFixture(
+    "hermes-chat-readonly-mapped-recover-",
+    ({ root, callsPath }) => {
+      const freshMarker = join(root, "fresh-created");
+      return [
+        "if (args[0] === 'skills' && args[1] === 'list') {",
+        "  console.log('Title  Category  Source  Trust  Status');",
+        "  process.exit(0);",
+        "}",
+        "if (args[0] === 'sessions' && args[1] === 'list') {",
+        "  console.log('Title                            Preview          Last Active   ID');",
+        `  if (fs.existsSync(${JSON.stringify(freshMarker)})) {`,
+        "    console.log('Fresh CLI chat                   你好               just now      20261125_160000_freshcli');",
+        "  }",
+        "  process.exit(0);",
+        "}",
+        "if (args[0] === 'status' || (args[0] === 'sessions' && args[1] === 'export')) { process.exit(0); }",
+        "if (args[0] === 'chat') {",
+        `  const calls = fs.existsSync(${JSON.stringify(callsPath)}) ? JSON.parse(fs.readFileSync(${JSON.stringify(callsPath)}, 'utf8')) : [];`,
+        "  calls.push(args);",
+        `  fs.writeFileSync(${JSON.stringify(callsPath)}, JSON.stringify(calls));`,
+        "  if (args.includes('--resume')) {",
+        "    console.error('Session api_1795512609_b66068f8 found but has no messages. Starting fresh.');",
+        "    console.error('Error: session_read_only');",
+        "    console.error('session_id: api_1795512609_b66068f8');",
+        "    process.exit(1);",
+        "  }",
+        `  fs.writeFileSync(${JSON.stringify(freshMarker)}, '1');`,
+        "  console.log('fresh cli reply');",
+        "  process.exit(0);",
+        "}",
+        "process.exit(2);",
+      ];
+    },
+    async ({ callsPath }) => {
+      await rememberHermesSession("main", {
+        sessionKey: "main",
+        hermesSessionId: "api_1795512609_b66068f8",
+        kind: "hermes",
+      });
+      const setResult = await handleHermesCommand(
+        "hermes.thinking.set",
+        { sessionKey: "main", level: "high" },
+        { gatewayId: "gw-hermes" },
+      );
+      assert.equal(setResult?.ok, true);
+
+      const result = await runHermesChat(
+        { sessionKey: "main", message: "你好" },
+        { requestId: "run-readonly-mapped", gatewayId: "gw-hermes", hermesFileTransferCapability: "cli", publishEvent: () => undefined },
+      );
+      assert.equal(result.output, "fresh cli reply");
+      assert.equal(await getMappedHermesSessionId("main"), "20261125_160000_freshcli");
+      const calls = JSON.parse(readFileSync(callsPath, "utf8")) as string[][];
+      assert.equal(calls.length, 2);
+      assert.equal(calls[0]?.includes("--resume"), true);
+      assert.equal(calls[1]?.includes("--resume"), false);
+      assert.equal(calls[1]?.includes("--reasoning"), true);
+      assert.equal(calls[1]?.[calls[1].indexOf("--reasoning") + 1], "high");
+      assert.equal(calls[1]?.includes("--yolo"), true);
+    },
+  );
+});
+
+test("runHermesChat does not silently replace an explicitly requested read-only session", async () => {
+  await withHermesCliChatFixture(
+    "hermes-chat-readonly-explicit-",
+    ({ callsPath }) => [
+      "if (args[0] === 'skills' && args[1] === 'list') { process.exit(0); }",
+      "if (args[0] === 'sessions' && args[1] === 'list') { process.exit(0); }",
+      "if (args[0] === 'status' || (args[0] === 'sessions' && args[1] === 'export')) { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      `  const calls = fs.existsSync(${JSON.stringify(callsPath)}) ? JSON.parse(fs.readFileSync(${JSON.stringify(callsPath)}, 'utf8')) : [];`,
+      "  calls.push(args);",
+      `  fs.writeFileSync(${JSON.stringify(callsPath)}, JSON.stringify(calls));`,
+      "  console.error('Error: session_read_only');",
+      "  process.exit(1);",
+      "}",
+      "process.exit(2);",
+    ],
+    async ({ callsPath }) => {
+      await assert.rejects(
+        () => runHermesChat(
+          { sessionKey: "main", hermesSessionId: "api_1795512609_b66068f8", message: "你好" },
+          { requestId: "run-readonly-explicit", gatewayId: "gw-hermes", hermesFileTransferCapability: "cli", publishEvent: () => undefined },
+        ),
+        /session_read_only/,
+      );
+      const calls = JSON.parse(readFileSync(callsPath, "utf8")) as string[][];
+      assert.equal(calls.length, 1);
+    },
+  );
+});
+
+test("runHermesChat treats hermes:<id> sessionKey as explicit resume and does not pollute sessions.json on session_read_only", async () => {
+  await withHermesCliChatFixture(
+    "hermes-chat-hermes-prefix-readonly-",
+    ({ callsPath }) => [
+      "if (args[0] === 'skills' && args[1] === 'list') { process.exit(0); }",
+      "if (args[0] === 'sessions' && args[1] === 'list') { process.exit(0); }",
+      "if (args[0] === 'status' || (args[0] === 'sessions' && args[1] === 'export')) { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      `  const calls = fs.existsSync(${JSON.stringify(callsPath)}) ? JSON.parse(fs.readFileSync(${JSON.stringify(callsPath)}, 'utf8')) : [];`,
+      "  calls.push(args);",
+      `  fs.writeFileSync(${JSON.stringify(callsPath)}, JSON.stringify(calls));`,
+      "  console.error('Error: session_read_only');",
+      "  process.exit(1);",
+      "}",
+      "process.exit(2);",
+    ],
+    async ({ callsPath }) => {
+      await assert.rejects(
+        () => runHermesChat(
+          { sessionKey: "hermes:api_1795512609_b66068f8", message: "你好" },
+          { requestId: "run-hermes-prefix-readonly", gatewayId: "gw-hermes", hermesFileTransferCapability: "cli", publishEvent: () => undefined },
+        ),
+        /session_read_only/,
+      );
+      const calls = JSON.parse(readFileSync(callsPath, "utf8")) as string[][];
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0]?.includes("--resume"), true);
+      assert.equal(calls[0]?.[calls[0].indexOf("--resume") + 1], "api_1795512609_b66068f8");
+      assert.deepEqual(await listStoredHermesSessions(), []);
+    },
+  );
+});
+
+test("runHermesChat retries without --skills when stderr has a warning alongside stdout unknown_skill", async () => {
+  await withHermesCliChatFixture(
+    "hermes-chat-stderr-warning-unknown-skill-",
+    ({ callsPath }) => [
+      "if (args[0] === 'skills' && args[1] === 'list') {",
+      "  console.log('│ file-transfer │ productivity │ local │ local │ enabled │');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'list') { process.exit(0); }",
+      "if (args[0] === 'status' || (args[0] === 'sessions' && args[1] === 'export')) { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      `  const calls = fs.existsSync(${JSON.stringify(callsPath)}) ? JSON.parse(fs.readFileSync(${JSON.stringify(callsPath)}, 'utf8')) : [];`,
+      "  calls.push(args);",
+      `  fs.writeFileSync(${JSON.stringify(callsPath)}, JSON.stringify(calls));`,
+      "  if (args.includes('--skills')) {",
+      "    console.error('Warning: shared profile notice');",
+      "    console.log(\"Hermes couldn't start the model connection: unknown_skill. Your message was not sent.\");",
+      "    process.exit(1);",
+      "  }",
+      "  console.log('recovered despite stderr warning');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+    ],
+    async ({ callsPath }) => {
+      const result = await runHermesChat(
+        { sessionKey: "main", message: "你好" },
+        { requestId: "run-stderr-warn-unknown-skill", gatewayId: "gw-hermes", hermesFileTransferCapability: "cli", publishEvent: () => undefined },
+      );
+      assert.equal(result.output, "recovered despite stderr warning");
+      const calls = JSON.parse(readFileSync(callsPath, "utf8")) as string[][];
+      assert.equal(calls.length, 2);
+      assert.equal(calls[0]?.includes("--skills"), true);
+      assert.equal(calls[1]?.includes("--skills"), false);
+    },
+  );
+});
+
+test("parseHermesSessionsList and bare-ID resolution support latest local-<hex> and api_<ts>_<hex> session IDs", async () => {
+  const localId = "local-fc8f3ddd187ebfd2300ff37ce3a7ed87b2149f0a39d0c0209ece1c32bd16c578";
+  const apiId = "api_1795512609_b66068f8";
+  const parsed = parseHermesSessionsList([
+    "Title                        Workspace          Last Active   ID",
+    "──────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+    `查询Hermes版本                   qiuqiquan          7h ago        ${localId}`,
+    `mobile-api                   —                  just now      ${apiId}`,
+  ].join("\n"));
+
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0]?.hermesSessionId, localId);
+  assert.equal(parsed[0]?.sessionKey, `hermes:${localId}`);
+  assert.equal(parsed[1]?.hermesSessionId, apiId);
+  assert.equal(parsed[1]?.sessionKey, `hermes:${apiId}`);
+
+  assert.deepEqual(await resolveHermesSessionIdFromParams({ sessionKey: localId }), {
+    sessionId: localId,
+    sessionKey: localId,
+    fromMappedSessionKey: false,
+  });
+  assert.deepEqual(await resolveHermesSessionIdFromParams({ sessionKey: apiId }), {
+    sessionId: apiId,
+    sessionKey: apiId,
+    fromMappedSessionKey: false,
+  });
 });
 
 test("runHermesChat treats timeout-denied command output as a terminal error", async () => {

@@ -9,8 +9,9 @@ import {
   rememberHermesSession,
 } from "../hermes-session-store.js";
 import {
-  isHermesMissingSessionError,
   isHermesResumePolicyMismatchError,
+  isHermesUnknownSkillError,
+  isHermesUnresumableMappedSessionError,
   sanitizeHermesChatOutput,
 } from "./hermes-runtime-process.js";
 import type { HermesChatResult } from "./hermes-runtime-types.js";
@@ -155,9 +156,13 @@ async function runHermesChatPrepared(params: {
   hermesSessionId: unknown;
   context: LocalCommandContext;
 }): Promise<HermesChatResult> {
-  const explicitResume = typeof params.hermesSessionId === "string" && params.hermesSessionId.trim().length > 0
+  const explicitFromParam = typeof params.hermesSessionId === "string" && params.hermesSessionId.trim().length > 0
     ? params.hermesSessionId.trim()
     : undefined;
+  const explicitFromSessionKey = params.sessionKey.toLowerCase().startsWith("hermes:")
+    ? (params.sessionKey.slice("hermes:".length).trim() || undefined)
+    : undefined;
+  const explicitResume = explicitFromParam ?? explicitFromSessionKey;
   const mappedResume = explicitResume ? undefined : await getMappedHermesSessionId(params.sessionKey);
   let resume = explicitResume ?? mappedResume;
   const preparationPlan = await planHermesChatPreparation({
@@ -219,7 +224,7 @@ async function runHermesChatPrepared(params: {
       // preserves every previously completed turn for the next request.
       throw error;
     }
-    if (!mappedResume || !isHermesMissingSessionError(error)) {
+    if (!mappedResume || !isHermesUnresumableMappedSessionError(error)) {
       throw error;
     }
     await forgetHermesSession(params.sessionKey, mappedResume);
@@ -260,94 +265,22 @@ async function runHermesChatPrepared(params: {
     }
   }
   const beforeSessions = await listHermesSessions();
-  let cliActiveHead = resume
-    ? await captureHermesSessionActiveHead(resume)
-    : undefined;
-  let rawOutput: string;
-  try {
-    rawOutput = await runHermesChatOnceWithMobileFileRoute({
-      message: params.preparedMessage.cliMessage,
-      sessionKey: params.sessionKey,
-      resume,
-      context: params.context,
-      preloadedSkillArgs: preloadedSkillContext.cliArgs,
-      reasoningEffort,
-      enableFileTransferRoute: preparationPlan.preloadFileTransferSkill,
-      gatewayId: params.context.gatewayId ?? "clawconnect",
-      sourceRunId: params.sourceRunId,
-      historyCompletion: () => detectHermesHistoryCompletion({
-        beforeSessions,
-        resume,
-        sessionKey: params.sessionKey,
-        userMessage: params.rawMessage,
-        sourceRunId: params.sourceRunId,
-      }),
-    });
-  } catch (error) {
-    if (isHermesChatAbortedError(error)) {
-      await recoverHermesCliSessionAfterAbort({
-        sessionKey: params.sessionKey,
-        resume,
-        mappedResume,
-        activeHead: cliActiveHead,
-        sourceRunId: params.sourceRunId,
-      });
-      throw error;
-    }
-    if (resume && reasoningEffort && isHermesResumePolicyMismatchError(error)) {
-      try {
-        await runHermesSlashCommand({
-          message: `/reasoning ${reasoningEffort}`,
-          sessionKey: params.sessionKey,
-          hermesSessionId: resume,
-          gatewayId: params.context.gatewayId,
-        });
-      } catch {
-        // Best-effort: even if /reasoning slash switch is unavailable, still resume cleanly without creation override flags.
-      }
-      rawOutput = await runHermesChatOnceWithMobileFileRoute({
-        message: params.preparedMessage.cliMessage,
-        sessionKey: params.sessionKey,
-        resume,
-        context: params.context,
-        preloadedSkillArgs: preloadedSkillContext.cliArgs,
-        reasoningEffort: undefined,
-        enableFileTransferRoute: preparationPlan.preloadFileTransferSkill,
-        gatewayId: params.context.gatewayId ?? "clawconnect",
-        sourceRunId: params.sourceRunId,
-        historyCompletion: () => detectHermesHistoryCompletion({
-          beforeSessions,
-          resume,
-          sessionKey: params.sessionKey,
-          userMessage: params.rawMessage,
-          sourceRunId: params.sourceRunId,
-        }),
-      });
-    } else if (!mappedResume || !isHermesMissingSessionError(error)) {
-      throw error;
-    } else {
-      await forgetHermesSession(params.sessionKey, mappedResume);
-      resume = undefined;
-      cliActiveHead = undefined;
-      rawOutput = await runHermesChatOnceWithMobileFileRoute({
-        message: params.preparedMessage.cliMessage,
-        sessionKey: params.sessionKey,
-        context: params.context,
-        preloadedSkillArgs: preloadedSkillContext.cliArgs,
-        reasoningEffort,
-        enableFileTransferRoute: preparationPlan.preloadFileTransferSkill,
-        gatewayId: params.context.gatewayId ?? "clawconnect",
-        sourceRunId: params.sourceRunId,
-        historyCompletion: () => detectHermesHistoryCompletion({
-          beforeSessions,
-          sessionKey: params.sessionKey,
-          userMessage: params.rawMessage,
-          sourceRunId: params.sourceRunId,
-        }),
-      });
-    }
-  }
-  const output = sanitizeHermesChatOutput(rawOutput).trim();
+  const cliResult = await runHermesCliChatWithRecovery({
+    cliMessage: params.preparedMessage.cliMessage,
+    rawMessage: params.rawMessage,
+    sessionKey: params.sessionKey,
+    initialResume: resume,
+    mappedResume,
+    initialReasoningEffort: reasoningEffort,
+    initialPreloadedSkillArgs: preloadedSkillContext.cliArgs,
+    enableFileTransferRoute: preparationPlan.preloadFileTransferSkill,
+    gatewayId: params.context.gatewayId ?? "clawconnect",
+    sourceRunId: params.sourceRunId,
+    beforeSessions,
+    context: params.context,
+  });
+  resume = cliResult.resume;
+  const output = sanitizeHermesChatOutput(cliResult.rawOutput).trim();
   requireVisibleHermesOutput(output);
   const sessions = await listHermesSessions();
   const mappedSession = selectHermesSessionForCompletedChat(sessions, {
@@ -376,6 +309,108 @@ async function runHermesChatPrepared(params: {
     usage,
     ...verifiedFileTransfer,
   };
+}
+
+/**
+ * 执行 Hermes CLI 对话，并在命中策略差异、不可写只读会话或未知技能拒绝时按单次受控恢复路径重试。
+ */
+async function runHermesCliChatWithRecovery(params: {
+  cliMessage: string;
+  rawMessage: string;
+  sessionKey: string;
+  initialResume: string | undefined;
+  mappedResume: string | undefined;
+  initialReasoningEffort: string | undefined;
+  initialPreloadedSkillArgs: string[];
+  enableFileTransferRoute: boolean;
+  gatewayId: string;
+  sourceRunId: string | undefined;
+  beforeSessions: Awaited<ReturnType<typeof listHermesSessions>>;
+  context: LocalCommandContext;
+}): Promise<{ rawOutput: string; resume: string | undefined }> {
+  let resume = params.initialResume;
+  let reasoningEffort = params.initialReasoningEffort;
+  let preloadedSkillArgs = params.initialPreloadedSkillArgs;
+  let cliActiveHead = resume
+    ? await captureHermesSessionActiveHead(resume)
+    : undefined;
+  let switchedReasoningForResume = false;
+  let clearedMappedResume = false;
+  let droppedUnknownSkills = false;
+
+  while (true) {
+    try {
+      const rawOutput = await runHermesChatOnceWithMobileFileRoute({
+        message: params.cliMessage,
+        sessionKey: params.sessionKey,
+        resume,
+        context: params.context,
+        preloadedSkillArgs,
+        reasoningEffort,
+        enableFileTransferRoute: params.enableFileTransferRoute,
+        gatewayId: params.gatewayId,
+        sourceRunId: params.sourceRunId,
+        historyCompletion: () => detectHermesHistoryCompletion({
+          beforeSessions: params.beforeSessions,
+          resume,
+          sessionKey: params.sessionKey,
+          userMessage: params.rawMessage,
+          sourceRunId: params.sourceRunId,
+        }),
+      });
+      return { rawOutput, resume };
+    } catch (error) {
+      if (isHermesChatAbortedError(error)) {
+        await recoverHermesCliSessionAfterAbort({
+          sessionKey: params.sessionKey,
+          resume,
+          mappedResume: params.mappedResume,
+          activeHead: cliActiveHead,
+          sourceRunId: params.sourceRunId,
+        });
+        throw error;
+      }
+      if (!switchedReasoningForResume && resume && reasoningEffort && isHermesResumePolicyMismatchError(error)) {
+        switchedReasoningForResume = true;
+        try {
+          await runHermesSlashCommand({
+            message: `/reasoning ${reasoningEffort}`,
+            sessionKey: params.sessionKey,
+            hermesSessionId: resume,
+            gatewayId: params.context.gatewayId,
+          });
+        } catch {
+          // Best-effort: even if /reasoning slash switch is unavailable, still resume cleanly without creation override flags.
+        }
+        reasoningEffort = undefined;
+        continue;
+      }
+      if (
+        !clearedMappedResume
+        && params.mappedResume
+        && resume === params.mappedResume
+        && isHermesUnresumableMappedSessionError(error)
+      ) {
+        clearedMappedResume = true;
+        await forgetHermesSession(params.sessionKey, params.mappedResume);
+        resume = undefined;
+        cliActiveHead = undefined;
+        reasoningEffort = params.initialReasoningEffort;
+        continue;
+      }
+      if (
+        !droppedUnknownSkills
+        && !resume
+        && preloadedSkillArgs.length > 0
+        && isHermesUnknownSkillError(error)
+      ) {
+        droppedUnknownSkills = true;
+        preloadedSkillArgs = [];
+        continue;
+      }
+      throw error;
+    }
+  }
 }
 
 export function buildHermesAssistantDeltaPayload(params: {

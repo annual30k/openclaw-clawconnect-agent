@@ -241,6 +241,22 @@ export function isHermesMissingSessionError(error: unknown): boolean {
     || /Use a session ID from a previous CLI run/i.test(message);
 }
 
+export function isHermesReadOnlySessionError(error: unknown): boolean {
+  const message = typeof error === "string" ? error : errorMessageWithOutput(error);
+  return /\bsession_read_only\b/i.test(message)
+    || /stored conversation can be read but not continued/i.test(message);
+}
+
+export function isHermesUnresumableMappedSessionError(error: unknown): boolean {
+  return isHermesMissingSessionError(error) || isHermesReadOnlySessionError(error);
+}
+
+export function isHermesUnknownSkillError(error: unknown): boolean {
+  const message = typeof error === "string" ? error : errorMessageWithOutput(error);
+  return /\bunknown_skill\b/i.test(message)
+    || /\bUnknown skill\(s\):/i.test(message);
+}
+
 export function isHermesResumePolicyMismatchError(error: unknown): boolean {
   const message = typeof error === "string" ? error : errorMessageWithOutput(error);
   return /Resume retains gateway session policy/i.test(message)

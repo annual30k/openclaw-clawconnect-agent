@@ -380,7 +380,13 @@ async function runHermesChatStreaming(
           return;
         }
         if (code && code !== 0) {
-          const reason = stderr.trim() || output.trim() || `hermes chat exited with code ${code}`;
+          const trimmedStderr = stderr.trim();
+          const trimmedOutput = output.trim();
+          const reasonParts = [trimmedStderr];
+          if (trimmedOutput && !trimmedStderr.includes(trimmedOutput)) {
+            reasonParts.push(trimmedOutput);
+          }
+          const reason = reasonParts.filter(Boolean).join("\n") || `hermes chat exited with code ${code}`;
           finishReject(new Error(signal ? `${reason} (${signal})` : reason));
           return;
         }
