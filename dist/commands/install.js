@@ -1,8 +1,10 @@
 import { existsSync, unlinkSync } from "fs";
+import { dirname } from "path";
 import { t } from "../i18n/index.js";
 import { getServicePlatform, getServiceStatus, getServicePaths, installService, restartService, setRestrictiveFilePermissions, stopService, uninstallService, } from "../platform/service-manager.js";
-import { clearProfileLogs, getActiveProfile, profileConfigPath, profileDisplayName } from "../config/profile.js";
-import { pairCommandForProfile } from "./profile-hints.js";
+import { clearProfileLogs, getActiveProfile, listNamedProfileDirs, listProfileNames, profileConfigPath, profileDisplayName, profileErrorLogPath, profileLogPath, removeEmptyProfileDir, setActiveProfile, } from "../config/profile.js";
+import { pruneRegistrationBackups } from "../config/config-backups.js";
+import { pairCommandForProfile, resetCommandForProfile } from "./profile-hints.js";
 import { clearReliableRelayOutboxStorage } from "../core/relay/reliable-relay-outbox-store.js";
 import { configExists, readConfig } from "../config/config.js";
 import { ensureHermesApiServer } from "../hermes/runtime/hermes-api-bootstrap.js";
@@ -16,7 +18,13 @@ export function installCommand() {
         console.log(t("install.runForeground"));
         return;
     }
-    if (configExists() && readConfig().gatewayType === "hermes") {
+    const activeProfile = getActiveProfile();
+    if (!configExists(activeProfile)) {
+        process.exitCode = 1;
+        console.error(t("install.profileNotPaired", profileDisplayName(activeProfile), pairCommandForProfile(activeProfile)));
+        return;
+    }
+    if (readConfig().gatewayType === "hermes") {
         const apiSetup = ensureHermesApiServer();
         if (apiSetup === "configured") {
             console.log("Hermes API Server enabled for synchronized text streaming.");
@@ -42,8 +50,8 @@ export function installCommand() {
     }
     else if (platform === "linux") {
         console.log(t("install.serviceFileWritten", servicePaths.linuxServicePath));
-        console.log(t("install.startManually", "systemctl --user daemon-reload && systemctl --user enable --now clawconnect-agent.service"));
-        console.log(t("install.startManually", `bash "${servicePaths.linuxNohupStartScriptPath}"`));
+        console.log(t("install.startManually", `systemctl --user daemon-reload && systemctl --user enable --now ${servicePaths.linuxServiceName}`));
+        console.log(t("install.startManually", `sh "${servicePaths.linuxNohupStartScriptPath}"`));
     }
     else if (platform === "windows") {
         console.log(t("install.startManually", getServiceStatus().startHint ?? ""));
@@ -101,9 +109,45 @@ export function stopCommand() {
         console.log(t("install.noService"));
     }
 }
-export function resetCommand() {
-    stopCommand();
-    const configPath = profileConfigPath();
+export function listResettableProfiles() {
+    const names = new Set();
+    const defaultHasState = configExists(undefined)
+        || getServiceStatus(undefined).installed
+        || existsSync(profileLogPath(undefined))
+        || existsSync(profileErrorLogPath(undefined));
+    if (defaultHasState) {
+        names.add("default");
+    }
+    for (const name of listProfileNames()) {
+        names.add(name);
+    }
+    for (const name of listNamedProfileDirs()) {
+        names.add(name);
+    }
+    for (const builtin of ["openclaw", "hermes"]) {
+        if (getServiceStatus(builtin).installed) {
+            names.add(builtin);
+        }
+    }
+    return [...names].sort((left, right) => {
+        if (left === "default")
+            return -1;
+        if (right === "default")
+            return 1;
+        return left.localeCompare(right);
+    });
+}
+export function resetCommand(deps = {}) {
+    const activeProfile = getActiveProfile();
+    const isInstalled = deps.isServiceInstalled ?? ((targetProfile) => getServiceStatus(targetProfile).installed);
+    const wasInstalled = isInstalled(activeProfile);
+    (deps.uninstall ?? uninstallCommand)();
+    if (wasInstalled && isInstalled(activeProfile)) {
+        process.exitCode = 1;
+        console.error(t("install.resetServiceRemovalFailed", resetCommandForProfile(activeProfile)));
+        return;
+    }
+    const configPath = profileConfigPath(activeProfile);
     if (existsSync(configPath)) {
         try {
             if (process.platform === "win32") {
@@ -121,14 +165,61 @@ export function resetCommand() {
     else {
         console.log(t("install.noConfig"));
     }
-    clearProfileLogs();
     try {
-        clearReliableRelayOutboxStorage(getActiveProfile());
+        pruneRegistrationBackups(dirname(configPath), 0);
+    }
+    catch (err) {
+        console.error("[clawconnect] Failed to remove registration backups:", err);
+    }
+    clearProfileLogs(activeProfile);
+    try {
+        clearReliableRelayOutboxStorage(activeProfile);
     }
     catch (err) {
         console.error("[clawconnect] Failed to clear reliable delivery state:", err);
     }
-    console.log(t("install.resetCompleteWithCommand", pairCommandForProfile(getActiveProfile())));
+    removeEmptyProfileDir(activeProfile);
+    console.log(t("install.resetCompleteWithCommand", pairCommandForProfile(activeProfile)));
+}
+export function resetAllCommand() {
+    const profiles = listResettableProfiles();
+    if (profiles.length === 0) {
+        console.log(t("install.noResettableProfiles"));
+        return;
+    }
+    const previousProfile = getActiveProfile();
+    try {
+        profiles.forEach((profile, index) => {
+            if (index > 0)
+                console.log("");
+            console.log(`── Resetting profile: ${profile} ──`);
+            setActiveProfile(profile === "default" ? undefined : profile);
+            resetCommand();
+        });
+    }
+    finally {
+        setActiveProfile(previousProfile);
+    }
+}
+export function uninstallAllCommand() {
+    const profiles = listResettableProfiles().filter((profile) => getServiceStatus(profile === "default" ? undefined : profile).installed);
+    if (profiles.length === 0) {
+        console.log(t("install.noService"));
+        return;
+    }
+    const previousProfile = getActiveProfile();
+    try {
+        profiles.forEach((profile, index) => {
+            if (index > 0)
+                console.log("");
+            console.log(`── Uninstalling profile service: ${profile} ──`);
+            setActiveProfile(profile === "default" ? undefined : profile);
+            uninstallCommand();
+        });
+    }
+    finally {
+        setActiveProfile(previousProfile);
+    }
 }
 function servicePathsProfile() {
     const profile = getServicePaths().profile;

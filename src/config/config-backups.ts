@@ -30,6 +30,9 @@ export function backupConfigBeforeRegistration(
  * 只处理本模块生成的备份，其他 .bak 文件（迁移、手工备份）一律保留。
  */
 export function pruneRegistrationBackups(directory: string, retention: number = REGISTRATION_BACKUP_RETENTION): string[] {
+  if (!existsSync(directory)) {
+    return [];
+  }
   const backups = readdirSync(directory)
     .filter((name) => name.startsWith(REGISTRATION_BACKUP_PREFIX) && name.endsWith(REGISTRATION_BACKUP_SUFFIX))
     .sort();

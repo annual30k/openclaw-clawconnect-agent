@@ -26,6 +26,7 @@ export type HermesStateDbHistoryPage = {
 const HERMES_STATE_DB_SCRIPT = String.raw`
 import datetime
 import json
+import pathlib
 import sqlite3
 import sys
 
@@ -59,6 +60,7 @@ def turn_rows(conn, session_id, row_id):
         SELECT id, role, content, tool_calls, tool_name, finish_reason FROM messages
         WHERE session_id = ?
           AND COALESCE(active, 1) != 0
+          AND LOWER(COALESCE(role, '')) != 'session_meta'
           AND id >= COALESCE((
             SELECT MAX(id) FROM messages
             WHERE session_id = ? AND COALESCE(active, 1) != 0 AND role = 'user' AND id < ?
@@ -79,7 +81,13 @@ def turn_rows(conn, session_id, row_id):
 
 def connect(writable=False):
     uri_mode = "rw" if writable else "ro"
-    conn = sqlite3.connect(f"file:{db_path}?mode={uri_mode}", uri=True, timeout=1.0)
+    uri = f"{pathlib.Path(db_path).resolve().as_uri()}?mode={uri_mode}"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+    except sqlite3.OperationalError:
+        if writable:
+            raise
+        conn = sqlite3.connect(db_path, timeout=1.0)
     conn.row_factory = sqlite3.Row
     if not writable:
         conn.execute("PRAGMA query_only=ON")
@@ -104,12 +112,12 @@ try:
               ) AS first_user_content,
               (
                 SELECT content FROM messages
-                WHERE session_id = s.id AND COALESCE(active, 1) != 0
+                WHERE session_id = s.id AND COALESCE(active, 1) != 0 AND LOWER(COALESCE(role, '')) != 'session_meta'
                 ORDER BY id DESC LIMIT 1
               ) AS latest_content,
               (
                 SELECT timestamp FROM messages
-                WHERE session_id = s.id AND COALESCE(active, 1) != 0
+                WHERE session_id = s.id AND COALESCE(active, 1) != 0 AND LOWER(COALESCE(role, '')) != 'session_meta'
                 ORDER BY id DESC LIMIT 1
               ) AS latest_message_at
             FROM sessions s
@@ -142,7 +150,7 @@ try:
             messages = []
             for message in conn.execute("""
                 SELECT * FROM messages
-                WHERE session_id = ? AND COALESCE(active, 1) != 0
+                WHERE session_id = ? AND COALESCE(active, 1) != 0 AND LOWER(COALESCE(role, '')) != 'session_meta'
                 ORDER BY id ASC
             """, (session_id,)).fetchall():
                 item = row_dict(message)
@@ -179,6 +187,7 @@ try:
                     SELECT * FROM messages
                     WHERE session_id = ?
                       AND COALESCE(active, 1) != 0
+                      AND LOWER(COALESCE(role, '')) != 'session_meta'
                       AND id > ?
                 """ + assistant_terminal + " ORDER BY id ASC LIMIT ?"
             else:
@@ -187,6 +196,7 @@ try:
                     SELECT * FROM messages
                     WHERE session_id = ?
                       AND COALESCE(active, 1) != 0
+                      AND LOWER(COALESCE(role, '')) != 'session_meta'
                       AND id < ?
                 """ + assistant_terminal + " ORDER BY id DESC LIMIT ?"
             selected = conn.execute(query, (session_id, boundary, limit + 1)).fetchall()

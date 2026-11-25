@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildDefaultDisplayName,
   findConflictingRegistration,
   normalizeRelayServerIdentity,
   postRelayJson,
+  resolvePairProfile,
   sameRelayServer,
   shouldReuseExistingPairing,
 } from "./pair.js";
@@ -42,6 +44,31 @@ test("existing pairing is reused only for same gateway type and same relay serve
     shouldReuseExistingPairing(baseConfig, "hermes", "https://clawlinks.cn"),
     false
   );
+  assert.equal(
+    shouldReuseExistingPairing(baseConfig, "openclaw", "https://clawlinks.cn", true),
+    false
+  );
+});
+
+test("resolvePairProfile eliminates accidental default profile creation", () => {
+  assert.equal(resolvePairProfile({ gatewayType: "openclaw" }), "openclaw");
+  assert.equal(resolvePairProfile({ gatewayType: "hermes" }), "hermes");
+  assert.equal(resolvePairProfile({}), "openclaw");
+  assert.equal(resolvePairProfile({ gatewayType: "openclaw", local: true }), "openclaw-local");
+  assert.equal(resolvePairProfile({ gatewayType: "hermes", local: true }), "hermes-local");
+  assert.equal(resolvePairProfile({ local: true }), "openclaw-local");
+  assert.equal(resolvePairProfile({ profile: "custom-dev", gatewayType: "openclaw", local: true }), "custom-dev");
+  assert.equal(resolvePairProfile({ profile: "custom-gw", gatewayType: "hermes" }), "custom-gw");
+  assert.equal(resolvePairProfile({ profile: "default", gatewayType: "openclaw" }), undefined);
+});
+
+test("buildDefaultDisplayName avoids hardcoded Mac labels across platforms", () => {
+  assert.equal(buildDefaultDisplayName("openclaw", "linux-box"), "linux-box OpenClaw");
+  assert.equal(buildDefaultDisplayName("hermes", "linux-box"), "linux-box Hermes");
+  assert.equal(buildDefaultDisplayName("openclaw", "linux-box", true), "linux-box OpenClaw (Local)");
+  assert.equal(buildDefaultDisplayName("hermes", "linux-box", true), "linux-box Hermes (Local)");
+  assert.equal(buildDefaultDisplayName("openclaw", "Mac OpenClaw"), "Mac OpenClaw");
+  assert.equal(buildDefaultDisplayName("hermes", "My Hermes Node"), "My Hermes Node");
 });
 
 test("remote and local relay servers are not interchangeable", () => {

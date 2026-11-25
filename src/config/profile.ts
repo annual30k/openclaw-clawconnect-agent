@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, statSync, unlinkSync } from "fs";
+import { existsSync, readdirSync, rmdirSync, statSync, unlinkSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
@@ -57,6 +57,45 @@ export function clearProfileLogs(profile: string | undefined = getActiveProfile(
   try {
     if (existsSync(errorLogPath)) unlinkSync(errorLogPath);
   } catch { /* ignore */ }
+}
+
+export function removeEmptyProfileDir(profile: string | undefined = getActiveProfile()): boolean {
+  const normalized = normalizeProfileName(profile);
+  if (!normalized) {
+    return false;
+  }
+  const dir = profileRoot(normalized);
+  try {
+    if (!existsSync(dir)) return false;
+    if (readdirSync(dir).length > 0) return false;
+    rmdirSync(dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function listNamedProfileDirs(): string[] {
+  const names = new Set<string>();
+  const profilesDir = join(CLAWCONNECT_HOME, "profiles");
+  try {
+    for (const entry of readdirSync(profilesDir)) {
+      const normalized = normalizeProfileName(entry);
+      if (!normalized) {
+        continue;
+      }
+      try {
+        if (statSync(join(profilesDir, entry)).isDirectory()) {
+          names.add(normalized);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return [...names].sort((left, right) => left.localeCompare(right));
 }
 
 export function listProfileNames(): string[] {

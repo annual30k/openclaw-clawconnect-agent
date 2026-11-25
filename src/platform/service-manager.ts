@@ -11,6 +11,7 @@ import {
   getProgramArgs,
   getLinuxNohupPidPath,
   getLinuxNohupStartScriptPath,
+  getLinuxServiceName,
   getLinuxServicePath,
   run,
   setRestrictiveDirPermissions,
@@ -104,33 +105,75 @@ ${argsXml}
   }
 }
 
+/**
+ * launchd 标签是用户级全局的，而 plist 路径跟随 HOME。HOME 被隔离（测试、临时账户）时，
+ * 对真实标签执行 unload/remove/kickstart 会误停用户真实正在运行的服务。
+ * 只有“本 HOME 下的 plist 存在”或“已加载作业的 plist 正是本 HOME 下这一份”才允许操作。
+ */
+export function shouldManageMacLaunchdJob(input: {
+  plistExists: boolean;
+  loadedPlistPath?: string;
+  plistPath: string;
+}): boolean {
+  return input.plistExists || (input.loadedPlistPath !== undefined && input.loadedPlistPath === input.plistPath);
+}
+
+export function parseLaunchctlPrintPlistPath(output: string): string | undefined {
+  const match = output.match(/^\s*path\s*=\s*(.+)$/m);
+  return match?.[1]?.trim() || undefined;
+}
+
+function readLoadedMacPlistPath(label: string): string | undefined {
+  const getuid = process.getuid;
+  if (typeof getuid !== "function") return undefined;
+  try {
+    const output = run(`launchctl print ${macLaunchctlServiceTarget(label, getuid.call(process))}`).toString();
+    return parseLaunchctlPrintPlistPath(output);
+  } catch {
+    return undefined;
+  }
+}
+
+function macJobIsManagedByThisHome(profile?: string): boolean {
+  const plistPath = macPlistPath(profile);
+  const plistExists = existsSync(plistPath);
+  return shouldManageMacLaunchdJob({
+    plistExists,
+    loadedPlistPath: plistExists ? undefined : readLoadedMacPlistPath(macLabel(profile)),
+    plistPath,
+  });
+}
+
 function uninstallMacArtifacts(profile?: string): boolean {
   let changed = false;
   const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
   const label = macLabel(profile);
   const plistPath = macPlistPath(profile);
-  try {
-    run(`launchctl unload -w "${plistPath}"`);
-    changed = true;
-  } catch {
-    // ignore
+  const managed = macJobIsManagedByThisHome(profile);
+  if (managed) {
+    try {
+      run(`launchctl unload -w "${plistPath}"`);
+      changed = true;
+    } catch {
+      // ignore
+    }
   }
   if (existsSync(plistPath)) {
     unlinkSync(plistPath);
     changed = true;
   }
   if (!resolvedProfile) {
-    try {
-      run(`launchctl unload -w "${MAC_PLIST_PATH_OLD}"`);
-      changed = true;
-    } catch {
-      // ignore
-    }
     if (existsSync(MAC_PLIST_PATH_OLD)) {
+      try {
+        run(`launchctl unload -w "${MAC_PLIST_PATH_OLD}"`);
+        changed = true;
+      } catch {
+        // ignore
+      }
       unlinkSync(MAC_PLIST_PATH_OLD);
       changed = true;
     }
-  } else {
+  } else if (managed) {
     try {
       run(`launchctl remove ${label}`);
       changed = true;
@@ -143,7 +186,7 @@ function uninstallMacArtifacts(profile?: string): boolean {
 
 function restartMacService(profile?: string): boolean {
   const getuid = process.getuid;
-  if (typeof getuid === "function") {
+  if (typeof getuid === "function" && macJobIsManagedByThisHome(profile)) {
     const target = macLaunchctlServiceTarget(macLabel(profile), getuid.call(process));
     try {
       // `kickstart -k` is one launchd transaction. Unlike unload + load, it
@@ -273,6 +316,7 @@ export function getServicePaths(profile?: string) {
     logPath: getProfileLogPath(resolvedProfile),
     errorLogPath: getProfileErrorLogPath(resolvedProfile),
     macPlistPath: macPlistPath(resolvedProfile),
+    linuxServiceName: getLinuxServiceName(resolvedProfile),
     linuxServicePath: getLinuxServicePath(resolvedProfile),
     linuxNohupPidPath: getLinuxNohupPidPath(resolvedProfile),
     linuxNohupStartScriptPath: getLinuxNohupStartScriptPath(resolvedProfile),

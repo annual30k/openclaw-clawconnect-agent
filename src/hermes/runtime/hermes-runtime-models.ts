@@ -72,7 +72,7 @@ export async function runHermesModelSelect(params: unknown): Promise<LocalResult
       },
     };
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    return { ok: false, error: errorMessageWithOutput(error) };
   }
 }
 
@@ -80,12 +80,49 @@ export function hermesModelAssignmentScript(providerId: string, modelId: string)
   return [
     "from hermes_cli.inventory import load_picker_context",
     "from hermes_cli.providers import resolve_provider_full",
-    "from hermes_cli.web_server import _apply_model_assignment_sync",
     "ctx = load_picker_context()",
     `provider = ${JSON.stringify(providerId)}`,
+    `model_id = ${JSON.stringify(modelId)}`,
     "provider_def = resolve_provider_full(provider, ctx.user_providers, ctx.custom_providers)",
     "base_url = provider_def.base_url if provider_def is not None else \"\"",
-    `_apply_model_assignment_sync("main", provider, ${JSON.stringify(modelId)}, "", base_url)`,
+    "apply_sync = None",
+    "for mod_name in (\"hermes_cli.web_server_config\", \"hermes_cli.web_server\"):",
+    "    try:",
+    "        mod = __import__(mod_name, fromlist=[\"_apply_model_assignment_sync\"])",
+    "        candidate = getattr(mod, \"_apply_model_assignment_sync\", None)",
+    "        if callable(candidate):",
+    "            apply_sync = candidate",
+    "            break",
+    "    except Exception:",
+    "        continue",
+    "if apply_sync is not None:",
+    "    try:",
+    "        apply_sync(\"main\", provider, model_id, \"\", base_url)",
+    "    except Exception as exc:",
+    "        detail = getattr(exc, \"detail\", None)",
+    "        if detail:",
+    "            raise RuntimeError(str(detail)) from exc",
+    "        raise",
+    "else:",
+    "    from hermes_cli.config import load_config",
+    "    from hermes_cli.model_switch import persist_model_selection, switch_model",
+    "    cfg = load_config()",
+    "    model_cfg = cfg.get(\"model\") if isinstance(cfg.get(\"model\"), dict) else {}",
+    "    is_bare_custom = provider.strip().lower() in {\"custom\", \"local\"}",
+    "    result = switch_model(",
+    "        raw_input=model_id,",
+    "        explicit_provider=provider,",
+    "        is_global=True,",
+    "        current_provider=str(model_cfg.get(\"provider\") or \"\"),",
+    "        current_model=str(model_cfg.get(\"default\") or \"\"),",
+    "        current_base_url=base_url if is_bare_custom else str(model_cfg.get(\"base_url\") or \"\"),",
+    "        current_api_key=\"\",",
+    "        user_providers=ctx.user_providers,",
+    "        custom_providers=ctx.custom_providers,",
+    "    )",
+    "    if not result.success:",
+    "        raise RuntimeError(result.error_message or \"model switch rejected\")",
+    "    persist_model_selection(result)",
   ].join("\n");
 }
 

@@ -18,110 +18,97 @@ Windows 会自动保留 npm 的 `clawconnect.cmd` 入口，并移除同目录下
 
 ## 使用方式
 
-### 1. 配对
+### 1. 配对并自动启动后台服务
 
-生成移动端扫码配对用的二维码：
+推荐直接使用快捷配对命令：
 
 ```bash
-clawconnect pair
+clawconnect pair-openclaw
+# 或
+clawconnect pair-hermes
 ```
+
+`pair`、`pair-openclaw` 和 `pair-hermes` 在注册成功后会**自动安装并启动后台服务**（macOS 使用 `launchd`，Linux 优先 `systemd --user`、不可用时回退 POSIX `nohup`，Windows 注册为 Windows Service；Windows 建议用“以管理员身份运行”的 PowerShell 一步完成，若在普通终端配对则以管理员补跑一次 `clawconnect install`）。
 
 如果只想输出配对码，不打印二维码：
 
 ```bash
-clawconnect pair --code-only
+clawconnect pair-openclaw --code-only
 ```
 
 可选参数：
 
 - `-n, --name <name>`：指定这台主机在移动端显示的名称
 - `-s, --server <url>`：指定中继服务器地址
-- `-p, --profile <name>`：指定本机配置 profile；同一台主机同时配对 OpenClaw 和 Hermes Agent 时必须分开
+- `-p, --profile <name>`：显式指定配置档案；省略时会按网关类型自动路由到 `openclaw` 或 `hermes`，不会误建 `default`
 - `--gateway-type <type>`：指定网关类型，可选 `openclaw` 或 `hermes`
+- `--local`：连接本地测试中继（`http://127.0.0.1:8080`），自动写入隔离档案 `openclaw-local` / `hermes-local`，不会覆盖线上配置
+- `-f, --force`：即使已配对也强制注册新的网关
 - `--code-only`：只输出访问码，不打印二维码
 
-### 2. 同时配对 OpenClaw 和 Hermes Agent
+### 2. 同时配对 OpenClaw / Hermes 以及本地测试隔离
 
-同一台电脑上同时运行 OpenClaw 和 Hermes Agent 时，必须使用不同的 `--profile`。这样两条链路会使用不同的本地配置、日志和后台服务，避免 OpenClaw 与 Hermes Agent 串到一起。
+不同网关类型以及 `--local` 会自动存放在完全隔离的 profile 目录，日志与后台服务互不干扰。
 
-配对 OpenClaw：
+配对线上 Relay（`https://clawlinks.cn`）：
 
 ```bash
 clawconnect pair-openclaw
-```
-
-配对 Hermes Agent：
-
-```bash
 clawconnect pair-hermes
 ```
 
-如果使用本地开发 Relay `http://127.0.0.1:8080`，加一个 `--local` 即可：
+配对本地开发 Relay（`http://127.0.0.1:8080`，写入 `openclaw-local` / `hermes-local`）：
 
 ```bash
 clawconnect pair-openclaw --local
 clawconnect pair-hermes --local
 ```
 
-上面的快捷命令等价于下面的完整写法。
+每条命令执行后，使用移动端扫码或输入终端打印的配对码即可绑定。Relay 会校验移动端请求的类型和主机注册的类型是否一致，避免 OpenClaw 与 Hermes 串绑。
 
-OpenClaw：
-
-```bash
-clawconnect pair \
-  --profile openclaw \
-  --server http://127.0.0.1:8080 \
-  --gateway-type openclaw \
-  --name "Mac OpenClaw"
-```
-
-Hermes Agent：
-
-```bash
-clawconnect pair \
-  --profile hermes \
-  --server http://127.0.0.1:8080 \
-  --gateway-type hermes \
-  --name "Mac Hermes Agent"
-```
-
-每条命令执行后，使用移动端扫码，或在移动端输入终端打印的配对码。配对 payload 会带上 `gatewayType`，Relay 会校验手机端请求的类型和主机注册的类型是否一致；类型不一致会拒绝绑定，避免 OpenClaw 手机网关绑定到 Hermes Agent 主机，或反过来绑定错误。
-
-配对完成后，安装已配对的后台服务：
+通常**不需要再手动运行 `clawconnect install`**；只有在修改过 `~/.clawconnect/.env` 后想刷新全部已配对服务，或 Windows 上次在非管理员终端配对需要提权补装时，才运行：
 
 ```bash
 clawconnect install
 ```
 
-不带 `--profile` 时，`clawconnect install` 会安装当前能找到的所有已配对 profile。只想指定一个 profile 时，可以用 `clawconnect install-openclaw`、`clawconnect install-hermes`，或 `clawconnect install --profile <name>`。
+不带 `--profile` 时，`clawconnect install` 会安装/刷新所有已配对的 profile（没有任何已配对档案时会提示先配对，不会创建空 `default` 服务）。也可通过 `clawconnect install-openclaw [--local]`、`clawconnect install-hermes [--local]` 或 `clawconnect install --profile <name>` 单独指定。
 
-清除失效凭证时也必须使用同一个 profile。如果 `pair-openclaw` 或 `pair-hermes` 提示凭证无效，不要只运行默认 `clawconnect reset`，而是重置对应 profile：
+彻底清除某个配对档案（会卸载对应后台服务并删除 `config.json`、备份、日志与 outbox，但保留 `.env`）：
 
 ```bash
 clawconnect reset-openclaw
+clawconnect reset-openclaw --local
 clawconnect reset-hermes
+clawconnect reset-hermes --local
+clawconnect reset-all
 ```
 
-查看两个实例：
+查看全部已配对档案状态（也支持 `--profile <name>` 单独查看）：
 
 ```bash
-clawconnect status-all
+clawconnect status
 ```
 
-单独重启或停止某一个实例：
+单独重启、停止或卸载某一个实例的后台服务：
 
 ```bash
-clawconnect restart-openclaw
-clawconnect restart-hermes
-clawconnect stop-openclaw
-clawconnect stop-hermes
+clawconnect restart-openclaw [--local]
+clawconnect restart-hermes [--local]
+clawconnect stop-openclaw [--local]
+clawconnect stop-hermes [--local]
+clawconnect uninstall-openclaw [--local]
+clawconnect uninstall-hermes [--local]
+clawconnect uninstall-all
 ```
 
 本机配置文件位置：
 
 ```text
 ~/.clawconnect/profiles/openclaw/config.json
+~/.clawconnect/profiles/openclaw-local/config.json
 ~/.clawconnect/profiles/hermes/config.json
+~/.clawconnect/profiles/hermes-local/config.json
 ```
 
 终态事件和命令响应会先写入权限受限、按 profile/Relay/gateway 隔离的
@@ -263,10 +250,10 @@ clawconnect restart
 
 ### 8. 设置 Gateway Token
 
-当本机 Gateway 使用 token 鉴权时，可以手动保存 token：
+当本机 Gateway 使用 token 鉴权时，可以为对应档案手动保存 token：
 
 ```bash
-clawconnect set-token
+clawconnect set-token --profile openclaw
 ```
 
 ### 9. 卸载服务
@@ -274,25 +261,23 @@ clawconnect set-token
 移除后台服务定义，但保留本地配置：
 
 ```bash
-clawconnect uninstall
+clawconnect uninstall-openclaw [--local]
+clawconnect uninstall-hermes [--local]
+clawconnect uninstall-all
+clawconnect uninstall --profile <name>
 ```
 
 ### 10. 重置配对
 
-停止服务并清除本地配对配置：
+停止并移除后台服务，彻底清除配对配置、注册备份、日志与 outbox（保留 `.env`）：
 
 ```bash
-clawconnect reset
+clawconnect reset-openclaw [--local]
+clawconnect reset-hermes [--local]
+clawconnect reset-all
 ```
 
-快捷配对命令使用独立 profile。修复 OpenClaw 或 Hermes 配对时，请使用对应的 reset 命令：
-
-```bash
-clawconnect reset-openclaw
-clawconnect reset-hermes
-```
-
-自定义 profile 仍使用 `clawconnect reset --profile <name>`。
+自定义 profile 使用 `clawconnect reset --profile <name>`。
 
 ### 11. 升级到最新版本
 

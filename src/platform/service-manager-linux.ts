@@ -1,3 +1,4 @@
+import { execSync } from "child_process";
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "fs";
 import { dirname } from "path";
 
@@ -6,6 +7,7 @@ import {
   buildLinuxNohupStartScript,
   buildLinuxSystemdUnit,
   defaultIsPidRunning,
+  parseSystemdMajorVersion,
   posixShellEscape,
   readLinuxNohupPid,
   removeLinuxNohupPidFile,
@@ -23,7 +25,6 @@ import {
   getProfileLogDir,
   getProfileLogPath,
   getProgramArgs,
-  run,
   type ServiceStatus,
 } from "./service-manager-common.js";
 
@@ -34,6 +35,7 @@ export {
   formatSystemdExecArg,
   isMatchingLinuxAgentRunArgv,
   parseProcCmdline,
+  parseSystemdMajorVersion,
   stopLinuxProfileProcesses,
   type LinuxProcessControlDeps,
   type LinuxServicePaths,
@@ -44,6 +46,7 @@ export interface LinuxServiceDeps extends LinuxProcessControlDeps {
   paths?: Partial<LinuxServicePaths>;
   programArgs?: readonly string[];
   canUseSystemd?: boolean;
+  systemdVersion?: number;
   runCommand?: (command: string, stdio?: "pipe" | "inherit") => Buffer | string;
 }
 
@@ -64,12 +67,53 @@ export function getLinuxServicePaths(
   };
 }
 
+/**
+ * SSH / su 登录或精简发行版会话经常缺失 XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS，
+ * 导致 `systemctl --user` 误判不可用。仅在当前环境变量缺失且 `/run/user/<uid>` 真实存在时自动补齐。
+ */
+export function resolveLinuxSystemdEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  uid: number | undefined = typeof process.getuid === "function" ? process.getuid() : undefined,
+  pathExists: (path: string) => boolean = existsSync,
+): NodeJS.ProcessEnv {
+  const nextEnv: NodeJS.ProcessEnv = { ...env };
+  if (!nextEnv.XDG_RUNTIME_DIR?.trim() && uid !== undefined) {
+    const candidate = `/run/user/${uid}`;
+    if (pathExists(candidate)) {
+      nextEnv.XDG_RUNTIME_DIR = candidate;
+    }
+  }
+  const runtimeDir = nextEnv.XDG_RUNTIME_DIR?.trim();
+  if (!nextEnv.DBUS_SESSION_BUS_ADDRESS?.trim() && runtimeDir) {
+    const busPath = `${runtimeDir}/bus`;
+    if (pathExists(busPath)) {
+      nextEnv.DBUS_SESSION_BUS_ADDRESS = `unix:path=${busPath}`;
+    }
+  }
+  return nextEnv;
+}
+
 function runLinuxCommand(
   command: string,
   stdio: "pipe" | "inherit" = "pipe",
   deps: LinuxServiceDeps = {},
 ): Buffer | string {
-  return (deps.runCommand ?? run)(command, stdio);
+  if (deps.runCommand) {
+    return deps.runCommand(command, stdio);
+  }
+  return execSync(command, { stdio, env: resolveLinuxSystemdEnv() });
+}
+
+function detectSystemdMajorVersion(deps: LinuxServiceDeps = {}): number | undefined {
+  if (deps.systemdVersion !== undefined) {
+    return deps.systemdVersion;
+  }
+  try {
+    const output = runLinuxCommand("systemctl --version", "pipe", deps).toString();
+    return parseSystemdMajorVersion(output);
+  } catch {
+    return undefined;
+  }
 }
 
 function canUseSystemdUser(deps: LinuxServiceDeps = {}): boolean {
@@ -98,7 +142,7 @@ function isSystemdActive(paths: LinuxServicePaths, deps: LinuxServiceDeps = {}):
 }
 
 function getNohupStartCommand(paths: LinuxServicePaths): string {
-  return `bash ${posixShellEscape(paths.startScriptPath)}`;
+  return `sh ${posixShellEscape(paths.startScriptPath)}`;
 }
 
 function writeLinuxNohupStartScript(paths: LinuxServicePaths, deps: LinuxServiceDeps): void {
@@ -117,6 +161,7 @@ function writeSystemdServiceUnit(paths: LinuxServicePaths, deps: LinuxServiceDep
     workingDirectory: paths.workingDirectory,
     stdoutLogPath: paths.logPath,
     stderrLogPath: paths.errorLogPath,
+    systemdVersion: detectSystemdMajorVersion(deps),
   });
   writeFileSync(paths.servicePath, serviceContent, "utf-8");
 }
@@ -235,6 +280,10 @@ function uninstallLinuxArtifacts(
   }
   if (removeFile && existsSync(paths.startScriptPath)) {
     unlinkSync(paths.startScriptPath);
+    changed = true;
+  }
+  if (removeFile && existsSync(paths.pidPath)) {
+    unlinkSync(paths.pidPath);
     changed = true;
   }
   return changed;

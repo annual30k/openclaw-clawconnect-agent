@@ -25,6 +25,7 @@ export interface LinuxSystemdUnitConfig {
   workingDirectory: string;
   stdoutLogPath: string;
   stderrLogPath: string;
+  systemdVersion?: number;
 }
 
 export interface LinuxProcessControlDeps {
@@ -97,10 +98,18 @@ export function formatSystemdExecArg(arg: string): string {
   return arg.replace(/%/g, "%%").replace(/\$/g, "$$$$");
 }
 
+export function parseSystemdMajorVersion(versionOutput: string): number | undefined {
+  const match = versionOutput.match(/systemd\s+(\d+)/i);
+  if (!match) return undefined;
+  const parsed = Number.parseInt(match[1]!, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 /**
  * 生成 `systemd --user` unit 内容。
- * `WorkingDirectory=` 与 `StandardOutput=append:` 直接接收路径，不能使用 shell 单引号包裹，
- * 否则 systemd 会因路径不以 `/` 开头而拒绝加载（`bad unit file setting`）。
+ * - systemd >= 240（Debian 10+ / Ubuntu 20.04+ / CentOS 8+ 等）：直接使用 `StandardOutput=append:`。
+ * - systemd < 240（如 CentOS 7 / RHEL 7 的 219、Ubuntu 18.04 的 237）：不支持 `append:`，通过 `/bin/sh -c 'exec "$@" >> ... 2>> ...'` 保持日志追加。
+ * - `WorkingDirectory=` 直接接收路径，不能使用 shell 单引号包裹。
  */
 export function buildLinuxSystemdUnit(config: LinuxSystemdUnitConfig): string {
   if (config.programArgs.length === 0) {
@@ -112,24 +121,42 @@ export function buildLinuxSystemdUnit(config: LinuxSystemdUnitConfig): string {
   assertSingleLineSystemdValue("StandardOutput", config.stdoutLogPath);
   assertSingleLineSystemdValue("StandardError", config.stderrLogPath);
 
-  const execStart = config.programArgs.map(formatSystemdExecArg).join(" ");
-  return `[Unit]
-Description=ClawConnect host agent (${escapeSystemdSpecifier(profileLabel)})
-After=network-online.target
-Wants=network-online.target
+  const supportsAppendLogging = config.systemdVersion === undefined || config.systemdVersion >= 240;
+  const execStart = supportsAppendLogging
+    ? config.programArgs.map(formatSystemdExecArg).join(" ")
+    : [
+        "/bin/sh",
+        "-c",
+        `exec "$@" >> ${posixShellEscape(config.stdoutLogPath)} 2>> ${posixShellEscape(config.stderrLogPath)}`,
+        "clawconnect",
+        ...config.programArgs,
+      ].map(formatSystemdExecArg).join(" ");
 
-[Service]
-Type=simple
-ExecStart=${execStart}
-Restart=always
-RestartSec=5
-WorkingDirectory=${escapeSystemdSpecifier(config.workingDirectory)}
-StandardOutput=append:${escapeSystemdSpecifier(config.stdoutLogPath)}
-StandardError=append:${escapeSystemdSpecifier(config.stderrLogPath)}
+  const loggingLines = supportsAppendLogging
+    ? [
+        `StandardOutput=append:${escapeSystemdSpecifier(config.stdoutLogPath)}`,
+        `StandardError=append:${escapeSystemdSpecifier(config.stderrLogPath)}`,
+      ]
+    : [];
 
-[Install]
-WantedBy=default.target
-`;
+  return [
+    "[Unit]",
+    `Description=ClawConnect host agent (${escapeSystemdSpecifier(profileLabel)})`,
+    "After=network-online.target",
+    "Wants=network-online.target",
+    "",
+    "[Service]",
+    "Type=simple",
+    `ExecStart=${execStart}`,
+    "Restart=always",
+    "RestartSec=5",
+    `WorkingDirectory=${escapeSystemdSpecifier(config.workingDirectory)}`,
+    ...loggingLines,
+    "",
+    "[Install]",
+    "WantedBy=default.target",
+    "",
+  ].join("\n");
 }
 
 export function buildLinuxNohupStartScript(
@@ -137,8 +164,8 @@ export function buildLinuxNohupStartScript(
   programArgs: readonly string[],
 ): string {
   const args = programArgs.map(posixShellEscape).join(" ");
-  return `#!/usr/bin/env bash
-set -euo pipefail
+  return `#!/bin/sh
+set -eu
 
 mkdir -p ${posixShellEscape(paths.workingDirectory)}
 cd ${posixShellEscape(paths.workingDirectory)}

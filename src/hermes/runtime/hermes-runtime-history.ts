@@ -325,8 +325,13 @@ function normalizeHermesHistoryMessages(
     if (Object.keys(source).length === 0) {
       return;
     }
-    const rawSeq = numberParam(source, "seq");
-    const providerMessageId = stringParam(source, "id", "messageId", "message_id");
+    if (source.active === 0 || source.active === false || isHermesInternalHistoryRole(source.role)) {
+      return;
+    }
+    const numericRowId = positiveSafeIntegerParam(source, "id", "messageId", "message_id");
+    const rawSeq = numberParam(source, "seq") ?? numericRowId;
+    const providerMessageId = stringParam(source, "id", "messageId", "message_id")
+      ?? (numericRowId !== undefined ? String(numericRowId) : undefined);
     if (options.projectionVersion === 3) {
       requireHermesProjectionSequence(rawSeq);
       requireHermesProjectionIdentity(providerMessageId, "sourceMessageId");
@@ -552,6 +557,23 @@ function stableAttachmentId(block: Record<string, unknown>): string | undefined 
     numberParam(block, "byteSize", "byte_size", "sizeBytes", "size_bytes"),
   ].filter((value) => value !== undefined).join("\u0000");
   return source ? `att_${createHash("sha256").update(source).digest("hex").slice(0, 16)}` : undefined;
+}
+
+function isHermesInternalHistoryRole(value: unknown): boolean {
+  const normalized = typeof value === "string"
+    ? value.trim().toLowerCase().replace(/[\s_-]+/g, "")
+    : "";
+  return normalized === "sessionmeta";
+}
+
+function positiveSafeIntegerParam(record: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 function numberParam(record: Record<string, unknown>, ...keys: string[]): number | undefined {

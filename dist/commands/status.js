@@ -12,10 +12,11 @@ import { resolveHermesApiSettings, resolveHermesRuntimeExecutionMode, } from "..
 import { CHAT_TIMELINE_DELTA_CAPABILITY, CLAWCONNECT_AGENT_VERSION, buildHermesHostRuntimeMetadata, buildOpenClawHostRuntimeMetadata, } from "../runtime-metadata.js";
 const WINDOWS_LOG_READ_TIMEOUT_MS = 5_000;
 export function statusCommand(opts = {}) {
-    if (opts.profile === "all") {
+    const showAll = opts.profile === "all" || (!opts.explicitProfile && !opts.profile);
+    if (showAll) {
         const profiles = listProfileNames();
         if (profiles.length === 0) {
-            statusCommand({ profile: undefined });
+            statusOne(undefined);
             return;
         }
         profiles.forEach((profile, index) => {
@@ -32,7 +33,8 @@ function statusOne(profile) {
     console.log(`Profile:  ${profileDisplayName(profile)}`);
     console.log(`ClawConnect Agent: ${CLAWCONNECT_AGENT_VERSION}`);
     let gatewayType = "openclaw";
-    if (!configExists(profile)) {
+    const isPaired = configExists(profile);
+    if (!isPaired) {
         console.log(t("status.notPaired"));
     }
     else {
@@ -90,7 +92,7 @@ function statusOne(profile) {
     }
     console.log(t("status.servicePlatform", service.manager));
     if (!service.installed) {
-        console.log(t("status.serviceNotInstalled"));
+        console.log(t(isPaired ? "status.serviceNotInstalled" : "status.serviceNotInstalledUnpaired"));
     }
     else if (service.running) {
         console.log(t("status.serviceRunning", service.manager));

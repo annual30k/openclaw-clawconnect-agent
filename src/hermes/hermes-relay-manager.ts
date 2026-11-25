@@ -155,6 +155,10 @@ const DEFAULT_HERMES_RELAY_MANAGER_DEPENDENCIES: HermesRelayManagerDependencies 
   startCronChangeRelay: startHermesCronChangeRelay,
 };
 
+export function isHermesGatewayRestartMethod(method: string | undefined): boolean {
+  return method === "hermes.gateway.restart" || method === "hermes.agent.restart";
+}
+
 export function buildHermesRelayHelloMessage(opts: {
   platform: string;
   agentVersion: string;
@@ -390,11 +394,24 @@ export async function runHermesRelayManagerWithDependencies(
           return;
         }
 
-        const localResult = await handleHermesCommand(msg.method, msg.params, {
-          requestId,
-          gatewayId: opts.gatewayId,
-          publishEvent: (event) => send(event),
-        });
+        // Hermes Gateway 重启期间 Agent 本身保持在线，但 Hermes 运行时会短暂不可用。
+        // 显式上报断开/恢复，让 Relay 聚合状态不再在重启窗口内误报“在线”。
+        const isGatewayRestart = isHermesGatewayRestartMethod(msg.method);
+        if (isGatewayRestart) {
+          send({ type: "gateway_disconnected", reason: "hermes gateway restart" });
+        }
+        let localResult: Awaited<ReturnType<typeof handleHermesCommand>>;
+        try {
+          localResult = await handleHermesCommand(msg.method, msg.params, {
+            requestId,
+            gatewayId: opts.gatewayId,
+            publishEvent: (event) => send(event),
+          });
+        } finally {
+          if (isGatewayRestart) {
+            send({ type: "gateway_connected" });
+          }
+        }
         if (localResult !== null) {
           if (requestId) {
             send(localResult.ok

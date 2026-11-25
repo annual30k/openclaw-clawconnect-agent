@@ -269,7 +269,7 @@ test("runHermesChat bypasses interactive command approvals for mobile bridge que
     assert.equal(args.includes("--tui"), false);
     assert.equal(args.includes("--quiet"), true);
     assert.equal(args.includes("--source"), true);
-    assert.equal(args.includes("pocketclaw"), true);
+    assert.equal(args.includes("cli"), true);
     assert.equal(args.includes("--yolo"), true);
   } finally {
     restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
@@ -915,6 +915,7 @@ test("runHermesChat uses the CLI path for preloaded file-transfer mobile sends w
     assert.doesNotMatch(result.output, /已发送 \d+ 个文件/);
     assert.deepEqual(apiChatCalls, []);
     const args = JSON.parse(readFileSync(chatArgsPath, "utf8")) as string[];
+    assert.equal(args.includes("--resume"), false);
     assert.equal(args.includes("--skills"), true);
     assert.equal(args.includes("file-transfer"), true);
     assert.equal(args.includes("--yolo"), true);
@@ -1037,6 +1038,7 @@ test("runHermesChat keeps explicit file-transfer mobile sends off the API path w
     assert.doesNotMatch(result.output, /已发送 \d+ 个文件/);
     assert.deepEqual(apiChatCalls, []);
     const args = JSON.parse(readFileSync(chatArgsPath, "utf8")) as string[];
+    assert.equal(args.includes("--resume"), false);
     assert.equal(args.includes("--skills"), true);
     assert.equal(args.includes("file-transfer"), true);
     assert.equal(args.includes("--yolo"), true);
@@ -1048,6 +1050,169 @@ test("runHermesChat keeps explicit file-transfer mobile sends off the API path w
     restoreEnv("CLAWCONNECT_HERMES_API_URL", previousApiUrl);
     restoreEnv("CLAWCONNECT_HERMES_API_KEY", previousApiKey);
     restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat omits creation policy flags when resuming an existing session and passes HERMES_YOLO_MODE=1", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-resume-policy-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousRuntimeMode = process.env.CLAWCONNECT_HERMES_RUNTIME_MODE;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  const previousHome = process.env.HERMES_HOME;
+  const previousReasoningStore = process.env.CLAWCONNECT_HERMES_REASONING_STORE;
+  const capturedPath = join(root, "captured.json");
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = join(root, "hermes");
+    writeFileSync(binPath, [
+      "#!/usr/bin/env node",
+      "const fs = require('fs');",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'skills' && args[1] === 'list') {",
+      "  console.log('│ file-transfer │ productivity │ local │ local │ enabled │');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'sessions' && args[1] === 'list') {",
+      "  console.log('Title Preview Last Active ID');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'status' || (args[0] === 'sessions' && args[1] === 'export')) { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      `  fs.writeFileSync(${JSON.stringify(capturedPath)}, JSON.stringify({ args, yoloEnv: process.env.HERMES_YOLO_MODE }));`,
+      "  console.log('resumed cleanly');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(binPath, 0o755);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    process.env.CLAWCONNECT_HERMES_RUNTIME_MODE = "local";
+    process.env.CLAWCONNECT_HERMES_STATE_DB = join(root, "missing-state.db");
+    process.env.HERMES_HOME = join(root, "hermes-home");
+    process.env.CLAWCONNECT_HERMES_REASONING_STORE = join(root, "reasoning-efforts.json");
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId: "20261124_180000_resume_ok",
+      kind: "hermes",
+    });
+
+    const result = await runHermesChat(
+      { sessionKey: "main", message: "把文件发到手机" },
+      { requestId: "run-resume-clean", gatewayId: "gw-hermes", hermesFileTransferCapability: "cli" },
+    );
+    assert.doesNotMatch(result.output, /已发送/);
+    const captured = JSON.parse(readFileSync(capturedPath, "utf8")) as { args: string[]; yoloEnv?: string };
+    assert.equal(captured.yoloEnv, "1");
+    assert.equal(captured.args.includes("--resume"), true);
+    assert.equal(captured.args[captured.args.indexOf("--resume") + 1], "20261124_180000_resume_ok");
+    assert.equal(captured.args.includes("--skills"), false);
+    assert.equal(captured.args.includes("--source"), false);
+    assert.equal(captured.args.includes("--yolo"), false);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("CLAWCONNECT_HERMES_RUNTIME_MODE", previousRuntimeMode);
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
+    restoreEnv("HERMES_HOME", previousHome);
+    restoreEnv("CLAWCONNECT_HERMES_REASONING_STORE", previousReasoningStore);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runHermesChat recovers via /reasoning retry when resume hits gateway session policy mismatch", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-resume-reasoning-recover-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousPython = process.env.HERMES_PYTHON;
+  const previousRuntimeMode = process.env.CLAWCONNECT_HERMES_RUNTIME_MODE;
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  const previousHome = process.env.HERMES_HOME;
+  const previousReasoningStore = process.env.CLAWCONNECT_HERMES_REASONING_STORE;
+  const chatCallsPath = join(root, "chat-calls.json");
+  const slashCallsPath = join(root, "slash-calls.json");
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = join(root, "hermes");
+    const pythonPath = join(root, "fake-python");
+    const hermesSessionId = "20261124_180500_reasoning_mismatch";
+    writeFileSync(binPath, [
+      "#!/usr/bin/env node",
+      "const fs = require('fs');",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'sessions' && args[1] === 'list') { process.exit(0); }",
+      "if (args[0] === 'status' || (args[0] === 'sessions' && args[1] === 'export')) { process.exit(0); }",
+      "if (args[0] === 'chat') {",
+      `  const calls = fs.existsSync(${JSON.stringify(chatCallsPath)}) ? JSON.parse(fs.readFileSync(${JSON.stringify(chatCallsPath)}, 'utf8')) : [];`,
+      "  calls.push(args);",
+      `  fs.writeFileSync(${JSON.stringify(chatCallsPath)}, JSON.stringify(calls));`,
+      "  if (args.includes('--resume') && args.includes('--reasoning')) {",
+      "    console.error(\"Error: Resume retains gateway session policy; creation overrides are unsupported on resume. --reasoning differs from this session's launch: resume without it and use /reasoning after resuming to switch.\");",
+      "    process.exit(2);",
+      "  }",
+      "  console.log('recovered after reasoning switch');",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(binPath, 0o755);
+    writeFileSync(pythonPath, [
+      "#!/usr/bin/env node",
+      "const fs = require('fs');",
+      `fs.writeFileSync(${JSON.stringify(slashCallsPath)}, JSON.stringify({ command: process.env.CLAWCONNECT_HERMES_SLASH_COMMAND, resume: process.env.CLAWCONNECT_HERMES_SLASH_RESUME }));`,
+      `console.log(JSON.stringify({ ok: true, output: 'Reasoning set', sessionId: ${JSON.stringify(hermesSessionId)}, keepGoing: true, pendingInputs: [] }));`,
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(pythonPath, 0o755);
+
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    process.env.HERMES_PYTHON = pythonPath;
+    process.env.CLAWCONNECT_HERMES_RUNTIME_MODE = "local";
+    process.env.CLAWCONNECT_HERMES_STATE_DB = join(root, "missing-state.db");
+    process.env.HERMES_HOME = join(root, "hermes-home");
+    process.env.CLAWCONNECT_HERMES_REASONING_STORE = join(root, "reasoning-efforts.json");
+    await rememberHermesSession("main", {
+      sessionKey: "main",
+      hermesSessionId,
+      kind: "hermes",
+    });
+    const setResult = await handleHermesCommand(
+      "hermes.thinking.set",
+      { sessionKey: "main", level: "high" },
+      { gatewayId: "gw-hermes" },
+    );
+    assert.equal(setResult?.ok, true);
+
+    const result = await runHermesChat(
+      { sessionKey: "main", message: "hello after thinking change" },
+      { requestId: "run-resume-reasoning", gatewayId: "gw-hermes", publishEvent: () => undefined },
+    );
+    assert.equal(result.output, "recovered after reasoning switch");
+    assert.deepEqual(JSON.parse(readFileSync(slashCallsPath, "utf8")), {
+      command: "/reasoning high",
+      resume: hermesSessionId,
+    });
+    const chatCalls = JSON.parse(readFileSync(chatCallsPath, "utf8")) as string[][];
+    assert.equal(chatCalls.length, 2);
+    assert.equal(chatCalls[0]?.includes("--reasoning"), true);
+    assert.equal(chatCalls[1]?.includes("--resume"), true);
+    assert.equal(chatCalls[1]?.includes("--reasoning"), false);
+    assert.equal(chatCalls[1]?.includes("--skills"), false);
+    assert.equal(chatCalls[1]?.includes("--source"), false);
+    assert.equal(chatCalls[1]?.includes("--yolo"), false);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("HERMES_PYTHON", previousPython);
+    restoreEnv("CLAWCONNECT_HERMES_RUNTIME_MODE", previousRuntimeMode);
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
+    restoreEnv("HERMES_HOME", previousHome);
+    restoreEnv("CLAWCONNECT_HERMES_REASONING_STORE", previousReasoningStore);
     rmSync(root, { recursive: true, force: true });
   }
 });

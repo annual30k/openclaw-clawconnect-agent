@@ -7,6 +7,8 @@ import test from "node:test";
 import { restoreEnv, writeHermesStateDb } from "../hermes-runtime-test-support.js";
 import {
   captureHermesSessionActiveHead,
+  exportHermesSessionFromStateDb,
+  listHermesSessionsFromStateDb,
   queryHermesHistoryPageFromStateDb,
   rewindHermesSessionAfterActiveHead,
 } from "./hermes-runtime-state-db.js";
@@ -90,6 +92,49 @@ conn.close()
     };
     assert.equal(result.rows.every((row) => row[1] === 1), true);
     assert.equal(result.rewindCount, 0);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Hermes state.db excludes session_meta rows across history_page, export, and list", async () => {
+  const root = mkdtempSync(join(tmpdir(), "clawconnect-hermes-session-meta-"));
+  const previousStateDb = process.env.CLAWCONNECT_HERMES_STATE_DB;
+  try {
+    const dbPath = writeHermesStateDb(root);
+    const sessionId = "session_with_meta";
+    process.env.CLAWCONNECT_HERMES_STATE_DB = dbPath;
+    execFileSync("python3", ["-c", String.raw`
+import sqlite3
+import sys
+db_path, session_id = sys.argv[1:3]
+conn = sqlite3.connect(db_path)
+conn.execute("INSERT INTO sessions (id, source, started_at, title, message_count) VALUES (?, 'cli', 1, 'Meta test', 3)", (session_id,))
+conn.execute("INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?, 'user', 'real user turn', 1, 1)", (session_id,))
+conn.execute("INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?, 'assistant', 'real assistant reply', 2, 1)", (session_id,))
+conn.execute("INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?, 'session_meta', '{\"internal\":true}', 3, 1)", (session_id,))
+conn.commit()
+conn.close()
+`, dbPath, sessionId], { stdio: "pipe" });
+
+    const page = await queryHermesHistoryPageFromStateDb({ sessionId, limit: 50, direction: "older" });
+    assert.ok(page);
+    assert.deepEqual(page.messages.map((message) => [message.role, message.content]), [
+      ["user", "real user turn"],
+      ["assistant", "real assistant reply"],
+    ]);
+
+    const exported = await exportHermesSessionFromStateDb(sessionId);
+    const exportedMessages = (exported?.messages ?? []) as Array<Record<string, unknown>>;
+    assert.deepEqual(exportedMessages.map((message) => [message.role, message.content]), [
+      ["user", "real user turn"],
+      ["assistant", "real assistant reply"],
+    ]);
+
+    const listed = await listHermesSessionsFromStateDb();
+    const row = listed?.find((item) => item.hermesSessionId === sessionId);
+    assert.equal(row?.label, "real assistant reply");
   } finally {
     restoreEnv("CLAWCONNECT_HERMES_STATE_DB", previousStateDb);
     rmSync(root, { recursive: true, force: true });

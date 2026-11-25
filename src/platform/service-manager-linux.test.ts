@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  buildLinuxNohupStartScript,
   buildLinuxSystemdUnit,
   findLinuxProfileAgentPids,
   formatSystemdExecArg,
@@ -12,6 +13,8 @@ import {
   getLinuxServiceStatus,
   installLinuxService,
   isMatchingLinuxAgentRunArgv,
+  parseSystemdMajorVersion,
+  resolveLinuxSystemdEnv,
   restartLinuxService,
   stopLinuxService,
   type LinuxServicePaths,
@@ -350,4 +353,62 @@ test("restartLinuxService heals a legacy single-quoted systemd unit file", () =>
     assert.match(healed, new RegExp(`^WorkingDirectory=${paths.workingDirectory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"));
     assert.ok(commands.includes("systemctl --user start clawconnect-agent-hermes.service"));
   });
+});
+
+test("parseSystemdMajorVersion supports CentOS 7, Ubuntu, and Debian output", () => {
+  assert.equal(parseSystemdMajorVersion("systemd 219 (219)\n+PAM"), 219);
+  assert.equal(parseSystemdMajorVersion("systemd 237\n+PAM"), 237);
+  assert.equal(parseSystemdMajorVersion("systemd 252 (252.22-1~deb12u1)"), 252);
+  assert.equal(parseSystemdMajorVersion("systemd 255 (255.4-1ubuntu8)"), 255);
+  assert.equal(parseSystemdMajorVersion("unknown output"), undefined);
+});
+
+test("buildLinuxSystemdUnit adapts logging for systemd < 240 (CentOS 7 / Ubuntu 18.04) vs >= 240", () => {
+  const legacyUnit = buildLinuxSystemdUnit({
+    profile: "hermes",
+    programArgs: ["/usr/bin/node", "/opt/clawconnect/dist/index.js", "run", "--profile", "hermes"],
+    workingDirectory: "/home/ops/.clawconnect/profiles/hermes",
+    stdoutLogPath: "/home/ops/.clawconnect/profiles/hermes/clawconnect.log",
+    stderrLogPath: "/home/ops/.clawconnect/profiles/hermes/clawconnect-error.log",
+    systemdVersion: 219,
+  });
+
+  assert.doesNotMatch(legacyUnit, /StandardOutput=append:/);
+  assert.doesNotMatch(legacyUnit, /StandardError=append:/);
+  assert.match(legacyUnit, /^ExecStart=\/bin\/sh -c "exec \\"\$\$@\\" >> /m);
+  assert.match(legacyUnit, /--profile hermes/);
+
+  const modernUnit = buildLinuxSystemdUnit({
+    profile: "hermes",
+    programArgs: ["/usr/bin/node", "/opt/clawconnect/dist/index.js", "run", "--profile", "hermes"],
+    workingDirectory: "/home/ops/.clawconnect/profiles/hermes",
+    stdoutLogPath: "/home/ops/.clawconnect/profiles/hermes/clawconnect.log",
+    stderrLogPath: "/home/ops/.clawconnect/profiles/hermes/clawconnect-error.log",
+    systemdVersion: 252,
+  });
+
+  assert.match(modernUnit, /^StandardOutput=append:\/home\/ops\/\.clawconnect\/profiles\/hermes\/clawconnect\.log$/m);
+  assert.match(modernUnit, /^StandardError=append:\/home\/ops\/\.clawconnect\/profiles\/hermes\/clawconnect-error\.log$/m);
+});
+
+test("buildLinuxNohupStartScript uses POSIX /bin/sh so minimal Linux containers without bash work", () => {
+  withTempSandbox((_sandboxDir, paths) => {
+    const script = buildLinuxNohupStartScript(paths, ["/usr/bin/node", "/opt/index.js", "run", "--profile", "hermes"]);
+    assert.match(script, /^#!\/bin\/sh\nset -eu\n/);
+    assert.doesNotMatch(script, /bash|pipefail/);
+  });
+});
+
+test("resolveLinuxSystemdEnv populates missing XDG_RUNTIME_DIR and DBUS bus for SSH/su sessions", () => {
+  const populated = resolveLinuxSystemdEnv({}, 1000, (path) => path === "/run/user/1000" || path === "/run/user/1000/bus");
+  assert.equal(populated.XDG_RUNTIME_DIR, "/run/user/1000");
+  assert.equal(populated.DBUS_SESSION_BUS_ADDRESS, "unix:path=/run/user/1000/bus");
+
+  const preserved = resolveLinuxSystemdEnv(
+    { XDG_RUNTIME_DIR: "/custom/runtime", DBUS_SESSION_BUS_ADDRESS: "unix:path=/custom/bus" },
+    1000,
+    () => false,
+  );
+  assert.equal(preserved.XDG_RUNTIME_DIR, "/custom/runtime");
+  assert.equal(preserved.DBUS_SESSION_BUS_ADDRESS, "unix:path=/custom/bus");
 });

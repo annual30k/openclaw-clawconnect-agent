@@ -17,6 +17,7 @@ import {
   queryWindowsServiceState,
   resolveWindowsCscPath,
   restartWindowsService,
+  stopWindowsService,
   uninstallWindowsService,
   windowsServiceAccount,
   windowsServiceName,
@@ -232,6 +233,30 @@ test("Windows install refuses to run without elevation and changes nothing", () 
   assert.deepEqual(deps.events, []);
   assert.match(messages.join("\n"), /requires an elevated terminal/);
   assert.match(messages.join("\n"), /clawconnect install --profile unit-test-profile/);
+});
+
+test("Windows restart/stop/uninstall elevation hints name the matching command", () => {
+  const denied = recordingExec((call) => {
+    if (call.command === "fltmc") throw new Error("access denied");
+    if (isStateQuery(call)) return Buffer.from("Running");
+    return undefined;
+  });
+  const deps = baseDeps({ execFileSyncImpl: denied.impl });
+  const originalError = console.error;
+  const messages: string[] = [];
+  console.error = (message: unknown) => { messages.push(String(message)); };
+  try {
+    assert.equal(restartWindowsService(TEST_PROFILE, deps), false);
+    assert.equal(stopWindowsService(TEST_PROFILE, deps), false);
+    assert.equal(uninstallWindowsService(TEST_PROFILE, deps), false);
+  } finally {
+    console.error = originalError;
+  }
+
+  const combined = messages.join("\n");
+  assert.match(combined, /clawconnect restart --profile unit-test-profile/);
+  assert.match(combined, /clawconnect stop --profile unit-test-profile/);
+  assert.match(combined, /clawconnect uninstall --profile unit-test-profile/);
 });
 
 /** 模拟 SCM：missing → 创建后 stopped → start 后 running。 */

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1175,10 +1176,88 @@ test("model options select one provider-qualified duplicate model", () => {
 test("Hermes model assignment uses the official provider-aware config path", () => {
   const script = hermesModelAssignmentScript("openai-api", "gpt-4o-mini");
 
+  assert.match(script, /hermes_cli\.web_server_config/);
+  assert.match(script, /hermes_cli\.web_server/);
   assert.match(script, /_apply_model_assignment_sync/);
-  assert.match(script, /resolve_provider_full/);
+  assert.match(script, /persist_model_selection/);
+  assert.match(script, /switch_model/);
   assert.match(script, /provider = "openai-api"/);
-  assert.match(script, /provider, "gpt-4o-mini", "", base_url/);
+  assert.match(script, /model_id = "gpt-4o-mini"/);
+  assert.match(script, /apply_sync\("main", provider, model_id, "", base_url\)/);
+
+  // Real Python execution: new web_server_config module layout AND headless fastapi-free fallback.
+  const root = mkdtempSync(join(tmpdir(), "hermes-model-assign-"));
+  try {
+    const pkgDir = join(root, "hermes_cli");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "__init__.py"), "", "utf8");
+    writeFileSync(join(pkgDir, "inventory.py"), [
+      "class _Ctx:",
+      "    user_providers = {'openai-api': {'base_url': 'https://api.openai.com/v1'}}",
+      "    custom_providers = []",
+      "def load_picker_context():",
+      "    return _Ctx()",
+      "",
+    ].join("\n"), "utf8");
+    writeFileSync(join(pkgDir, "providers.py"), [
+      "class _Prov:",
+      "    base_url = 'https://api.openai.com/v1'",
+      "def resolve_provider_full(name, user_providers=None, custom_providers=None):",
+      "    return _Prov()",
+      "",
+    ].join("\n"), "utf8");
+    writeFileSync(join(pkgDir, "web_server.py"), "# empty in newer Hermes\n", "utf8");
+    const callsPath = join(root, "calls.json");
+    writeFileSync(join(pkgDir, "web_server_config.py"), [
+      "import json",
+      "def _apply_model_assignment_sync(scope, provider, model_id, task, base_url):",
+      `    with open(${JSON.stringify(callsPath)}, 'w', encoding='utf-8') as f:`,
+      "        json.dump({'mode': 'web_server_config', 'args': [scope, provider, model_id, task, base_url]}, f)",
+      "",
+    ].join("\n"), "utf8");
+
+    execFileSync("python3", ["-c", script], {
+      env: { ...process.env, PYTHONPATH: root },
+      stdio: "pipe",
+    });
+    assert.deepEqual(JSON.parse(readFileSync(callsPath, "utf8")), {
+      mode: "web_server_config",
+      args: ["main", "openai-api", "gpt-4o-mini", "", "https://api.openai.com/v1"],
+    });
+
+    // Headless Linux without fastapi: web_server_config raises ModuleNotFoundError -> fallback to model_switch.
+    writeFileSync(join(pkgDir, "web_server_config.py"), "import nonexistent_fastapi_pkg\n", "utf8");
+    writeFileSync(join(pkgDir, "config.py"), "def load_config(): return {'model': {'provider': 'stepfun', 'default': 'step-5-preview'}}\n", "utf8");
+    writeFileSync(join(pkgDir, "model_switch.py"), [
+      "import json",
+      "class _Res:",
+      "    success = True",
+      "    error_message = ''",
+      "    def __init__(self, target_provider, new_model, is_global):",
+      "        self.target_provider = target_provider",
+      "        self.new_model = new_model",
+      "        self.is_global = is_global",
+      "def switch_model(**kwargs):",
+      "    assert kwargs['is_global'] is True",
+      "    return _Res(kwargs['explicit_provider'], kwargs['raw_input'], kwargs['is_global'])",
+      "def persist_model_selection(result):",
+      `    with open(${JSON.stringify(callsPath)}, 'w', encoding='utf-8') as f:`,
+      "        json.dump({'mode': 'model_switch', 'provider': result.target_provider, 'model': result.new_model}, f)",
+      "",
+    ].join("\n"), "utf8");
+
+    execFileSync("python3", ["-c", script], {
+      env: { ...process.env, PYTHONPATH: root },
+      stdio: "pipe",
+    });
+    assert.deepEqual(JSON.parse(readFileSync(callsPath, "utf8")), {
+      mode: "model_switch",
+      provider: "openai-api",
+      model: "gpt-4o-mini",
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Hermes model list does not synthesize fallback models when Hermes returns none", () => {

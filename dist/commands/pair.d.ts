@@ -5,7 +5,15 @@ interface PairOptions {
     codeOnly?: boolean;
     gatewayType?: string;
     profile?: string;
+    local?: boolean;
+    force?: boolean;
 }
+export declare function resolvePairProfile(opts: {
+    profile?: string;
+    gatewayType?: string;
+    local?: boolean;
+}): string | undefined;
+export declare function buildDefaultDisplayName(gatewayType: "openclaw" | "hermes", rawHostName?: string, isLocal?: boolean): string;
 export declare function pairCommand(opts: PairOptions): Promise<void>;
 /** 配对请求的时间上限：代理/NAT 卡住连接时必须给出明确失败，而不是让命令无限挂起。 */
 export declare const PAIR_REQUEST_TIMEOUT_MS = 20000;
@@ -21,5 +29,5 @@ export type ProfileConfigEntry = {
  */
 export declare function findConflictingRegistration(currentProfile: string | undefined, gatewayType: "openclaw" | "hermes", relayServerUrl: string, candidates: ProfileConfigEntry[]): ProfileConfigEntry | undefined;
 export declare function sameRelayServer(left: string, right: string): boolean;
-export declare function shouldReuseExistingPairing(config: ClawConnectConfig | null, gatewayType: "openclaw" | "hermes", requestedRelayServerUrl: string): boolean;
+export declare function shouldReuseExistingPairing(config: ClawConnectConfig | null, gatewayType: "openclaw" | "hermes", requestedRelayServerUrl: string, force?: boolean): boolean;
 export { normalizeRelayServerIdentity } from "../core/relay/file-upload-utils.js";

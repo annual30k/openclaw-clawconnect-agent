@@ -37,6 +37,7 @@ async function runHermesChatOnce(params: {
   reasoningEffort?: string;
   historyCompletion?: () => Promise<string | undefined>;
 }): Promise<string> {
+  const resumedSessionId = params.resume?.trim() || undefined;
   const args = [
     "chat",
     // Hermes 会按 display.interface 自动切到 TUI；移动端桥接必须强制经典 CLI，
@@ -45,14 +46,19 @@ async function runHermesChatOnce(params: {
     "--query",
     params.message,
     "--quiet",
-    "--source",
-    "pocketclaw",
-    ...(params.preloadedSkillArgs ?? []),
-    ...buildHermesCliReasoningArgs(params.reasoningEffort),
-    "--yolo",
   ];
-  if (params.resume) {
-    args.push("--resume", params.resume);
+  if (resumedSessionId) {
+    // Hermes >= 0.22.4 冻结会话创建策略：--resume 时传 --source/--skills/--yolo 等创建参数会被网关拒绝。
+    // 思考等级覆盖只在用户显式设置时附带；若与建表时不一致，上层会捕获策略拒绝并走 /reasoning 切换后无参重连。
+    args.push(...buildHermesCliReasoningArgs(params.reasoningEffort), "--resume", resumedSessionId);
+  } else {
+    args.push(
+      "--source",
+      "cli",
+      ...(params.preloadedSkillArgs ?? []),
+      ...buildHermesCliReasoningArgs(params.reasoningEffort),
+      "--yolo",
+    );
   }
   const runId = params.context.requestId ?? `hermes-${Date.now()}`;
   const env = hermesChatSubprocessEnv(runId, params.sessionKey);
@@ -401,6 +407,7 @@ async function runHermesChatStreaming(
 function hermesChatSubprocessEnv(runId: string, sessionKey: string): NodeJS.ProcessEnv {
   return {
     ...SUBPROCESS_ENV,
+    HERMES_YOLO_MODE: "1",
     CLAWCONNECT_SOURCE_RUN_ID: runId,
     CLAWCONNECT_SESSION_KEY: sessionKey,
     CLAWCONNECT_CHAT_SESSION_KEY: sessionKey,

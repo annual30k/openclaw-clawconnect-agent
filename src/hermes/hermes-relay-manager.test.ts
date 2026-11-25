@@ -13,6 +13,7 @@ import {
   buildHermesRelayHelloMessage,
   collectHermesSlashCommandCatalog,
   extractFileBlock,
+  isHermesGatewayRestartMethod,
   rememberActiveHermesChatRun,
   resolveHermesChatPreferredRunId,
   resolveHermesAbortRun,
@@ -182,6 +183,14 @@ test("Hermes relay manager forwards a cron event after Relay hello when the cron
     clearHermesCronChangeRelayStateForTests();
     rmSync(hermesHome, { recursive: true, force: true });
   }
+});
+
+test("Hermes gateway restart methods are reported as a temporary gateway disconnect", () => {
+  assert.equal(isHermesGatewayRestartMethod("hermes.gateway.restart"), true);
+  assert.equal(isHermesGatewayRestartMethod("hermes.agent.restart"), true);
+  assert.equal(isHermesGatewayRestartMethod("hermes.gateway.start"), false);
+  assert.equal(isHermesGatewayRestartMethod("chat.send"), false);
+  assert.equal(isHermesGatewayRestartMethod(undefined), false);
 });
 
 const imageUpload = {

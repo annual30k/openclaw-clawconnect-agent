@@ -267,6 +267,54 @@ test("runHermesChatHistory projection v3 rejects missing gateway, source ids, or
   }
 });
 
+test("runHermesChatHistory projection v3 accepts real Hermes export numeric ids without seq and skips session_meta/inactive rows", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-v3-export-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  try {
+    const storePath = join(root, "sessions.json");
+    const binPath = join(root, "hermes");
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    const realStyleExport = {
+      session_id: "hermes-v3-real-export",
+      messages: [
+        { id: 9, role: "session_meta", content: "{\"surface\":\"cli\"}", active: 1 },
+        { id: 10, role: "user", content: "hello export", timestamp: 1_780_000_000 },
+        { id: 11, role: "assistant", content: "rewound draft", active: 0, timestamp: 1_780_000_001 },
+        { id: 12, role: "assistant", content: "final export reply", timestamp: 1_780_000_002 },
+      ],
+    };
+    writeFileSync(binPath, [
+      "#!/usr/bin/env node",
+      `console.log(${JSON.stringify(JSON.stringify(realStyleExport))});`,
+      "",
+    ].join("\n"));
+    chmodSync(binPath, 0o755);
+
+    const result = await runHermesChatHistory({
+      sessionKey: "hermes:hermes-v3-real-export",
+      sessionId: "hermes-v3-real-export",
+      projectionVersion: 3,
+      projectionGatewayId: "gw-hermes",
+      limit: 10,
+    });
+
+    assert.equal(result.ok, true);
+    const payload = result.payload as {
+      messages: Array<{ id: string; role: string; seq: number; content: Array<{ text?: string }> }>;
+    };
+    assert.deepEqual(payload.messages.map((message) => [message.id, message.role, message.seq, message.content[0]?.text]), [
+      ["10", "user", 10, "hello export"],
+      ["12", "assistant", 12, "final export reply"],
+    ]);
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runHermesChatHistory does not emit epoch timestamps when export omits message times", async () => {
   const root = mkdtempSync(join(tmpdir(), "hermes-chat-history-untimed-"));
   const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;

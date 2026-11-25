@@ -18,6 +18,35 @@ interface PairOptions {
   codeOnly?: boolean;
   gatewayType?: string;
   profile?: string;
+  local?: boolean;
+  force?: boolean;
+}
+
+export function resolvePairProfile(opts: {
+  profile?: string;
+  gatewayType?: string;
+  local?: boolean;
+}): string | undefined {
+  if (opts.profile !== undefined && opts.profile.trim() !== "") {
+    return normalizeProfileName(opts.profile);
+  }
+  const base = normalizeGatewayType(opts.gatewayType);
+  return opts.local ? `${base}-local` : base;
+}
+
+export function buildDefaultDisplayName(
+  gatewayType: "openclaw" | "hermes",
+  rawHostName: string = getDisplayName(),
+  isLocal = false,
+): string {
+  const base = sanitizeDisplayName(rawHostName).trim() || "Host";
+  const resolved = gatewayType === "hermes"
+    ? (/hermes/i.test(base) ? base : `${base} Hermes`)
+    : (/openclaw/i.test(base) ? base : `${base} OpenClaw`);
+  if (isLocal && !/\blocal\b/i.test(resolved)) {
+    return `${resolved} (Local)`;
+  }
+  return resolved;
 }
 
 export async function pairCommand(opts: PairOptions): Promise<void> {
@@ -35,7 +64,8 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
   const canReuseExistingConfig = shouldReuseExistingPairing(
     existingConfig,
     gatewayType,
-    requestedRelayServerUrl
+    requestedRelayServerUrl,
+    Boolean(opts.force),
   );
 
   let reRegisterNeeded = false;
@@ -92,7 +122,9 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
       console.log(`Previous config backed up to ${backupPath}`);
     }
     relayServerUrl = requestedRelayServerUrl;
-    displayName = opts.name ? sanitizeDisplayName(opts.name) : existingConfig?.displayName ?? getDisplayName();
+    displayName = opts.name
+      ? sanitizeDisplayName(opts.name)
+      : existingConfig?.displayName ?? buildDefaultDisplayName(gatewayType, undefined, Boolean(opts.local));
     console.log(t("pair.registering"));
 
     const httpBase = toRelayHttpBase(relayServerUrl);
@@ -114,7 +146,7 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
     accessCode = data.accessCode;
 
     writeConfig({ relayServerUrl, gatewayId, relaySecret, displayName, gatewayType, capabilities });
-    clearProfileLogs(opts.profile);
+    clearProfileLogs(getActiveProfile());
 
     console.log(t("pair.registered", gatewayId));
   }
@@ -132,15 +164,17 @@ export async function pairCommand(opts: PairOptions): Promise<void> {
   });
 
   if (opts.codeOnly) {
+    console.log(t("pair.installingService"));
+    installCommand();
     console.log(accessCode);
   } else {
+    console.log(t("pair.installingService"));
+    installCommand();
     console.log(t("pair.scanQR"));
     qrcodeTerminal.generate(qrPayload, { small: true });
+    console.log(t("pair.summary", profileDisplayName(getActiveProfile()), gatewayId, httpBase));
     console.log(t("pair.accessCode", accessCode));
   }
-
-  console.log(t("pair.installingService"));
-  installCommand();
 }
 
 /** 配对请求的时间上限：代理/NAT 卡住连接时必须给出明确失败，而不是让命令无限挂起。 */
@@ -223,9 +257,10 @@ export function sameRelayServer(left: string, right: string): boolean {
 export function shouldReuseExistingPairing(
   config: ClawConnectConfig | null,
   gatewayType: "openclaw" | "hermes",
-  requestedRelayServerUrl: string
+  requestedRelayServerUrl: string,
+  force = false,
 ): boolean {
-  if (!config) return false;
+  if (force || !config) return false;
   return (config.gatewayType ?? "openclaw") === gatewayType
     && sameRelayServer(config.relayServerUrl, requestedRelayServerUrl);
 }

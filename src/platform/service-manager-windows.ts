@@ -148,14 +148,19 @@ export function isWindowsElevated(execFileSyncImpl: typeof execFileSync = execFi
   }
 }
 
-function requireElevation(action: string, profile: string | undefined, deps: WindowsServiceDeps): boolean {
+function requireElevation(
+  action: string,
+  profile: string | undefined,
+  deps: WindowsServiceDeps,
+  commandName: "install" | "restart" | "stop" | "uninstall" = "install",
+): boolean {
   if (isWindowsElevated(deps.execFileSyncImpl)) {
     return true;
   }
   const profileArg = profile ? ` --profile ${profile}` : "";
   console.error(
     `[clawconnect] ${action} a Windows service requires an elevated terminal. `
-    + `Open PowerShell with "Run as administrator" and run: clawconnect install${profileArg}`,
+    + `Open PowerShell with "Run as administrator" and run: clawconnect ${commandName}${profileArg}`,
   );
   return false;
 }
@@ -355,7 +360,7 @@ export function restartWindowsService(profile?: string, deps: WindowsServiceDeps
   if (queryWindowsServiceState(serviceName, deps) === "missing") {
     return installWindowsService(resolvedProfile, deps);
   }
-  if (!requireElevation("Restarting", resolvedProfile, deps)) {
+  if (!requireElevation("Restarting", resolvedProfile, deps, "restart")) {
     return false;
   }
   try {
@@ -377,7 +382,7 @@ export function stopWindowsService(profile?: string, deps: WindowsServiceDeps = 
   const state = queryWindowsServiceState(serviceName, deps);
   let changed = false;
   if (state === "running" || state === "pending") {
-    if (!requireElevation("Stopping", resolvedProfile, deps)) {
+    if (!requireElevation("Stopping", resolvedProfile, deps, "stop")) {
       return false;
     }
     changed = stopServiceAndWait(serviceName, deps);
@@ -390,7 +395,7 @@ export function uninstallWindowsService(profile?: string, deps: WindowsServiceDe
   const resolvedProfile = normalizeProfileName(profile ?? getActiveProfile());
   const serviceName = windowsServiceName(resolvedProfile);
   const state = queryWindowsServiceState(serviceName, deps);
-  if (state !== "missing" && !requireElevation("Removing", resolvedProfile, deps)) {
+  if (state !== "missing" && !requireElevation("Removing", resolvedProfile, deps, "uninstall")) {
     return false;
   }
   try {

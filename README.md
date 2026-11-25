@@ -12,109 +12,96 @@ On Windows, installation keeps npm's `clawconnect.cmd` entry and removes only th
 
 ## Usage
 
-### Pair
+### Pair & Auto-Start
 
-Generate a QR code for mobile pairing:
+Recommended quickstart:
 
 ```bash
-clawconnect pair
+clawconnect pair-openclaw
+# or
+clawconnect pair-hermes
 ```
+
+`pair`, `pair-openclaw`, and `pair-hermes` **automatically install and start the background service** (launchd on macOS, `systemd --user` / POSIX `nohup` on Linux, and Windows Service on Windows; on Windows, run from an Administrator PowerShell so service installation succeeds in one step).
 
 Print only the pairing code without rendering a QR code:
 
 ```bash
-clawconnect pair --code-only
+clawconnect pair-openclaw --code-only
 ```
 
 Options:
 - `-n, --name <name>` — Display name for this host
 - `-s, --server <url>` — Relay server URL
-- `-p, --profile <name>` — Local profile name. Use separate profiles when pairing more than one gateway type on the same host
+- `-p, --profile <name>` — Explicit profile name (omitting `--profile` automatically routes to `openclaw` or `hermes`, avoiding accidental `default` config creation)
 - `--gateway-type <type>` — Gateway type: `openclaw` or `hermes`
+- `--local` — Connect to local relay (`http://127.0.0.1:8080`) using isolated `openclaw-local` / `hermes-local` profile without overwriting online configs
+- `-f, --force` — Force registering a new gateway even if already paired
 - `--code-only` — Print only the access code and skip QR code output
 
-### Pair OpenClaw and Hermes Agent on the Same Host
+### Pair OpenClaw and Hermes Agent on the Same Host (Online & Local)
 
-Use separate ClawConnect profiles so OpenClaw and Hermes Agent do not share the same local config, log file, or background service.
+Each gateway type (and `--local`) uses an isolated profile directory so OpenClaw, Hermes Agent, and local relay testing never collide:
 
-Pair OpenClaw:
+Online relay (`https://clawlinks.cn`):
 
 ```bash
 clawconnect pair-openclaw
-```
-
-Pair Hermes Agent:
-
-```bash
 clawconnect pair-hermes
 ```
 
-When using the local development relay at `http://127.0.0.1:8080`, add `--local`:
+Local development relay (`http://127.0.0.1:8080`, uses `openclaw-local` / `hermes-local`):
 
 ```bash
 clawconnect pair-openclaw --local
 clawconnect pair-hermes --local
 ```
 
-The shortcut commands expand to the profile-aware form below.
-
-OpenClaw:
-
-```bash
-clawconnect pair \
-  --profile openclaw \
-  --server http://127.0.0.1:8080 \
-  --gateway-type openclaw \
-  --name "Mac OpenClaw"
-```
-
-Hermes Agent:
-
-```bash
-clawconnect pair \
-  --profile hermes \
-  --server http://127.0.0.1:8080 \
-  --gateway-type hermes \
-  --name "Mac Hermes Agent"
-```
-
 After each command, scan the QR code in the mobile app or enter the printed access code. The pairing payload includes `gatewayType`, and the relay rejects mismatched pairing attempts so an OpenClaw mobile gateway cannot bind to a Hermes Agent host, or the reverse.
 
-Install paired background service(s) once after pairing:
+Re-install or refresh paired background services when needed (e.g., after editing `~/.clawconnect/.env`, or in an elevated Windows PowerShell):
 
 ```bash
 clawconnect install
 ```
 
-Without `--profile`, `clawconnect install` installs every paired profile it finds. To target one profile explicitly, use `clawconnect install-openclaw`, `clawconnect install-hermes`, or `clawconnect install --profile <name>`.
+Without `--profile`, `clawconnect install` installs/refreshes every currently paired profile (and refuses to create an unpaired empty `default` service). Target one profile explicitly with `clawconnect install-openclaw [--local]`, `clawconnect install-hermes [--local]`, or `clawconnect install --profile <name>`.
 
-The same profile rule applies when clearing stale credentials. If `pair-openclaw` or `pair-hermes` reports invalid credentials, reset the matching profile instead of the default config:
+Resetting stale or unwanted pairings (automatically removes background service, `config.json`, backups, logs, and outbox while preserving `.env`):
 
 ```bash
 clawconnect reset-openclaw
+clawconnect reset-openclaw --local
 clawconnect reset-hermes
+clawconnect reset-hermes --local
+clawconnect reset-all
 ```
 
-Check both instances:
+Check all paired profiles (or filter with `--profile <name>`):
 
 ```bash
-clawconnect status-all
+clawconnect status
 ```
 
-Restart or stop a single instance:
+Restart, stop, or remove background service for a specific profile:
 
 ```bash
-clawconnect restart-openclaw
-clawconnect restart-hermes
-clawconnect stop-openclaw
-clawconnect stop-hermes
+clawconnect restart-openclaw [--local]
+clawconnect restart-hermes [--local]
+clawconnect stop-openclaw [--local]
+clawconnect stop-hermes [--local]
+clawconnect uninstall-openclaw [--local]
+clawconnect uninstall-hermes [--local]
+clawconnect uninstall-all
 ```
 
 Profile config files:
 
 ```text
 ~/.clawconnect/profiles/openclaw/config.json
+~/.clawconnect/profiles/openclaw-local/config.json
 ~/.clawconnect/profiles/hermes/config.json
+~/.clawconnect/profiles/hermes-local/config.json
 ```
 
 Reliable terminal events and command responses are written to a restricted,
@@ -234,7 +221,7 @@ clawconnect stop
 Store the OpenClaw Gateway token locally when token auth is enabled:
 
 ```bash
-clawconnect set-token
+clawconnect set-token --profile openclaw
 ```
 
 ### Remove Service
@@ -242,22 +229,20 @@ clawconnect set-token
 Remove the background service (keeps config):
 
 ```bash
-clawconnect uninstall
+clawconnect uninstall-openclaw [--local]
+clawconnect uninstall-hermes [--local]
+clawconnect uninstall-all
+clawconnect uninstall --profile <name>
 ```
 
 ### Reset Pairing
 
-Stop the service and clear local pairing config:
+Stop and remove the background service, then clear local pairing config, backups, logs, and outbox:
 
 ```bash
-clawconnect reset
-```
-
-Shortcut pair commands use isolated profiles. Use the matching reset command when repairing those pairings:
-
-```bash
-clawconnect reset-openclaw
-clawconnect reset-hermes
+clawconnect reset-openclaw [--local]
+clawconnect reset-hermes [--local]
+clawconnect reset-all
 ```
 
 For custom profiles, use `clawconnect reset --profile <name>`.

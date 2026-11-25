@@ -11,6 +11,23 @@ import { getDefaultRelayServerUrl } from "../config/env.js";
 import { gatewayCapabilitiesForType, normalizeGatewayType } from "../gateway-profiles.js";
 import { clearProfileLogs, getActiveProfile, listProfileNames, normalizeProfileName, profileDisplayName } from "../config/profile.js";
 import { pairCommandForProfile, resetCommandForProfile } from "./profile-hints.js";
+export function resolvePairProfile(opts) {
+    if (opts.profile !== undefined && opts.profile.trim() !== "") {
+        return normalizeProfileName(opts.profile);
+    }
+    const base = normalizeGatewayType(opts.gatewayType);
+    return opts.local ? `${base}-local` : base;
+}
+export function buildDefaultDisplayName(gatewayType, rawHostName = getDisplayName(), isLocal = false) {
+    const base = sanitizeDisplayName(rawHostName).trim() || "Host";
+    const resolved = gatewayType === "hermes"
+        ? (/hermes/i.test(base) ? base : `${base} Hermes`)
+        : (/openclaw/i.test(base) ? base : `${base} OpenClaw`);
+    if (isLocal && !/\blocal\b/i.test(resolved)) {
+        return `${resolved} (Local)`;
+    }
+    return resolved;
+}
 export async function pairCommand(opts) {
     let gatewayId = "";
     let relaySecret = "";
@@ -22,7 +39,7 @@ export async function pairCommand(opts) {
     const existingConfig = configExists() ? readConfig() : null;
     const existingGatewayType = existingConfig?.gatewayType ?? "openclaw";
     const requestedRelayServerUrl = opts.server ?? getDefaultRelayServerUrl();
-    const canReuseExistingConfig = shouldReuseExistingPairing(existingConfig, gatewayType, requestedRelayServerUrl);
+    const canReuseExistingConfig = shouldReuseExistingPairing(existingConfig, gatewayType, requestedRelayServerUrl, Boolean(opts.force));
     let reRegisterNeeded = false;
     if (existingConfig && canReuseExistingConfig) {
         const config = existingConfig;
@@ -64,7 +81,9 @@ export async function pairCommand(opts) {
             console.log(`Previous config backed up to ${backupPath}`);
         }
         relayServerUrl = requestedRelayServerUrl;
-        displayName = opts.name ? sanitizeDisplayName(opts.name) : existingConfig?.displayName ?? getDisplayName();
+        displayName = opts.name
+            ? sanitizeDisplayName(opts.name)
+            : existingConfig?.displayName ?? buildDefaultDisplayName(gatewayType, undefined, Boolean(opts.local));
         console.log(t("pair.registering"));
         const httpBase = toRelayHttpBase(relayServerUrl);
         const res = await postRelayJson(httpBase, "/api/relay/register", { displayName, gatewayType, capabilities });
@@ -77,7 +96,7 @@ export async function pairCommand(opts) {
         relaySecret = data.relaySecret;
         accessCode = data.accessCode;
         writeConfig({ relayServerUrl, gatewayId, relaySecret, displayName, gatewayType, capabilities });
-        clearProfileLogs(opts.profile);
+        clearProfileLogs(getActiveProfile());
         console.log(t("pair.registered", gatewayId));
     }
     const httpBase = toRelayHttpBase(relayServerUrl);
@@ -92,15 +111,18 @@ export async function pairCommand(opts) {
         capabilities,
     });
     if (opts.codeOnly) {
+        console.log(t("pair.installingService"));
+        installCommand();
         console.log(accessCode);
     }
     else {
+        console.log(t("pair.installingService"));
+        installCommand();
         console.log(t("pair.scanQR"));
         qrcodeTerminal.generate(qrPayload, { small: true });
+        console.log(t("pair.summary", profileDisplayName(getActiveProfile()), gatewayId, httpBase));
         console.log(t("pair.accessCode", accessCode));
     }
-    console.log(t("pair.installingService"));
-    installCommand();
 }
 /** 配对请求的时间上限：代理/NAT 卡住连接时必须给出明确失败，而不是让命令无限挂起。 */
 export const PAIR_REQUEST_TIMEOUT_MS = 20_000;
@@ -163,8 +185,8 @@ function loadOtherProfileConfigs() {
 export function sameRelayServer(left, right) {
     return normalizeRelayServerIdentity(left) === normalizeRelayServerIdentity(right);
 }
-export function shouldReuseExistingPairing(config, gatewayType, requestedRelayServerUrl) {
-    if (!config)
+export function shouldReuseExistingPairing(config, gatewayType, requestedRelayServerUrl, force = false) {
+    if (force || !config)
         return false;
     return (config.gatewayType ?? "openclaw") === gatewayType
         && sameRelayServer(config.relayServerUrl, requestedRelayServerUrl);
