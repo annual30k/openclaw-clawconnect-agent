@@ -4,30 +4,39 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  COMMAND_NAMES,
   isClawConnectPowerShellShim,
   removeWindowsPowerShellShim,
+  resolveAllWindowsShimPaths,
   resolveWindowsShimPaths,
 } from "../../scripts/fix-windows-powershell-shim.mjs";
 
-test("Windows global install removes only the blocked ClawConnect PowerShell shim", () => {
+test("Windows global install removes only the blocked ClawConnect and clawc PowerShell shims", () => {
   const prefix = mkdtempSync(join(tmpdir(), "clawconnect-global-prefix-"));
   const packageRoot = join(prefix, "node_modules", "clawconnect-agent");
-  const paths = resolveWindowsShimPaths(packageRoot);
-  assert.ok(paths);
+  const allPaths = resolveAllWindowsShimPaths(packageRoot);
+  assert.ok(allPaths);
+  assert.deepEqual(COMMAND_NAMES, ["clawconnect", "clawc"]);
+  assert.equal(allPaths.length, 2);
 
-  writeFileSync(paths.cmdPath, "@echo off\r\nnode node_modules\\clawconnect-agent\\dist\\index.js %*\r\n");
-  writeFileSync(
-    paths.ps1Path,
-    "& $basedir/node.exe $basedir/node_modules/clawconnect-agent/dist/index.js $args\r\n",
-  );
+  for (const paths of allPaths) {
+    writeFileSync(paths.cmdPath, "@echo off\r\nnode node_modules\\clawconnect-agent\\dist\\index.js %*\r\n");
+    writeFileSync(
+      paths.ps1Path,
+      "& $basedir/node.exe $basedir/node_modules/clawconnect-agent/dist/index.js $args\r\n",
+    );
+  }
 
   assert.equal(removeWindowsPowerShellShim({
     platform: "win32",
     env: { npm_config_global: "true" },
     packageRoot,
   }), true);
-  assert.equal(readFileSync(paths.cmdPath, "utf8").startsWith("@echo off"), true);
-  assert.throws(() => readFileSync(paths.ps1Path, "utf8"), { code: "ENOENT" });
+  for (const paths of allPaths) {
+    assert.equal(readFileSync(paths.cmdPath, "utf8").startsWith("@echo off"), true);
+    assert.throws(() => readFileSync(paths.ps1Path, "utf8"), { code: "ENOENT" });
+  }
+  assert.deepEqual(resolveWindowsShimPaths(packageRoot), allPaths[0]);
 
   rmSync(prefix, { recursive: true, force: true });
 });

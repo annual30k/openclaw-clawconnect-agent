@@ -8,13 +8,18 @@
 npm install -g clawconnect-agent
 ```
 
-安装完成后可使用命令：
+安装完成后可使用命令（同时提供短别名 **`clawc`**，与 `clawconnect` 完全等价）：
 
 ```bash
 clawconnect --help
+# 或使用短别名与目标简写（oc=openclaw, hm=hermes, all=全部；st=status, up=update, rs=restart）
+clawc st
+clawc pair oc
+clawc rs hm
+clawc up
 ```
 
-Windows 会自动保留 npm 的 `clawconnect.cmd` 入口，并移除同目录下会被严格 PowerShell 执行策略优先拦截的 npm `.ps1` 包装器，因此不需要降低系统执行策略。若安装时使用了 `--ignore-scripts`，可在 PowerShell 中改用 `clawconnect.cmd`。
+Windows 会自动保留 npm 的 `clawconnect.cmd` / `clawc.cmd` 入口，并移除同目录下会被严格 PowerShell 执行策略优先拦截的 npm `.ps1` 包装器，因此不需要降低系统执行策略。若安装时使用了 `--ignore-scripts`，可在 PowerShell 中改用 `clawconnect.cmd` 或 `clawc.cmd`。
 
 ## 使用方式
 

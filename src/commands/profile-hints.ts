@@ -93,4 +93,12 @@ export const MAIN_HELP_TEXT = [
   "  update                Update the globally installed clawconnect-agent package",
   "  help                  Show detailed help for a command",
   "",
+  "Short alias & target shortcuts (clawc is a drop-in alias for clawconnect):",
+  "  clawc st [oc|hm|all]       Short for status (e.g. clawc st, clawc st oc --local)",
+  "  clawc up                   Short for update",
+  "  clawc pair <oc|hm>         Pair OpenClaw (oc) or Hermes (hm) (supports --local)",
+  "  clawc rs [oc|hm|all]       Restart service (omitting target auto-selects when only 1 profile is paired)",
+  "  clawc stop [oc|hm|all]     Stop service (omitting target auto-selects when only 1 profile is paired)",
+  "  clawc reset <oc|hm|all>    Reset one profile or all profiles (supports --local)",
+  "",
 ].join("\n");

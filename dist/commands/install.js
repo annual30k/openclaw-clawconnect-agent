@@ -221,6 +221,71 @@ export function uninstallAllCommand() {
         setActiveProfile(previousProfile);
     }
 }
+export function listManageableServiceProfiles() {
+    const names = new Set();
+    for (const name of listProfileNames()) {
+        names.add(name);
+    }
+    for (const name of listResettableProfiles()) {
+        if (getServiceStatus(name === "default" ? undefined : name).installed) {
+            names.add(name);
+        }
+    }
+    return [...names].sort((left, right) => {
+        if (left === "default")
+            return -1;
+        if (right === "default")
+            return 1;
+        return left.localeCompare(right);
+    });
+}
+export function restartAllCommand() {
+    if (isActiveMobileChatProcess()) {
+        console.error("[clawconnect] Refusing to restart the host service from the active mobile chat process. "
+            + "The ASR configuration reloads automatically; run a service restart only from an independent host terminal.");
+        process.exitCode = 1;
+        return;
+    }
+    const installedProfiles = listResettableProfiles().filter((profile) => getServiceStatus(profile === "default" ? undefined : profile).installed);
+    const profiles = installedProfiles.length > 0 ? installedProfiles : listProfileNames();
+    if (profiles.length === 0) {
+        console.log(t("install.noService"));
+        return;
+    }
+    const previousProfile = getActiveProfile();
+    try {
+        profiles.forEach((profile, index) => {
+            if (index > 0)
+                console.log("");
+            console.log(`── Restarting profile service: ${profile} ──`);
+            setActiveProfile(profile === "default" ? undefined : profile);
+            restartCommand();
+        });
+    }
+    finally {
+        setActiveProfile(previousProfile);
+    }
+}
+export function stopAllCommand() {
+    const profiles = listResettableProfiles().filter((profile) => getServiceStatus(profile === "default" ? undefined : profile).installed);
+    if (profiles.length === 0) {
+        console.log(t("install.noService"));
+        return;
+    }
+    const previousProfile = getActiveProfile();
+    try {
+        profiles.forEach((profile, index) => {
+            if (index > 0)
+                console.log("");
+            console.log(`── Stopping profile service: ${profile} ──`);
+            setActiveProfile(profile === "default" ? undefined : profile);
+            stopCommand();
+        });
+    }
+    finally {
+        setActiveProfile(previousProfile);
+    }
+}
 function servicePathsProfile() {
     const profile = getServicePaths().profile;
     return profile === "default" ? undefined : profile;

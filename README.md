@@ -8,7 +8,7 @@
 npm install -g clawconnect-agent
 ```
 
-On Windows, installation keeps npm's `clawconnect.cmd` entry and removes only the generated `.ps1` shim that strict PowerShell execution policies can block before the CLI starts. No execution-policy change is required. If npm was run with `--ignore-scripts`, use `clawconnect.cmd` from PowerShell.
+Both `clawconnect` and its short alias **`clawc`** are installed globally (`st` = `status`, `up` = `update`, `rs` = `restart`; positional target shortcuts `oc` = `openclaw`, `hm` = `hermes`, `all` = all profiles). On Windows, installation keeps npm's `clawconnect.cmd` / `clawc.cmd` entries and removes only the generated `.ps1` shims that strict PowerShell execution policies can block before the CLI starts. No execution-policy change is required. If npm was run with `--ignore-scripts`, use `clawconnect.cmd` or `clawc.cmd` from PowerShell.
 
 ## Usage
 

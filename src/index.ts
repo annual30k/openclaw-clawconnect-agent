@@ -10,11 +10,20 @@ import {
   uninstallCommand,
   uninstallAllCommand,
   stopCommand,
+  stopAllCommand,
   restartCommand,
+  restartAllCommand,
   resetCommand,
   resetAllCommand,
+  listManageableServiceProfiles,
   listResettableProfiles,
 } from "./commands/install.js";
+import {
+  formatShortTargetHint,
+  parsePairGatewayTarget,
+  resolveImplicitSingleProfileTarget,
+  resolveProfileCommandTarget,
+} from "./commands/cli-target.js";
 import { statusCommand } from "./commands/status.js";
 import { setTokenCommand } from "./commands/set-token.js";
 import { updateCommand } from "./commands/update.js";
@@ -82,28 +91,89 @@ function runInstallCommand(opts: { profile?: string }): void {
   }
 }
 
+function runProfileError(err: unknown): never {
+  console.error("Error:", err instanceof Error ? err.message : err);
+  process.exit(1);
+}
+
+function defaultProfileHasRuntimeState(): boolean {
+  return configExists(undefined) || getServiceStatus(undefined).installed;
+}
+
+function runServiceLifecycleCommand(
+  verb: "restart" | "stop",
+  target: string | undefined,
+  opts: { profile?: string; local?: boolean; all?: boolean },
+): void {
+  let resolved;
+  try {
+    resolved = resolveProfileCommandTarget({
+      target,
+      profile: opts.profile,
+      local: opts.local,
+      all: opts.all,
+      allowAll: true,
+    });
+  } catch (err) {
+    runProfileError(err);
+  }
+
+  if (resolved.kind === "all") {
+    if (verb === "restart") restartAllCommand();
+    else stopAllCommand();
+    return;
+  }
+
+  const action = verb === "restart" ? restartCommand : stopCommand;
+  if (resolved.explicit) {
+    runWithProfile(resolved.profile, action);
+    return;
+  }
+
+  const implicit = resolveImplicitSingleProfileTarget({
+    defaultHasState: defaultProfileHasRuntimeState(),
+    profiles: listManageableServiceProfiles(),
+  });
+  if (implicit.kind === "ambiguous") {
+    process.exitCode = 1;
+    const hints = [
+      ...implicit.profiles.map((name) => formatShortTargetHint(verb, name)),
+      `clawc ${verb === "restart" ? "rs" : "stop"} all`,
+    ];
+    console.error(
+      `Multiple profiles detected (${implicit.profiles.join(", ")}). Specify a target:\n  ${hints.join("\n  ")}`,
+    );
+    return;
+  }
+  runWithProfile(implicit.profile, action);
+}
+
 program
   .name("clawconnect")
-  .description("ClawConnect host agent — connects OpenClaw gateway hosts to your relay server")
+  .description("ClawConnect host agent (short alias: clawc) — connects OpenClaw/Hermes hosts to your relay server")
   .version(CLAWCONNECT_AGENT_VERSION)
   .addHelpText("after", MAIN_HELP_TEXT);
 
 program
-  .command("pair")
-  .description("Register with relay server and display QR code for mobile pairing")
+  .command("pair [target]")
+  .description("Register with relay server and display QR code (target: openclaw/oc or hermes/hm)")
   .option(
     "-s, --server <url>",
     `Relay server URL (default: CLAWCONNECT_RELAY_SERVER_URL or ${DEFAULT_RELAY_SERVER_URL})`
   )
   .option("-n, --name <name>", "Display name for this host")
-  .option("--gateway-type <type>", "Gateway type: openclaw or hermes (default profile matches type)", "openclaw")
+  .option("--gateway-type <type>", "Gateway type: openclaw or hermes (default profile matches type)")
   .option(...profileOption)
   .option("--local", `Use local relay server (${LOCAL_RELAY_SERVER_URL}) with an isolated *-local profile (never overwrites online config)`, false)
   .option("-f, --force", "Force registering a new gateway even if already paired", false)
   .option("--code-only", "Print only the access code and skip QR code output", false)
-  .action(async (opts: PairCliOptions) => {
+  .action(async (target: string | undefined, opts: PairCliOptions) => {
     try {
-      await runPairCommand(opts);
+      const gatewayType = parsePairGatewayTarget(target, opts.gatewayType) ?? "openclaw";
+      await runPairCommand({
+        ...opts,
+        gatewayType,
+      });
     } catch (err) {
       console.error("Error:", err instanceof Error ? err.message : err);
       process.exit(1);
@@ -198,12 +268,20 @@ program
   });
 
 program
-  .command("run")
+  .command("run [target]")
   .description("Run relay client in foreground (used by the background service manager)")
   .option(...profileOption)
-  .action(async (opts: { profile?: string }) => {
+  .option("--local", "Target the isolated local relay profile (with oc/hm target)", false)
+  .action(async (target: string | undefined, opts: { profile?: string; local?: boolean }) => {
     try {
-      setActiveProfile(opts.profile);
+      const resolved = resolveProfileCommandTarget({
+        target,
+        profile: opts.profile,
+        local: opts.local,
+        allowAll: false,
+      });
+      if (resolved.kind !== "profile") return;
+      setActiveProfile(resolved.profile);
       // 运行时模块包含 OpenClaw/Hermes 路径与子进程环境快照；必须在 .env 加载后再初始化。
       const { runCommand } = await import("./commands/run.js");
       await runCommand();
@@ -214,12 +292,13 @@ program
   });
 
 program
-  .command("stop")
-  .description("Stop relay client background service")
+  .command("stop [target]")
+  .description("Stop relay client background service (target: oc/openclaw, hm/hermes, all, or profile)")
   .option(...profileOption)
-  .action((opts: { profile?: string }) => {
-    setActiveProfile(opts.profile);
-    stopCommand();
+  .option("--local", "Target the isolated local relay profile (with oc/hm target)", false)
+  .option("--all", "Stop background services for all profiles", false)
+  .action((target: string | undefined, opts: { profile?: string; local?: boolean; all?: boolean }) => {
+    runServiceLifecycleCommand("stop", target, opts);
   });
 
 program
@@ -239,13 +318,33 @@ program
   });
 
 program
-  .command("status")
+  .command("status [target]")
+  .alias("st")
   .description("Show pairing config, gateway URL, and background service status (all paired profiles by default)")
   .option(...profileOption)
-  .action((opts: { profile?: string }) => {
-    const explicitProfile = opts.profile !== undefined;
-    setActiveProfile(opts.profile === "all" ? undefined : opts.profile);
-    statusCommand({ profile: opts.profile, explicitProfile });
+  .option("--local", "Target the isolated local relay profile (with oc/hm target)", false)
+  .action((target: string | undefined, opts: { profile?: string; local?: boolean }) => {
+    let resolved;
+    try {
+      resolved = resolveProfileCommandTarget({
+        target,
+        profile: opts.profile,
+        local: opts.local,
+        allowAll: true,
+      });
+    } catch (err) {
+      runProfileError(err);
+    }
+    if (resolved.kind === "all") {
+      setActiveProfile(undefined);
+      statusCommand({ profile: "all", explicitProfile: true });
+      return;
+    }
+    setActiveProfile(resolved.profile);
+    statusCommand({
+      profile: resolved.explicit ? (resolved.profile ?? "default") : undefined,
+      explicitProfile: resolved.explicit,
+    });
   });
 
 program
@@ -257,11 +356,27 @@ program
   });
 
 program
-  .command("install")
+  .command("install [target]")
   .description("Register as a background service (launchd on macOS, systemd --user on Linux, Windows Service on Windows, requires an elevated terminal)")
   .option(...profileOption)
-  .action((opts: { profile?: string }) => {
-    runInstallCommand(opts);
+  .option("--local", "Target the isolated local relay profile (with oc/hm target)", false)
+  .action((target: string | undefined, opts: { profile?: string; local?: boolean }) => {
+    let resolved;
+    try {
+      resolved = resolveProfileCommandTarget({
+        target,
+        profile: opts.profile,
+        local: opts.local,
+        allowAll: true,
+      });
+    } catch (err) {
+      runProfileError(err);
+    }
+    if (resolved.kind === "all" || !resolved.explicit) {
+      runInstallCommand({});
+      return;
+    }
+    runWithProfile(resolved.profile, installCommand);
   });
 
 program
@@ -281,12 +396,14 @@ program
   });
 
 program
-  .command("restart")
-  .description("Restart the relay background service")
+  .command("restart [target]")
+  .alias("rs")
+  .description("Restart the relay background service (target: oc/openclaw, hm/hermes, all, or profile)")
   .option(...profileOption)
-  .action((opts: { profile?: string }) => {
-    setActiveProfile(opts.profile);
-    restartCommand();
+  .option("--local", "Target the isolated local relay profile (with oc/hm target)", false)
+  .option("--all", "Restart background services for all profiles", false)
+  .action((target: string | undefined, opts: { profile?: string; local?: boolean; all?: boolean }) => {
+    runServiceLifecycleCommand("restart", target, opts);
   });
 
 program
@@ -306,16 +423,29 @@ program
   });
 
 program
-  .command("uninstall")
-  .description("Remove background service definition")
+  .command("uninstall [target]")
+  .description("Remove background service definition (target: oc/openclaw, hm/hermes, all, or profile)")
   .option(...profileOption)
+  .option("--local", "Target the isolated local relay profile (with oc/hm target)", false)
   .option("--all", "Remove background service definitions for all profiles", false)
-  .action((opts: { profile?: string; all?: boolean }) => {
-    if (opts.all) {
+  .action((target: string | undefined, opts: { profile?: string; local?: boolean; all?: boolean }) => {
+    let resolved;
+    try {
+      resolved = resolveProfileCommandTarget({
+        target,
+        profile: opts.profile,
+        local: opts.local,
+        all: opts.all,
+        allowAll: true,
+      });
+    } catch (err) {
+      runProfileError(err);
+    }
+    if (resolved.kind === "all") {
       uninstallAllCommand();
       return;
     }
-    setActiveProfile(opts.profile);
+    setActiveProfile(resolved.profile);
     uninstallCommand();
   });
 
@@ -343,12 +473,32 @@ program
   });
 
 program
-  .command("set-token")
+  .command("set-token [target]")
   .description("Set the local OpenClaw gateway token (needed when using token auth)")
   .option(...profileOption)
-  .action(async (opts: { profile?: string }) => {
+  .option("--local", "Target the isolated local relay profile (with oc/hm target)", false)
+  .action(async (target: string | undefined, opts: { profile?: string; local?: boolean }) => {
     try {
-      setActiveProfile(opts.profile);
+      const resolved = resolveProfileCommandTarget({
+        target,
+        profile: opts.profile,
+        local: opts.local,
+        allowAll: false,
+      });
+      if (resolved.kind !== "profile") return;
+      if (resolved.explicit) {
+        setActiveProfile(resolved.profile);
+      } else {
+        const implicit = resolveImplicitSingleProfileTarget({
+          defaultHasState: configExists(undefined),
+          profiles: listProfileNames(),
+        });
+        if (implicit.kind === "ambiguous") {
+          const hints = implicit.profiles.map((name) => formatShortTargetHint("set-token", name));
+          throw new Error(`Multiple profiles detected (${implicit.profiles.join(", ")}). Specify a target:\n  ${hints.join("\n  ")}`);
+        }
+        setActiveProfile(implicit.profile);
+      }
       await setTokenCommand();
     } catch (err) {
       console.error("Error:", err instanceof Error ? err.message : err);
@@ -357,18 +507,31 @@ program
   });
 
 program
-  .command("reset")
+  .command("reset [target]")
   .description("Uninstall service and clear saved config, logs, backups, and outbox for a profile")
   .option(...profileOption)
+  .option("--local", "Target the isolated local relay profile (with oc/hm target)", false)
   .option("--all", "Reset all profiles (OpenClaw, Hermes, default, and custom)", false)
   .addHelpText("after", RESET_PROFILE_HELP_TEXT)
-  .action((opts: { profile?: string; all?: boolean }) => {
-    if (opts.all) {
+  .action((target: string | undefined, opts: { profile?: string; local?: boolean; all?: boolean }) => {
+    let resolved;
+    try {
+      resolved = resolveProfileCommandTarget({
+        target,
+        profile: opts.profile,
+        local: opts.local,
+        all: opts.all,
+        allowAll: true,
+      });
+    } catch (err) {
+      runProfileError(err);
+    }
+    if (resolved.kind === "all") {
       resetAllCommand();
       return;
     }
-    if (opts.profile !== undefined) {
-      setActiveProfile(opts.profile);
+    if (resolved.explicit) {
+      setActiveProfile(resolved.profile);
       resetCommand();
       return;
     }
@@ -415,6 +578,7 @@ program
 
 program
   .command("update")
+  .alias("up")
   .description("Upgrade the globally installed clawconnect-agent package to the latest npm version")
   .action(() => {
     try {

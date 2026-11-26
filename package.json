@@ -1,11 +1,12 @@
 {
   "name": "clawconnect-agent",
-  "version": "0.2.19",
+  "version": "0.2.20",
   "description": "ClawConnect host agent for OpenClaw remote access",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "clawconnect": "dist/index.js"
+    "clawconnect": "dist/index.js",
+    "clawc": "dist/index.js"
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

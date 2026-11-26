@@ -12,3 +12,6 @@ export interface ResetProfileDeps {
 export declare function resetCommand(deps?: ResetProfileDeps): void;
 export declare function resetAllCommand(): void;
 export declare function uninstallAllCommand(): void;
+export declare function listManageableServiceProfiles(): string[];
+export declare function restartAllCommand(): void;
+export declare function stopAllCommand(): void;
