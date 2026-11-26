@@ -76,6 +76,16 @@ test("OpenClaw projection v3 rejects missing gateway, session, source id, or sou
     projectionVersion: 3,
     projectionGatewayId: "gw-writer",
   }), /sourceOrderSeq/);
+
+  const emptyWithoutSessionId = canonicalizeOpenClawGatewayHistoryResponse({
+    sessionKey: "agent:main:main",
+    messages: [],
+  }, {
+    sessionKey: "agent:main:main",
+    projectionVersion: 3,
+    projectionGatewayId: "gw-empty",
+  });
+  assert.deepEqual(emptyWithoutSessionId.timelineSnapshot?.messages, []);
 });
 
 test("OpenClaw v4 gateway history becomes a canonical snapshot with native user turns", () => {

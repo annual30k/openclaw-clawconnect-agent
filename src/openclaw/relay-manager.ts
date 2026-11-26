@@ -217,10 +217,71 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
       isAcknowledged: () => relayEventsAcknowledged,
     });
     const chatRunContexts = new Map<string, OpenClawChatRunIdentity>();
+    const forwardedActiveLiveRuns = new Map<string, {
+      canonicalRunId: string;
+      sessionKey: string;
+      snapshotKey?: string;
+    }>();
     const chatSendDedupe = new OpenClawChatSendDedupeCoordinator(() => sessionDefaults);
     const outgoingMediaUploadCache = new Map<string, FileUploadResult>();
     let relayHelloNegotiated = false;
     let relayHelloTimer: ReturnType<typeof setTimeout> | undefined;
+    let relayClosing = false;
+
+    const trackForwardedActiveLiveRun = (
+      providerRunId: string | undefined,
+      canonicalRunId: string | undefined,
+      sessionKey: string | undefined,
+      snapshotKey?: string,
+    ): void => {
+      const normalizedProviderRunId = providerRunId?.trim();
+      const normalizedCanonicalRunId = canonicalRunId?.trim() || normalizedProviderRunId;
+      const normalizedSessionKey = sessionKey?.trim();
+      if (!normalizedProviderRunId || !normalizedCanonicalRunId || !normalizedSessionKey) {
+        return;
+      }
+      forwardedActiveLiveRuns.set(normalizedProviderRunId, {
+        canonicalRunId: normalizedCanonicalRunId,
+        sessionKey: normalizedSessionKey,
+        ...(snapshotKey ? { snapshotKey } : {}),
+      });
+      while (forwardedActiveLiveRuns.size > 2048) {
+        const oldest = forwardedActiveLiveRuns.keys().next().value as string | undefined;
+        if (!oldest) break;
+        forwardedActiveLiveRuns.delete(oldest);
+      }
+    };
+
+    const forgetForwardedActiveLiveRun = (providerRunId: string | undefined): void => {
+      const normalizedProviderRunId = providerRunId?.trim();
+      if (normalizedProviderRunId) {
+        forwardedActiveLiveRuns.delete(normalizedProviderRunId);
+      }
+    };
+
+    const flushSilentLifecycleCloseForLiveRun = (
+      providerRunId: string,
+      fallbackSessionKey?: string,
+      fallbackSnapshotKey?: string,
+    ): void => {
+      const tracked = forwardedActiveLiveRuns.get(providerRunId);
+      if (!tracked) return;
+      forwardedActiveLiveRuns.delete(providerRunId);
+      const resolvedSessionKey = tracked.sessionKey || fallbackSessionKey;
+      if (!resolvedSessionKey) return;
+      const snapshotKey = fallbackSnapshotKey ?? tracked.snapshotKey;
+      runAfterAssistantSnapshot(snapshotKey, true, async () => {
+        await publishAndSendGatewayEvent(
+          "chat",
+          buildMobileAssistantCompletedPayload({
+            run: { runId: tracked.canonicalRunId, sessionKey: resolvedSessionKey },
+            includeTimelineEvents: true,
+          }),
+          false,
+        );
+        openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
+      }, true);
+    };
 
     const contextUsage = createOpenClawContextUsagePublisher({
       getGatewayClient: () => gatewayClient,
@@ -703,6 +764,17 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
           console.log(`Gateway disconnected: ${reason}`);
           subscribedSessionMessageKeys.clear();
           pendingSessionMessageSubscriptions.clear();
+          chatRunContexts.clear();
+          if (relayClosing) {
+            // Relay WS teardown calls gatewayClient.stop(); keep module-level run
+            // identities/text intact across Relay reconnects instead of flushing
+            // premature completion frames to an already closed socket.
+            forwardedActiveLiveRuns.clear();
+            return;
+          }
+          for (const providerRunId of Array.from(forwardedActiveLiveRuns.keys())) {
+            flushSilentLifecycleCloseForLiveRun(providerRunId);
+          }
           send({ type: "gateway_disconnected", reason });
           publishOfficeSnapshot(send, "gateway_disconnected", {
             reason,
@@ -801,26 +873,39 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               assistantText: currentText,
               chatState: state,
             })) {
-              if (providerRunId && (state === "final" || state === "error" || state === "failed" || state === "fail" || state === "aborted")) {
-                openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
+              if (providerRunId && isTerminalState) {
+                if (forwardedActiveLiveRuns.has(providerRunId)) {
+                  // 若该心跳轮次此前已经转发过 agent 工具事件或流式 delta，隐藏纯确认 final
+                  // 前必须给 Relay 补发 run.completed，避免主会话长期残留 active 状态。
+                  flushSilentLifecycleCloseForLiveRun(providerRunId, resolvedSessionKey, runSnapshotKey);
+                } else {
+                  openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
+                }
                 chatRunContexts.delete(providerRunId);
               }
-              if (runSnapshotKey) {
+              if (!isTerminalState && runSnapshotKey) {
                 assistantSnapshots.clear(runSnapshotKey);
               }
               return;
             }
             // A roleless error/abort is still a terminal lifecycle signal when
-            // it belongs to a previously registered provider run. Its identity
-            // comes from that run context; never infer it from the payload
-            // text. A roleless empty final is lifecycle-only and leaves source
-            // rows to the transcript/source-commit watcher. Text-bearing
-            // roleless deltas/finals remain rejected user/source echoes.
+            // it belongs to a previously registered provider run or an agent
+            // tool stream already forwarded to Relay. Its identity comes from
+            // that run state; never infer it from the payload text.
             if (role !== "assistant") {
-              if (!runContext || !providerRunId || !canonicalRunId || !resolvedSessionKey) {
+              if (role === "user") {
+                return;
+              }
+              const trackedLiveRun = providerRunId ? forwardedActiveLiveRuns.get(providerRunId) : undefined;
+              const effectiveCanonicalRunId = runContext?.canonicalRunId
+                ?? trackedLiveRun?.canonicalRunId
+                ?? (trackedLiveRun ? canonicalRunId : undefined);
+              const effectiveSessionKey = resolvedSessionKey ?? trackedLiveRun?.sessionKey;
+              if ((!runContext && !trackedLiveRun) || !providerRunId || !effectiveCanonicalRunId || !effectiveSessionKey) {
                 return;
               }
               if (state === "error" || state === "failed" || state === "fail" || state === "aborted") {
+                forgetForwardedActiveLiveRun(providerRunId);
                 chatSendDedupe.scheduleForRun(providerRunId, 100);
                 chatRunContexts.delete(providerRunId);
                 runAfterAssistantSnapshot(runSnapshotKey, true, async () => {
@@ -829,7 +914,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     mergeCanonicalChatPayload(
                       normalizedPayload,
                       buildMobileAssistantErrorPayload({
-                        run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
+                        run: { runId: effectiveCanonicalRunId, sessionKey: effectiveSessionKey },
                         errorMessage: extractChatErrorMessage(normalizedPayload),
                         includeTimelineEvents: true,
                       }),
@@ -842,6 +927,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                 return;
               }
               if (state === "final" && !currentText) {
+                forgetForwardedActiveLiveRun(providerRunId);
                 chatRunContexts.delete(providerRunId);
                 const lifecyclePayload = lifecycleOnlyChatPayload(normalizedPayload);
                 runAfterAssistantSnapshot(runSnapshotKey, true, async () => {
@@ -850,7 +936,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                     mergeCanonicalChatPayload(
                       lifecyclePayload,
                       buildMobileAssistantCompletedPayload({
-                        run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
+                        run: { runId: effectiveCanonicalRunId, sessionKey: effectiveSessionKey },
                         includeTimelineEvents: true,
                       }),
                     ),
@@ -913,6 +999,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
               (state === "delta" || state === "streaming" || state === "in_progress") &&
               extractChatText(realtimePayload).trim()
             ) {
+              trackForwardedActiveLiveRun(providerRunId, canonicalRunId, resolvedSessionKey, runSnapshotKey);
               assistantSnapshots.schedule(runSnapshotKey, {
                 eventName: event,
                 payload: realtimePayload,
@@ -1014,6 +1101,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                         )
                       : withMessageText(normalizedPayload, resolvedText);
                   }
+                  forgetForwardedActiveLiveRun(providerRunId);
                   await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
                   if (providerRunId) {
                     openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
@@ -1024,10 +1112,32 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
               // 转录里还没有这次运行的终态行（工具前导、final 先于提交到达、历史读取失败）
               // 时，什么都不发布：正文与终态必须由 source-commit watcher 以 v3 源行投影，
-              // 运行在此期间保持打开。原始 provider payload 一旦转发，Relay 会把它包装成
-              // relay-legacy 的“已确认”空行，之后无法被 v3 行替换。没有 run 身份的旧路径保持原样。
+              // 运行在此期间保持打开。但若本机根本没有 SQLite source-commit 源、且此前
+              // 已向 Relay 转发过流式/工具 active 事件，则补发生命周期 `run.completed`
+              // 关闭 active 状态，同时不生成空 assistant 气泡。
               const publishTerminalWithoutHistory = async (reason: string): Promise<void> => {
                 if (providerRunId && canonicalRunId) {
+                  if (
+                    forwardedActiveLiveRuns.has(providerRunId)
+                    && resolvedSessionKey
+                    && !readOpenClawSourceCommitCursor({
+                      sessionKey: resolvedSessionKey,
+                      projectionGatewayId: opts.gatewayId,
+                    }, sessionDefaults)
+                  ) {
+                    forgetForwardedActiveLiveRun(providerRunId);
+                    await publishAndSendGatewayEvent(
+                      event,
+                      buildMobileAssistantCompletedPayload({
+                        run: { runId: canonicalRunId, sessionKey: resolvedSessionKey },
+                        includeTimelineEvents: true,
+                      }),
+                      false,
+                      runContext?.promptText,
+                    );
+                    openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
+                    return;
+                  }
                   console.warn(`[relay] provider final for run ${canonicalRunId} deferred to source projection (${reason})`);
                   return;
                 }
@@ -1073,6 +1183,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                         })
                       : normalizedPayload;
                     const outgoingPayload = buildFinalPayloadFromHistoryOutcome(basePayload, outcome);
+                    forgetForwardedActiveLiveRun(providerRunId);
                     await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice, runContext?.promptText);
                     if (providerRunId) {
                       openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
@@ -1094,6 +1205,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                           state: "error",
                           errorMessage: outcome.errorMessage,
                         };
+                    forgetForwardedActiveLiveRun(providerRunId);
                     await publishAndSendGatewayEvent(event, outgoingPayload, shouldPublishOffice);
                     if (providerRunId) openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
                     return;
@@ -1109,20 +1221,25 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
             }
 
             if (providerRunId && (state === "error" || state === "failed" || state === "fail" || state === "aborted")) {
+              forgetForwardedActiveLiveRun(providerRunId);
               chatRunContexts.delete(providerRunId);
               contextUsage.scheduleRefresh(p?.sessionKey, 450);
             }
             const isTerminal = state === "error" || state === "failed" || state === "fail" || state === "aborted";
+            if (!isTerminal && providerRunId && canonicalRunId && resolvedSessionKey) {
+              trackForwardedActiveLiveRun(providerRunId, canonicalRunId, resolvedSessionKey, runSnapshotKey);
+            }
             runAfterAssistantSnapshot(runSnapshotKey, isTerminal, async () => {
               await publishAndSendGatewayEvent(event, realtimePayload, shouldPublishOffice);
               if (providerRunId && isTerminal) {
+                forgetForwardedActiveLiveRun(providerRunId);
                 openClawChatRunIdentities.clearTransient(opts.gatewayId, providerRunId);
               }
             }, Boolean(providerRunId && isTerminal));
             return;
           }
           if (event === "agent") {
-            const p = normalizedPayload as { sessionKey?: string; runId?: string };
+            const p = normalizedPayload as { sessionKey?: string; runId?: string; stream?: string; data?: unknown };
             const providerRunId = typeof p?.runId === "string" ? p.runId.trim() : "";
             let runContext = providerRunId
               ? chatRunContexts.get(providerRunId) ?? openClawChatRunIdentities.resolve(opts.gatewayId, providerRunId)
@@ -1136,6 +1253,28 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
                   ...(resolvedSessionKey ? { sessionKey: resolvedSessionKey } : {}),
                 }
               : normalizedPayload;
+            const agentData = p?.data && typeof p.data === "object" && !Array.isArray(p.data)
+              ? p.data as Record<string, unknown>
+              : undefined;
+            const agentPhase = typeof agentData?.phase === "string" ? agentData.phase.trim().toLowerCase() : "";
+            const isTerminalAgentPhase =
+              agentPhase === "result"
+              || agentPhase === "end"
+              || agentPhase === "completed"
+              || agentPhase === "error"
+              || agentPhase === "failed"
+              || agentPhase === "denied"
+              || agentPhase === "cancelled"
+              || agentPhase === "canceled";
+            if (
+              providerRunId
+              && resolvedSessionKey
+              && (p?.stream === "tool" || p?.stream === "item")
+              && !isTerminalAgentPhase
+              && !openClawChatRunIdentities.isTerminal(opts.gatewayId, providerRunId)
+            ) {
+              trackForwardedActiveLiveRun(providerRunId, canonicalRunId, resolvedSessionKey, snapshotKeyForGatewayPayload(mappedPayload));
+            }
             runAfterAssistantSnapshot(snapshotKeyForGatewayPayload(mappedPayload), false, () => (
               publishAndSendGatewayEvent(event, mappedPayload, shouldPublishOffice)
             ));
@@ -1465,6 +1604,7 @@ export async function runRelayManager(opts: RelayManagerOptions): Promise<boolea
 
     relayWs.on("close", (code, reason) => {
       console.log(`Relay connection closed: ${code} ${reason.toString()}`);
+      relayClosing = true;
       livenessMonitor?.stop();
       opts.onDisconnected?.(code);
       gatewayClient?.stop();

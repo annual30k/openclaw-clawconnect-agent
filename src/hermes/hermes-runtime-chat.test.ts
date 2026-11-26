@@ -588,3 +588,65 @@ test("runHermesChat does not reuse cached runtime context across Hermes environm
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("runHermesChat closes unclosed CLI tool invocations when process exits cleanly", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hermes-chat-tool-close-"));
+  const previousStore = process.env.CLAWCONNECT_HERMES_SESSION_STORE;
+  const previousBin = process.env.HERMES_BIN;
+  const previousHermesHome = process.env.HERMES_HOME;
+  try {
+    const storePath = join(root, "sessions.json");
+    const hermesHome = join(root, ".hermes");
+    const hermesLogDir = join(hermesHome, "logs");
+    mkdirSync(hermesLogDir, { recursive: true });
+    const logPath = join(hermesLogDir, "agent.log");
+    writeFileSync(logPath, "", "utf8");
+    const binPath = join(root, "hermes-tool-exit");
+    writeFileSync(binPath, [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"chat\" ]; then",
+      `  echo '2026-11-25 18:00:00,000 INFO [session] agent.tool_executor: tool terminal running' >> '${logPath.replace(/'/g, "'\\''")}'`,
+      "  sleep 0.35",
+      "  echo 'done'",
+      "  exit 0",
+      "fi",
+      "if [ \"$1\" = \"sessions\" ] && [ \"$2\" = \"list\" ]; then echo 'ID'; exit 0; fi",
+      "if [ \"$1\" = \"status\" ]; then exit 0; fi",
+      "exit 0",
+      "",
+    ].join("\n"), "utf8");
+    chmodSync(binPath, 0o755);
+    process.env.CLAWCONNECT_HERMES_SESSION_STORE = storePath;
+    process.env.HERMES_BIN = binPath;
+    process.env.HERMES_HOME = hermesHome;
+
+    const events: Array<{ event: string; payload: unknown }> = [];
+    const { runHermesChatOnceWithMobileFileRoute } = await import("./runtime/hermes-runtime-chat-cli.js");
+    const out = await runHermesChatOnceWithMobileFileRoute({
+      sessionKey: "main",
+      message: "run ls",
+      gatewayId: "gw-hermes-cli",
+      enableFileTransferRoute: false,
+      context: {
+        requestId: "hermes-cli-tool-close-1",
+        gatewayId: "gw-hermes-cli",
+        publishEvent: (evt) => {
+          events.push(evt);
+        },
+      },
+    });
+    assert.match(out, /done/);
+    const toolEvents = events
+      .flatMap((entry) => ((entry.payload as { timelineEvents?: Array<Record<string, unknown>> })?.timelineEvents ?? []))
+      .filter((evt) => evt.eventType === "tool.invocation.updated");
+    assert.equal(toolEvents.some((evt) => evt.messageState === "streaming" && evt.runState === "active"), true);
+    const lastTool = toolEvents.at(-1);
+    assert.equal(lastTool?.messageState, "completed");
+    assert.equal(lastTool?.runState, "inactive");
+  } finally {
+    restoreEnv("CLAWCONNECT_HERMES_SESSION_STORE", previousStore);
+    restoreEnv("HERMES_BIN", previousBin);
+    restoreEnv("HERMES_HOME", previousHermesHome);
+    rmSync(root, { recursive: true, force: true });
+  }
+});

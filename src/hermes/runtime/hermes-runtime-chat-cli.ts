@@ -1,9 +1,11 @@
 // Hermes CLI 对话执行：构建 chat 参数、派生子进程、过滤展示输出并把工具/stderr 事件发布给 Relay。
 import { spawn } from "child_process";
+import { join } from "path";
 import type { LocalCommandContext } from "../../core/command-types.js";
 import {
   buildToolInvocationUpdatedEvent,
 } from "../../core/relay/timeline-event-builder.js";
+import { resolveHermesHomeDir } from "./hermes-runtime-paths.js";
 import {
   CHAT_TIMEOUT_MS,
   SUBPROCESS_ENV,
@@ -174,7 +176,19 @@ async function runHermesChatStreaming(
       },
     });
   };
-  const toolLogWatcher = createHermesToolLogWatcher(publishToolLogEvent);
+  const finishActiveTools = (phase: "completed" | "failed"): void => {
+    for (const [toolName] of Array.from(toolCallIdsByName.entries())) {
+      publishToolLogEvent({
+        phase,
+        toolName,
+        text: "",
+        ...(phase === "failed" ? { isError: true } : {}),
+      });
+    }
+  };
+  const toolLogWatcher = createHermesToolLogWatcher(publishToolLogEvent, {
+    logFile: join(resolveHermesHomeDir(), "logs", "agent.log"),
+  });
 
   const filterChatLine = (line: string): string | null => {
     const clean = stripAnsi(line).trim();
@@ -288,6 +302,7 @@ async function runHermesChatStreaming(
       cleanup();
       clearTimeout(timeout);
       toolLogWatcher.stop();
+      finishActiveTools("completed");
       resolveOutput(value);
     };
     const finishReject = (error: Error): void => {
@@ -298,6 +313,7 @@ async function runHermesChatStreaming(
       cleanup();
       clearTimeout(timeout);
       toolLogWatcher.stop();
+      finishActiveTools("failed");
       rejectOutput(error);
     };
     const timeout = setTimeout(() => {

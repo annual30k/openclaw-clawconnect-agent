@@ -2887,3 +2887,115 @@ async function createEmptyOpenClawHomeFixture(): Promise<{ home: string; cleanup
     },
   };
 }
+
+test("relay manager closes active OpenClaw heartbeat tool runs and gateway disconnects cleanly", async () => {
+  openClawChatRunIdentities.clear();
+  const openclawHome = await createEmptyOpenClawHomeFixture();
+  const previousOpenClawHome = process.env.CLAWCONNECT_OPENCLAW_HOME;
+  process.env.CLAWCONNECT_OPENCLAW_HOME = openclawHome.home;
+
+  const relayServer = new WebSocketServer({ port: 0 });
+  const gatewayServer = new WebSocketServer({ port: 0 });
+  const abort = new AbortController();
+  const relayMessages: Array<Record<string, unknown>> = [];
+  let gatewaySocket: WebSocket | undefined;
+
+  relayServer.on("connection", (socket) => {
+    sendRelayHello(socket, "gw-heartbeat-close");
+    socket.on("message", (raw) => relayMessages.push(JSON.parse(raw.toString()) as Record<string, unknown>));
+  });
+  gatewayServer.on("connection", (socket) => {
+    gatewaySocket = socket;
+    socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "nonce-hb", ts: Date.now() } }));
+    socket.on("message", (raw) => {
+      const msg = JSON.parse(raw.toString()) as { type?: string; id?: string; method?: string };
+      if (msg.type !== "req" || !msg.id) return;
+      socket.send(JSON.stringify({
+        type: "res",
+        id: msg.id,
+        ok: true,
+        payload: msg.method === "config.get" ? sessionDefaultsPayload() : {},
+      }));
+      if (msg.method !== "connect") return;
+      // 1. 心跳运行先触发了 agent tool，随后产出纯确认 HEARTBEAT_OK
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "agent",
+        payload: {
+          runId: "hb-tool-run",
+          sessionKey: "agent:main:main",
+          stream: "tool",
+          seq: 1,
+          ts: Date.now(),
+          data: { phase: "start", name: "exec", toolCallId: "hb-call-1" },
+        },
+      }));
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "hb-tool-run",
+          sessionKey: "agent:main:main",
+          state: "final",
+          role: "assistant",
+          message: { role: "assistant", content: [{ type: "text", text: "HEARTBEAT_OK" }] },
+        },
+      }));
+      // 2. 非移动端运行发出 tool 后网关直接断开
+      socket.send(JSON.stringify({
+        type: "event",
+        event: "agent",
+        payload: {
+          runId: "disconnect-tool-run",
+          sessionKey: "agent:main:main",
+          stream: "tool",
+          seq: 2,
+          ts: Date.now(),
+          data: { phase: "start", name: "exec", toolCallId: "disc-call-1" },
+        },
+      }));
+      setTimeout(() => socket.close(1001, "crash"), 80);
+    });
+  });
+
+  const relayAddress = relayServer.address();
+  const gatewayAddress = gatewayServer.address();
+  assert.ok(relayAddress && typeof relayAddress === "object");
+  assert.ok(gatewayAddress && typeof gatewayAddress === "object");
+  const manager = runRelayManager({
+    relayServerUrl: `http://127.0.0.1:${relayAddress.port}`,
+    gatewayId: "gw-heartbeat-close",
+    relaySecret: "secret",
+    gatewayUrl: `ws://127.0.0.1:${gatewayAddress.port}`,
+    signal: abort.signal,
+  });
+
+  try {
+    const hasCompletedFor = (runId: string) => relayMessages.some((msg) => (
+      msg.type === "event"
+      && msg.event === "chat"
+      && isRecord(msg.payload)
+      && msg.payload.runId === runId
+      && Array.isArray(msg.payload.timelineEvents)
+      && msg.payload.timelineEvents.some((evt) => isRecord(evt) && evt.eventType === "run.completed")
+    ));
+    await waitFor(() => hasCompletedFor("hb-tool-run") && hasCompletedFor("disconnect-tool-run"), 4_000);
+    // 心跳纯确认文本绝不能发送到 Relay
+    assert.equal(
+      relayMessages.some((msg) => JSON.stringify(msg).includes("HEARTBEAT_OK")),
+      false,
+    );
+  } finally {
+    abort.abort();
+    gatewaySocket?.close(1000, "test done");
+    await manager.catch(() => false);
+    await closeServer(relayServer);
+    await closeServer(gatewayServer);
+    if (previousOpenClawHome === undefined) {
+      delete process.env.CLAWCONNECT_OPENCLAW_HOME;
+    } else {
+      process.env.CLAWCONNECT_OPENCLAW_HOME = previousOpenClawHome;
+    }
+    await openclawHome.cleanup();
+  }
+});

@@ -547,9 +547,11 @@ export function canonicalizeOpenClawGatewayHistoryResponse(
   ) ?? (cleanHistoryString(filtered.sessionKey) ?? request.sessionKey);
   const messages = filtered.messages ?? [];
   const rawSourceSessionId = cleanHistoryString(filtered.sessionId);
-  const sourceSessionId = projectionVersion === 3
+  // 空会话（刚初始化的 main 等）可能还没有生成 sourceSessionId；
+  // 只有在存在消息需要 v3 身份投影时才要求强制提供 sourceSessionId。
+  const sourceSessionId = projectionVersion === 3 && messages.length > 0
     ? requireProjectionIdentity(rawSourceSessionId, "sourceSessionId")
-    : undefined;
+    : rawSourceSessionId;
   const agentId = openClawAgentIdFromSessionKey(sessionKey);
   const sourceOrderScope = rawSourceSessionId
     ? projectionVersion === 3
